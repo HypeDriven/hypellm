@@ -210,13 +210,12 @@ Still outstanding:
 
 | Target | Property to assert | Status |
 |---|---|---|
-| `openai_stream_event` | Arbitrary UTF-8 into `OpenAiAdapter::decode_stream_event` terminates, allocates within `Limits::STREAM_EVENT`, and never panics | Required, not yet implemented (§21) |
-| `anthropic_stream_event` | As above, across arbitrary and absent `event_name` values, including the `error` branch | Required, not yet implemented (§21) |
-| `openai_response_body` | Arbitrary bytes at arbitrary status into `decode_response`: no panic, and a non-2xx status always yields `Err` | Required, not yet implemented (§21) |
-| `anthropic_response_body` | As above, plus that a decoded sequence always ends in a terminal event | Required, not yet implemented (§21) |
-| `error_classification` | For arbitrary `(status, body)`, no byte sequence from `body` appears in `safe_detail`, and `provider_code` stays inside the sanitized alphabet | Required, not yet implemented (§21) |
-| `request_encode_roundtrip` | For an arbitrary `CanonicalRequest`, `encode_request` either errors or produces valid JSON within `MAX_REQUEST_BYTES` that re-parses under `Limits::DEFAULT` | Required, not yet implemented (§21) |
-| `tool_schema_passthrough` | An arbitrary JSON schema that parses is byte-for-byte semantically identical after encode/decode — the parser-differential property above | Required, not yet implemented (§21) |
+| Stream event decoding | Mutated OpenAI and Anthropic fixture frames terminate without panic and obey event limits | Implemented in `tests/fuzz.rs` |
+| Response body decoding | Mutated recorded bodies across success and error statuses terminate without panic | Implemented in `tests/fuzz.rs` |
+| Error status handling | A non-success status never decodes as a completion | Implemented in `tests/fuzz.rs` |
+| Error redaction | Provider bodies never enter client-safe detail; provider codes stay bounded and narrowed | Implemented in `tests/fuzz.rs` |
+| Determinism | Repeated classification of the same status and body is identical | Implemented in `tests/fuzz.rs` |
+| Oversized events | Oversized provider stream events are rejected | Implemented in `tests/fuzz.rs` |
 
 ## Public API
 

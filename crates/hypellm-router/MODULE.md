@@ -9,7 +9,7 @@ input/resource limits.
 | Owner | Platform (primary), Security (secondary) |
 | Unsafe code | None. `#![forbid(unsafe_code)]` is declared in both `lib.rs` and `main.rs` and inherited from the workspace lint table. |
 | External dependencies | None. Rust standard library plus workspace path dependencies: `hypellm-adapters`, `hypellm-admin-api`, `hypellm-auth`, `hypellm-config`, `hypellm-core`, `hypellm-crypto`, `hypellm-net`, `hypellm-store`, `hypellm-telemetry`, `wire-http1`, `wire-json`, `wire-sse`. |
-| Fuzz targets | None exist. Six are required; see [Fuzz targets](#fuzz-targets). |
+| Fuzz targets | Implemented in `tests/fuzz.rs`: nine seeded mutation properties over the client protocol parsers and their trust boundaries. |
 
 Ownership is Platform-primary because the crate's centre of gravity is the
 listener, the process lifecycle, and the request pipeline. Three areas inside it
@@ -72,28 +72,14 @@ stream target of specification 2.1.
 ## Threat notes
 
 These are the threats specific to what this code does, not the generic list.
-The first two are known defects, not hypotheticals.
 
-- **Group membership is never checked against the principal.**
-  `routes::groups_for` walks `config.roles` and returns *every* `RoleSubject::Group`
-  it finds, discarding the principal entirely (the two `Principal` arms both
-  return `None`). Every authenticated caller therefore presents as a member of
-  every group named in any role binding, and those groups flow straight into
-  `RoutingContext::groups`, which is what `PolicySnapshot::route` filters grants
-  and bindings on. Any `grant scope=group:…` is effectively a grant to all
-  authenticated callers, across tenants. This breaks specification 9.3 and
-  Appendix B's tenant-isolation invariant and is the highest-severity open item
-  in this crate.
-- **The data-plane listener discloses configuration before authentication.**
-  `InferenceHandler::handle` answers `/health/live`, `/health/ready`, and
-  `/metrics` before calling `authenticate`. Readiness returns
-  `config_version` and `config_digest`; the metrics exposition carries
-  `LabelName::Target` values taken from configured target identifiers, plus alias
-  and operation dimensions. Anyone who can reach the inference port can enumerate
-  target names and fingerprint the active configuration. Specification 8 requires
-  the health endpoints to expose "no sensitive provider detail", and does not put
-  `/metrics` on the inference listener at all — it belongs behind the management
-  listener or a scope.
+- **Identity and group membership.** `routes::groups_for` derives membership
+  only from configured groups in the authenticated principal's tenant. Request
+  bodies and identity-provider group claims cannot add memberships.
+- **Pre-authentication health surface.** The inference listener exposes only
+  minimal liveness and readiness verdicts before authentication. Metrics and
+  detailed configuration health remain on the management or dedicated metrics
+  listener.
 - **Failover splicing.** Specification 6.5's rule — never emit failover output
   after client-visible semantic bytes — is carried by exactly one value:
   `AttemptPhase`, set at each failure site in `dispatch::attempt` and consulted by
@@ -102,21 +88,10 @@ The first two are known defects, not hypotheticals.
   `pipeline::execute` continue its loop after `saw_output`, re-opens the ability
   to splice a second model's tokens into a stream the client is already reading.
   The truth table is pinned by tests in `dispatch.rs`.
-- **Credential material in a `Debug` rendering.** `CredentialStore::with_secret`
-  is a scoped borrow with no owned getter, so a secret cannot outlive header
-  construction — that part is sound. But `CredentialStore` *derives* `Debug` over
-  `RwLock<BTreeMap<CredentialRef, Vec<u8>>>`, so `{:?}` on it prints the key
-  bytes as a numeric array. The existing test only asserts that the UTF-8 spelling
-  does not appear. `RouterState` derives `Debug` too and holds it. Specification
-  7.1 and 10 require a redacting type here; today the protection is that nothing
-  logs router state, which is a convention rather than a boundary.
-- **Cross-tenant connection reuse via an ambiguous pool key.**
-  `RouterState::credential_class` builds `format!("{tenant}:{reference}")`, and
-  `:` is a legal identifier character (`hypellm_core::ids::validate`). Tenant `a:b`
-  with credential `c` produces the same class as tenant `a` with credential `b:c`,
-  so two tenants could share a pooled socket. Identifiers come from operator
-  configuration rather than from callers, which bounds the exposure, but the key
-  should be built from a length-prefixed or delimiter-free encoding.
+- **Credential handling.** `CredentialStore::with_secret` provides a scoped
+  borrow with no owned getter, and its `Debug` implementation redacts values.
+  Connection-pool credential isolation classes use length-prefixed tenant and
+  credential identifiers so distinct pairs cannot collide.
 - **Request smuggling and framing confusion.** Framing is decided once, by
   `wire-http1`, and `serve_connection` treats any `HttpError` as terminal: it
   writes a stable error and breaks the loop rather than continuing, so bytes left
@@ -263,12 +238,11 @@ renderers — are still requirements rather than facts:
 
 | Target | Drives | Status |
 |---|---|---|
-| `client_chat_request` | `protocol::openai::parse_chat_request` over arbitrary bodies | Required, not yet implemented (§21) |
-| `client_messages_request` | `protocol::anthropic::parse_messages_request` | Required, not yet implemented (§21) |
-| `client_embeddings_request` | `protocol::openai::parse_embeddings_request` | Required, not yet implemented (§21) |
-| `inference_head_and_body` | `server::serve_connection` end to end against a raw byte stream, for framing and smuggling | Required, not yet implemented (§21) |
-| `upstream_stream_decode` | `dispatch::stream_events` against an adversarial SSE/chunked upstream | Required, not yet implemented (§21) |
-| `event_render_roundtrip` | canonical events through `StreamSink` and the two renderers, re-parsed with `wire-sse` and `wire-json` | Required, not yet implemented (§21) |
+| Client request parsers | Mutated OpenAI chat, responses and embeddings plus Anthropic messages bodies terminate deterministically | Implemented in `tests/fuzz.rs` |
+| Identity isolation | Parsed requests retain authenticated tenant, principal and request identity rather than caller-planted values | Implemented in `tests/fuzz.rs` |
+| Policy constraints | Caller bodies cannot change residency, cost ceiling or unauthorized routing hints | Implemented in `tests/fuzz.rs` |
+| Bounds | Oversized, deep and high-cardinality bodies are rejected under parser limits | Implemented in `tests/fuzz.rs` |
+| Prompt inertness | Prompt-shaped destination and credential strings remain canonical content only | Implemented in `tests/fuzz.rs` |
 
 Every target must assert bounded work and a stable error, per specification 21.1:
 no panic, no allocation beyond the declared limits, and an error body containing

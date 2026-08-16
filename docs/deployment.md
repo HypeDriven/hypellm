@@ -1,9 +1,8 @@
 # HypeLLM Router — deployment
 
-Specification 20 defines four deployment profiles and 20.1 defines process
-hardening. This document maps them onto what the binary actually does today, and
-says clearly which parts of 20.1 are **not** implemented in code and must be
-supplied by the deployment image or the init system.
+This guide explains how to deploy the current router: supported runtime
+profiles, platform dependencies, secrets and state, listener separation,
+configuration, lifecycle and host hardening.
 
 Contents: [The binary](#the-binary) · [Deployment
 profiles](#deployment-profiles) · [The TLS boundary](#the-tls-boundary) ·
@@ -66,9 +65,9 @@ settings inference_listen=127.0.0.1:8000 admin_listen=127.0.0.1:8001 \
 provider id=local family=llamacpp scheme=http host=127.0.0.1 port=8080 egress=local
 ```
 
-The router listens on 8000/8001 because llama.cpp's own default is 8080. Both
-examples used to put the inference listener on 8080 as well, which validates
-happily and then makes the router its own only provider.
+The router listens on 8000/8001 because llama.cpp commonly listens on 8080.
+Keep the inference and provider addresses distinct to avoid routing the router
+back to itself.
 
 Cleartext `http` is permitted **only** to a loopback literal or the name
 `localhost`; anything else is refused at load time
@@ -98,9 +97,8 @@ code.
 > is restricted to its owner. So `inference_listen=/run/hypellm/inference.sock`
 > works, and the TLS edge can reach the router without a loopback port at all.
 >
-> One consequence worth knowing: a Unix peer has no IP address, so a key with a
-> source restriction fails closed over a Unix socket rather than matching
-> everything. Formerly recorded as `DI-028`, now resolved.
+> A Unix peer has no IP address, so an API key with a source-network restriction
+> fails closed over a Unix socket rather than matching every peer.
 
 ### HA stateless data plane
 
@@ -109,7 +107,7 @@ process lock, no replication, no leader election, no distributed lock
 (`crates/hypellm-store/src/durable.rs`, `ProcessLock`). Specification 11.2 defers
 multi-node to an external consensus/config distributor and none is implemented.
 Running two routers against one state directory is unsafe — the lock is advisory
-and its stale-reclaim path is racy. Recorded as `DI-029`.
+and its stale-reclaim path is racy.
 
 Multiple routers with *separate* state directories and a shared upstream is
 possible, and the quota half of it is now addressed. Specification 12 requires
@@ -279,7 +277,7 @@ runtime re-key path. Provider credentials rotate at runtime — see
 > log frame magic and the snapshot-metadata magic both changed, so `log.bin` and
 > `snapshot.meta` from an older build are refused at startup with a message
 > naming the file. That refusal is deliberate: the alternative was truncating
-> the log and reporting the loss as a routine torn tail (`DI-055`). There is no
+> the log and reporting the loss as a routine torn tail . There is no
 > migration path — start from an empty `state_dir`, and re-issue API keys.
 
 
@@ -337,8 +335,8 @@ Operational notes that matter:
   spool directory: `GET /admin/v1/audit/export` (permission `ExportAudit`)
   emits the chain with its checkpoints on request, but nothing ships them
   off-node on its own. Arrange a periodic export to immutable storage —
-  otherwise the trust anchor lives in the same directory as the data it anchors
-  (`DI-030`).
+  otherwise the trust anchor lives in the same directory as the data it anchors.
+  See [data lifecycle and external operations](deferred-issues.md#data-lifecycle-and-external-operations).
 
 ---
 
@@ -377,17 +375,18 @@ mistake can move a bound but not remove one.
 > times over — a tenant limit of 100 becomes 400 across four nodes, silently.
 > `settings quota_partitions=4` divides every quota limit by four so the four
 > together honour the configured figure (specification 12's "conservative node
-> partitions", `DI-029`). Division truncates, so the sum never exceeds the
-> limit; a quota smaller than the partition count is a load error rather than a
+> partitions"). Division truncates, so the sum never exceeds the limit. See
+> [multi-node limitations](deferred-issues.md#independent-nodes-are-not-a-cluster).
+> A quota smaller than the partition count is a load error rather than a
 > clamp, because zero encodes "unlimited" and clamping would invert the setting.
 > This makes the quota arithmetic right for a fanned-out data plane. It does
 > **not** make the router highly available, and two routers still must not share
 > a state directory.
 
 > **`max_connections` is not the real connection ceiling.** The router serves
-> one thread per connection (`DI-001`), so the practical limit is address space
-> divided by `connection_stack_kib`, whichever is lower. The default 512 KiB
-> stack is what makes the inference profile's 4096 connections reachable at all
+> [one thread per connection](deferred-issues.md#connection-model), so the
+> practical limit is address space divided by `connection_stack_kib`, whichever
+> is lower. The default 512 KiB stack is what makes the inference profile's 4096 connections reachable at all
 > — the platform default of 8 MiB would reserve 32 GiB for the same number. If
 > you raise `max_connections`, check the product; if a handler needs deeper
 > stacks, raise `connection_stack_kib` and expect a lower ceiling in exchange.
@@ -399,14 +398,14 @@ mistake can move a bound but not remove one.
 > specification 14's SSE comment cadence — how often the router writes into an
 > *open stream* so an intermediary with an idle timeout does not drop a
 > connection whose provider is still thinking. Tuning either must not move the
-> other, which is why they are separate settings (`DI-031`).
+> other, which is why they are separate settings .
 
 Failed sign-ins on the two pre-session endpoints — the OIDC callback and
 break-glass — are audited under a bound: the first ten in a sixty-second window
 are recorded individually and the rest are summarised in one record per window.
 Each path has its own budget, so a flood against one cannot suppress records
 from the other. `hypellm_auth_failures_total` counts every attempt regardless, so
-alert on the metric rather than on audit-row volume (`DI-052`).
+alert on the metric rather than on audit-row volume .
 
 `POST /admin/v1/targets` proposes a target rather than creating one: it returns
 a policy draft carrying the new `target` record, which then follows the ordinary
@@ -421,9 +420,8 @@ The inference listener answers `GET /health/live` and `GET /health/ready`
 **before** authentication, because health must answer when the configuration is
 broken. Both return the verdict and nothing more: `/health/ready` is
 `{"status":"ready"}` or `{"status":"not_ready"}`, with no configuration version,
-digest, target, or address. It used to disclose the version and digest, which
-together fingerprint the deployment and reveal its change cadence (`DI-032`).
-The detailed form lives on the management listener, behind authentication.
+digest, target, or address. The detailed form, including configuration information, lives on the
+management listener behind authentication.
 
 The metrics exposition is served on the management listener at `GET /metrics`
 and is deliberately **not** on the inference listener — it carries target
@@ -435,7 +433,6 @@ operational map of the deployment.
 > `GET /metrics` and `GET /health/live` — and 404 for everything else, so a
 > scraper and a supervisor can reach it without any path to the management
 > plane. Leave it unset and the exposition stays on the management listener.
-> Formerly recorded as `DI-011`, now resolved.
 >
 > The exposition is still an operational map (target identifiers, breaker
 > states, queue depths), so restrict this listener to your monitoring network.
@@ -444,8 +441,8 @@ One series is worth knowing about when diagnosing a slow stream:
 `hypellm_stream_backpressure_milliseconds` is how long a stream spent blocked
 writing to its client. The router serves one thread per connection, so a client
 that stops reading blocks that thread, which stops it reading from the provider
-— backpressure without a knob to turn (`DI-037`). A high value here means the
-*client* is slow; `hypellm_upstream_latency_milliseconds` on the same request
+— [backpressure without a configurable watermark](deferred-issues.md#streaming-backpressure).
+A high value here means the *client* is slow; `hypellm_upstream_latency_milliseconds` on the same request
 means the *provider* is. Without the first, the two were indistinguishable.
 
 ### The static admin application
@@ -575,7 +572,7 @@ invoice:
 The figure appears as `estimated_cost` on usage rows from `GET
 /admin/v1/usage`, alongside its currency, and is labelled an estimate there.
 The tokenizer half of specification 25's cost question — pre-flight token
-*counting* — is not implemented; see `DI-048`.
+*counting* — is not implemented; see [current limitations](deferred-issues.md#conservative-token-estimation).
 
 ### Alias quotas
 
@@ -595,7 +592,7 @@ that alias; a cap of two on the alias admits two.
 An operation-specific quota replaces the alias-wide one for that operation
 rather than combining with it, so the effective ceiling never depends on which
 was evaluated first. Scopes available: `global`, `tenant:<id>`,
-`principal:<id>`, `alias:<id>`, `target:<id>` (`DI-053`).
+`principal:<id>`, `alias:<id>`, `target:<id>`.
 
 ### Byte rates and spend budgets
 
@@ -623,7 +620,7 @@ already in flight when the budget is crossed still complete.
 Periods are fixed rolling windows — `daily` is 24 hours, `monthly` is 30 days —
 not calendar months. Exhaustion reports `budget_exhausted`, separately from the
 rate limits, because it does not clear when load drops; it clears when the
-period rolls. Both partition under `quota_partitions` (`DI-053`).
+period rolls. Both partition under `quota_partitions`.
 
 ### Admission queueing
 
@@ -670,24 +667,23 @@ which prints provider/target/alias counts and the configuration digest, and
 exits 2 with every accumulated error on failure. Validation collects all errors
 rather than stopping at the first.
 
-**Parsed but inert.** Two remain: `settings capture_bodies` (there is no
-body-capture implementation at all, which is fail-safe but implies a feature
-that does not exist) and `tenant retention_days` (no retention or expiry is
-implemented for any stored data). Setting either has no effect (`DI-011`).
+**Unsupported lifecycle settings.** `settings capture_bodies` and `tenant
+retention_days` are accepted by the grammar but have no runtime effect. The
+router does not capture prompt or completion bodies and does not automatically
+expire stored data. Apply retention to exported logs and audit data externally;
+see [current limitations](deferred-issues.md#data-lifecycle-and-external-operations).
 
-Three fields were on this list and are now honoured:
+Related active settings:
 
-- `settings keepalive_interval_ms` — the SSE keepalive cadence. A stream whose
-  provider is silent gets a comment at that interval (default 15 s; zero
+- `settings keepalive_interval_ms` controls the SSE keepalive cadence. A stream
+  whose provider is silent gets a comment at that interval (default 15 s; zero
   disables it).
-- `settings metrics_listen` — binds a dedicated listener serving only
-  `GET /metrics` and `GET /health/live`. Use it rather than scraping the
-  management listener, which means admitting the collector to the control
-  plane. Everything else on that address answers 404.
-- `credential rotates_after_days` — `GET /admin/v1/credentials` reports
-  `last_rotated` and `overdue` against the audit chain. The router does not
-  force a rotation: cutting off a working credential on a timer would turn a
-  policy into an outage.
+- `settings metrics_listen` binds a dedicated listener serving only
+  `GET /metrics` and `GET /health/live`. Everything else on that address
+  answers 404.
+- `credential rotates_after_days` makes `GET /admin/v1/credentials` report
+  `last_rotated` and `overdue`. Rotation remains an operator action so an
+  expired schedule cannot automatically create a provider outage.
 
 ---
 
@@ -704,7 +700,7 @@ Order (`crates/hypellm-router/src/startup.rs`, `Router::assemble`):
    restart. To override it deliberately, start once with
    `--adopt-config "<reason>"`: the file becomes a new activation, the reason is
    recorded in the audit chain, and it persists across later restarts
-   (`DI-027`).
+   .
 4. Load the provider credentials the *resumed* configuration declares. Missing
    or empty → exit 5.
 5. Check reachability: every `https` endpoint needs `tls_helper_socket`.
@@ -765,7 +761,7 @@ timeout, so they end on their own.
 process dies immediately and in-flight streams are cut. Handling it needs
 `sigaction` or `signalfd`, both `unsafe` FFI, which specification 18.2 forbids
 workspace-wide — so the control socket is the router's shutdown mechanism and
-`ExecStop=` is how a supervisor reaches it (`DI-033`).
+`ExecStop=` is how a supervisor reaches the [graceful shutdown path](deferred-issues.md#graceful-shutdown-uses-the-control-socket).
 
 **Use this unit rather than assembling one**, because the `ExecStop=` line is
 the whole point and a unit without it drops streams on every restart:
@@ -791,7 +787,7 @@ TimeoutStopSec=90
 Restart=on-failure
 
 # Specification 20.1's process hardening, none of which the router can do for
-# itself (DI-003).
+# itself; host hardening is supplied by the service manager.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
@@ -818,16 +814,16 @@ Specification 20.1, item by item, against what exists.
 
 | Requirement (20.1) | Status |
 |---|---|
-| Dedicated unprivileged user | **Detected, not enforced.** The router cannot drop privilege — `setuid` is `unsafe` FFI — so run it as an unprivileged user from the start. It does check: an effective uid of 0 logs `startup.hardening_missing` at critical. `DI-003` |
+| Dedicated unprivileged user | **Detected, not enforced.** The router cannot drop privilege — `setuid` is `unsafe` FFI — so run it as an unprivileged user from the start. It does check: an effective uid of 0 logs `startup.hardening_missing` at critical. |
 | Read-only executable and configuration | Deployment concern. The router opens the configuration read-only and never writes to it. |
-| Writable directories separated for state, audit spool, temporary files | Partly. State and secrets are separate directories, and the router writes temporary files only inside the directory it is replacing a file in. There is no audit *spool*: the chain and its checkpoints are exported on request through `GET /admin/v1/audit/export`, not pushed (`DI-030`). |
+| Writable directories separated for state, audit spool, temporary files | Partly. State and secrets are separate directories, and the router writes temporary files only inside the directory it is replacing a file in. There is no audit *spool*: the chain and its checkpoints are exported on request through `GET /admin/v1/audit/export`, not pushed. |
 | No shell, compiler, package manager, or writable executable directory in the image | Deployment concern. The router spawns no subprocess and links no dynamic loader beyond libc. |
-| System-call / filesystem / network sandbox | **Detected, not enforced.** No seccomp, no Landlock, no namespace work — all would need `unsafe` FFI. Supply it from systemd (`SystemCallFilter`, `ProtectSystem=strict`, `ReadWritePaths`, `PrivateTmp`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`) or the container runtime. The router reads `Seccomp:` and `NoNewPrivs:` from `/proc/self/status` at startup and logs `startup.hardening_missing` if either is absent, so a directive that silently failed to apply is visible. `DI-003` |
+| System-call / filesystem / network sandbox | **Detected, not enforced.** No seccomp, no Landlock, no namespace work — all would need `unsafe` FFI. Supply it from systemd (`SystemCallFilter`, `ProtectSystem=strict`, `ReadWritePaths`, `PrivateTmp`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`) or the container runtime. The router reads `Seccomp:` and `NoNewPrivs:` from `/proc/self/status` at startup and logs `startup.hardening_missing` if either is absent, so a directive that silently failed to apply is visible. |
 | Outbound connections restricted to resolved approved endpoints | Partly. In-process: destinations are administrator-configured tuples, addresses are classified and pinned, redirects are off, proxy environment variables are ignored (`crates/hypellm-net/src/egress.rs`). At the OS level: nothing. An egress firewall is still worth having. |
 | Core dumps disabled or restricted | **Detected, not enforced.** Set `LimitCORE=0` / `RLIMIT_CORE=0` in the unit. The release profile uses `panic = "abort"` and `strip = "symbols"`, so a dump would be both likely on panic and full of key material. The router reads the *soft* core limit from `/proc/self/limits` at startup and logs `startup.hardening_missing` if it is non-zero. |
 | Memory locking for secret pages | **Not implemented.** `mlock` needs `unsafe` FFI. `hypellm_crypto::Secret<N>` zeroes on drop as a best effort; Rust gives no guarantee against compiler copies. Disable swap, or use an encrypted swap device. |
-| Environment scrubbed after startup | **Not implemented.** The router reads no configuration from the environment, so there is little to scrub, but nothing clears what it inherited. `DI-003` |
-| Graceful shutdown: stop admission, drain within deadline, cancel remainder, flush audit/state, exit nonzero on integrity failure | **Done.** Admission stops, `Server::serve` drains within `drain_timeout` and reports what was still running at the deadline (`router.drain_incomplete`), the audit `RouterStopped` record and `Store::sync` run, and a failed flush exits nonzero. The remainder is not killed: each connection already carries a request deadline and a write timeout. |
+| Environment scrubbed after startup | **Not implemented.** The router reads no configuration from the environment, so there is little to scrub, but nothing clears what it inherited. |
+| Graceful shutdown: stop admission, drain within deadline, cancel remainder, flush audit/state, exit nonzero on integrity failure | **Implemented.** Admission stops, `Server::serve` drains within `drain_timeout` and reports what was still running at the deadline (`router.drain_incomplete`), the audit `RouterStopped` record and `Store::sync` run, and a failed flush exits nonzero. The remainder is not killed: each connection already carries a request deadline and a write timeout. |
 
 > **Check the first few log lines after a deploy.** Every row above marked
 > "detected" is read from `/proc/self` at startup and reported as

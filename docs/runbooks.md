@@ -1,10 +1,9 @@
 # HypeLLM Router — operational runbooks
 
-Specification 22 defines four runbooks. This document writes each one against
-the interface the router *actually* exposes today. Where a step the
-specification describes has no implementation, the step says so plainly rather
-than inventing a command — a runbook that tells an operator to run something
-that does not exist is worse than one that admits a gap.
+These runbooks cover the four operational incidents defined by the project:
+provider outage, provider credential rotation, compromised router API key and
+Google identity outage. Commands and response fields match the current
+management API.
 
 Contents: [Preconditions](#preconditions) · [22.1 Provider
 outage](#221-provider-outage) · [22.2 Credential
@@ -107,7 +106,7 @@ only a sanitised `type`/`code` token ever survives
   Health is tracked per `(target, operation)`; the summary answers "is anything
   about this target broken", and `breaker_state_by_operation` alongside it says
   which. `targets_healthy` in the overview counts on the same rule, so the two
-  views cannot disagree (`DI-017`).
+  views cannot disagree .
 - **There is no "breaker reason" field.** The specification asks for one; the
   API exposes counters and a state, not a cause. Use the decision traces and
   logs below to infer it.
@@ -170,8 +169,7 @@ Lift it with `{"state":"enabled"}` on the same endpoint; lifting also requires
 > **The override does not survive a restart.** It is held in memory, and a
 > restart re-reads the configuration. The response says so explicitly
 > (`persists_across_restart: false`). For a change meant to outlive a restart,
-> publish a policy draft (step 4). The in-memory scope of the override is
-> deliberate and reported, not a defect — see `DI-010`.
+> publish a policy draft (step 4).
 >
 > `duration_seconds` is capped at 90 days and refused above it. For an
 > indefinite removal use `{"state":"disabled"}`, which is what it means anyway —
@@ -230,7 +228,7 @@ under pressure.
 > is not persisted on purpose: it depends on the configuration grammar the
 > running binary implements, so a stored "valid" replayed across an upgrade
 > would let a draft that no longer builds be published as though it had been
-> checked. Re-run `:validate` after a restart; it costs one call (`DI-013`).
+> checked. Re-run `:validate` after a restart; it costs one call .
 
 ### 5. Simulate critical aliases
 
@@ -256,13 +254,13 @@ target that happens to be breaking should not make a policy look wrong.
 
 The response carries `live_state`, so you can tell which question you asked. An
 answer of "no eligible target" means something different in each mode
-(`DI-018`).
+.
 
 > **A simulation reserves nothing and calls no provider** (specification 15.4).
 > A live one reads admission and health state without consuming any, so
 > simulating cannot cause the rejection it is investigating.
 >
-> `input_tokens` is bounded (`DI-007`); keep it realistic anyway, since it is
+> `input_tokens` is bounded ; keep it realistic anyway, since it is
 > expanded into filler.
 
 ### 6. Do not broaden model families or residency during an incident
@@ -296,7 +294,7 @@ breaker.
 > The ramp is a **score** term, never a filter. A recovered target that is the
 > only candidate is still chosen; it is merely less preferred than one that has
 > been healthy throughout. Do not read a lower rank during that window as the
-> target being excluded (`DI-019`).
+> target being excluded .
 
 Close the incident against the audit record. `GET /admin/v1/audit` shows the
 quarantine and any policy publication, tenant-scoped and cursor-paginated. It
@@ -408,7 +406,7 @@ the target out of service.
 >
 > **Still rotate in the right order**, because the window is five minutes and
 > not a plan: create the new key at the provider, confirm it works, rotate here,
-> probe (step 2), and only then revoke the old one at the provider (`DI-021`).
+> probe (step 2), and only then revoke the old one at the provider .
 
 ### 4. Drain connections whose authentication is connection-bound
 
@@ -428,7 +426,7 @@ killing it would turn a rotation into a client-visible failure.
 > is per-request, so a pooled socket carries no stale credential and there is
 > usually nothing that needs dropping. The wiring exists so that a provider with
 > connection-bound authentication works correctly without anyone having to
-> notice this first (`DI-022`).
+> notice this first .
 
 If you want certainty, restart the router (see
 [`deployment.md`](deployment.md#shutdown)); the credential is already durable, so
@@ -525,13 +523,10 @@ bill.
 > Every parameter narrows and none widens: the tenant filter runs first, so no
 > query string reaches another tenant's records. For usage, filter the router's
 > structured logs by the principal pseudonym and correlate to the key through
-> `GET /admin/v1/keys` (`DI-023`).
+> `GET /admin/v1/keys` .
 >
 > **`method` distinguishes how a caller authenticated:** `api_key`, `oidc`,
-> `break_glass`, or `local_peer`. It used to stamp `local_peer` on every
-> key-authenticated principal because `AuthMethod` had no `ApiKey` variant, so
-> the field answered wrongly for every request on the inference listener
-> (`DI-024`).
+> `break_glass`, or `local_peer`.
 >
 > The in-memory audit index is a 2 048-record ring and is lost on restart; the
 > durable chain in `log.bin` is authoritative. `durable=true` reads it, and
@@ -588,7 +583,7 @@ Each entry is a CIDR block; a bare address is refused, so write `/32` if you
 mean one host. Omitting `source_networks` gives an unrestricted key, and a
 listing shows `null` for one. A restricted key whose peer address cannot be
 determined **fails closed** — worth knowing if the key will be used from behind
-a proxy that does not preserve the source address (`DI-026`).
+a proxy that does not preserve the source address .
 
 Document the incident in the audit trail by attaching a `description` to the
 key; key creation and revocation both append audit records automatically.
@@ -779,7 +774,7 @@ window is still bounded, but explicitly closing is better evidence.
    > audit record, so the override is attributable afterwards and persists
    > across later restarts. It is **not** the old workaround of starting against
    > an empty state directory, which discarded the audit chain and every stored
-   > API key (`DI-027`).
+   > API key .
 
 6. **Review afterwards.** Every break-glass window is in `GET /admin/v1/audit`
    with its reason. Read them after the incident, not during it.

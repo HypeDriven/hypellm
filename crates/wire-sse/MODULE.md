@@ -168,10 +168,10 @@ Still outstanding:
 
 | Target | Property to assert | Status |
 |---|---|---|
-| `sse_parse_chunked` | Arbitrary bytes split at arbitrary boundaries produce the same event sequence as the same bytes pushed whole, and never panic. Generalizes the hand-written `byte_at_a_time_matches_whole_input` test to adversarial split points. | Required, not yet implemented (§21) |
-| `sse_limits_hold` | For arbitrary `SseLimits` and arbitrary input, `buffered() <= max_buffer_bytes` and every returned `data.len() <= max_event_bytes` at all times, and a limit error is sticky. | Required, not yet implemented (§21) |
-| `sse_encode_roundtrip` | For an arbitrary payload and event name, `encode_event` followed by a parse yields exactly one event whose data equals the CR-normalized payload — no payload can forge a frame boundary. | Required, not yet implemented (§21) |
-| `sse_provider_events` | Recorded provider stream fixtures with injected corruption (truncated frames, interleaved comments, oversized events) reach a typed error or a well-formed event, never a partial dispatch. Depends on the specification 21 fixture corpus. | Required, not yet implemented (§21) |
+| Split delivery | Mutated streams split at arbitrary boundaries match whole-input parsing | Implemented in `tests/fuzz.rs` |
+| Limits | Buffered and accumulated event data remain within `SseLimits`; limit errors stay terminal | Implemented in `tests/fuzz.rs` |
+| Encoding round trip | Encoded payloads produce one equivalent event and cannot forge frame boundaries | Implemented in `tests/fuzz.rs` |
+| Provider fixtures | Mutated recorded streams produce typed errors or complete well-formed events | Implemented in `tests/fuzz.rs` |
 
 ## Public API
 

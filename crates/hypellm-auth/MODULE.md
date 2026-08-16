@@ -55,28 +55,13 @@ What this crate deliberately does **not** do:
 
 ## Threat notes
 
-### Derived `Debug` prints live credentials — the most serious gap here
+### Secret-bearing values redact diagnostic output
 
-Specification 18.2 requires that `Sensitive<T>` implement redacted
-`Debug`/`Display`, and specification 10 makes API keys, cookies, and
-`Authorization` headers sensitive by default. Five types in this crate carry
-plaintext secrets behind a `#[derive(Debug)]`:
-
-| Type | Field printed in cleartext |
-|---|---|
-| `apikey::NewKey` | `secret` — the full presentable `hypellmk_…` key |
-| `apikey::KeyStore` | `verifier_key` — the server HMAC key for **every** key record |
-| `session::IssuedSession` | `token` (the session cookie value) and `csrf_token` |
-| `session::SessionStore` | `digest_key` — the session and CSRF derivation key |
-| `oidc::Transaction` / `TransactionStore` | `state`, `nonce`, `code_verifier`, `handle_key` |
-
-`Digest` redacts itself (`Digest(abcdef…)`), so the *records* are safe to log.
-The one-time secrets and the store keys are not. One `{store:?}` in a panic
-path, a trace line, or a crash report discloses the key that authenticates every
-API key or session in the process. These fields must be wrapped in
-`Sensitive<T>` / `Secret<N>` before this crate is used on a path that can log
-its own values. Until then, treat "do not `Debug`-format a store or an issued
-credential" as an unenforced convention, not a property of the code.
+`NewKey`, `KeyStore`, `IssuedSession`, `SessionStore`, OIDC transactions and
+transaction stores use hand-written `Debug` implementations that redact
+one-time tokens and derivation keys. Digest records expose only a shortened
+digest representation. Tests assert that API keys, session/CSRF tokens, PKCE
+values and store keys do not appear in diagnostic output.
 
 ### Credential-oracle leakage through error differentiation
 

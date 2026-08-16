@@ -35,35 +35,17 @@ cargo run --release -p hypellm-bench --offline -- --scale 10   # quick smoke run
 
 Run it under `--release`. A debug build measures the debug build.
 
-## The measurement defect this crate exposed, and the fix
+## Timing units
 
-`DecisionTrace::routing_micros` is named in microseconds and is the value the
-router publishes as its own overhead. It was computed as the difference of two
-`Clock::now_millis()` readings.
+`DecisionTrace::routing_micros` and the benchmark's routing distributions use a
+microsecond clock, allowing the specification's low-millisecond latency target
+to be measured without millisecond quantisation. The public
+`hypellm_router_overhead_milliseconds` metric and `router_ms` log field retain
+milliseconds for compatibility; values are rounded up at the emit site.
 
-At millisecond granularity, a 2 ms target cannot be measured at all: every
-healthy sample reads as 0 or 1, the quantisation error on a p99 is a tenth of
-the entire specification 19 budget, and the number stored in the field was a
-thousand times smaller than its name claimed. The decision explorer
-(`web/views/decisions.js`) already rendered the field as microseconds, so the
-value shown to operators was wrong by three orders of magnitude.
-
-The fix, made alongside this crate:
-
-| Change | File |
-|---|---|
-| `Clock::now_micros()` added as a required trait method; `SystemClock` reads the same `Instant` origin as `now_millis`, `TestClock` stores microseconds and truncates for `now_millis` | `crates/hypellm-core/src/time.rs` |
-| `TestClock::advance_micros` added, so sub-millisecond behaviour is testable without sleeping | `crates/hypellm-core/src/time.rs` |
-| `Stopwatch` re-based on microseconds, gaining `elapsed_micros` | `crates/hypellm-core/src/time.rs` |
-| `pipeline::execute` measures routing with `now_micros`, so `routing_micros` is genuinely microseconds | `crates/hypellm-router/src/pipeline.rs` |
-| `hypellm_router_overhead_milliseconds` and the `router_ms` log field keep their published unit; the trace's microseconds are converted with `div_ceil` at the emit site | `crates/hypellm-router/src/pipeline.rs` |
-
-The published metric was deliberately **not** converted to microseconds.
-Changing the unit of a series that deployments already scrape and alert on would
-silently reinterpret every threshold. The consequence is that
-`hypellm_router_overhead_milliseconds` cannot distinguish 1 µs from 1000 µs, which
-is exactly why specification 19's target is judged by this crate against
-`routing_micros` and not by scraping that series.
+Use the benchmark's `routing_micros` distribution for sub-millisecond analysis.
+The metrics series is intended for operational trends and alerts, not precise
+microbenchmarking.
 
 ## Scope, and the "a benchmark is not a load test" rule
 
@@ -92,7 +74,7 @@ partially covered; treat each as an open gap in release evidence.
 | Configuration reload, pointer swap < 1 ms | **Not implemented.** |
 | Overload behaviour, admission rejection under pressure | **Not implemented.** |
 | Soak with reloads, credential rotation, DNS changes, circuit transitions, log rotation, audit checkpointing | **Not implemented.** |
-| Adversarial parser corpus, header fragmentation, slowloris, oversized SSE, deep JSON, retry storms | **Not implemented.** The corpus itself does not exist — see `crates/hypellm-test-corpus/MODULE.md`. |
+| Adversarial parser performance: header fragmentation, slowloris, oversized SSE, deep JSON and retry storms | **Not implemented in this benchmark.** Functional adversarial corpora exist in `hypellm-test-corpus`, but this crate does not measure them. |
 | Result retention with the release artifact (specification 21.1) | **Not implemented.** The report is printed to stdout; nothing archives it. |
 
 Two further limitations of what *is* implemented:

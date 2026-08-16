@@ -201,13 +201,12 @@ protocol parsers to be fuzzed. The targets this module needs, in priority order:
 
 | Target | Property asserted | Status |
 |---|---|---|
-| `json_parse_arbitrary` | No panic, no abort, termination, and bounded work on any byte string under each preset | Required, not yet implemented (§21) |
-| `json_limits_respected` | Every accepted document satisfies the named depth, string, array, and object bounds — the limit checks cannot be skipped by any input path | Required, not yet implemented (§21) |
-| `json_roundtrip` | `parse → to_string → parse` yields an equal `Value` | Required, not yet implemented (§21) |
-| `json_canonical_stability` | Permuting object key order does not change `to_canonical_vec` | Required, not yet implemented (§11.1, §21) |
-| `json_strictness_differential` | Documents this parser accepts are a subset of a strict reference grammar, and every extension listed in the threat notes stays rejected | Required, not yet implemented (§21.1) |
-| `json_prefix_termination` | Every prefix of any input terminates, and no truncated prefix parses to a *different* value | Required, not yet implemented (§21); currently covered only by the unit tests in `lib.rs` |
-| `json_escape_roundtrip` | `escape_string` output reparses to the original string for every `char` sequence | Required, not yet implemented (§21) |
+| Arbitrary parsing | Mutated corpus values terminate with bounded work under every parser profile | Implemented in `tests/fuzz.rs` |
+| Limits | Every accepted mutation remains within depth, string, array and object bounds | Implemented in `tests/fuzz.rs` |
+| Round trip | Parse, serialize and parse preserves accepted values | Implemented in `tests/fuzz.rs` |
+| Canonical stability | Object key order does not alter canonical output | Implemented in `tests/fuzz.rs` |
+| Strictness | Mutations cannot enable duplicate keys or unsupported grammar extensions | Implemented in `tests/fuzz.rs` |
+| Prefixes and escapes | Truncated prefixes terminate safely and escaped strings round-trip | Implemented in `tests/fuzz.rs` |
 
 Until these exist, the adversarial-corpus gate in specification 19.1 and the
 "known attack corpus produces bounded work" gate in 21.1 are unmet for JSON.

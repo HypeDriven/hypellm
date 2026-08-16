@@ -55,15 +55,10 @@ the store's protected frames and the audit chain.
 
 ## Threat notes
 
-- **Load-time failure-open in `parse_model_selector` (build.rs).** Every other
-  field rejects a malformed value; this one does not. `AliasId::new(v)` failure
-  is swallowed by `map_or(ModelSelector::Any, …)`, so a `binding model=…` or
-  `grant model=…` value that is not a valid identifier — anything outside
-  `[A-Za-z0-9._:-]`, or longer than `MAX_ID_LEN` (128) — silently *widens* the
-  record from one alias to **every** alias instead of failing the load. On a
-  `grant … allow=true` that is a privilege escalation authored by a typo. This
-  is a known defect, not a design choice; it should become an
-  `invalid_identifier` error.
+- **Model selectors fail closed.** `parse_model_selector` distinguishes an
+  omitted selector (the explicit wildcard default) from an empty or malformed
+  identifier. Invalid `binding model=` and `grant model=` values produce
+  `invalid_identifier` rather than widening to every alias.
 - **Error messages echo raw field values.** `Fields::bool_field`,
   `u64_field`/`i64_field`, `parsed`/`opt_parsed`, and most `build_*` helpers
   format the offending value into `ConfigError::message` (up to
@@ -141,7 +136,7 @@ Enforced by `ParseLimits::DEFAULT` (`parse.rs`), which `load` always uses:
 | Endpoint host | 253 bytes total, labels ≤ 63 | `hypellm_core::netaddr::is_valid_host` |
 | Endpoint port | 0–65 535 | `u16::try_from`, `invalid_port` |
 | Integer fields | 32- or 64-bit range, checked conversion | `Fields::u32_field` / `i32_field`, `integer_out_of_range` |
-| Record types accepted | 10, closed set | `schema::SCHEMAS`; anything else is `unknown_record_type` |
+| Record types accepted | 13, closed set | `schema::SCHEMAS`; anything else is `unknown_record_type` |
 | Field names accepted | Closed per record type | `schema::validate_record`; anything else is `unknown_field` |
 
 Limits and validations that are **not** enforced here, and must not be assumed:

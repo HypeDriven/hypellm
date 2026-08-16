@@ -86,41 +86,20 @@ compares it against the payload actually on disk. A mismatched pair is
 `SnapshotIntegrity`, not a silent acceptance of stale sequence and audit head.
 The log reset still happens last, so no records are lost either way.
 
-**Recovery rebuilds the chain head without verifying it.** `Store::open`
-re-chains post-snapshot audit frames by taking each record's own `link()`. It
-never calls `verify_chain`, so continuity is not checked at startup, and a
-record whose payload fails `AuditRecord::from_payload` is skipped silently —
-advancing the count but not the head. A protected frame that verifies its MAC
-yet does not parse (see the field-length asymmetry below) will therefore leave
-the live head diverged from the durable history, with no error surfaced.
+**Recovery verifies integrity and continuity.** `Store::open` authenticates
+protected frames, checks monotonic sequence numbers, decodes every audit record
+under the same field bounds used by the writer, and verifies each chain link.
+A torn final frame is recoverable; corruption before the tail, an unreadable
+protected record or a broken chain refuses startup rather than discarding later
+history.
 
-**Written-but-unreadable audit records.** `AuditEvent::reason` is capped at 512
-bytes, but `actor`, `tenant`, `object`, `request_id`, and `source` are plain
-`String` with no cap on the write path — while the read path parses under
-`wire_json::Limits::SMALL` (64 KiB per string, 1 MiB total). A caller that
-supplies an oversized actor or object writes a record that cannot be parsed
-back. Specification 17 requires capped audit fields; callers must cap these
-themselves today.
+**Replay is window-bounded.** Log replay streams through a bounded window rather
+than materialising the complete log. Snapshot payload size is validated before
+allocation. Compaction remains an operator-controlled lifecycle action, so disk
+capacity still needs monitoring.
 
-**A torn frame in the middle of the log discards everything after it.**
-`Log::replay` stops at the first frame that does not decode and reports that
-offset as `valid_len`; `Store::open` then truncates there. This is correct for a
-tail, which is the only case a clean crash produces. It is not correct for a
-frame damaged mid-file — for example after a partial write on ENOSPC, where
-`Log::append` returns an error without advancing `self.len` and the next append
-lands past the partial bytes. Every durable record after the damage is then
-silently dropped at the next startup.
-
-**Unbounded startup memory.** `Log::replay` reads the whole log into a `Vec` with
-`read_to_end` and then materialises every frame, so peak startup memory is
-roughly twice the log size. Nothing in this crate caps the log or triggers
-compaction; that budget is set by whoever calls `Store::compact`. `read_optional`
-is likewise unbounded and is what loads `snapshot.bin`.
-
-**The MAC key is in a `Debug`-derived struct.** `Store` holds `mac_key: Vec<u8>`
-under `#[derive(Debug)]`, so any `{:?}` of a `Store` prints the key bytes.
-Specification 7.1 and 10 require redacting `Debug` on secret material; this
-field should move to `hypellm_crypto::Secret` or get a hand-written `Debug`.
+**Diagnostic output redacts the MAC key.** `Store` has a hand-written `Debug`
+implementation that never renders key bytes.
 
 **The process lock is advisory and racy.** `ProcessLock` is a PID file, not an OS
 lock — `flock` would need `unsafe` FFI, which the workspace forbids. Liveness is
@@ -131,10 +110,8 @@ a stale lock can both proceed, giving two writers on one log. `Drop` removes the
 lock file unconditionally, including one another process has since claimed. On a
 shared or network volume the lock provides no protection at all.
 
-**Backup trusts the in-memory boundary.** `Store::backup_to` slices the log bytes
-it read from disk to `Log::len()`. If the file is shorter than the tracked length
-— an external truncation, or a length desynchronised by a failed append — the
-slice is out of range and panics.
+**Backup validates its boundary.** `Store::backup_to` refuses a log shorter than
+the tracked durable boundary and copies only complete validated bytes.
 
 **Forward compatibility is one-directional.** An unknown `RecordKind` is
 preserved as `Unknown(v)` so a newer writer's records survive a rollback, but
@@ -202,11 +179,11 @@ Still outstanding:
 
 | Target | Property under test |
 |---|---|
-| `store_frame_decode` | Required, not yet implemented (§21). Arbitrary bytes into `frame::decode` never panic, never allocate beyond `MAX_PAYLOAD_LEN`, and always terminate. |
-| `store_log_replay` | Required, not yet implemented (§21). Arbitrary log files replay to a prefix of whole frames or a classified stop reason — never a fabricated frame, never a panic. |
-| `store_recovery` | Required, not yet implemented (§21). Structured: a generated append sequence, cut at an arbitrary offset, must reopen; the resulting `valid_len` must be a frame boundary. |
-| `store_audit_payload` | Required, not yet implemented (§21). `AuditRecord::from_payload` and `AuditCheckpoint::from_payload` over arbitrary bytes. |
-| `store_snapshot_meta` | Required, not yet implemented (§21). `read_snapshot` over arbitrary `snapshot.meta` content, including the length and magic boundaries. |
+| Frame decode | Mutated bytes terminate without panic or oversized allocation | Implemented in `tests/fuzz.rs` |
+| Log replay | Mutated logs produce a validated frame prefix or a classified integrity failure | Implemented in `tests/fuzz.rs` |
+| Recovery | Structured truncation and corruption preserve the torn-tail versus mid-file-damage distinction | Implemented in `tests/fuzz.rs` |
+| Audit payloads | Mutated records and checkpoints cannot fabricate authenticated history | Implemented in `tests/fuzz.rs` |
+| Snapshot metadata | Mutated metadata and payload pairs are bounded and integrity-checked | Implemented in `tests/fuzz.rs` |
 
 Differential and property coverage that fuzzing should back: encode/decode round
 trip for every `RecordKind`, and "every proper prefix of a frame reports

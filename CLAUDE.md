@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The specification is `secure_llm_router_specification.md` (v1.0, "HypeLLM Router"). It is the authority: when this file and the specification disagree, the specification wins.
 
-The implementation exists — a Rust workspace of 16 crates plus a static admin SPA under `web/`. It is **not** feature-complete against the specification; `docs/deferred-issues.md` is the honest register of what is missing or deviates.
+The implementation is a Rust workspace of 16 crates plus a static admin SPA under `web/`. It is **not** feature-complete against the specification; `docs/deferred-issues.md` lists only the current limitations and accepted deviations.
 
-There is still no version control. Nothing is committed.
+The repository uses Git. Do not assume an edited working tree is disposable.
 
 ### Commands
 
@@ -120,13 +120,13 @@ All layers except a few fuzz rows now exist:
 
 A fuzz target that only asserts "does not panic" is close to worthless here. Each of these asserts a property the code could plausibly violate — no silent widening, no leaked body, no identity taken from a caller, no unauthenticated success — and three of them have found real defects. When adding one, write the property first.
 
-Do not describe the missing rows as present, and do not describe the present ones as missing — this paragraph itself said "no fuzz target is implemented anywhere" long after five crates had them, and a review agent repeated it as a finding.
+Keep fuzz documentation aligned with the suites that exist. The required seven areas are present; module-specific optional targets may still be absent and must not be claimed as implemented.
 
 Two-person review is required for changes to auth, parsers, adapter credential handling, policy activation, and storage integrity.
 
 ### What a test here is for
 
-The bar is not coverage, it is *would this catch the bug*. Several defects in this codebase shipped under passing suites because the tests asserted that a call returned 200 rather than that it did anything. When adding a test:
+The bar is not coverage, it is *would this catch the bug*. Assert the security or state property, not merely the response status. When adding a test:
 
 - Name the property, not the function: `a_healthy_pin_outranks_its_own_emergency_fallback`, not `test_pin`.
 - Make the fixture adversarial. A pin test where the pin is also the cheapest target proves nothing.
@@ -144,8 +144,6 @@ Open decisions with recommended defaults are in §25 — check there before desi
 This is a security artifact, and its documentation is read as one. Two rules follow:
 
 - **Never describe something as implemented when it is not.** A `MODULE.md` claiming fuzz targets that do not exist, or a handler replying `stored: true` after discarding the secret, is worse than an acknowledged gap — it removes the reason anyone would go looking.
-- **When a capability is missing, say so where the reader will be.** The SPA screens with no backing endpoint render an explicit "not available yet" rather than plausible-looking rows; `hypellm-core`'s `MODULE.md` says **"None exist in this repository yet"** under Fuzz targets rather than listing the ones it needs as though they were written. Prefer that to a comfortable answer.
+- **When a capability is missing, say so where the reader will be.** The SPA screens with no backing endpoint render an explicit "not available yet" rather than plausible-looking rows. Keep public documentation focused on current behavior; closed defects belong in version control, not in current limitations.
 
-  This bullet used to cite the rotation endpoint reporting `overlap_seconds: 0` "because no dual-accept window exists". The window was built (`DI-021`) and the endpoint reports 300, so the example outlived its own truth — which is the failure the section is about, in the section about it.
-
-`docs/deferred-issues.md` is the register. Add to it rather than quietly working around something.
+`docs/deferred-issues.md` lists current limitations. Add a newly confirmed limitation there rather than quietly working around it, and remove it when the limitation is resolved.

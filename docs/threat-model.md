@@ -22,13 +22,9 @@ document links to them rather than restating them.
 | Metrics and log vocabularies | [`crates/hypellm-telemetry/MODULE.md`](../crates/hypellm-telemetry/MODULE.md) |
 | HTTP/1.1, JSON, SSE parsers | [`crates/wire-http1/MODULE.md`](../crates/wire-http1/MODULE.md), [`crates/wire-json/MODULE.md`](../crates/wire-json/MODULE.md), [`crates/wire-sse/MODULE.md`](../crates/wire-sse/MODULE.md) |
 
-> **A note on currency.** Several `MODULE.md` threat notes describe defects that
-> have since been fixed in the code (for example the `groups_for` membership
-> bug, the derived `Debug` implementations over key material, and the blocking
-> DNS path). Where this document and a `MODULE.md` disagree, this document was
-> checked against the source on the date in the register; verify against the
-> code before relying on either. The open items are tracked in
-> [`deferred-issues.md`](deferred-issues.md).
+> Current deployment limitations and their mitigations are listed in
+> [current limitations](deferred-issues.md). Source-level details live in each
+> crate's `MODULE.md`.
 
 ---
 
@@ -207,8 +203,7 @@ permissive profile cannot be reused under a stricter one.
 Pinning is a capability, not a convention: `PinnedDestination`'s fields are
 private and its constructors are module-private, so outside `egress` the only
 way to obtain one is `Resolver::resolve`, which cannot return an address it has
-not classified. It used to have public fields, and a struct literal anywhere in
-the workspace would have bypassed classification entirely (`DI-012`).
+not classified.
 
 ### 4.3 Request smuggling
 
@@ -233,10 +228,7 @@ the workspace would have bypassed classification entirely (`DI-012`).
 | Connection reuse is keyed by a credential isolation class derived from `(tenant, credential)` | `crates/hypellm-router/src/state.rs`, `credential_class`; `crates/hypellm-net/src/pool.rs` |
 
 `credential_class` is length-prefixed — `{len}:{tenant}:{len}:{reference}` —
-rather than delimited, so no pair of (tenant, credential) can collide into one
-pool key. It was `format!("{tenant}:{reference}")`, and `:` is a legal
-identifier character, so tenant `a:b` with credential `c` shared a pool with
-tenant `a` with credential `b:c` (`DI-009`).
+so no pair of tenant and credential identifiers can collide into one pool key.
 
 ### 4.5 Credential exfiltration
 
@@ -273,7 +265,7 @@ Prompts are inert by construction rather than by filtering. See abuse case A1.
 | Bounded DNS worker pool and bounded queue | `crates/hypellm-net/src/dns.rs` |
 
 Known weakness: the metric-cardinality cap still folds when a metric's table is
-full of *live* series (`DI-014`) — stale series are evicted, so a metric is no
+full of *live* series — stale series are evicted, so a metric is no
 longer blinded for the life of the process, but a genuinely high-cardinality one
 stops attributing and reports that it has via
 `hypellm_metric_series_overflowed_total`.
@@ -296,7 +288,7 @@ and continuity, not authenticity — the per-frame HMAC and the checkpoint MAC a
 the trust anchor. A chain verified without a checkpoint proves very little.
 Startup does verify continuity: a record whose `previous_link` does not follow,
 or that authenticates but does not decode, is reported as
-`Recovery::audit_chain_broken_at` and refuses startup (`DI-015`). What that
+`Recovery::audit_chain_broken_at` and refuses startup. What that
 proves is ordering, not authorship.
 
 ### 4.9 Malicious admin browser content
@@ -384,7 +376,7 @@ credential (`crates/hypellm-net/src/helper.rs`, `crates/hypellm-net/src/egress.r
 Residual risk: an operator with `PublishPolicy` can configure any *permitted-class*
 destination. Egress restriction to approved endpoints at the OS level
 (specification 20.1) is a deployment control that is not implemented in code —
-see `DI-003`.
+see [current limitations](deferred-issues.md#host-hardening-is-external).
 
 ### A3 — Request smuggling through the inference listener
 
@@ -416,13 +408,8 @@ deployment obligation, not a code control.
 tenant B's targets, requests, and spend.*
 
 - `list_audit` reads `AuditIndex::recent_for_tenant(session.tenant, …)`, not the
-  global ring. The filter is load-bearing, and its failure mode has already
-  happened twice in the opposite direction: a writer that appended durably
-  without indexing, and one that indexed a synthesised placeholder carrying no
-  tenant, both left the endpoint returning nothing at all (`DI-051`). Every
-  audit write goes through `record_audit`, which indexes the event it actually
-  appended; a new write path that calls `append_audit` directly reintroduces the
-  defect and no test will notice unless it reads back through the endpoint.
+  global ring. Every management audit write goes through `record_audit`, which
+  durably appends and indexes the same tenant-bearing event.
 - `DecisionCache::get` requires a tenant match and reports a foreign trace as
   absent, so it is not an existence oracle.
 - `UsageAggregate` never crosses a tenant boundary and refuses to attribute an
@@ -430,22 +417,11 @@ tenant B's targets, requests, and spend.*
 - `list_keys` filters on `session.tenant`; `revoke_key` re-filters before acting.
 - Alias visibility is default-deny through `PolicySnapshot::authorizes`.
 
-Two weaknesses that were here, both now closed:
-
-- OIDC principals used to be assigned `config.tenants.keys().next()` — the first
-  tenant by map order — because there was no tenant claim mapping. In a
-  multi-tenant deployment that was the dominant cross-tenant risk on the
-  management plane. An `identity` record now binds each `(iss, sub)` to its own
-  principal *and* tenant, and an account with no such record cannot sign in at
-  all (`DI-006`, resolved).
-- `list_targets`, `list_providers`, `list_aliases`, and `overview` are now all
-  tenant-scoped, derived from the same authorization `GET /v1/models` applies on
-  the data plane: a provider is visible when it backs a target the caller's
-  tenant can reach. The provider listing is the one that mattered — it carries
-  endpoint hostnames and credential references — and it was unscoped
-  (`DI-016`, resolved). There is no platform-scoped role that sees the whole
-  deployment;
-  adding one would need its own decision.
+OIDC identity is explicitly configured: an `identity` record binds each
+`(issuer, subject)` pair to a principal and tenant, and an account with no
+matching record cannot sign in. `list_targets`, `list_providers`, `list_aliases`
+and `overview` derive visibility from the same tenant authorization used by
+`GET /v1/models`. There is no platform-wide role that bypasses tenant scoping.
 
 ### A5 — Credential disclosure through logs
 
@@ -475,7 +451,7 @@ The design forbids free text rather than scrubbing it:
   (`crates/hypellm-router/src/dispatch.rs`).
 - Prompt and completion bodies are not logged. `capture_bodies` exists in the
   configuration grammar but **nothing reads it** — there is no capture
-  implementation at all (`DI-011`), which is fail-safe for this threat.
+  implementation at all, which is fail-safe for this threat.
 
 Residual risks worth naming: a stalled log reader no longer stalls the data path
 (`QueueingSink` bounds the queue and drops oldest-first, reporting what it
@@ -486,25 +462,15 @@ access-controlled as identity-bearing data.
 
 ---
 
-## 6. Where the gaps are recorded
+## 6. Current assurance boundaries
 
-This document describes controls that exist. Requirements that are unmet, and
-implementations that deviate from the specification, are in
-[`deferred-issues.md`](deferred-issues.md). The most security-relevant of those,
-at the time of writing:
+The required fuzz areas are exercised by a seeded in-repository mutator. It is
+reproducible and runs under `cargo test`, but it is not coverage-guided and does
+not shrink failures. A green run is evidence for the properties asserted by its
+seeds and mutations, not evidence that malformed input cannot exist.
 
-- Specification 21's fuzz row is met across all seven areas (`DI-002`), but the
-  engine is a seeded in-repo mutator rather than libFuzzer: it is not
-  coverage-guided and does not shrink, so it finds what its seeds and mutation
-  strategies reach and no more. Treat a green fuzz run as evidence about the
-  asserted properties, not as evidence of absence.
-- No privilege drop, environment scrub, or sandbox in the process
-  (`DI-003`).
-- Break-glass exists (`DI-005`) but is only as good as its preprovisioning: a
-  deployment that never generated a token, or that lets the break-glass
-  principal's `role_binding` lapse, has no recovery path during an
-  identity-provider outage and will not discover that until the outage.
-- `GET /admin/v1/audit` returned an empty list in production for a long time
-  (`DI-051`), and the failure mode is easy to reintroduce — see A4. The durable
-  chain was always correct; the *view* was not, which quietly undercut the
-  detection half of every control in section 4.8 while every test passed.
+Process sandboxing and privilege management are deployment controls; see
+[current limitations](deferred-issues.md#host-hardening-is-external). Break-glass
+access also requires operational preparation: retain the generated token
+offline and keep its principal's `role_binding` active. Test that path before an
+identity-provider outage.

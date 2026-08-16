@@ -9,7 +9,7 @@ input/resource limits.
 | Owner | Security (primary), Platform (secondary) |
 | Unsafe code | None. `#![forbid(unsafe_code)]` declared in `lib.rs` and inherited from the workspace. |
 | External dependencies | None. Rust standard library plus the workspace path dependencies `hypellm-auth`, `hypellm-config`, `hypellm-core`, `hypellm-crypto`, `hypellm-store`, `hypellm-telemetry`, `wire-http1`, `wire-json`. |
-| Fuzz targets | **None exist.** Required targets are listed under [Fuzz targets](#fuzz-targets); all are unimplemented. |
+| Fuzz targets | Implemented in `tests/fuzz.rs`: nine seeded mutation properties over authentication, authorization, CSRF, tenant isolation, error redaction and bounded request handling. |
 
 ## Scope and the control-plane boundary
 
@@ -204,13 +204,12 @@ Still outstanding:
 
 | Target | Surface | Status |
 |---|---|---|
-| `admin_request` | Arbitrary method/path/query/headers/body through `AdminApi::handle`; asserts a response or a typed `ApiError`, never a panic | Required, not yet implemented (§21) |
-| `admin_query_decode` | `query_params` / `percent_decode`, including non-ASCII and truncated `%` escapes — the byte-slicing hazard above | Required, not yet implemented (§21) |
-| `admin_pagination` | `Pagination::from_query` and `Pagination::apply`, asserting no item is skipped or repeated across pages under insertion and deletion | Required, not yet implemented (§21) |
-| `admin_if_match` | `if_match_satisfied` against arbitrary `If-Match` header lists | Required, not yet implemented (§21) |
-| `cors_origin` | `CorsPolicy::permits` differentially against an exact-equality oracle, with a corpus of near-miss origins | Required, not yet implemented (§21) |
-| `admin_draft_text` | Arbitrary draft text through `validate` → `simulate` → `prepare_publish`, asserting bounded work and that self-approval is never granted | Required, not yet implemented (§21) |
-| `usage_aggregate` | Arbitrary `UsageSample` sequences, asserting the series bound holds and that summed totals equal the samples recorded | Required, not yet implemented (§21) |
+| Management request handling | Mutated bodies traverse the real handler with bounded responses and no panics | Implemented in `tests/fuzz.rs` |
+| Authentication and authorization | Mutated requests cannot create unauthenticated or unprivileged success | Implemented in `tests/fuzz.rs` |
+| CSRF | Mutated bodies cannot bypass a missing CSRF header | Implemented in `tests/fuzz.rs` |
+| Query and tenant isolation | Mutated query strings cannot widen tenant-scoped listings | Implemented in `tests/fuzz.rs` |
+| Error redaction | Planted request secrets do not appear in error responses | Implemented in `tests/fuzz.rs` |
+| Draft and input bounds | Oversized and malformed management inputs fail within configured limits | Implemented in `tests/fuzz.rs` |
 
 The security tests of 21.1 also apply and are not yet written: positive and
 negative authorization cases for every privileged endpoint, tenant-isolation

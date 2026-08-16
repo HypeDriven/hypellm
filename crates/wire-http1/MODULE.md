@@ -208,12 +208,11 @@ vectors in `lib.rs::smuggling_tests`. Still outstanding:
 
 | Target | Property to assert | Status |
 |---|---|---|
-| `http1_request_head` | Never panics; every result is `Complete`, `Incomplete`, or a typed `HttpError`; no allocation exceeds `max_head_bytes` | Required, not yet implemented (§21) |
-| `http1_response_head` | As above, across all `request_method` values, including `HEAD` framing | Required, not yet implemented (§21) |
-| `http1_body_chunked` | Never panics; decoded length never exceeds `max_body_bytes`; consumed count never exceeds the input | Required, not yet implemented (§21) |
-| `http1_split_delivery` | Differential: an arbitrary split of the same input yields byte-identical output and the same terminal state as a single-buffer decode | Required, not yet implemented (§21) |
-| `http1_builder_roundtrip` | Anything `RequestBuilder`/`ResponseBuilder` emits is accepted by this crate's own parsers — the internal-differential guard | Required, not yet implemented (§21) |
-| `http1_head_differential` | Request and response head parsers agree on line splitting, folding, and duplicate rules for inputs valid in both | Required, not yet implemented (§21) |
+| Request and response heads | Mutated corpus heads terminate with bounded allocations and stable outcomes | Implemented in `tests/fuzz.rs` |
+| Chunked bodies | Mutated chunk framing never exceeds body limits or reports consumption past input | Implemented in `tests/fuzz.rs` |
+| Split delivery | Fragmented and whole delivery produce equivalent parser outcomes | Implemented in `tests/fuzz.rs` |
+| Framing safety | Smuggling mutations never turn ambiguous framing into accepted pipelined requests | Implemented in `tests/fuzz.rs` |
+| Builders | Emitted messages reparse under the corresponding wire profile | Implemented in `tests/fuzz.rs` |
 
 Until these land, the smuggling corpus in `lib.rs` and the byte-at-a-time and
 split-read tests in `request.rs`, `client.rs`, and `body.rs` are the only

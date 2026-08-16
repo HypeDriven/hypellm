@@ -9,7 +9,7 @@ input/resource limits.
 | Owner | Security (primary), Platform (secondary) |
 | Unsafe code | None. `#![forbid(unsafe_code)]` declared in `src/lib.rs`; `unsafe_code = "forbid"` inherited from the workspace lints. |
 | External dependencies | None. `Cargo.toml` declares no `[dependencies]` and no `[dev-dependencies]` — not even workspace path dependencies. Rust standard library only. |
-| Fuzz targets | **None exist.** This crate is the declared home of the fuzz corpora required by specification 21; the required targets are listed under [Fuzz targets](#fuzz-targets) and are all unimplemented. |
+| Fuzz targets | `src/fuzz.rs` provides the deterministic mutation engine used by ordinary test targets in eight workspace crates. |
 
 Security owns this crate — not because it is test code, but because its contents
 are the *oracle* for the security suite (specification 21: SSRF, smuggling,
@@ -19,8 +19,9 @@ recording tooling.
 
 ## Current state
 
-The crate holds six data modules and one expectation type. Nothing in it
-performs I/O, and nothing in it asserts.
+The crate holds six data modules, one expectation type and the deterministic
+mutation engine in `fuzz`. Nothing in it performs I/O; corpus self-checks and
+consumer suites own the assertions.
 
 | Module | Contents | Specification |
 |---|---|---|
@@ -155,7 +156,7 @@ This module deliberately does **not**:
 | Input / resource | Required bound | Enforced by | Status |
 |---|---|---|---|
 | Single committed fixture | Small enough to review inline; the largest is under 1 KiB | Review | **Not mechanically enforced** — no size constant exists |
-| Total corpus on disk | Bounded and minimized per fuzz target; no unminimized crash inputs retained | none | **Not enforced** — no fuzz corpus exists |
+| Total corpus on disk | Bounded and reviewable; generated mutations are not persisted | Static source fixtures only | **Enforced by construction** for generated cases; fixture growth remains a review concern |
 | HTTP head fixtures | Must span the 32 KiB default and its `+1` rejection case (specification 3.2) | `limits::http_head_size_cases` | **Enforced**, and `wire-http1/tests/corpus.rs` asserts the constant still equals `Limits::DEFAULT.max_head_bytes` |
 | HTTP header count | Must span the 100-field default and its `+1` rejection case | `limits::http_header_count_cases` | **Enforced**, constant cross-checked in the consumer test |
 | JSON depth fixtures | Must span the 64-level bound in both array and object form | `limits::json_depth_cases` | **Enforced**, constant cross-checked in the consumer test |
@@ -189,27 +190,23 @@ it from ordinary `tests/fuzz.rs` targets so that `cargo test` runs them and a
 failing case is reproducible by seed number rather than by corpus file.
 
 Targets written against it today: `wire-json` (6), `wire-http1` (7), `wire-sse`
-(8), `hypellm-config` (7), `hypellm-store` (7). The table below is specification
-21's full required set; the "Seeds available" column says what this crate can
-supply for the ones still outstanding.
+(8), `hypellm-config` (7), `hypellm-store` (7), `hypellm-adapters` (9),
+`hypellm-admin-api` (9), and `hypellm-router` (9). Together they cover all seven
+fuzz areas required by specification 21 plus the client protocol translators.
 
 | Target | Corpus | Seeds available | Specification |
 |---|---|---|---|
 | `http1_request` | Header fragmentation, smuggling, chunked framing | `http1::all`, `limits::http_head_size_cases` | 21 (`Fuzz`), 19.1 |
 | `json_value` | Depth, string length, number edge cases, bounded work | `json::all`, `limits::json_depth_cases` | 21 (`Fuzz`), 3.2 |
 | `sse_events` | CRLF/LF mixing, multi-line `data`, comments, oversized events, terminal markers | `sse::all`, `limits::sse_line_length_cases` | 21 (`Fuzz`), 14 |
-| `config_grammar` | Native line-oriented records, unknown fields, quoting | **none** | 21 (`Fuzz`), 11.1 |
+| `config_grammar` | Native line-oriented records, unknown fields, quoting | Seeds are local to `hypellm-config/tests/fuzz.rs` | 21 (`Fuzz`), 11.1 |
 | `provider_events` | Per-provider-family stream decoding and error mapping | `golden::streams`, `golden::failures` | 21 (`Fuzz`), 7.1 |
-| `admin_api` | Management request bodies and schema validation | **none** | 21 (`Fuzz`), 16 |
-| `state_recovery` | Framed-log replay, corrupt and truncated tails | **none** | 21 (`Fuzz`), 11.2 |
+| `admin_api` | Management request bodies and schema validation | Seeds are local to `hypellm-admin-api/tests/fuzz.rs` | 21 (`Fuzz`), 16 |
+| `state_recovery` | Framed-log replay, corrupt and truncated tails | Seeds are local to `hypellm-store/tests/fuzz.rs` | 21 (`Fuzz`), 11.2 |
 
-**Required, not yet implemented:** all seven.
-
-Known documentation discrepancy: `crates/hypellm-crypto/MODULE.md` lists
-`sha256_stream`, `base64_roundtrip`, and `hex_roundtrip` as fuzz targets and
-points at this crate. Those targets do not exist here or elsewhere. That entry
-overstates the current state and should be corrected to the "required, not yet
-implemented" form used above.
+These are deterministic mutation suites, not coverage-guided fuzzing. They do
+not shrink failures; a failing test reports the reproducible seed and generated
+case.
 
 ## Honest gaps
 

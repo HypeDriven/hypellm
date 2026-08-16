@@ -80,21 +80,11 @@ This module deliberately does **not**:
 
 ## Threat notes
 
-- **`Pseudonymizer` leaks its key through derived `Debug` — open defect.**
-  `logs.rs` declares `#[derive(Debug)] pub struct Pseudonymizer { key: Vec<u8> }`.
-  The derived implementation prints the key bytes, and `Telemetry` also derives
-  `Debug` while holding a `Pseudonymizer` field, so a single `{:?}` on the
-  telemetry facade — in a diagnostic log line, an error path, or a panic message —
-  discloses the 256-bit pseudonym key sourced from
-  `hypellm_crypto::random::secret_256` and persisted as `pseudonym.key`. Disclosure
-  is retroactive: the key is stable for the life of the file, so anyone holding it
-  can de-anonymize every historical log line by enumerating candidate tenant and
-  principal identifiers, whose space is small. Specification 10 requires
-  redaction types for crash reports, traces, and errors; specification 7.1
-  requires secret material behind redacting `Debug`/`Display`. The key must be
-  held in `hypellm_core::sensitive::Sensitive` or `hypellm_crypto::Secret<32>`, or
-  `Debug` must be hand-written to print `Pseudonymizer { key: [redacted] }`. The
-  `Vec<u8>` is also not zeroed on drop, unlike `Secret<N>`.
+- **The pseudonym key is secret material.** `Pseudonymizer` uses a hand-written
+  `Debug` implementation that redacts the key, and `Telemetry` inherits that
+  safe rendering. Disclosure of the persisted key would still permit
+  dictionary-based re-identification of historical pseudonyms, so
+  `pseudonym.key` requires the same filesystem protection as other router keys.
 - **Pseudonyms are 48 bits and never rotate.** `Pseudonymizer::pseudonym`
   truncates the HMAC tag to 6 bytes. 48 bits is ample against accidental
   collision at any plausible tenant count, but it is a *linkage* identifier with
@@ -108,9 +98,7 @@ This module deliberately does **not**:
   becomes.** `LabelName::Alias` and `LabelName::Target` are the two label names
   whose values can trace back to request content — a client chooses the model
   string in `requested_model`. `MAX_SERIES_PER_METRIC` stops that from exhausting
-  memory. The backstop used to convert a memory attack into an observability
-  attack — a full table blinded the metric for the life of the process — so a
-  full table now admits a new series by evicting the stalest one, provided that
+  memory. A full table admits a new series by evicting the stalest one, provided that
   series has gone `STALE_AFTER_ACCESSES` (8 × the cap) accesses untouched. A
   table full of *live* series still folds rather than evicting: that is a
   genuinely high-cardinality metric, and evicting from it would only thrash. The
@@ -131,8 +119,7 @@ This module deliberately does **not**:
   observations past the cap are dropped and counted, because a number that looks
   like data and describes nothing is worse than an absent sample. The overflow
   series carries `LabelName::Overflow` (`hypellm_overflow="true"`), a reserved name
-  no emit site uses; it used to be `{outcome="overflow"}`, indistinguishable in
-  the exposition from a legitimate `Outcome` value.
+  no emit site uses, keeping folded values distinct from legitimate outcomes.
 - **Log-line forging via field values, defended by delegation.** The output
   format is newline-delimited JSON, so a value containing a newline followed by a
   plausible JSON object would inject a synthetic log record — a way for an

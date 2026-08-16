@@ -113,18 +113,11 @@ deal. Specification 18.2 is explicit that `Drop` is not relied upon for
 *accounting*: the reconciled numbers come from `commit`, and `Drop` only
 guarantees *capacity*.
 
-**Known defect — an over-estimated request freezes its scope's token bucket.**
-`Scope::release` charges usage above the estimate with
-`bucket.try_take(actual - reserved, u64::MAX)`. `TokenBucket::refill_locked`
-then stores `last_ms = u64::MAX`, so every later refill computes
-`now_ms.saturating_sub(u64::MAX) == 0` and returns early. The bucket never
-refills again; it can only be credited by `refund`. Two consequences: the
-overage is charged against a bucket that was just refilled to full capacity
-rather than against its real level, and any scope with `tokens_per_minute > 0`
-that ever serves one under-estimated request degrades toward permanent
-rate-limiting. This is a live availability defect, not a theoretical one, and it
-is not covered by the existing tests (`over_estimate_is_charged` asserts only
-the immediately following rejection).
+**Actual usage reconciles against the reservation timestamp.** When provider
+usage exceeds the pre-admission estimate, `Scope::release` charges the overage
+without advancing the token bucket's refill clock into the future. Property and
+regression tests verify that the bucket subsequently refills and that estimated
+and actual charges reconcile conservatively.
 
 **Unbounded, unevicted scope maps.** `AdmissionController::tenant_scope` and
 `principal_scope` insert a `Scope` for every tenant and principal observed and
