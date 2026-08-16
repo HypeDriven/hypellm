@@ -1,0 +1,27 @@
+[package]
+name = "hypellm-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Benchmark harness: router-overhead distributions measured against an in-process fake upstream."
+
+[lints]
+workspace = true
+
+[lib]
+name = "hypellm_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hypellm-bench"
+path = "src/main.rs"
+
+[dependencies]
+hypellm-adapters = { path = "../hypellm-adapters", features = ["test-harness"] }
+hypellm-core = { path = "../hypellm-core" }
+# The benchmark harness builds the *same* router the integration suite does,
+# so it needs the test fixtures — and now has to say so, rather than getting
+# them because they were unconditionally public (specification 4.1).
+hypellm-router = { path = "../hypellm-router", features = ["test-harness"] }

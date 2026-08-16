@@ -1,0 +1,29 @@
+[package]
+name = "hypellm-adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Compile-time provider-family adapters."
+
+[lints]
+workspace = true
+
+[features]
+# Test scaffolding — fixtures, fakes, and temporary directories — that uses
+# `expect` and fixed keys, which specification 18.2 permits in tests and
+# nowhere else. Off by default so it is not part of the library a non-test
+# consumer sees.
+test-harness = []
+
+[dependencies]
+hypellm-core = { path = "../hypellm-core" }
+wire-json = { path = "../wire-json" }
+wire-sse = { path = "../wire-sse" }
+
+# The shared golden corpus (specification 18.1, 21). Dev-only: it must never
+# reach the router binary, and it declares no dependencies of its own.
+[dev-dependencies]
+hypellm-adapters = { path = ".", features = ["test-harness"] }
+hypellm-test-corpus = { path = "../hypellm-test-corpus" }

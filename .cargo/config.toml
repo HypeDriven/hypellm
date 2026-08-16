@@ -1,0 +1,9 @@
+# Specification 4: release profile builds with --offline against the repository
+# and fails if crates.io dependencies are present. Enforcing `offline` here means
+# any accidental registry dependency fails the build immediately rather than
+# silently entering the trusted computing base.
+[net]
+offline = true
+
+[term]
+quiet = false

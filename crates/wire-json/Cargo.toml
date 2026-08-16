@@ -1,0 +1,16 @@
+[package]
+name = "wire-json"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Strict bounded JSON tokenizer, parser and serializer."
+
+[lints]
+workspace = true
+
+# The shared protocol corpus (specification 18.1, 21). Dev-only, and the corpus
+# declares no dependencies of its own, so this introduces no cycle.
+[dev-dependencies]
+hypellm-test-corpus = { path = "../hypellm-test-corpus" }

@@ -1,0 +1,17 @@
+[package]
+name = "wire-http1"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Strict bounded HTTP/1.1 server and client state machines."
+
+[lints]
+workspace = true
+
+# The shared protocol corpus (specification 18.1, 21). Dev-only: it must never
+# reach the router binary, and it declares no dependencies of its own, so this
+# introduces no cycle.
+[dev-dependencies]
+hypellm-test-corpus = { path = "../hypellm-test-corpus" }

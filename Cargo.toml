@@ -1,0 +1,70 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/hypellm-crypto",
+    "crates/wire-json",
+    "crates/wire-http1",
+    "crates/wire-sse",
+    "crates/hypellm-core",
+    "crates/hypellm-config",
+    "crates/hypellm-store",
+    "crates/hypellm-net",
+    "crates/hypellm-auth",
+    "crates/hypellm-adapters",
+    "crates/hypellm-telemetry",
+    "crates/hypellm-admin-api",
+    "crates/hypellm-router",
+    "crates/hypellm-test-corpus",
+    "crates/hypellm-devtools",
+    "crates/hypellm-bench",
+]
+
+# Specification 4: the production router MUST NOT download, resolve, or execute
+# third-party packages. There are no [dependencies] on any registry anywhere in
+# this workspace; `cargo tree` must show only path dependencies. The check is
+# enforced mechanically by `crates/hypellm-devtools` (bin: depscan).
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "NOASSERTION"
+publish = false
+
+[workspace.lints.rust]
+# Specification 18.2: #![forbid(unsafe_code)] at workspace root.
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+# Specification 18.2: no panics on data-plane input; unwrap/expect forbidden
+# outside startup invariants and tests. These lints are `warn` at workspace
+# level and escalated to `deny` inside data-plane modules via module attributes,
+# because test code legitimately uses them.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+indexing_slicing = "warn"
+integer_division = "warn"
+as_conversions = "warn"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+cast_possible_wrap = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+overflow-checks = true
+debug-assertions = false
+incremental = false
+
+[profile.dev]
+overflow-checks = true
+
+[profile.bench]
+inherits = "release"

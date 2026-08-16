@@ -1,0 +1,82 @@
+<!doctype html>
+<!--
+  The HypeLLM Router admin application.
+
+  Specification 15: "only first-party static HTML, CSS, JavaScript, SVG, and
+  optional WOFF2 assets… no build-time or runtime package dependencies, CDN
+  assets, remote fonts, telemetry SDKs, service-worker code execution, eval, or
+  WebAssembly."
+
+  Specification 15.1: "Semantic shell, CSP-compatible external first-party
+  files, no inline event handlers."
+
+  Every rule above is visible in this file: there is no <script> with a body,
+  no style attribute, no onclick, and no URL that is not same-origin.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="referrer" content="no-referrer">
+  <title>HypeLLM Router</title>
+  <link rel="stylesheet" href="/styles/main.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%230f766e'/><path d='M8 3l4 2v3.5c0 2.2-1.6 4-4 4.5-2.4-.5-4-2.3-4-4.5V5z' fill='%23fff'/></svg>">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to main content</a>
+
+  <header class="masthead">
+    <div class="masthead__brand">
+      <svg class="masthead__mark" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+        <rect width="16" height="16" rx="3"></rect>
+        <path d="M8 3l4 2v3.5c0 2.2-1.6 4-4 4.5-2.4-.5-4-2.3-4-4.5V5z"></path>
+      </svg>
+      <span class="masthead__name">HypeLLM Router</span>
+    </div>
+
+    <dl class="masthead__facts" id="masthead-facts">
+      <div class="fact">
+        <dt>Configuration</dt>
+        <dd id="fact-config">—</dd>
+      </div>
+      <div class="fact">
+        <dt>Signed in</dt>
+        <dd id="fact-principal">—</dd>
+      </div>
+    </dl>
+
+    <button type="button" class="button button--quiet" id="sign-out" hidden>Sign out</button>
+  </header>
+
+  <div class="shell">
+    <nav class="nav" aria-label="Sections">
+      <ul class="nav__list" id="nav-list">
+        <!--
+          Populated by app.js from the route table, so the navigation and the
+          router cannot disagree about which screens exist.
+        -->
+      </ul>
+    </nav>
+
+    <main class="main" id="main" tabindex="-1">
+      <div class="banner banner--error" id="error-banner" hidden role="alert">
+        <span class="banner__text" id="error-text"></span>
+        <button type="button" class="button button--quiet" id="error-dismiss">Dismiss</button>
+      </div>
+
+      <div id="view" class="view" aria-live="polite" aria-busy="false">
+        <p class="loading">Loading…</p>
+      </div>
+    </main>
+  </div>
+
+  <noscript>
+    <p class="noscript">
+      The HypeLLM Router admin application requires JavaScript. The management API
+      remains available at <code>/admin/v1</code> for scripted use.
+    </p>
+  </noscript>
+</body>
+</html>

@@ -1,0 +1,23 @@
+[package]
+name = "hypellm-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Egress guard, DNS policy, connection pools, TLS helper boundary."
+
+[lints]
+workspace = true
+
+[dependencies]
+hypellm-core = { path = "../hypellm-core" }
+hypellm-auth = { path = "../hypellm-auth" }
+wire-http1 = { path = "../wire-http1" }
+wire-json = { path = "../wire-json" }
+wire-sse = { path = "../wire-sse" }
+
+[dev-dependencies]
+# `TempDir` is behind `test-harness` (specification 18.2), and this crate's
+# helper-socket tests need one.
+hypellm-store = { path = "../hypellm-store", features = ["test-harness"] }

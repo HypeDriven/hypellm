@@ -1,0 +1,18 @@
+[package]
+name = "hypellm-devtools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Repository policy tooling: dependency scan and build manifest."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "depscan"
+path = "src/main.rs"
+
+[dependencies]
+hypellm-crypto = { path = "../hypellm-crypto" }

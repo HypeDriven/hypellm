@@ -1,0 +1,13 @@
+[package]
+name = "hypellm-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "In-repository reviewed primitives: SHA-256, HMAC-SHA-256, CRC-32, base64, hex, constant-time compare, OS randomness."
+
+[lints]
+workspace = true
+
+# No dependencies. See MODULE.md for the security decision record.

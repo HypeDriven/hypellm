@@ -1,0 +1,1013 @@
+/*
+ * HypeLLM Router admin application styles.
+ *
+ * Specification 15.1: "Design tokens, responsive layout, print styles,
+ * reduced-motion and high-contrast support."
+ *
+ * No @import, no remote font, no external URL of any kind — the content
+ * security policy in specification 15.2 permits none, and a stylesheet that
+ * silently fails to load is worse than one that never tried.
+ */
+
+/* ---------------------------------------------------------------- tokens - */
+
+:root {
+  color-scheme: light dark;
+
+  /* Type. A system stack: specification 15 permits a WOFF2 asset, but a
+     gateway's admin screen does not need one, and not shipping a font is one
+     fewer thing to serve and to review. */
+  --font-ui: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+
+  --step--1: clamp(0.78rem, 0.76rem + 0.1vw, 0.83rem);
+  --step-0: clamp(0.875rem, 0.85rem + 0.12vw, 0.94rem);
+  --step-1: clamp(1.05rem, 1rem + 0.25vw, 1.2rem);
+  --step-2: clamp(1.3rem, 1.2rem + 0.5vw, 1.6rem);
+
+  /* Space. A 4px rhythm, named by use rather than by size, so a change of
+     scale does not require renaming every call site. */
+  --space-hair: 0.25rem;
+  --space-tight: 0.5rem;
+  --space: 0.75rem;
+  --space-loose: 1.25rem;
+  --space-section: 2rem;
+
+  --radius: 6px;
+  --radius-sm: 4px;
+  --border: 1px solid var(--line);
+
+  /* Colour. Light values on :root; the dark set is redefined below. */
+  --bg: #f6f7f8;
+  --surface: #ffffff;
+  --surface-sunken: #f0f2f4;
+  --line: #d9dee3;
+  --line-strong: #b8c1c9;
+
+  --ink: #161b22;
+  --ink-muted: #57616b;
+  --ink-faint: #7d8791;
+
+  --accent: #0f766e;
+  --accent-ink: #ffffff;
+  --accent-quiet: #d7efec;
+
+  --ok: #1a7f4b;
+  --ok-quiet: #dcf3e6;
+  --warn: #9a6700;
+  --warn-quiet: #fdf3d7;
+  --danger: #b42318;
+  --danger-quiet: #fde4e2;
+
+  --focus: 2px solid var(--accent);
+  --focus-offset: 2px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1216;
+    --surface: #161b22;
+    --surface-sunken: #1c222b;
+    --line: #2b333d;
+    --line-strong: #3d4753;
+
+    --ink: #e6edf3;
+    --ink-muted: #9aa5b1;
+    --ink-faint: #77828e;
+
+    --accent: #2dd4bf;
+    --accent-ink: #04211f;
+    --accent-quiet: #12312e;
+
+    --ok: #4ade80;
+    --ok-quiet: #10301f;
+    --warn: #fbbf24;
+    --warn-quiet: #32270a;
+    --danger: #f87171;
+    --danger-quiet: #3a1614;
+  }
+}
+
+/* Specification 15.1 asks for high-contrast support explicitly. The forced
+   colours mode replaces the palette wholesale; what it needs from us is that
+   nothing depends on a colour alone to carry meaning. */
+@media (forced-colors: active) {
+  :root {
+    --line: CanvasText;
+    --line-strong: CanvasText;
+  }
+
+  .pill,
+  .card,
+  .table {
+    border: 1px solid CanvasText;
+  }
+}
+
+/* ------------------------------------------------------------------ base - */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-ui);
+  font-size: var(--step-0);
+  line-height: 1.5;
+}
+
+:focus-visible {
+  outline: var(--focus);
+  outline-offset: var(--focus-offset);
+  border-radius: var(--radius-sm);
+}
+
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  padding: var(--space-tight) var(--space);
+  background: var(--accent);
+  color: var(--accent-ink);
+  z-index: 10;
+}
+
+.skip-link:focus {
+  left: var(--space);
+  top: var(--space);
+}
+
+/* -------------------------------------------------------------- masthead - */
+
+.masthead {
+  display: flex;
+  align-items: center;
+  gap: var(--space-loose);
+  padding: var(--space) var(--space-loose);
+  background: var(--surface);
+  border-bottom: var(--border);
+  flex-wrap: wrap;
+}
+
+.masthead__brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-tight);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+/* The masthead wraps at narrow widths; the product name is a single unit and
+   should move as one rather than break across two lines beside the mark. */
+.masthead__name {
+  white-space: nowrap;
+}
+
+.masthead__mark {
+  width: 22px;
+  height: 22px;
+  flex: none;
+}
+
+.masthead__mark rect {
+  fill: var(--accent);
+}
+
+.masthead__mark path {
+  fill: var(--accent-ink);
+}
+
+.masthead__facts {
+  display: flex;
+  gap: var(--space-loose);
+  margin: 0;
+  margin-inline-start: auto;
+  font-size: var(--step--1);
+}
+
+.fact {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.fact dt {
+  color: var(--ink-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 0.7rem;
+}
+
+.fact dd {
+  margin: 0;
+  font-family: var(--font-mono);
+}
+
+/* ------------------------------------------------------------------ nav -- */
+
+.shell {
+  display: grid;
+  grid-template-columns: 13rem 1fr;
+  min-height: calc(100vh - 3.5rem);
+}
+
+.nav {
+  border-inline-end: var(--border);
+  background: var(--surface);
+  padding: var(--space) var(--space-tight);
+}
+
+.nav__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  position: sticky;
+  top: var(--space);
+}
+
+.nav__link {
+  display: block;
+  padding: var(--space-tight) var(--space);
+  border-radius: var(--radius-sm);
+  color: var(--ink-muted);
+  text-decoration: none;
+}
+
+.nav__link:hover {
+  background: var(--surface-sunken);
+  color: var(--ink);
+}
+
+.nav__link[aria-current="page"] {
+  background: var(--accent-quiet);
+  color: var(--ink);
+  font-weight: 600;
+  /* Not colour alone: the marker keeps the current item legible in forced
+     colours mode and for anyone who cannot distinguish the tint. */
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.main {
+  padding: var(--space-loose);
+  min-width: 0;
+}
+
+@media (max-width: 48rem) {
+  .shell {
+    grid-template-columns: 1fr;
+  }
+
+  .nav {
+    border-inline-end: none;
+    border-block-end: var(--border);
+  }
+
+  .nav__list {
+    flex-direction: row;
+    flex-wrap: wrap;
+    position: static;
+  }
+
+  .masthead__facts {
+    margin-inline-start: 0;
+    width: 100%;
+  }
+}
+
+/* ---------------------------------------------------------------- blocks - */
+
+.view > * + * {
+  margin-block-start: var(--space-loose);
+}
+
+.page-title {
+  font-size: var(--step-2);
+  margin: 0 0 var(--space-hair);
+  letter-spacing: -0.02em;
+}
+
+.page-lede {
+  margin: 0;
+  color: var(--ink-muted);
+  max-width: 62ch;
+}
+
+.card {
+  background: var(--surface);
+  border: var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-loose);
+}
+
+.card__title {
+  font-size: var(--step-1);
+  margin: 0 0 var(--space);
+}
+
+.grid {
+  display: grid;
+  gap: var(--space);
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+}
+
+.stat {
+  background: var(--surface);
+  border: var(--border);
+  border-radius: var(--radius);
+  padding: var(--space);
+}
+
+.stat__label {
+  font-size: var(--step--1);
+  color: var(--ink-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.stat__value {
+  font-size: var(--step-2);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.15;
+  margin-block-start: var(--space-hair);
+}
+
+.stat__note {
+  font-size: var(--step--1);
+  color: var(--ink-muted);
+}
+
+/* --------------------------------------------------------------- tables -- */
+
+.table-scroll {
+  /* Wide tables scroll inside their own container; the page body never
+     scrolls sideways. */
+  overflow-x: auto;
+  border: var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--step--1);
+}
+
+.table caption {
+  text-align: start;
+  padding: var(--space) var(--space);
+  color: var(--ink-muted);
+  border-block-end: var(--border);
+}
+
+.table th,
+.table td {
+  text-align: start;
+  padding: var(--space-tight) var(--space);
+  border-block-end: var(--border);
+  vertical-align: top;
+}
+
+.table th {
+  font-weight: 600;
+  color: var(--ink-muted);
+  white-space: nowrap;
+  position: sticky;
+  top: 0;
+  background: var(--surface);
+}
+
+.table tbody tr:last-child td {
+  border-block-end: none;
+}
+
+.table tbody tr:hover {
+  background: var(--surface-sunken);
+}
+
+.numeric {
+  font-variant-numeric: tabular-nums;
+  text-align: end;
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-size: 0.95em;
+}
+
+/* ---------------------------------------------------------------- pills -- */
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-hair);
+  padding: 1px var(--space-tight);
+  border-radius: 999px;
+  font-size: var(--step--1);
+  font-weight: 600;
+  background: var(--surface-sunken);
+  color: var(--ink-muted);
+  white-space: nowrap;
+}
+
+/* Each state carries a glyph as well as a tint, so the meaning survives
+   monochrome printing and forced-colours mode. */
+.pill--ok {
+  background: var(--ok-quiet);
+  color: var(--ok);
+}
+
+.pill--ok::before {
+  content: "●";
+}
+
+.pill--warn {
+  background: var(--warn-quiet);
+  color: var(--warn);
+}
+
+.pill--warn::before {
+  content: "▲";
+}
+
+.pill--danger {
+  background: var(--danger-quiet);
+  color: var(--danger);
+}
+
+.pill--danger::before {
+  content: "■";
+}
+
+/* --------------------------------------------------------------- forms --- */
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-hair);
+  margin-block-end: var(--space);
+}
+
+.field__label {
+  font-weight: 600;
+  font-size: var(--step--1);
+}
+
+.field__hint {
+  font-size: var(--step--1);
+  color: var(--ink-muted);
+}
+
+/* The types are named individually rather than matched with `input:not(...)`,
+   so a control added later is styled deliberately. `search` is here because the
+   audit and usage filters use it; without it those two boxes render as bare
+   browser defaults next to their styled siblings. */
+input[type="text"],
+input[type="number"],
+input[type="search"],
+select,
+textarea {
+  font: inherit;
+  font-size: var(--step-0);
+  padding: var(--space-tight);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--ink);
+  width: 100%;
+}
+
+textarea {
+  font-family: var(--font-mono);
+  font-size: var(--step--1);
+  min-height: 18rem;
+  resize: vertical;
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+}
+
+.button {
+  font: inherit;
+  font-size: var(--step-0);
+  font-weight: 600;
+  padding: var(--space-tight) var(--space);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: var(--accent-ink);
+  cursor: pointer;
+}
+
+.button:hover {
+  filter: brightness(1.08);
+}
+
+.button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  filter: none;
+}
+
+.button--quiet {
+  background: transparent;
+  color: var(--ink-muted);
+  border-color: var(--line-strong);
+}
+
+.button--danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+
+.button-row {
+  display: flex;
+  gap: var(--space-tight);
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+/* -------------------------------------------------------------- banners -- */
+
+.banner {
+  display: flex;
+  gap: var(--space);
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space) var(--space-loose);
+  border-radius: var(--radius);
+  margin-block-end: var(--space-loose);
+  border: var(--border);
+}
+
+.banner--error {
+  background: var(--danger-quiet);
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.banner--ok {
+  background: var(--ok-quiet);
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+.banner--warn {
+  background: var(--warn-quiet);
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.banner__text {
+  font-weight: 600;
+}
+
+.secret {
+  font-family: var(--font-mono);
+  font-size: var(--step--1);
+  padding: var(--space);
+  background: var(--surface-sunken);
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-sm);
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.loading,
+.empty {
+  color: var(--ink-muted);
+  padding: var(--space-section) 0;
+  text-align: center;
+}
+
+.noscript {
+  padding: var(--space-loose);
+  color: var(--danger);
+}
+
+pre {
+  overflow-x: auto;
+  background: var(--surface-sunken);
+  padding: var(--space);
+  border-radius: var(--radius-sm);
+  font-size: var(--step--1);
+}
+
+code {
+  font-family: var(--font-mono);
+}
+
+/* ---------------------------------------------------------------- layout - */
+
+/* The screen renders into its own container inside #view so that the shell's
+   loading line can be removed without disturbing what the screen built. */
+.view__body > * + * {
+  margin-block-start: var(--space-loose);
+}
+
+.deflist {
+  display: grid;
+  grid-template-columns: minmax(8rem, 14rem) 1fr;
+  gap: var(--space-hair) var(--space);
+  margin: 0;
+}
+
+.deflist dt {
+  color: var(--ink-muted);
+  font-weight: 600;
+  font-size: var(--step--1);
+}
+
+.deflist dd {
+  margin: 0;
+  min-width: 0;
+  /* Digests, identifiers, and reason codes have no spaces to break at. */
+  overflow-wrap: anywhere;
+}
+
+.deflist--wide {
+  grid-template-columns: 1fr;
+  gap: 0;
+}
+
+.deflist--wide dt {
+  margin-block-start: var(--space);
+}
+
+@media (max-width: 40rem) {
+  .deflist {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+
+  .deflist dt {
+    margin-block-start: var(--space);
+  }
+}
+
+.panel__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: start;
+  justify-content: space-between;
+  gap: var(--space);
+  margin-block-end: var(--space);
+}
+
+.panel__head .card__title {
+  margin: 0;
+}
+
+.panel__note {
+  margin: var(--space-hair) 0 0;
+  color: var(--ink-muted);
+  font-size: var(--step--1);
+  max-width: 62ch;
+}
+
+.panel__actions {
+  display: flex;
+  gap: var(--space-tight);
+  flex-wrap: wrap;
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: var(--space);
+  margin-block-end: var(--space);
+}
+
+.toolbar__field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-hair);
+}
+
+.toolbar__label {
+  font-size: var(--step--1);
+  font-weight: 600;
+  color: var(--ink-muted);
+}
+
+/* Form controls are full width by default, which is right in a stacked form
+   and wrong in a filter row. */
+.toolbar__field input,
+.toolbar__field select {
+  width: auto;
+  min-width: 9rem;
+}
+
+/* ------------------------------------------------------------ confirmation */
+
+.confirm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-tight);
+  padding: var(--space);
+  border: 1px solid var(--danger);
+  background: var(--danger-quiet);
+  border-radius: var(--radius);
+}
+
+.confirm__message {
+  margin: 0;
+  font-weight: 600;
+}
+
+.confirm__detail {
+  margin: 0;
+  color: var(--ink-muted);
+  font-size: var(--step--1);
+  max-width: 62ch;
+}
+
+.confirm__phrase {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-hair);
+  font-size: var(--step--1);
+  max-width: 24rem;
+}
+
+/* ----------------------------------------------------------------- secret - */
+
+.secret-block {
+  display: grid;
+  gap: var(--space-tight);
+  padding: var(--space);
+  border: 1px solid var(--warn);
+  background: var(--warn-quiet);
+  border-radius: var(--radius);
+}
+
+.secret__label {
+  margin: 0;
+  font-size: var(--step-1);
+}
+
+.secret__notice {
+  margin: 0;
+  font-weight: 600;
+  max-width: 62ch;
+}
+
+.secret__status {
+  margin: 0;
+  font-size: var(--step--1);
+  color: var(--ink-muted);
+  /* Reserved so the block does not jump when the copy result appears. */
+  min-height: 1.3em;
+}
+
+/* ------------------------------------------------------------ empty states */
+
+.empty-state {
+  padding: var(--space-section) var(--space-loose);
+  text-align: center;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius);
+  color: var(--ink-muted);
+}
+
+.empty-state__title {
+  margin: 0 0 var(--space-hair);
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.empty-state__detail {
+  margin: 0 auto;
+  max-width: 52ch;
+  font-size: var(--step--1);
+}
+
+.empty-state--pending {
+  background: var(--surface-sunken);
+}
+
+.pager {
+  justify-content: center;
+  margin-block-start: var(--space);
+}
+
+/* ---------------------------------------------------------------- motion - */
+
+/* Specification 15.1: reduced-motion support. There is very little motion to
+   begin with; what exists is removed rather than shortened. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ----------------------------------------------------------------- print - */
+
+/* An operator printing a decision trace or an audit page for an incident
+   review should get the content, not the chrome. */
+@media print {
+  .masthead,
+  .nav,
+  .button,
+  .banner,
+  .toolbar,
+  .confirm,
+  .pager {
+    display: none !important;
+  }
+
+  .shell {
+    grid-template-columns: 1fr;
+  }
+
+  body {
+    background: #fff;
+    color: #000;
+    font-size: 10pt;
+  }
+
+  .card,
+  .table-scroll {
+    border: 1px solid #000;
+    break-inside: avoid;
+  }
+
+  .table th {
+    position: static;
+  }
+
+  .table-scroll {
+    overflow: visible;
+  }
+
+  a[href]::after {
+    content: " (" attr(href) ")";
+    font-size: 0.85em;
+  }
+}
+
+/* ---------------------------------------------------------------- digests - */
+
+/*
+ * A full hash digest: monospace, and breakable at any character. A 64-hex
+ * chain head has no natural break opportunity, so without this it either
+ * overflows its container or forces the page to scroll sideways.
+ */
+.digest {
+  font-family: var(--font-mono);
+  font-size: var(--step--1);
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+/* ------------------------------------------------------------ status line - */
+
+/* The result of an asynchronous action, announced through aria-live (the
+   session re-check on views/access.js). The height is reserved so the block
+   below does not jump when the line fills, and the line is dropped from print
+   because a status about a click has no meaning on paper. */
+.status-line {
+  margin: var(--space) 0 0;
+  font-size: var(--step--1);
+  color: var(--ink-muted);
+  min-height: 1.3em;
+}
+
+@media print {
+  .status-line {
+    display: none !important;
+  }
+}
+
+/* ------------------------------------------------------------- checksets -- */
+
+/*
+ * A group of checkboxes that is one control: a real `fieldset`/`legend`, so it
+ * is announced once with a name rather than as a run of unlabelled boxes. Used
+ * for API key scopes, where the group is the security decision.
+ */
+
+.checkset {
+  display: grid;
+  gap: var(--space-hair);
+  border: 0;
+  padding: 0;
+  margin: 0 0 var(--space) 0;
+  min-inline-size: 0;
+}
+
+.checkset__legend {
+  font-weight: 600;
+  font-size: var(--step--1);
+  padding: 0;
+}
+
+.checkset__item {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--space-hair);
+}
+
+.checkset__item label {
+  font-family: var(--font-mono);
+  font-size: var(--step--1);
+}
+
+.checkset__hint {
+  color: var(--ink-muted);
+  font-size: var(--step--1);
+}
+
+/* The shared input rule sets `width: 100%`, which is wrong for a checkbox. */
+.checkset__item input[type="checkbox"] {
+  inline-size: auto;
+  flex: none;
+}
+
+input[type="date"] {
+  font: inherit;
+  font-size: var(--step-0);
+  padding: var(--space-tight);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--ink);
+  width: 100%;
+}
+
+/* ------------------------------------------------------------ credentials - */
+
+/* Provider secrets are typed into masked inputs. The shared input rule names
+   its types explicitly, so `password` has to be named too or the field on the
+   credentials screen renders as an unstyled browser default next to styled
+   siblings. Same declarations, deliberately — this is not a variant. */
+input[type="password"] {
+  font: inherit;
+  font-size: var(--step-0);
+  padding: var(--space-tight);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--ink);
+  width: 100%;
+}
+
+/* --------------------------------------------------------------- policies - */
+
+/*
+ * Stacked blocks inside one card. `.view__body` gives rhythm to the top-level
+ * blocks of a screen, but a panel that holds a form, a status line and a result
+ * table needs the same separation one level down.
+ */
+.policy-stack > * + * {
+  margin-block-start: var(--space);
+}
+
+/*
+ * The live region a policy action reports into. It keeps its height when empty
+ * so that a validation or publication result does not shift the controls under
+ * the pointer at the moment the operator is reading them.
+ */
+.policy-status {
+  margin: 0;
+  min-height: 1.4em;
+  font-size: var(--step--1);
+  color: var(--ink-muted);
+}
+
+.policy-status:focus-visible {
+  outline: var(--focus);
+  outline-offset: var(--focus-offset);
+}
+
+/* ---------------------------------------------------------------- targets - */
+
+/* More than one state can be true of a target at once — an open breaker on a
+   quarantined target — so a cell may carry several pills. */
+.pill-row {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--space-hair);
+}

@@ -1,0 +1,19 @@
+# Build output. `target/` is ~9 GB and fully reproducible from source.
+/target
+/dist
+
+# Windows "mark of the web" sidecar files. Two spellings: some tools write
+# `name.ext:Zone.Identifier` (a colon, an NTFS alternate data stream surfaced as
+# a file under WSL), which `*.Zone.Identifier` does not match.
+*.Zone.Identifier
+*:Zone.Identifier
+
+# Runtime state. The router writes its append-only log, snapshots, and control
+# socket under these; none of it belongs in version control, and the secrets
+# bundle in particular must never be committed.
+/run
+/state
+/secrets
+
+# Machine-local editor and tool settings, not project configuration.
+.claude/settings.local.json

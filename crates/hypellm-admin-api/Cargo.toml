@@ -1,0 +1,28 @@
+[package]
+name = "hypellm-admin-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Versioned management API handlers and schemas."
+
+[lints]
+workspace = true
+
+[dependencies]
+hypellm-auth = { path = "../hypellm-auth" }
+hypellm-config = { path = "../hypellm-config" }
+hypellm-core = { path = "../hypellm-core" }
+hypellm-crypto = { path = "../hypellm-crypto" }
+hypellm-store = { path = "../hypellm-store" }
+hypellm-telemetry = { path = "../hypellm-telemetry" }
+wire-http1 = { path = "../wire-http1" }
+wire-json = { path = "../wire-json" }
+
+[dev-dependencies]
+hypellm-test-corpus = { path = "../hypellm-test-corpus" }
+# The management harness builds a real store and captures log lines, both of
+# which are test scaffolding gated in their own crates (specification 18.2).
+hypellm-store = { path = "../hypellm-store", features = ["test-harness"] }
+hypellm-telemetry = { path = "../hypellm-telemetry", features = ["test-harness"] }
