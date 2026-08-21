@@ -81,6 +81,8 @@ impl AdminHandler {
                 let allowed = [
                     "/views/overview.js",
                     "/views/targets.js",
+                    "/views/fleet.js",
+                    "/views/activations.js",
                     "/views/policies.js",
                     "/views/access.js",
                     "/views/keys.js",
@@ -346,6 +348,16 @@ pub fn admin_state_from(
         next_version: std::sync::atomic::AtomicU64::new(version + 1),
         break_glass: break_glass_policy(&router.config(), break_glass_verifier),
         credentials: Some(credentials),
+        // Present only when orchestration is configured *and* enabled. Absent,
+        // the whole `/admin/v1/fleet` surface answers "not configured on this
+        // router" rather than serving empty rows that read as a healthy idle
+        // fleet.
+        fleet: router.fleet().map(|runtime| {
+            let control: Arc<dyn hypellm_admin_api::FleetControl> = Arc::new(
+                crate::fleet::FleetControlAdapter::new(Arc::clone(runtime)),
+            );
+            control
+        }),
     }
 }
 

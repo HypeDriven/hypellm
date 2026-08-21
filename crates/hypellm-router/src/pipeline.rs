@@ -66,10 +66,17 @@ impl Outcome {
 }
 
 /// Execute a request end to end.
+///
+/// `permissions` are the principal's, and are consulted for exactly two
+/// things: whether this caller may cause a deployment to start, and whether
+/// they may cause an artifact to be fetched. Neither is permission to *reach* a
+/// model — that is the alias grant, unchanged — and a caller without them
+/// still uses whatever is already warm.
 pub fn execute(
     state: &RouterState,
     request: &CanonicalRequest,
     groups: &[GroupId],
+    permissions: hypellm_core::rbac::PermissionSet,
     sink: &mut dyn EventSink,
 ) -> Outcome {
     let clock = state.clock.as_ref();
@@ -86,9 +93,15 @@ pub fn execute(
         groups,
         tenant: &request.tenant,
         attempted: &attempted,
+        now_millis: clock.now_millis(),
     };
 
-    let route = snapshot.route(&context, request, state.health.as_ref());
+    // Sampled once, before routing, and borrowed for the whole decision. A
+    // second sample could classify a target one way for the filter and another
+    // for the score.
+    let fleet_view = state.fleet_view(request, &permissions);
+    let live = crate::fleet::FleetAwareLiveState::new(state.health.as_ref(), &fleet_view);
+    let route = snapshot.route(&context, request, &live);
 
     let mut trace = DecisionTrace {
         request_id: request.request_id,
@@ -271,6 +284,56 @@ pub fn execute(
             }
         };
 
+        // The fleet step, placed here deliberately: after the admission
+        // reservation and before any outbound I/O. Evicting a running model and
+        // *then* discovering the tenant is over quota is exactly the unforced
+        // error Appendix B's ordering exists to prevent.
+        //
+        // Activation failure is strictly before upstream acceptance, so
+        // specification 6.5 failover applies unchanged and the no-splice rule
+        // is untouched: the loop simply moves to the next candidate.
+        if candidate.residency == hypellm_core::decision::ResidencyClass::Activating {
+            // Somebody else already paid for this swap; this request rides on
+            // it rather than dispatching into a model that has not finished
+            // loading. This is what turns a burst of ten requests into one
+            // activation *and* ten served requests, rather than one activation
+            // and nine failovers.
+            if let Err(reason) = wait_for(state, request, candidate, overall) {
+                trace.exclusions.push(hypellm_core::decision::Exclusion {
+                    target: target.id.clone(),
+                    reason,
+                });
+                drop(reservation);
+                continue;
+            }
+        } else if candidate.residency.requires_activation() {
+            match activate_for(state, request, &fleet_view, candidate, overall) {
+                Ok(()) => {}
+                Err(reason) => {
+                    trace.exclusions.push(hypellm_core::decision::Exclusion {
+                        target: target.id.clone(),
+                        reason,
+                    });
+                    // The reservation is dropped here, on this path as on every
+                    // other, before the next candidate asks for capacity.
+                    drop(reservation);
+                    last_failure = Some(AttemptFailure {
+                        phase: dispatch::AttemptPhase::BeforeAcceptance,
+                        class: hypellm_core::event::UpstreamErrorClass::Connection,
+                        // Deliberately vague: "capability unavailable", and not
+                        // a word about which host, which accelerator, or what
+                        // else is loaded there.
+                        error: RouterError::new(
+                            ErrorCode::NoEligibleTarget,
+                            "the requested capability is not available",
+                        ),
+                        provider_code: None,
+                    });
+                    continue;
+                }
+            }
+        }
+
         // Recorded before dispatch: the request is bound to this family from
         // the moment an attempt is made against it, whether or not it succeeds.
         first_family.get_or_insert(provider.family);
@@ -391,7 +454,37 @@ pub fn execute(
                 saw_output |= summary.saw_output;
                 // Reconcile the estimate against what the provider reported
                 // (specification 12).
-                reservation.commit(summary.usage.total());
+                let actual = summary.usage.total();
+                // Reserved minus reconciled, which is what validates the
+                // effort multipliers and the per-document constants against
+                // reality. Labelled by what made the estimate hard: a request
+                // with documents and one with a reasoning tier over-estimate
+                // for different reasons, and an operator tuning one needs to
+                // see it separately from the other.
+                //
+                // Only the over-estimate is recorded, because that is the
+                // direction the estimator is *supposed* to err in; an
+                // under-estimate would mean a request slipped past a quota,
+                // which is a defect rather than a tuning signal.
+                let source = if request.document_parts() > 0 {
+                    "document"
+                } else if request.reasoning_effort
+                    != hypellm_core::canonical::ReasoningEffort::Unset
+                {
+                    "effort"
+                } else {
+                    "base"
+                };
+                state.telemetry.metrics.histogram_observe(
+                    hypellm_telemetry::names::TOKEN_ESTIMATE_ERROR,
+                    "Reserved minus reconciled tokens, when the estimate was high.",
+                    &hypellm_telemetry::Labels::one(
+                        hypellm_telemetry::LabelName::UsageSource,
+                        source,
+                    ),
+                    estimate.saturating_sub(actual),
+                );
+                reservation.commit(actual);
                 health.record_success(
                     summary.first_byte_millis.unwrap_or(0),
                     summary.total_millis,
@@ -603,6 +696,20 @@ pub fn record_completion(
         hypellm_telemetry::names::REQUESTS_TOTAL,
         "Requests by protocol, operation, and outcome.",
         &labels,
+    );
+
+    // Whether the reasoning tiers are used as expected, and whether the
+    // expensive ones succeed at the same rate as the cheap ones. Both labels
+    // are closed enums, so the series count is bounded by construction.
+    state.telemetry.count(
+        hypellm_telemetry::names::REQUESTS_BY_EFFORT,
+        "Requests by reasoning tier and outcome.",
+        &hypellm_telemetry::Labels::new()
+            .with(
+                hypellm_telemetry::LabelName::Effort,
+                request.reasoning_effort.as_str(),
+            )
+            .with(hypellm_telemetry::LabelName::Outcome, code),
     );
 
     // `hypellm_router_overhead_milliseconds` and the `router_ms` log field are
@@ -849,6 +956,125 @@ fn target_of(trace: &hypellm_core::decision::DecisionTrace) -> Option<&hypellm_c
     trace.chosen.as_ref()
 }
 
+/// Wait for an activation somebody else started.
+///
+/// Bounded by the request's own deadline. The wait is reported as
+/// `hypellm_fleet_queue_wait_milliseconds`, which is the cost of batching as
+/// the caller actually experienced it — the number an operator needs to decide
+/// whether `activation_max_wait_ms` is set well.
+fn wait_for(
+    state: &RouterState,
+    request: &CanonicalRequest,
+    candidate: &hypellm_core::decision::Candidate,
+    deadline: Deadline,
+) -> Result<(), ExclusionReason> {
+    let Some(fleet) = state.fleet() else {
+        return Err(ExclusionReason::FleetAgentUnavailable);
+    };
+    let clock = state.clock.as_ref();
+    let remaining = u64::try_from(deadline.remaining(clock).as_millis()).unwrap_or(u64::MAX);
+    match fleet.await_ready(&candidate.target, remaining) {
+        Ok(waited) => {
+            let capability = state
+                .config()
+                .snapshot
+                .aliases
+                .get(&request.requested_model)
+                .and_then(|a| a.capability);
+            if let Some(capability) = capability {
+                state.telemetry.metrics.histogram_observe(
+                    hypellm_telemetry::names::FLEET_QUEUE_WAIT_MS,
+                    "Time a request spent waiting for a cold capability to become available.",
+                    &hypellm_telemetry::Labels::one(
+                        hypellm_telemetry::LabelName::Capability,
+                        capability.as_str(),
+                    ),
+                    waited,
+                );
+            }
+            fleet.record_served(&candidate.target);
+            Ok(())
+        }
+        Err("fleet_activation_timeout") => Err(ExclusionReason::ActivationExceedsDeadline),
+        Err(_) => Err(ExclusionReason::HostCapacityInsufficient),
+    }
+}
+
+/// Make a cold candidate ready, or say why it could not be.
+///
+/// Returns the exclusion reason to record against the target. Nothing here
+/// names a host, an accelerator, or what else is loaded: specification-extension
+/// 15 makes fleet topology management-plane data, and a data-plane error that
+/// disclosed it would be a cross-tenant leak by another name.
+fn activate_for(
+    state: &RouterState,
+    request: &CanonicalRequest,
+    view: &crate::fleet::FleetView,
+    candidate: &hypellm_core::decision::Candidate,
+    deadline: Deadline,
+) -> Result<(), ExclusionReason> {
+    let Some(fleet) = state.fleet() else {
+        // A candidate classified as needing activation by a router with no
+        // fleet runtime is a contradiction; refuse rather than dispatch to
+        // something that is not running.
+        return Err(ExclusionReason::FleetAgentUnavailable);
+    };
+    let Some(plan) = view.plan(&candidate.target) else {
+        return Err(ExclusionReason::FleetStateStale);
+    };
+
+    // Batching. Ten requests for one cold capability should cost one swap, not
+    // ten, so only the request that trips the threshold pays for it.
+    let config = state.config();
+    let capability = config
+        .snapshot
+        .aliases
+        .get(&request.requested_model)
+        .and_then(|a| a.capability);
+    if let Some(capability) = capability {
+        match fleet.admit_to_queue(capability, &plan.host) {
+            hypellm_fleet::governance::QueueAdmission::Activate => {}
+            hypellm_fleet::governance::QueueAdmission::Wait { .. } => {
+                // Waiting is not this request\'s job: it fails over to the next
+                // candidate, and the activation the queue triggered serves
+                // whoever asks next. A request that blocked here would hold a
+                // connection and an admission slot for a whole model load.
+                fleet.leave_queue(capability);
+                return Err(ExclusionReason::ActivationExceedsDeadline);
+            }
+            hypellm_fleet::governance::QueueAdmission::Full => {
+                fleet.leave_queue(capability);
+                return Err(ExclusionReason::ActivationBudgetExhausted);
+            }
+        }
+    }
+
+    let clock = state.clock.as_ref();
+    let remaining = u64::try_from(deadline.remaining(clock).as_millis()).unwrap_or(u64::MAX);
+    let result = fleet.ensure_ready(
+        &candidate.target,
+        plan,
+        &request.request_id.to_hex(),
+        remaining,
+    );
+    if let Some(capability) = capability {
+        fleet.leave_queue(capability);
+    }
+
+    match result {
+        crate::fleet::ActivationResult::Ready => {
+            fleet.record_served(&candidate.target);
+            Ok(())
+        }
+        crate::fleet::ActivationResult::Failed { code } => Err(match code {
+            "fleet_budget_exhausted" | "fleet_busy" => ExclusionReason::ActivationBudgetExhausted,
+            "fleet_activation_timeout" => ExclusionReason::ActivationExceedsDeadline,
+            "fleet_unavailable" => ExclusionReason::FleetAgentUnavailable,
+            _ => ExclusionReason::HostCapacityInsufficient,
+        }),
+    }
+}
+
 /// A terminal error event for a stream that has already begun.
 ///
 /// Specification 14: "Emit protocol-supported error event if possible, then
@@ -903,6 +1129,7 @@ mod tests {
             alias.clone(),
             hypellm_core::target::Alias {
                 id: alias.clone(),
+                capability: None,
                 permitted_targets: vec![TargetId::new("t").unwrap()],
                 allow_family_failover: false,
                 description: None,
@@ -927,6 +1154,7 @@ mod tests {
             alias.clone(),
             hypellm_core::target::Alias {
                 id: alias,
+                capability: None,
                 permitted_targets: vec![TargetId::new("t").unwrap()],
                 allow_family_failover: false,
                 description: None,
@@ -949,6 +1177,7 @@ mod tests {
             alias.clone(),
             hypellm_core::target::Alias {
                 id: alias,
+                capability: None,
                 permitted_targets: vec![TargetId::new("t").unwrap()],
                 allow_family_failover: false,
                 description: None,

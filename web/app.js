@@ -36,6 +36,8 @@ import { buttonRow, card, pageHeader, render } from './components/table.js';
 // happened.
 import * as overview from './views/overview.js';
 import * as targets from './views/targets.js';
+import * as fleet from './views/fleet.js';
+import * as activations from './views/activations.js';
 import * as policies from './views/policies.js';
 import * as access from './views/access.js';
 import * as keys from './views/keys.js';
@@ -49,6 +51,12 @@ import * as settings from './views/settings.js';
 const VIEWS = [
   overview,
   targets,
+  // The fleet sits next to targets: a target is what routing chooses, and a
+  // deployment is that target's lifecycle on a machine. Reading one without the
+  // other is how an operator concludes a model is "down" when it is merely
+  // cold.
+  fleet,
+  activations,
   policies,
   access,
   keys,

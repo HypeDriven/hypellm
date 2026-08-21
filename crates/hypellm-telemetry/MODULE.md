@@ -78,6 +78,19 @@ This module deliberately does **not**:
   `StderrSink` and `MemorySink` only. No file sink, no rotation, no retention, no
   syslog. Where output goes is a deployment concern (specification 20).
 
+### Fleet labels
+
+`host`, `deployment`, `accelerator`, `agent`, `capability` and `effort` join the
+closed label vocabulary. Each is admissible for the same reason the existing
+ones are: the first four are administrator-configured identifiers, bounded by
+the configuration; the last two are closed enums in the router. A user id, a
+request id, a prompt or a URL remain forbidden and always will.
+
+The fleet metrics are in `names`. Every one of them is emitted by
+`hypellm-router`; a declared series that nothing writes reads on a dashboard as
+"this never happens" rather than "this is not measured", which is the more
+misleading of the two.
+
 ## Threat notes
 
 - **The pseudonym key is secret material.** `Pseudonymizer` uses a hand-written

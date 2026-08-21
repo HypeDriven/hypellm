@@ -82,6 +82,31 @@ pub enum AuditAction {
     RouterStopped,
     /// Settings were changed.
     SettingsChanged,
+
+    // -- Fleet orchestration (specification-extension 18) -------------------
+    //
+    // Each names the actor: an operator, or the decision identifier that caused
+    // it — so every model that stops is traceable to a cause.
+    /// A deployment was started.
+    FleetActivate,
+    /// A deployment was stopped by an operator.
+    FleetDeactivate,
+    /// A deployment was displaced to make room for another.
+    FleetEvict,
+    /// A drain deadline expired and the deployment was stopped anyway.
+    FleetForcedStop,
+    /// An eviction was undone after the activation it made room for failed.
+    FleetRollback,
+    /// An artifact was acquired.
+    FleetFetch,
+    /// Observation disagreed with what the router asked for.
+    FleetDivergence,
+    /// Observed memory exceeded the declared figures beyond tolerance.
+    FleetMemoryDrift,
+    /// A lease outlived its expiry and was released.
+    FleetLeaseExpired,
+    /// The router and an agent disagreed about the fleet digest.
+    FleetConfigurationMismatch,
 }
 
 impl AuditAction {
@@ -89,6 +114,16 @@ impl AuditAction {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::FleetActivate => "fleet.activate",
+            Self::FleetDeactivate => "fleet.deactivate",
+            Self::FleetEvict => "fleet.evict",
+            Self::FleetForcedStop => "fleet.forced_stop",
+            Self::FleetRollback => "fleet.rollback",
+            Self::FleetFetch => "fleet.fetch",
+            Self::FleetDivergence => "fleet.divergence",
+            Self::FleetMemoryDrift => "fleet.memory_drift",
+            Self::FleetLeaseExpired => "fleet.lease_expired",
+            Self::FleetConfigurationMismatch => "fleet.configuration_mismatch",
             Self::Login => "login",
             Self::Logout => "logout",
             Self::LoginFailed => "login_failed",
@@ -130,7 +165,13 @@ impl AuditAction {
     pub const fn requires_reason(self) -> bool {
         matches!(
             self,
-            Self::TargetQuarantined | Self::BreakGlassOpened | Self::PolicyRolledBack
+            Self::TargetQuarantined
+                | Self::BreakGlassOpened
+                | Self::PolicyRolledBack
+                // A forced stop cuts in-flight requests off mid-stream. An
+                // operator who enabled it must be able to find out afterwards
+                // *why* the drain deadline was allowed to expire.
+                | Self::FleetForcedStop
         )
     }
 
@@ -162,6 +203,16 @@ impl AuditAction {
             Self::RouterStarted,
             Self::RouterStopped,
             Self::SettingsChanged,
+            Self::FleetActivate,
+            Self::FleetDeactivate,
+            Self::FleetEvict,
+            Self::FleetForcedStop,
+            Self::FleetRollback,
+            Self::FleetFetch,
+            Self::FleetDivergence,
+            Self::FleetMemoryDrift,
+            Self::FleetLeaseExpired,
+            Self::FleetConfigurationMismatch,
         ]
     }
 }

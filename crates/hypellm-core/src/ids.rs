@@ -167,6 +167,68 @@ define_id!(
     KeyId,
     "key"
 );
+define_id!(
+    /// A fleet agent: the out-of-process actuator that owns a set of hosts.
+    ///
+    /// Names a configured socket, never an address. See `hypellm-fleet`.
+    AgentId,
+    "agent"
+);
+define_id!(
+    /// A machine in the managed fleet.
+    ///
+    /// Administrator-configured. No client-supplied value ever becomes one:
+    /// the identifier crosses the agent socket, and the agent resolves it
+    /// against its own allowlist to reach an actual host.
+    HostId,
+    "host"
+);
+define_id!(
+    /// One accelerator on a host, as the agent addresses it.
+    ///
+    /// Globally unique rather than unique-within-host, because a `deployment`
+    /// record names an accelerator without repeating its host. A machine with
+    /// two very different GPUs — the fleet has one — needs two distinguishable
+    /// identifiers anyway, so the constraint costs nothing and removes a whole
+    /// class of "which host's device 1?" mistake.
+    AcceleratorId,
+    "accelerator"
+);
+define_id!(
+    /// The placement of one routable target onto one accelerator.
+    ///
+    /// The only fleet identifier that crosses the agent socket as part of a
+    /// mutating verb.
+    DeploymentId,
+    "deployment"
+);
+define_id!(
+    /// A distributable model or image, content-addressed by digest.
+    ArtifactId,
+    "artifact"
+);
+define_id!(
+    /// A memory budget shared by one or more accelerators.
+    ///
+    /// Unified memory is modelled by giving an accelerator and its host the
+    /// same pool, so a resident model correctly reduces host RAM availability.
+    PoolId,
+    "pool"
+);
+define_id!(
+    /// One router's claim on a piece of fleet work.
+    ///
+    /// Router-generated, durable, and idempotent at the agent: re-sending a
+    /// verb under the same lease returns the same activation rather than
+    /// starting a second one, which is what makes crash recovery tractable.
+    LeaseId,
+    "lease"
+);
+define_id!(
+    /// An agent-assigned handle to one in-flight activation.
+    ActivationId,
+    "activation"
+);
 
 /// A 128-bit request identifier.
 ///

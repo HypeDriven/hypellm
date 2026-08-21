@@ -31,6 +31,7 @@ hypellm-admin-api = { path = "../hypellm-admin-api" }
 hypellm-auth = { path = "../hypellm-auth" }
 hypellm-config = { path = "../hypellm-config" }
 hypellm-core = { path = "../hypellm-core" }
+hypellm-fleet = { path = "../hypellm-fleet" }
 hypellm-crypto = { path = "../hypellm-crypto" }
 hypellm-net = { path = "../hypellm-net" }
 hypellm-store = { path = "../hypellm-store" }
@@ -42,3 +43,9 @@ wire-sse = { path = "../wire-sse" }
 [dev-dependencies]
 hypellm-router = { path = ".", features = ["test-harness"] }
 hypellm-test-corpus = { path = "../hypellm-test-corpus" }
+# The simulated fleet agent and `TempDir`, both behind `test-harness`
+# (specification 18.2). The fleet integration suite needs a conformant agent on
+# a real socket; `cargo test --workspace --offline` must still reach neither SSH
+# nor Docker.
+hypellm-net = { path = "../hypellm-net", features = ["test-harness"] }
+hypellm-store = { path = "../hypellm-store", features = ["test-harness"] }

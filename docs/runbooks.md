@@ -792,3 +792,119 @@ window is still bounded, but explicitly closing is better evidence.
   the file-adoption path in step 5 is a viable last resort rather than a rewrite.
 - Take routine backups of the state directory (`Store::backup_to`, or a copy of
   a quiesced directory) so the destructive path in step 5 is recoverable.
+
+## 22.5 Fleet incidents
+
+The fleet is the set of accelerator hosts behind the aliases, and its failures
+look different from a provider outage: the model an alias points at may be
+correct, declared, and simply *not running*. Specification §26 and
+[orchestration.md](orchestration.md) are the design; this is what to do at three
+in the morning.
+
+### Symptom: requests refused with "the requested capability is not available"
+
+The data-plane error names nothing on purpose — host identifiers and residency
+are management-plane data — so the diagnosis happens on the Fleet screen or:
+
+```bash
+curl -s --unix-socket /dev/null https://admin.example/admin/v1/fleet | jq .
+```
+
+Read `observation_age_ms` **first**. It gates every other decision:
+
+| What you see | What it means | What to do |
+|---|---|---|
+| `null` | The router has never reached an agent. This is not "0 seconds"; it is "never". | Check the agent is running and the socket path in `fleet_agent` matches. |
+| Larger than `observation_max_age_ms` | Belief has expired. Cold targets are ineligible and no plan will execute; warm ones keep serving. | Check the agent's process and the SSH path to each host. Nothing will start until an observation succeeds. |
+| `digest_agreed: false` | The router and an agent disagree about what the identifiers mean. **No deployment will be started or stopped.** | Compare the digests (below) and reconcile the two files. Do not restart the agent hoping it clears — it will not. |
+
+### Reconciling a digest mismatch
+
+The two sides compute the digest independently, from two different files:
+
+```bash
+agent/fleet-agent --config /etc/hypellm/fleet.json --print-digest
+hypellm-router --check --config /etc/hypellm/hypellm.conf   # prints "fleet digest ..."
+```
+
+They cover identifiers, placement, and architecture — not timings or governance,
+so a dwell floor can be retuned without touching the agent. A mismatch means a
+host, accelerator, deployment or artifact was added, removed, renamed or moved
+on one side only. Fix the file that is wrong, then restart the agent (the router
+picks the new digest up on its next configuration activation).
+
+Fail closed is deliberate here. A router and an agent that disagree about what
+`spark-music3` means must not act on that disagreement: the failure mode of
+acting is stopping the wrong production model.
+
+### Symptom: a model will not start
+
+Ask the planner directly rather than guessing. It is a pure function, so this
+changes nothing:
+
+```bash
+curl -X POST https://admin.example/admin/v1/fleet:simulate \
+     -H 'content-type: application/json' \
+     -d '{"target":"spark:minimax-music3","patience_ms":900000}'
+```
+
+The reply carries the class, the estimated time to ready, the steps it would
+take, and — when it refuses — the reason code:
+
+| Reason | Meaning | Response |
+|---|---|---|
+| `deployment_in_dwell` | Something that would have to be evicted has not been resident long enough, or the deployment itself is inside its reactivation cooldown. | Wait. The trace shows how long. This is the mechanism working. |
+| `eviction_value_insufficient` | There *is* an admissible eviction set and it is large enough; the incoming demand simply does not beat its retention value by the configured margin. | Nothing is broken. Lower `eviction_margin_permille`, raise the deployment's `retention_weight`, or accept the answer. |
+| `host_capacity_insufficient` | No admissible set frees enough memory — usually because everything else on the host is pinned, not evictable, or not router-owned. | Check `pinned` and `router_owned` on the Fleet screen. A deployment the router did not start is never evicted by it. |
+| `activation_budget_exhausted` | The host has spent its hourly allowance. | Wait, or raise `max_activations_per_hour` deliberately. It is a hard ceiling on purpose: it is what bounds the worst case. |
+| `activation_exceeds_deadline` | The model takes longer to load than the request has left. | Raise the alias's deadline. A three-minute model cannot serve a thirty-second request, and offering it would turn a fast failure into a slow one. |
+| `artifact_unavailable` | The artifact is absent, on the wrong architecture, or fetching is not permitted. | Place it out of band, or grant `fleet.fetch` and set `allow_fetch=true` deliberately. |
+
+### Symptom: the fleet is swapping constantly
+
+Read `hypellm_fleet_thrash_ratio_permille`. It is activations per thousand
+requests served from activated deployments. A healthy fleet trends toward zero
+as batching amortises each swap; a value near 1,000 means every request costs a
+swap and the configuration is wrong.
+
+The usual causes, in the order they are worth checking:
+
+1. **Two capabilities that cannot co-reside, both in demand.** Raise
+   `min_resident_ms` on both. It costs responsiveness and buys throughput,
+   because each swap costs minutes.
+2. **`eviction_margin_permille` too low.** Two capabilities of near-identical
+   value trade places on noise. Raise it.
+3. **`activation_max_wait_ms` too short.** Batching is what turns ten requests
+   into one swap; too short a window defeats it.
+4. **A model that keeps failing to stay up.** Check the Activations screen for
+   repeated `failed` outcomes on one deployment. The flap counter is already
+   backing it off; the underlying problem is on the host.
+
+### Stopping the fleet moving at all
+
+Two levers, in increasing order of bluntness:
+
+```text
+# One deployment: the planner stops considering it for eviction.
+PATCH /admin/v1/fleet/deployments/spark-qwen38  {"pinned": true}
+
+# One deployment: routing demand can no longer start it, only an operator.
+PATCH /admin/v1/fleet/deployments/spark-music3  {"autostart": false}
+```
+
+and, in the configuration, `fleet_enabled=false` — which leaves every record
+declared and validated while the router opens no agent socket, takes no
+observation, and routes exactly as it did before orchestration existed.
+
+An operator action bypasses the *demand* threshold, because a person asking is
+demand enough. It does not bypass the dwell floor, the cooldown, the
+concurrency limit, or the activation budget. Those protect the fleet from every
+caller, and an operator who could step over them would find the protections
+absent at exactly the moment an incident makes them want to.
+
+### After an incident
+
+Every start and stop is in the audit chain — `fleet.activate`, `fleet.evict`,
+`fleet.rollback`, `fleet.forced_stop` — and each names either the operator or
+the decision identifier that caused it. The Activations screen links each row to
+the decision trace, so "why did this model stop" resolves to a specific request.

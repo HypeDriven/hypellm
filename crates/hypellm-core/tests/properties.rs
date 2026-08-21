@@ -122,6 +122,9 @@ fn capabilities() -> Capabilities {
     Capabilities {
         operations: vec![Operation::Chat],
         modalities: vec![Modality::Text],
+        verbs: Vec::new(),
+        reasoning_efforts: Vec::new(),
+        effort_multipliers: Default::default(),
         streaming: true,
         tools: true,
         parallel_tool_calls: true,
@@ -175,6 +178,8 @@ fn snapshot(rng: &mut Rng) -> PolicySnapshot {
                 aliases: vec![alias()],
                 capabilities: capabilities(),
                 cost_class: CostClass(u8::try_from(rng.below(10)).unwrap_or(0)),
+                quality_class: Default::default(),
+                document_token_estimate: None,
                 residency: None,
                 // A local target earns a large locality bonus, which is what
                 // makes pin ordering and deny handling non-trivial.
@@ -193,6 +198,7 @@ fn snapshot(rng: &mut Rng) -> PolicySnapshot {
         Alias {
             id: alias(),
             permitted_targets: TARGET_NAMES.iter().map(|n| tid(n)).collect(),
+            capability: None,
             allow_family_failover: true,
             description: None,
         },
@@ -242,10 +248,12 @@ fn request(rng: &mut Rng) -> CanonicalRequest {
         tool_choice: None,
         response_format: None,
         sampling: Sampling::default(),
+        reasoning_effort: Default::default(),
         limits: RequestLimits {
             max_output_tokens: None,
             deadline: hypellm_core::time::Deadline::after(&clock, std::time::Duration::from_secs(30)),
             max_cost_class: None,
+            min_quality_class: None,
             residency: None,
         },
         stream: StreamOptions::default(),
@@ -261,6 +269,7 @@ fn route(s: &PolicySnapshot, req: &CanonicalRequest) -> RouteOutcome {
         groups: &groups,
         tenant: &req.tenant,
         attempted: &attempted,
+        now_millis: 0,
     };
     s.route(&ctx, req, &IdealLiveState)
 }

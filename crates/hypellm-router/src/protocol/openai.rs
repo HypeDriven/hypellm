@@ -14,9 +14,9 @@
 //! the client contract.
 
 use hypellm_core::canonical::{
-    CanonicalRequest, ClientProtocol, ContentPart, CostClass, ImageSource, Message, Operation,
-    RequestLimits, Residency, ResponseFormat, Role, RoutingHints, Sampling, StreamOptions,
-    ToolCall, ToolChoice, ToolDef,
+    CanonicalRequest, ClientProtocol, ContentPart, CostClass, DocumentSource, DocumentType,
+    ImageSource, Message, Operation, QualityClass, ReasoningEffort, RequestLimits, Residency,
+    ResponseFormat, Role, RoutingHints, Sampling, StreamOptions, ToolCall, ToolChoice, ToolDef,
 };
 use hypellm_core::error::{ErrorCode, RouterError};
 use hypellm_core::event::{CanonicalEvent, FinishReason, ResponseAccumulator};
@@ -51,6 +51,88 @@ pub struct ParseContext {
     /// permit selection." The ceiling is policy, so it comes from
     /// configuration, not from the request body.
     pub max_cost_class: Option<CostClass>,
+    /// The lowest quality class this tenant's requests may select.
+    ///
+    /// The policy floor. Unlike the cost ceiling, a caller may *raise* it in
+    /// the request body — see [`effective_quality_floor`]. Raising a floor can
+    /// only narrow the candidate set, so it needs no permission gate; lowering
+    /// one would let a caller opt out of a compliance decision, which is why
+    /// the combination takes the maximum rather than the request's value.
+    pub min_quality_class: Option<QualityClass>,
+    /// Bounds on the document parts a request may carry.
+    pub document_limits: DocumentLimits,
+}
+
+/// The bounds a request's document parts must satisfy.
+///
+/// Specification-extension 3.3. Carried into the parser rather than checked
+/// afterwards for the count and per-part rules, because a request that has
+/// already been parsed has already allocated whatever it declared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DocumentLimits {
+    /// Maximum document parts in one request.
+    pub max_documents: u32,
+    /// Maximum decoded bytes in any one inline document.
+    pub max_document_bytes: u64,
+    /// Maximum decoded bytes across every inline document.
+    pub max_inline_bytes: u64,
+}
+
+impl DocumentLimits {
+    /// The compiled-in defaults, matching `Settings::default`.
+    pub const DEFAULT: Self = Self {
+        max_documents: 4,
+        max_document_bytes: 4 * 1024 * 1024,
+        max_inline_bytes: 8 * 1024 * 1024,
+    };
+}
+
+impl Default for DocumentLimits {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// The floor that applies to a request: the tenant's, or the caller's if higher.
+fn effective_quality_floor(value: &Value, context: &ParseContext) -> Option<QualityClass> {
+    let requested = value
+        .opt_field_i64("min_quality")
+        .ok()
+        .flatten()
+        .and_then(|v| u8::try_from(v).ok())
+        .map(QualityClass::new);
+    match (context.min_quality_class, requested) {
+        (None, other) | (other, None) => other,
+        (Some(policy), Some(caller)) => Some(policy.max(caller)),
+    }
+}
+
+/// The reasoning tier the caller asked for, in either OpenAI spelling.
+///
+/// Chat Completions carries a flat `reasoning_effort`; the Responses dialect
+/// nests it under `reasoning.effort`. Both are read here so that a request is
+/// not silently downgraded because it used the other one.
+///
+/// An unrecognised value is an error rather than a silent `Unset`. A caller who
+/// writes `"reasoning_effort": "maximum"` and receives a minimal answer has no
+/// way to discover why.
+fn parse_reasoning_effort(value: &Value) -> Result<ReasoningEffort, RouterError> {
+    let raw = match value.opt_field_str("reasoning_effort").map_err(type_error)? {
+        Some(v) => Some(v),
+        None => value
+            .get("reasoning")
+            .and_then(|r| r.get("effort"))
+            .and_then(Value::as_str),
+    };
+    let Some(raw) = raw else {
+        return Ok(ReasoningEffort::Unset);
+    };
+    ReasoningEffort::parse(raw).ok_or_else(|| {
+        RouterError::invalid_request(
+            "'reasoning_effort' must be one of minimal, low, medium, or high",
+        )
+        .with_param("reasoning_effort")
+    })
 }
 
 /// Parse an OpenAI-style chat completion request.
@@ -150,10 +232,12 @@ pub fn parse_responses_request(
         tool_choice: parse_responses_tool_choice(&value)?,
         response_format: parse_text_format(&value)?,
         sampling,
+        reasoning_effort: parse_reasoning_effort(&value)?,
         limits: RequestLimits {
             max_output_tokens,
             deadline: context.deadline,
             max_cost_class: context.max_cost_class,
+            min_quality_class: effective_quality_floor(&value, context),
             residency: context.residency.clone(),
         },
         stream: StreamOptions {
@@ -214,14 +298,23 @@ pub fn parse_embeddings_request(
         tool_choice: None,
         response_format: None,
         sampling: Sampling::default(),
+        // Embeddings have no reasoning tier to request. Left `Unset` rather
+        // than parsed, so an embeddings target is never excluded for a field
+        // that could not have applied to it.
+        reasoning_effort: ReasoningEffort::Unset,
         limits: RequestLimits {
             max_output_tokens: None,
             deadline: context.deadline,
             max_cost_class: context.max_cost_class,
+            min_quality_class: effective_quality_floor(&value, context),
             residency: context.residency.clone(),
         },
         stream: StreamOptions::default(),
-        hints: RoutingHints::default(),
+        // Embeddings honour hints too. They used to be dropped here
+        // unconditionally, which meant a caller who set `require_local` on an
+        // embeddings request silently got a remote target — a narrowing the
+        // caller asked for and did not receive, with nothing to tell them.
+        hints: parse_hints(&value, context)?,
     })
 }
 
@@ -300,10 +393,12 @@ fn build_request(
         tool_choice: parse_tool_choice(value)?,
         response_format: parse_response_format(value)?,
         sampling,
+        reasoning_effort: parse_reasoning_effort(value)?,
         limits: RequestLimits {
             max_output_tokens,
             deadline: context.deadline,
             max_cost_class: context.max_cost_class,
+            min_quality_class: effective_quality_floor(value, context),
             residency: context.residency.clone(),
         },
         stream: StreamOptions {
@@ -468,6 +563,11 @@ fn parse_content_part(part: &Value, message_index: usize) -> Result<ContentPart,
                 None => ContentPart::Image(ImageSource::Url(url.to_owned())),
             }
         }
+        // A document. The router never decodes, parses, renders, or fetches
+        // one; it records the declared media type — matched against a closed
+        // allowlist — and forwards the bytes or the URL to a target that
+        // declared the modality.
+        "file" | "input_file" => parse_document_part(part, &param)?,
         "input_audio" => {
             let audio = part.get("input_audio").ok_or_else(|| {
                 RouterError::invalid_request("an audio part requires 'input_audio'")
@@ -492,6 +592,93 @@ fn parse_content_part(part: &Value, message_index: usize) -> Result<ContentPart,
                     .with_param(&param),
             );
         }
+    })
+}
+
+/// Parse a `file` / `input_file` content part into a document.
+///
+/// Two shapes are accepted, matching the two OpenAI dialects: Chat Completions
+/// nests the payload under `file`, and the Responses dialect carries it flat.
+/// Both spell inline bytes as a `data:` URI and a remote document as a URL.
+///
+/// The media type comes from the `data:` URI, or from an explicit `media_type`
+/// / `filename` extension for the URL form. An unrecognised type is refused:
+/// the allowlist is what keeps "forward opaque bytes" from meaning "forward
+/// anything".
+fn parse_document_part(part: &Value, param: &str) -> Result<ContentPart, RouterError> {
+    let file = part.get("file").unwrap_or(part);
+
+    let declared = file
+        .opt_field_str("media_type")
+        .map_err(type_error)?
+        .or(file.opt_field_str("mime_type").map_err(type_error)?);
+
+    if let Some(data) = file
+        .opt_field_str("file_data")
+        .map_err(type_error)?
+        .or(file.opt_field_str("data").map_err(type_error)?)
+    {
+        // Inline. The `data:` URI carries its own media type; a bare base64
+        // payload needs `media_type` beside it.
+        let (media_type, base64_data) = match parse_data_uri(data) {
+            Some((declared_in_uri, payload)) => (declared_in_uri, payload),
+            None => (
+                declared
+                    .ok_or_else(|| {
+                        RouterError::invalid_request(
+                            "an inline document requires a data: URI or an explicit media_type",
+                        )
+                        .with_param(param)
+                    })?
+                    .to_owned(),
+                data.to_owned(),
+            ),
+        };
+        let media_type = document_type(&media_type, param)?;
+        return Ok(ContentPart::Document {
+            media_type,
+            source: DocumentSource::Inline { base64_data },
+        });
+    }
+
+    if let Some(url) = file
+        .opt_field_str("file_url")
+        .map_err(type_error)?
+        .or(file.opt_field_str("url").map_err(type_error)?)
+    {
+        let media_type = document_type(
+            declared.ok_or_else(|| {
+                // Without a declared type the router would have to look at the
+                // document to know what it is, and looking is the one thing it
+                // must not do. Guessing from a file extension would be a guess
+                // the caller controls.
+                RouterError::invalid_request(
+                    "a document URL requires an explicit media_type; the router does not \
+                     fetch or inspect the document to determine it",
+                )
+                .with_param(param)
+            })?,
+            param,
+        )?;
+        return Ok(ContentPart::Document {
+            media_type,
+            source: DocumentSource::Url(url.to_owned()),
+        });
+    }
+
+    Err(
+        RouterError::invalid_request("a document part requires file_data or file_url")
+            .with_param(param),
+    )
+}
+
+/// Match a declared media type against the closed allowlist.
+fn document_type(raw: &str, param: &str) -> Result<DocumentType, RouterError> {
+    DocumentType::parse(raw).ok_or_else(|| {
+        // The caller's string is not echoed. It is attacker-controlled text
+        // that would otherwise reach an error body and a log line.
+        RouterError::invalid_request("that document media type is not supported")
+            .with_param(param)
     })
 }
 
@@ -762,6 +949,11 @@ fn parse_responses_content_part(part: &Value, param: &str) -> Result<ContentPart
                 None => ContentPart::Image(ImageSource::Url(url.to_owned())),
             }
         }
+        // A document. The router never decodes, parses, renders, or fetches
+        // one; it records the declared media type — matched against a closed
+        // allowlist — and forwards the bytes or the URL to a target that
+        // declared the modality.
+        "file" | "input_file" => parse_document_part(part, &param)?,
         "input_audio" => {
             let audio = part.get("input_audio").unwrap_or(part);
             ContentPart::Audio {
@@ -903,13 +1095,31 @@ fn parse_text_format(value: &Value) -> Result<Option<ResponseFormat>, RouterErro
 /// principal has permission**." A principal without the permission gets its
 /// hints dropped silently rather than rejected, so a harness that always sends
 /// them still works — but they have no effect.
-fn parse_hints(value: &Value, context: &ParseContext) -> Result<RoutingHints, RouterError> {
-    let Some(raw) = value.get_present("hypellm_routing") else {
-        return Ok(RoutingHints::default());
-    };
+/// The object routing hints are carried in.
+///
+/// One constant rather than a literal at each site, because a test that plants
+/// hints under a *different* key than the parser reads asserts nothing while
+/// appearing to assert everything — which is exactly what the fuzz target
+/// `a_hint_is_ignored_unless_the_principal_may_supply_one` did before this
+/// existed. Its three cases all returned early on the key lookup and never
+/// reached the permission gate, so the target would have passed with the gate
+/// deleted.
+pub const HINTS_KEY: &str = "hypellm_routing";
+
+pub(crate) fn parse_hints(
+    value: &Value,
+    context: &ParseContext,
+) -> Result<RoutingHints, RouterError> {
+    // The permission gate comes first, so that "the principal may not supply
+    // hints" is decided before anything about the payload can change the
+    // outcome. Ordering it second made the gate unreachable for any body that
+    // omitted the key, which is every body a test wrote under the wrong one.
     if !context.hints_permitted {
         return Ok(RoutingHints::default());
     }
+    let Some(raw) = value.get_present(HINTS_KEY) else {
+        return Ok(RoutingHints::default());
+    };
 
     let prefer_target = raw
         .opt_field_str("prefer_target")
@@ -2024,6 +2234,8 @@ mod tests {
             principal: PrincipalId::new("user:42").unwrap(),
             deadline: Deadline::after(&clock, Duration::from_secs(60)),
             hints_permitted: false,
+            min_quality_class: None,
+            document_limits: DocumentLimits::DEFAULT,
             residency: None,
             max_cost_class: None,
         }
@@ -2746,12 +2958,29 @@ mod tests {
         // A dropped part is a request the caller believes they sent.
         let error = parse_responses(
             r#"{"model":"m","input":[{"role":"user","content":[
+                {"type":"computer_screenshot","image_url":"x"}
+            ]}]}"#,
+        )
+        .expect_err("must fail");
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(error.detail.as_str().contains("computer_screenshot"));
+        assert_eq!(error.param.expect("param").as_str(), "input[0].content");
+    }
+
+    #[test]
+    fn a_provider_side_file_reference_is_refused_rather_than_forwarded() {
+        // `file_id` names a file uploaded to the *provider*. The router
+        // manages no uploads and holds no such handle, so forwarding one would
+        // be passing through an opaque identifier whose meaning depends on
+        // which target routing happened to pick — the caller would get a
+        // different document, or none, depending on where the request landed.
+        let error = parse_responses(
+            r#"{"model":"m","input":[{"role":"user","content":[
                 {"type":"input_file","file_id":"file_1"}
             ]}]}"#,
         )
         .expect_err("must fail");
         assert_eq!(error.code, ErrorCode::InvalidRequest);
-        assert!(error.detail.as_str().contains("input_file"));
         assert_eq!(error.param.expect("param").as_str(), "input[0].content");
     }
 

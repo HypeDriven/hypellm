@@ -36,12 +36,16 @@
 
 pub mod client;
 pub mod dns;
+pub mod fleet;
+#[cfg(any(test, feature = "test-harness"))]
+pub mod fleet_sim;
 pub mod egress;
 pub mod helper;
 pub mod pool;
 
 pub use client::{UpstreamConnection, UpstreamError};
 pub use dns::PooledResolver;
+pub use fleet::{ActivationStatus, FleetAgentClient, FleetError, FleetSession};
 pub use egress::{
     DestinationAddress, Dialer, EgressError, PinnedDestination, Resolve, Resolver, StaticResolver,
     SystemResolver, Transport,

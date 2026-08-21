@@ -257,6 +257,30 @@ fn main() -> ExitCode {
                     config.snapshot.aliases.len()
                 );
                 println!("digest {}", config.digest);
+                // The fleet digest is printed separately and only when a fleet
+                // is declared, because it is a *different* agreement: the
+                // configuration digest says what this router activated, and
+                // this says what it and its agents must both believe the fleet
+                // is. An operator compares it against
+                // `fleet-agent --print-digest` before enabling orchestration,
+                // and the router refuses every mutating verb while the two
+                // disagree.
+                if !config.fleet.deployments.is_empty() {
+                    println!(
+                        "fleet: {} hosts, {} accelerators, {} deployments, {} artifacts \
+                         ({})",
+                        config.fleet.hosts.len(),
+                        config.fleet.accelerators.len(),
+                        config.fleet.deployments.len(),
+                        config.fleet.artifacts.len(),
+                        if config.settings.fleet_enabled {
+                            "enabled"
+                        } else {
+                            "declared but not enabled"
+                        }
+                    );
+                    println!("fleet digest {}", config.fleet.digest());
+                }
                 ExitCode::SUCCESS
             }
             Err(e) => {

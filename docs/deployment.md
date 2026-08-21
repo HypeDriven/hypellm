@@ -231,6 +231,7 @@ Created by `hypellm-router --generate-secrets <dir>`, read by `--secrets <dir>`.
   pseudonym.key       derives log pseudonyms
   oidc.key            derives OIDC transaction handles
   control.key         authenticates control-socket commands
+  fleet.key           authenticates the fleet-agent handshake (only when a fleet is used)
   break_glass.verifier  verifies the break-glass token — the digest, not the token
   credentials/
     <credential-id>   one provider secret per declared `credential` record
@@ -238,8 +239,8 @@ Created by `hypellm-router --generate-secrets <dir>`, read by `--secrets <dir>`.
 
 Rules the code enforces (`crates/hypellm-router/src/startup.rs`):
 
-- Each of the seven files must exist and be **at least 32 bytes**. A missing
-  or short file is `StartupError::MissingSecret`, exit 5. A missing file is
+- Each of the seven core files must exist and be **at least 32 bytes**. A
+  missing or short file is `StartupError::MissingSecret`, exit 5. A missing file is
   never silently replaced with a generated default: a router that invents its
   own store MAC key on first boot cannot detect tampering across a restart,
   because an attacker can delete the state and let it invent a new one.
@@ -252,6 +253,14 @@ Rules the code enforces (`crates/hypellm-router/src/startup.rs`):
   request.
 - Trailing `\n` and `\r` are trimmed, so `echo key > file` works.
 
+- **`fleet.key` is optional, and conditionally required.** A deployment with no
+  fleet has no such file and starts normally. A deployment with `fleet_enabled=true`
+  and declared deployments and *no* key fails at startup rather than starting and
+  refusing every orchestrated target with a reason nobody expects. It is
+  deliberately not `control.key`: that one is sent as a bearer line, which is
+  adequate for a local stop command and inadequate for verbs that stop production
+  models. Copy it to the agent host, owner-readable only — see
+  [the agent's README](../agent/README.md).
 - **`break_glass.verifier` is a digest, not a token.** The token itself is
   printed once by `--generate-secrets` and stored nowhere: specification 22.4
   requires it to be held offline, and a copy on the router would mean reading
@@ -268,6 +277,36 @@ requires a rewritten state directory; rotating `key_verifier.key` invalidates
 every API key; rotating `session.key` invalidates every session. There is no
 runtime re-key path. Provider credentials rotate at runtime — see
 [`runbooks.md` 22.2](runbooks.md#222-credential-rotation).
+
+### Fleet
+
+When `settings fleet_enabled=true` and the configuration declares deployments,
+the router additionally:
+
+- reads `<secrets>/fleet.key` and refuses to start without it;
+- opens each configured `fleet_agent` socket, performs the authenticated
+  handshake, and compares the fleet digest;
+- replays activation leases and flap counters from the durable log, audits any
+  lease that outlived its expiry, and takes a first observation;
+- observes on `observation_interval_ms` from the housekeeping thread, and
+  releases expired leases on the same tick.
+
+Until an observation succeeds, every cold orchestrated target is ineligible.
+That is the fail-closed reading of "no observation has ever succeeded", and it
+is what stops a router that cannot see the fleet from planning against a picture
+it does not have.
+
+Confirm both sides agree about what the identifiers mean before enabling it:
+
+```bash
+hypellm-router --check --config /etc/hypellm/hypellm.conf   # prints "fleet digest ..."
+fleet-agent --config /etc/hypellm/fleet.json --print-digest
+```
+
+The two are computed independently from two different files. When they differ
+the router issues no mutating verb at all. See
+[orchestration.md](orchestration.md) for the design and
+[runbooks.md 22.5](runbooks.md#225-fleet-incidents) for what to do when they do.
 
 ---
 
@@ -684,6 +723,76 @@ Related active settings:
 - `credential rotates_after_days` makes `GET /admin/v1/credentials` report
   `last_rotated` and `overdue`. Rotation remains an operator action so an
   expired schedule cannot automatically create a provider outage.
+
+---
+
+### Fleet records
+
+Six record types declare the fleet. All are optional: a configuration with none
+of them routes exactly as it did before orchestration existed, and validation
+runs whether or not `fleet_enabled` is set.
+
+```text
+fleet_agent id=local socket="/run/hypellm/fleet.sock" \
+    observation_interval_ms=5000 observation_max_age_ms=30000 \
+    request_timeout_ms=10000
+
+host id=spark agent=local arch=aarch64 status=enabled \
+    reserved_memory_bytes=17179869184 max_concurrent_activations=1
+
+accelerator host=spark id=spark-gb10 kind=unified pool=spark-unified \
+    memory_bytes=130673213440
+
+deployment id=spark-music3 target=spark:minimax-music3 accelerator=spark-gb10 \
+    artifact=music3-arm64 memory_bytes=68719476736 \
+    start_ms=180000 stop_ms=15000 drain_ms=30000 probe_ms=10000 \
+    readiness=inference min_resident_ms=600000 \
+    evictable=true pinned=false autostart=true retention_weight=0 \
+    max_drainable_inflight=0 force_stop=false
+
+artifact id=music3-arm64 kind=image arch=aarch64 size_bytes=21474836480 \
+    digest="sha256:…" source=mirror-local
+
+fleet_policy scope=host:spark max_activations_per_hour=12 \
+    eviction_margin_permille=250 max_eviction_set=2 \
+    activation_min_demand=1 activation_max_wait_ms=20000 \
+    reactivation_cooldown_ms=120000 flap_window_ms=900000 \
+    max_flap_cooldown_ms=3600000 allow_fetch=false \
+    fetch_disk_headroom_bytes=17179869184 \
+    memory_drift_tolerance_permille=100 adopt_unmanaged=false
+```
+
+`fleet_policy scope=fleet` sets the defaults; `scope=host:<id>` overrides them
+for one host and inherits everything it does not restate, whatever order the two
+records appear in.
+
+The fields worth thinking about rather than copying:
+
+| Field | Why it matters |
+|---|---|
+| `reserved_memory_bytes` | On a unified-memory host this is the operating system's and everything else's share of the *same* pool the models draw on. Set it generously; the Spark's 124 GiB is not 124 GiB of model. |
+| `pool` | Accelerators sharing a pool share one budget. Give a unified accelerator and its host the same pool so a resident model correctly reduces host RAM availability. A pool may not span two hosts, and validation refuses one that does. |
+| `start_ms` | Not a formality. A 20 GB Q5 GGUF with a speculative-decoding sidecar takes minutes, and every planning decision is dominated by this number. Observation refines it within a factor of four; it does not overrule you. |
+| `readiness` | `http_ok` is a health endpoint, `inference` a trivial completion, `container_healthy` the runtime's own check. A TCP connect is not readiness — a llama.cpp server accepts connections long before it has mapped its weights. |
+| `min_resident_ms` | The dwell floor, and the only hard one. At five minutes a host swaps at most twelve times an hour whatever demand does. |
+| `autostart` | Off unless declared. Routing demand starting a model is the feature; acquiring it by omission is not. |
+| `pinned`, `evictable` | Operator anchors. The planner is not asked to be clever about something you have already decided. |
+
+Existing records gain optional fields only:
+
+| Record | New fields |
+|---|---|
+| `settings` | `fleet_enabled`, `max_documents_per_request`, `max_document_bytes`, `max_inline_document_bytes`, `default_document_token_estimate`, `activation_effort_headroom_ms` |
+| `tenant` | `min_quality` |
+| `alias` | `capability` |
+| `target` | `capabilities`, `quality_class`, `reasoning_efforts`, `effort_multipliers`, `document_token_estimate`, and `document` among `modalities` |
+
+Slave-hosted providers use `egress=private_network`. That profile — and only that
+profile — also permits cleartext HTTP to a **private** address, because a
+llama.cpp server on a LAN speaks plain HTTP and requiring TLS would mean a
+terminator on every slave. The cost is real and is recorded in
+[current limitations](deferred-issues.md): traffic to an orchestrated slave is
+unencrypted on your own network.
 
 ---
 

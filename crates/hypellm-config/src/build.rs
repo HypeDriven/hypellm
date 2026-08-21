@@ -14,7 +14,9 @@
 
 use crate::parse::{Document, Position};
 use crate::schema::{ConfigError, Fields, validate_record};
-use hypellm_core::canonical::{CostClass, Modality, Operation, Residency};
+use hypellm_core::canonical::{
+    CostClass, Modality, Operation, QualityClass, ReasoningEffort, Residency,
+};
 use hypellm_core::ids::{
     AliasId, BindingId, CredentialRef, GroupId, PrincipalId, ProviderId, TargetId, TenantId,
 };
@@ -25,7 +27,8 @@ use hypellm_core::policy::{
 };
 use hypellm_core::rbac::Role;
 use hypellm_core::target::{
-    AdminState, Alias, Capabilities, Endpoint, EndpointScheme, Provider, ProviderFamily, Target,
+    AdminState, Alias, Capabilities, Capability, EffortMultipliers, Endpoint, EndpointScheme,
+    Provider, ProviderFamily, Target,
 };
 use hypellm_crypto::Digest;
 use std::collections::{BTreeMap, BTreeSet};
@@ -178,6 +181,33 @@ pub struct Settings {
     /// (specification 14). One governs connection reuse, the other stream
     /// liveness, and tuning either must not move the other.
     pub keepalive_timeout_ms: u64,
+    /// Whether fleet orchestration is enabled at all.
+    ///
+    /// Off by default. With it off, `host`, `accelerator`, `deployment`,
+    /// `artifact`, `fleet_agent`, and `fleet_policy` records are still parsed
+    /// and validated — so a configuration can be written and checked before it
+    /// is switched on — but no agent socket is opened, no observation runs, and
+    /// every target routes exactly as it does today.
+    pub fleet_enabled: bool,
+    /// Directory holding durable fleet state: leases, activation history, and
+    /// flap counters. Defaults to `fleet` inside the state directory.
+    pub fleet_state_dir: Option<String>,
+    /// Maximum document parts one request may carry.
+    pub max_documents_per_request: u32,
+    /// Maximum decoded bytes of any one inline document part.
+    pub max_document_bytes: u64,
+    /// Maximum decoded bytes of all inline document parts together.
+    ///
+    /// Validation rejects a set of limits whose base64-encoded aggregate
+    /// cannot fit `max_body_bytes`, so raising one forces raising the other
+    /// deliberately rather than producing requests that parse and then fail.
+    pub max_inline_document_bytes: u64,
+    /// Tokens charged per document part for targets declaring no figure.
+    pub default_document_token_estimate: u32,
+    /// Generation headroom, per unit of effort multiplier, a cold target must
+    /// leave inside the request deadline (see
+    /// `PolicySnapshot::activation_effort_headroom_ms`).
+    pub activation_effort_headroom_ms: u64,
     /// Path of the control socket used to request a graceful shutdown.
     ///
     /// Defaults to `control.sock` inside the state directory. A Unix socket
@@ -229,6 +259,16 @@ impl Default for Settings {
             break_glass_principal: None,
             break_glass_tenant: None,
             break_glass_ttl_secs: 900,
+            fleet_enabled: false,
+            fleet_state_dir: None,
+            max_documents_per_request: 4,
+            max_document_bytes: 4 * 1024 * 1024,
+            // 8 MiB decoded is about 10.7 MiB encoded, which leaves headroom
+            // inside the 16 MiB body default for the rest of the request.
+            max_inline_document_bytes: 8 * 1024 * 1024,
+            default_document_token_estimate:
+                hypellm_core::canonical::DEFAULT_DOCUMENT_TOKEN_ESTIMATE,
+            activation_effort_headroom_ms: 5_000,
             control_socket: None,
         }
     }
@@ -253,6 +293,13 @@ pub struct TenantConfig {
     /// permit selection." The ceiling is policy, so it lives here rather than
     /// in a request field a caller could raise.
     pub max_cost_class: Option<CostClass>,
+    /// The lowest quality class this tenant's requests may select.
+    ///
+    /// A floor, and the mirror of the ceiling above. A caller may raise it in
+    /// the request body but never lower it: raising a floor narrows what the
+    /// request will accept, which is the caller's business, while lowering one
+    /// would opt out of an operator's decision.
+    pub min_quality_class: Option<QualityClass>,
 }
 
 /// A quota scope selector.
@@ -518,6 +565,13 @@ pub struct ValidatedConfig {
     pub prices: Vec<PriceSchedule>,
     /// Egress profile per provider.
     pub egress_profiles: BTreeMap<ProviderId, EgressProfile>,
+    /// The declared fleet: hosts, accelerators, deployments, artifacts.
+    ///
+    /// Always present and always validated. An empty one — which is what every
+    /// configuration written before orchestration existed produces — routes
+    /// exactly as before, because a target with no deployment record is
+    /// classified `Unmanaged` and the fleet has nothing to say about it.
+    pub fleet: std::sync::Arc<hypellm_fleet::model::FleetConfig>,
     /// The canonical text this was built from.
     pub canonical: String,
     /// Digest of the canonical text.
@@ -584,6 +638,8 @@ pub fn build(document: &Document, version: u64) -> Result<ValidatedConfig, Vec<C
             Settings::default()
         }
     };
+
+    check_document_limits(&settings, &mut errors);
 
     let tenants = collect(document, "tenant", &mut errors, build_tenant);
     let mut tenant_map: BTreeMap<TenantId, TenantConfig> = BTreeMap::new();
@@ -901,6 +957,17 @@ pub fn build(document: &Document, version: u64) -> Result<ValidatedConfig, Vec<C
     // classification already happened in `build_provider`.
     let allowlisted_targets: BTreeSet<TargetId> = targets.keys().cloned().collect();
 
+    // After targets, so a deployment naming an undefined target is caught here
+    // rather than at the agent. Its errors get their own check below: the one
+    // above has already run, and a fleet mistake must fail the same reload
+    // every other mistake does rather than being accumulated into a vector
+    // nobody looks at again.
+    let fleet =
+        crate::fleet::build_fleet(document, &targets, settings.fleet_enabled, &mut errors);
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
     let canonical = document.to_canonical_string();
     let digest = hypellm_crypto::digest(canonical.as_bytes());
 
@@ -916,10 +983,13 @@ pub fn build(document: &Document, version: u64) -> Result<ValidatedConfig, Vec<C
         allowlisted_targets,
         weighted_tie_break: settings.weighted_tie_break,
         max_failure_percent: settings.max_failure_percent,
+        default_document_token_estimate: settings.default_document_token_estimate,
+        activation_effort_headroom_ms: settings.activation_effort_headroom_ms,
     };
 
     Ok(ValidatedConfig {
         snapshot,
+        fleet: std::sync::Arc::new(fleet),
         settings,
         tenants: tenant_map,
         quotas,
@@ -1009,8 +1079,74 @@ fn build_settings(document: &Document) -> Result<Settings, ConfigError> {
         break_glass_principal: f.opt_str("break_glass_principal").map(ToOwned::to_owned),
         break_glass_tenant: f.opt_str("break_glass_tenant").map(ToOwned::to_owned),
         break_glass_ttl_secs: f.u64_field("break_glass_ttl_secs", d.break_glass_ttl_secs)?,
+        fleet_enabled: f.bool_field("fleet_enabled", d.fleet_enabled)?,
+        fleet_state_dir: f.opt_str("fleet_state_dir").map(str::to_owned),
+        max_documents_per_request: f
+            .u32_field("max_documents_per_request", d.max_documents_per_request)?,
+        max_document_bytes: f.u64_field("max_document_bytes", d.max_document_bytes)?,
+        max_inline_document_bytes: f
+            .u64_field("max_inline_document_bytes", d.max_inline_document_bytes)?,
+        default_document_token_estimate: f.u32_field(
+            "default_document_token_estimate",
+            d.default_document_token_estimate,
+        )?,
+        activation_effort_headroom_ms: f.u64_field(
+            "activation_effort_headroom_ms",
+            d.activation_effort_headroom_ms,
+        )?,
         control_socket: f.opt_str("control_socket").map(str::to_owned),
     })
+}
+
+/// Reject a document-limit set whose encoded form cannot fit the body limit.
+///
+/// Base64 inflates by 4/3, so an 8 MiB decoded aggregate is about 10.7 MiB on
+/// the wire. A configuration that admits more than the body limit produces
+/// requests that pass every declared bound and are then refused by the body
+/// reader — a rejection whose reason names the wrong limit, which is the worst
+/// kind for an operator to debug.
+fn check_document_limits(settings: &Settings, errors: &mut Vec<ConfigError>) {
+    let position = Position { line: 1, column: 1 };
+    if settings.max_documents_per_request > 0 && settings.max_document_bytes == 0 {
+        errors.push(ConfigError::new(
+            "invalid_document_limits",
+            "max_document_bytes must be greater than zero when documents are permitted",
+            position,
+        ));
+    }
+    if settings.max_document_bytes > settings.max_inline_document_bytes {
+        errors.push(ConfigError::new(
+            "invalid_document_limits",
+            format!(
+                "max_document_bytes ({}) exceeds max_inline_document_bytes ({}), so the \
+                 per-part limit can never be reached",
+                settings.max_document_bytes, settings.max_inline_document_bytes
+            ),
+            position,
+        ));
+    }
+    let encoded = settings
+        .max_inline_document_bytes
+        .div_ceil(3)
+        .saturating_mul(4);
+    if encoded > settings.max_body_bytes {
+        errors.push(ConfigError::new(
+            "invalid_document_limits",
+            format!(
+                "max_inline_document_bytes ({}) is about {encoded} bytes once base64-encoded, \
+                 which exceeds max_body_bytes ({})",
+                settings.max_inline_document_bytes, settings.max_body_bytes
+            ),
+            position,
+        ));
+    }
+    if settings.default_document_token_estimate == 0 && settings.max_documents_per_request > 0 {
+        errors.push(ConfigError::new(
+            "invalid_document_limits",
+            "default_document_token_estimate must be greater than zero",
+            position,
+        ));
+    }
 }
 
 fn build_tenant(f: &Fields<'_>) -> Result<TenantConfig, ConfigError> {
@@ -1029,6 +1165,19 @@ fn build_tenant(f: &Fields<'_>) -> Result<TenantConfig, ConfigError> {
         },
         residency: f.opt_str("residency").map(Residency::new),
         retention_days: f.u32_field("retention_days", 30)?,
+        min_quality_class: match f.opt_str("min_quality") {
+            None => None,
+            Some(_) => {
+                let raw = f.u32_field("min_quality", 0)?;
+                if raw > 9 {
+                    return Err(f.error(
+                        "invalid_quality_class",
+                        format!("min_quality must be between 0 and 9, found {raw}"),
+                    ));
+                }
+                Some(QualityClass::new(u8::try_from(raw).unwrap_or(0)))
+            }
+        },
         max_cost_class: match f.opt_str("max_cost") {
             None => None,
             Some(_) => {
@@ -1179,12 +1328,35 @@ fn validate_endpoint(
                 ),
             ));
         }
-        if scheme == EndpointScheme::Http && !matches!(class, netaddr::AddressClass::Loopback) {
+        // Cleartext is permitted to loopback, and — narrowly — to a private
+        // address under the `private_network` profile.
+        //
+        // The second case exists because it is the one real deployments have:
+        // a llama.cpp server on a LAN accelerator speaks plain HTTP, and
+        // requiring TLS would mean a terminator on every slave or an ad-hoc
+        // TLS implementation, which specification 4 forbids outright. It is
+        // deliberately narrow on three counts: the address must classify as
+        // private (a public address is still refused), the profile must be
+        // exactly `private_network` rather than merely permissive, and an
+        // administrator has to have written that profile down. `egress=remote`
+        // does not open it, and neither does omitting the field.
+        //
+        // What it costs is stated rather than hidden: traffic to an
+        // orchestrated slave is unencrypted on the operator's own network, and
+        // an attacker already on that network can read prompts and completions
+        // in flight. `docs/deferred-issues.md` records it.
+        let private_cleartext = class == netaddr::AddressClass::Private
+            && profile == EgressProfile::PRIVATE_NETWORK;
+        if scheme == EndpointScheme::Http
+            && !matches!(class, netaddr::AddressClass::Loopback)
+            && !private_cleartext
+        {
             return Err(f.error(
                 "cleartext_not_permitted",
                 format!(
                     "endpoint {host}:{port} uses cleartext http to a non-loopback \
-                     address; remote cleartext is forbidden"
+                     address; remote cleartext is forbidden. A private address is \
+                     permitted only under egress=private_network"
                 ),
             ));
         }
@@ -1225,6 +1397,48 @@ fn build_target(f: &Fields<'_>) -> Result<(Target, Position), ConfigError> {
         modalities.push(Modality::Text);
     }
 
+    let mut verbs = Vec::new();
+    for v in f.list_field("capabilities") {
+        let verb = Capability::parse(v).ok_or_else(|| {
+            f.error("invalid_capability", format!("unknown capability '{v}'"))
+        })?;
+        if verbs.contains(&verb) {
+            return Err(f.error(
+                "duplicate_capability",
+                format!("capability '{v}' is declared twice"),
+            ));
+        }
+        verbs.push(verb);
+    }
+
+    let mut reasoning_efforts = Vec::new();
+    for e in f.list_field("reasoning_efforts") {
+        let tier = ReasoningEffort::parse(e).ok_or_else(|| {
+            f.error(
+                "invalid_reasoning_effort",
+                format!("unknown reasoning effort '{e}'"),
+            )
+        })?;
+        if tier == ReasoningEffort::Unset {
+            // `unset` is the absence of a request, not a tier a target can
+            // choose to serve. Accepting it here would let a configuration
+            // declare support for a caller saying nothing.
+            return Err(f.error(
+                "invalid_reasoning_effort",
+                "'unset' is not a declarable reasoning tier".to_owned(),
+            ));
+        }
+        if reasoning_efforts.contains(&tier) {
+            return Err(f.error(
+                "duplicate_reasoning_effort",
+                format!("reasoning effort '{e}' is declared twice"),
+            ));
+        }
+        reasoning_efforts.push(tier);
+    }
+
+    let effort_multipliers = build_effort_multipliers(f, &reasoning_efforts)?;
+
     let mut aliases = Vec::new();
     for a in f.list_field("aliases") {
         aliases.push(AliasId::new(a).map_err(|e| {
@@ -1234,7 +1448,10 @@ fn build_target(f: &Fields<'_>) -> Result<(Target, Position), ConfigError> {
 
     let capabilities = Capabilities {
         operations,
+        verbs,
         modalities,
+        reasoning_efforts,
+        effort_multipliers,
         streaming: f.bool_field("streaming", false)?,
         tools: f.bool_field("tools", false)?,
         parallel_tool_calls: f.bool_field("parallel_tools", false)?,
@@ -1268,6 +1485,35 @@ fn build_target(f: &Fields<'_>) -> Result<(Target, Position), ConfigError> {
     let cost = f.u32_field("cost", 0)?;
     let cost = u8::try_from(cost.min(9)).unwrap_or(9);
 
+    // A quality class out of range is an error rather than a clamp. Cost
+    // clamps for historical reasons; a *new* field that silently reinterprets
+    // `quality_class=50` as "the best there is" would let a typo satisfy every
+    // floor in the configuration.
+    let quality = f.u32_field("quality_class", 0)?;
+    if quality > 9 {
+        return Err(f.error(
+            "invalid_quality_class",
+            format!("quality_class must be between 0 and 9, found {quality}"),
+        ));
+    }
+    let quality = u8::try_from(quality).unwrap_or(0);
+
+    let document_token_estimate = match f.opt_str("document_token_estimate") {
+        None => None,
+        Some(_) => {
+            let raw = f.u32_field("document_token_estimate", 0)?;
+            if raw == 0 {
+                return Err(f.error(
+                    "invalid_document_token_estimate",
+                    "document_token_estimate must be greater than zero; a document \
+                     that costs nothing would let any number of them past a quota"
+                        .to_owned(),
+                ));
+            }
+            Some(raw)
+        }
+    };
+
     Ok((
         Target {
             id,
@@ -1276,6 +1522,8 @@ fn build_target(f: &Fields<'_>) -> Result<(Target, Position), ConfigError> {
             aliases,
             capabilities,
             cost_class: CostClass::new(cost),
+            quality_class: QualityClass::new(quality),
+            document_token_estimate,
             residency: f.opt_str("residency").map(Residency::new),
             is_local: f.bool_field("local", false)?,
             admin_state,
@@ -1285,6 +1533,67 @@ fn build_target(f: &Fields<'_>) -> Result<(Target, Position), ConfigError> {
         },
         f.position(),
     ))
+}
+
+/// Parse `effort_multipliers=medium:6,high:12`.
+///
+/// Every entry must name a tier the target also declares in
+/// `reasoning_efforts`. A multiplier for a tier the target refuses is not a
+/// harmless leftover: it reads, to whoever edits the file next, as evidence
+/// that the tier is served.
+fn build_effort_multipliers(
+    f: &Fields<'_>,
+    declared: &[ReasoningEffort],
+) -> Result<EffortMultipliers, ConfigError> {
+    let mut multipliers = EffortMultipliers::DEFAULT;
+    for entry in f.list_field("effort_multipliers") {
+        let (tier, value) = entry.split_once(':').ok_or_else(|| {
+            f.error(
+                "invalid_effort_multiplier",
+                format!("effort multiplier '{entry}' must be written tier:value"),
+            )
+        })?;
+        let tier = ReasoningEffort::parse(tier).ok_or_else(|| {
+            f.error(
+                "invalid_reasoning_effort",
+                format!("unknown reasoning effort '{tier}'"),
+            )
+        })?;
+        if !declared.contains(&tier) {
+            return Err(f.error(
+                "undeclared_reasoning_effort",
+                format!(
+                    "effort multiplier names tier '{tier}', which this target does not \
+                     declare in reasoning_efforts"
+                ),
+            ));
+        }
+        let value: u32 = value.parse().map_err(|_| {
+            f.error(
+                "invalid_effort_multiplier",
+                format!("effort multiplier for '{tier}' must be a positive integer"),
+            )
+        })?;
+        if value == 0 || value > EffortMultipliers::MAX {
+            return Err(f.error(
+                "invalid_effort_multiplier",
+                format!(
+                    "effort multiplier for '{tier}' must be between 1 and {}",
+                    EffortMultipliers::MAX
+                ),
+            ));
+        }
+        match tier {
+            ReasoningEffort::Minimal => multipliers.minimal = value,
+            ReasoningEffort::Low => multipliers.low = value,
+            ReasoningEffort::Medium => multipliers.medium = value,
+            ReasoningEffort::High => multipliers.high = value,
+            // Rejected above: `unset` is not declarable, so it cannot be
+            // present in `declared` and cannot reach here.
+            ReasoningEffort::Unset => {}
+        }
+    }
+    Ok(multipliers)
 }
 
 fn build_alias(f: &Fields<'_>) -> Result<(Alias, Position), ConfigError> {
@@ -1301,9 +1610,17 @@ fn build_alias(f: &Fields<'_>) -> Result<(Alias, Position), ConfigError> {
             format!("alias '{id}' lists no targets"),
         ));
     }
+    let capability = match f.opt_str("capability") {
+        None => None,
+        Some(raw) => Some(Capability::parse(raw).ok_or_else(|| {
+            f.error("invalid_capability", format!("unknown capability '{raw}'"))
+        })?),
+    };
+
     Ok((
         Alias {
             id,
+            capability,
             permitted_targets,
             allow_family_failover: f.bool_field("family_failover", false)?,
             description: f.opt_str("description").map(str::to_owned),

@@ -37,6 +37,13 @@ pub fn target_fixture() -> Target {
         aliases: vec![AliasId::new("code-premium").expect("valid identifier")],
         capabilities: Capabilities {
             operations: vec![Operation::Chat, Operation::Responses, Operation::Embeddings],
+            verbs: vec![
+                hypellm_core::target::Capability::Chat,
+                hypellm_core::target::Capability::Vision,
+                hypellm_core::target::Capability::Embeddings,
+            ],
+            reasoning_efforts: hypellm_core::canonical::ReasoningEffort::declarable().to_vec(),
+            effort_multipliers: Default::default(),
             modalities: vec![
                 hypellm_core::canonical::Modality::Text,
                 hypellm_core::canonical::Modality::Image,
@@ -54,6 +61,8 @@ pub fn target_fixture() -> Target {
             native_tokenizer: false,
         },
         cost_class: CostClass::new(4),
+        quality_class: Default::default(),
+        document_token_estimate: None,
         residency: None,
         is_local: false,
         admin_state: AdminState::Enabled,
@@ -124,10 +133,12 @@ pub fn request_fixture() -> CanonicalRequest {
         tool_choice: None,
         response_format: None,
         sampling: Sampling::default(),
+        reasoning_effort: Default::default(),
         limits: RequestLimits {
             max_output_tokens: Some(512),
             deadline: Deadline::after(&clock, Duration::from_secs(60)),
             max_cost_class: None,
+            min_quality_class: None,
             residency: None,
         },
         stream: StreamOptions {

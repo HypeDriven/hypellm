@@ -48,6 +48,25 @@ pub enum Permission {
     ManageSettings,
     /// Perform a break-glass action.
     BreakGlass,
+    /// Cause a deployment to be started or stopped.
+    ///
+    /// Distinct from using a model that is already running: this is permission
+    /// to make the *fleet* do work. Not granted to an ordinary inference key,
+    /// because an activation costs minutes of a host's time and may displace
+    /// something else.
+    FleetActivate,
+    /// Cause an artifact to be acquired.
+    ///
+    /// Separate from [`Permission::FleetActivate`] and not granted by default.
+    /// This is the one permission on which a single request can cost the fleet
+    /// hours of bandwidth and hundreds of gigabytes of disk.
+    FleetFetch,
+    /// Read fleet topology, residency, and activation history.
+    ///
+    /// Management-plane data. Host identifiers, memory figures, and which
+    /// models are co-resident are not visible to a data-plane caller at any
+    /// permission level.
+    ReadFleet,
 }
 
 impl Permission {
@@ -71,6 +90,9 @@ impl Permission {
             Self::ManagePrincipals => "manage_principals",
             Self::ManageSettings => "manage_settings",
             Self::BreakGlass => "break_glass",
+            Self::FleetActivate => "fleet_activate",
+            Self::FleetFetch => "fleet_fetch",
+            Self::ReadFleet => "read_fleet",
         }
     }
 
@@ -88,6 +110,10 @@ impl Permission {
                 | Self::ManagePrincipals
                 | Self::BreakGlass
                 | Self::ManageSettings
+                // A fetch commits the fleet to hours of bandwidth and hundreds
+                // of gigabytes of disk. That is the same class of consequence
+                // as publishing a policy.
+                | Self::FleetFetch
         )
     }
 
@@ -111,6 +137,9 @@ impl Permission {
             Self::ManagePrincipals,
             Self::ManageSettings,
             Self::BreakGlass,
+            Self::FleetActivate,
+            Self::FleetFetch,
+            Self::ReadFleet,
         ]
     }
 }
@@ -183,12 +212,20 @@ impl Role {
                 P::OperateTargets,
                 P::QuarantineTargets,
                 P::ReadDecisionTraces,
+                // Starting and stopping declared deployments is operating
+                // targets by another name: the same person, the same shift,
+                // the same audit trail. Fetching an artifact is not — it
+                // spends bandwidth and disk on a scale an operator action
+                // usually does not — so it stays out of every default role.
+                P::ReadFleet,
+                P::FleetActivate,
             ],
             Self::PolicyEditor => &[
                 P::ReadSummary,
                 P::ReadOwnUsage,
                 P::ReadTenantUsage,
                 P::ReadDecisionTraces,
+                P::ReadFleet,
                 P::EditPolicy,
                 P::SimulatePolicy,
             ],
@@ -219,6 +256,9 @@ impl Role {
                 P::ManagePrincipals,
                 P::ManageSettings,
                 P::BreakGlass,
+                P::ReadFleet,
+                P::FleetActivate,
+                P::FleetFetch,
             ],
         }
     }

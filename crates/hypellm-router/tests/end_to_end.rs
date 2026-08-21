@@ -2126,3 +2126,186 @@ fn a_genuinely_unreachable_upstream_is_still_reported_as_a_failure() {
     assert_ne!(response.status, 200, "{}", response.body);
     assert_eq!(harness.upstream.served(), 0);
 }
+
+// -- Fleet orchestration, end to end -----------------------------------------
+//
+// The goal the whole feature exists for, asserted at the outermost boundary: a
+// request arrives on the inference listener, the model it needs is not running,
+// the router starts it, and the caller gets an answer. Everything in between —
+// the plan, the lease, the agent verbs, the readiness confirmation — is
+// exercised by the real code on a real socket.
+
+fn fleet_config_text(port: u16, socket: &str) -> String {
+    format!(
+        "\
+settings state_dir=/tmp/hypellm-test default_deadline_ms=60000 retry_budget_ms=60000 \\
+         max_attempts=3 fleet_enabled=true
+tenant id=acme
+provider id=local family=openai scheme=http host=127.0.0.1 port={port} base_path=/v1 egress=local
+target id=local:model provider=local model=test-model local=true \\
+       operations=chat,embeddings streaming=true tools=true json_mode=true \\
+       capabilities=chat context=100000 max_output=8192 concurrency=8
+alias id=test-alias capability=chat targets=local:model description=\"the test model\"
+grant scope=tenant:acme model=* allow=true
+binding id=default scope=tenant:acme model=* prefer=local:model
+fleet_agent id=local socket=\"{socket}\" observation_interval_ms=1000 \\
+    observation_max_age_ms=600000 request_timeout_ms=5000
+host id=h1 agent=local arch=x86_64 reserved_memory_bytes=0 max_concurrent_activations=1
+accelerator host=h1 id=gpu0 kind=cuda memory_bytes=17179869184
+deployment id=d-model target=local:model accelerator=gpu0 memory_bytes=8589934592 \\
+    start_ms=1000 stop_ms=500 drain_ms=500 probe_ms=500 min_resident_ms=0 \\
+    autostart=true readiness=http_ok
+"
+    )
+}
+
+fn fleet_socket(name: &str) -> String {
+    format!("/tmp/hypellm-e2e-{name}-{}.sock", std::process::id())
+}
+
+const FLEET_KEY: &[u8] = b"an-end-to-end-fleet-key-0123456789";
+
+#[test]
+fn a_request_for_a_cold_model_starts_it_and_is_then_served() {
+    let socket = fleet_socket("cold");
+    let upstream = FakeUpstream::start(chat_completion_response());
+    let router = router_with_config_text(&fleet_config_text(upstream.address.port(), &socket));
+
+    // The agent admits the one declared deployment and reports it stopped until
+    // the router asks for it.
+    let digest = router.state.config().fleet.digest();
+    let mut agent = hypellm_net::fleet_sim::SimulatedAgent::start(
+        &socket,
+        hypellm_net::fleet_sim::AgentScript::empty(digest, FLEET_KEY)
+            .with_deployment("d-model", hypellm_net::fleet_sim::Behaviour::ReadyAfter(1))
+            .with_state("d-model", "stopped"),
+    );
+    hypellm_router::testing::attach_fleet(&router, FLEET_KEY);
+
+    let harness = Harness::start(upstream, router);
+    let response = harness.request("POST", "/v1/chat/completions", CHAT_BODY, true);
+
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    assert!(response.body.contains("chat.completion"));
+
+    let verbs = agent.verbs();
+    assert!(
+        verbs.iter().any(|v| v.starts_with("ACTIVATE d-model ")),
+        "the request must have started the model: {verbs:?}"
+    );
+    assert_eq!(agent.state_of("d-model").as_deref(), Some("ready"));
+    assert_eq!(
+        harness.upstream.served(),
+        1,
+        "and the model must then actually have served it"
+    );
+    agent.stop();
+}
+
+#[test]
+fn a_second_request_does_not_start_an_already_running_model_again() {
+    // The activation must be paid for once. A second request finding the model
+    // resident is the ordinary warm path, and it must not touch the agent at
+    // all beyond observation.
+    let socket = fleet_socket("warm");
+    let upstream = FakeUpstream::start_sequence(vec![
+        chat_completion_response(),
+        chat_completion_response(),
+    ]);
+    let router = router_with_config_text(&fleet_config_text(upstream.address.port(), &socket));
+    let digest = router.state.config().fleet.digest();
+    let mut agent = hypellm_net::fleet_sim::SimulatedAgent::start(
+        &socket,
+        hypellm_net::fleet_sim::AgentScript::empty(digest, FLEET_KEY)
+            .with_deployment("d-model", hypellm_net::fleet_sim::Behaviour::ReadyAfter(1))
+            .with_state("d-model", "stopped"),
+    );
+    hypellm_router::testing::attach_fleet(&router, FLEET_KEY);
+
+    let harness = Harness::start(upstream, router);
+    assert_eq!(
+        harness
+            .request("POST", "/v1/chat/completions", CHAT_BODY, true)
+            .status,
+        200
+    );
+    assert_eq!(
+        harness
+            .request("POST", "/v1/chat/completions", CHAT_BODY, true)
+            .status,
+        200
+    );
+
+    let activations = agent
+        .verbs()
+        .iter()
+        .filter(|v| v.starts_with("ACTIVATE "))
+        .count();
+    assert_eq!(activations, 1, "one swap, two requests");
+    assert_eq!(harness.upstream.served(), 2);
+    agent.stop();
+}
+
+#[test]
+fn a_key_without_the_fleet_permission_cannot_cause_an_activation() {
+    // The security property, at the outermost boundary. The model is declared,
+    // the deployment is `autostart`, the agent is ready — and an ordinary
+    // inference key still cannot make the fleet do work.
+    let socket = fleet_socket("unpriv");
+    let upstream = FakeUpstream::start(chat_completion_response());
+    let router = router_with_config_text(&fleet_config_text(upstream.address.port(), &socket));
+    let digest = router.state.config().fleet.digest();
+    let mut agent = hypellm_net::fleet_sim::SimulatedAgent::start(
+        &socket,
+        hypellm_net::fleet_sim::AgentScript::empty(digest, FLEET_KEY)
+            .with_deployment("d-model", hypellm_net::fleet_sim::Behaviour::ReadyAfter(1))
+            .with_state("d-model", "stopped"),
+    );
+    hypellm_router::testing::attach_fleet(&router, FLEET_KEY);
+
+    // A second key with inference scope and no roles at all.
+    let plain = router
+        .state
+        .keys
+        .create(
+            hypellm_core::ids::TenantId::new("acme").expect("tenant"),
+            hypellm_core::ids::PrincipalId::new("svc:plain").expect("principal"),
+            vec![hypellm_auth::Scope::Inference],
+            Vec::new(),
+            None,
+            hypellm_auth::SourceRestriction::Any,
+            Some("a key with no fleet permission".to_owned()),
+            router.state.clock.wall_millis(),
+        )
+        .expect("create key")
+        .into_secret();
+
+    let harness = Harness::start(upstream, router);
+    let raw = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: router.test\r\n\
+         Content-Type: application/json\r\nConnection: close\r\n\
+         Authorization: Bearer {plain}\r\nContent-Length: {}\r\n\r\n{CHAT_BODY}",
+        CHAT_BODY.len()
+    );
+    let response = harness.raw(&raw);
+
+    assert_eq!(
+        response.status, 503,
+        "the model is not running and this caller may not start it: {}",
+        response.body
+    );
+    // And nothing about the fleet reaches the caller.
+    for leak in ["h1", "gpu0", "d-model", "activation", "evict"] {
+        assert!(
+            !response.body.contains(leak),
+            "a data-plane error disclosed {leak}: {}",
+            response.body
+        );
+    }
+    assert!(
+        !agent.verbs().iter().any(|v| v.starts_with("ACTIVATE")),
+        "an unauthorized caller must not reach the agent: {:?}",
+        agent.verbs()
+    );
+    agent.stop();
+}

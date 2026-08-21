@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 hypellm-core = { path = "../hypellm-core" }
+hypellm-fleet = { path = "../hypellm-fleet" }
 hypellm-crypto = { path = "../hypellm-crypto" }
 
 # The shared protocol corpus and the fuzz mutation engine (specification 21).

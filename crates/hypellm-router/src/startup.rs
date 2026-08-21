@@ -209,6 +209,19 @@ pub struct Secrets {
     /// permission that depends on the deployment getting a directory mode right
     /// is one mistake away from letting any local account stop the router.
     pub control: Vec<u8>,
+    /// Authenticates the fleet-agent handshake.
+    ///
+    /// Deliberately **not** `control.key`. That one sends the hex-encoded key
+    /// itself as a bearer line; adequate for a local stop command, and
+    /// inadequate for verbs that stop production models. The fleet handshake
+    /// carries a keyed digest over the protocol version, a nonce, and the fleet
+    /// digest, so it binds both what is being spoken and what both sides think
+    /// the fleet is.
+    ///
+    /// Optional: a deployment with no fleet has no such file, and its absence
+    /// is not a startup failure. A deployment *with* a fleet and no key cannot
+    /// authenticate to its agent, which is.
+    pub fleet: Option<Vec<u8>>,
     /// Provider credential secrets, keyed by the reference the configuration
     /// declares.
     ///
@@ -236,6 +249,7 @@ impl fmt::Debug for Secrets {
             .field("pseudonym", &"[redacted key material]")
             .field("oidc", &"[redacted key material]")
             .field("control", &"[redacted key material]")
+            .field("fleet", &"[redacted key material]")
             .field("break_glass", &"[redacted verifier]")
             .field("break_glass_token", &"[redacted key material]")
             .field("provider", &format_args!("{} credential(s) [redacted]", self.provider.len()))
@@ -267,6 +281,11 @@ impl Secrets {
             pseudonym: read(dir, "pseudonym.key")?,
             oidc: read(dir, "oidc.key")?,
             control: read(dir, "control.key")?,
+            // Optional, and read the same way as everything else when present:
+            // a fleet key shorter than 32 bytes is treated as absent rather
+            // than accepted, so a truncated file cannot silently weaken the
+            // handshake.
+            fleet: read(dir, "fleet.key").ok(),
             break_glass: read(dir, "break_glass.verifier")?,
             // Never read back: the token exists offline or not at all.
             break_glass_token: None,
@@ -358,6 +377,7 @@ impl Secrets {
             pseudonym: hypellm_crypto::random::secret_256()?.to_vec(),
             oidc: hypellm_crypto::random::secret_256()?.to_vec(),
             control: hypellm_crypto::random::secret_256()?.to_vec(),
+            fleet: Some(hypellm_crypto::random::secret_256()?.to_vec()),
             break_glass: break_glass_verifier(&token),
             break_glass_token: Some(token),
             provider: BTreeMap::new(),
@@ -402,6 +422,13 @@ impl Secrets {
             // narrowed; the router's own keys were not, which is the more
             // serious of the two and was the easier to miss.
             crate::state::restrict_to_owner(&dir.join(name))?;
+        }
+        // Written only when present, so a bundle generated before this key
+        // existed is not rewritten with an empty file — which would read as
+        // "the fleet key is zero bytes" rather than "there is no fleet key".
+        if let Some(fleet) = &self.fleet {
+            hypellm_store::write_atomic(dir, "fleet.key", fleet)?;
+            crate::state::restrict_to_owner(&dir.join("fleet.key"))?;
         }
         // The directory provider credentials are read from. Created empty so an
         // operator can see where they go without having to read the source.
@@ -747,6 +774,20 @@ impl Router {
                 client
             });
 
+        // The fleet runtime, before the configuration moves into the
+        // activatable pointer.
+        let fleet_config = std::sync::Arc::clone(&config.fleet);
+        let fleet_enabled = fleet_config.is_active();
+        let fleet_key = secrets.fleet.clone();
+        if fleet_enabled && fleet_key.is_none() {
+            // A declared, enabled fleet with no key cannot authenticate to its
+            // agent. Refusing at startup is the honest failure: the alternative
+            // is a router that appears healthy and refuses every orchestrated
+            // target with a reason nobody expected.
+            return Err(StartupError::MissingSecret("fleet.key"));
+        }
+        let policy_for_fleet = config.snapshot.clone();
+
         let state = Arc::new(RouterState {
             config: Arc::new(Activatable::new(config)),
             keys,
@@ -761,7 +802,29 @@ impl Router {
             trusted_edge: TrustedEdge::none(),
             decisions: Arc::new(DecisionCache::default()),
             usage: Arc::new(hypellm_admin_api::UsageAggregate::default()),
+            fleet: std::sync::OnceLock::new(),
         });
+
+        // Built after the state so it shares the same store, clock, and
+        // telemetry, then published into the `OnceLock` every holder of the
+        // `Arc` can see.
+        if let (Some(key), true) = (fleet_key, fleet_enabled) {
+            if let Some(runtime) = crate::fleet::FleetRuntime::new(
+                fleet_config,
+                key,
+                Arc::clone(&state.clock),
+                Arc::clone(&state.telemetry),
+                Arc::clone(&state.store),
+            ) {
+                runtime.adopt_policy(&policy_for_fleet);
+                // Replay leases and flap counters, then take a first
+                // observation. Until one succeeds, every cold orchestrated
+                // target is ineligible — the fail-closed reading of "no
+                // observation has ever succeeded".
+                runtime.recover();
+                let _ = state.fleet.set(Arc::new(runtime));
+            }
+        }
 
         // 4. Listeners, last.
         //
@@ -1015,8 +1078,46 @@ fn housekeeping_loop(state: &Arc<RouterState>, stopping: &crate::server::Shutdow
     // Once at start, so the exposition carries them before the first interval.
     publish_process_gauges(state);
 
+    // Observation runs on its own, shorter interval: belief that expires is
+    // the gate on every fleet decision, and pacing it with the housekeeping
+    // interval would mean the router spends most of its time unable to plan.
+    let mut since_observation = Duration::ZERO;
+    let observation_interval = state
+        .fleet()
+        .map(|fleet| {
+            let config = fleet.config();
+            Duration::from_millis(
+                config
+                    .agents
+                    .values()
+                    .map(|a| a.observation_interval_ms)
+                    .min()
+                    .unwrap_or(5_000)
+                    .max(POLL.as_millis().try_into().unwrap_or(200)),
+            )
+        })
+        .unwrap_or(Duration::MAX);
+
     while !stopping.is_shutting_down() {
         std::thread::sleep(POLL);
+
+        if let Some(fleet) = state.fleet() {
+            since_observation = since_observation.saturating_add(POLL);
+            if since_observation >= observation_interval {
+                since_observation = Duration::ZERO;
+                // A publication may have swapped the configuration since the
+                // last tick. Reconcile before observing, so an observation is
+                // never parsed against a fleet the router has already replaced.
+                fleet.sync_configuration(&state.config());
+                fleet.observe();
+                // A lease that outlived its expiry is not evidence that the
+                // work is still running; it is evidence that whatever should
+                // have reported back did not. Releasing it here is what keeps a
+                // leaked lease from pinning a host out of service.
+                fleet.expire_leases();
+            }
+        }
+
         since_sample = since_sample.saturating_add(POLL);
         if since_sample < HOUSEKEEPING_INTERVAL {
             continue;
@@ -2326,4 +2427,99 @@ binding id=b scope=tenant:acme model=* prefer=local:m
         assert_ne!(secrets.key_verifier, secrets.pseudonym);
         assert_ne!(secrets.oidc, secrets.store_mac);
     }
+    #[test]
+    fn an_enabled_fleet_without_a_key_refuses_to_start() {
+        // The alternative is a router that appears healthy and refuses every
+        // orchestrated target with a reason nobody expects, hours later.
+        let dir = hypellm_store::TempDir::new("fleet-key");
+        let state = dir.join("state");
+        let path = dir.join("hypellm.conf");
+        let text = format!(
+            "settings state_dir={} fleet_enabled=true\n\
+             tenant id=acme\n\
+             provider id=local family=llamacpp scheme=http host=127.0.0.1 port=8080 \
+             egress=local\n\
+             target id=local:m provider=local model=m local=true operations=chat \
+             context=1000 max_output=100\n\
+             alias id=a targets=local:m\n\
+             grant scope=tenant:acme allow=true\n\
+             binding id=b scope=tenant:acme prefer=local:m\n\
+             fleet_agent id=local socket=\"/run/hypellm/fleet.sock\"\n\
+             host id=h agent=local arch=x86_64\n\
+             accelerator host=h id=gpu0 kind=cuda memory_bytes=8589934592\n\
+             deployment id=d target=local:m accelerator=gpu0 memory_bytes=1073741824\n",
+            state.display()
+        );
+        std::fs::write(&path, text).expect("write");
+
+        let mut secrets = Secrets::generate().expect("entropy");
+        secrets.fleet = None;
+        let error = Router::assemble(&path, secrets, Severity::Warn)
+            .err()
+            .expect("a declared, enabled fleet with no key must not start");
+        assert!(
+            matches!(error, StartupError::MissingSecret("fleet.key")),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_declared_but_disabled_fleet_starts_without_a_key() {
+        // Validation is off-path and does not depend on the switch: a fleet can
+        // be written, checked and reviewed before it is turned on, and a router
+        // that demanded the key to do that would make the review harder than
+        // the deployment.
+        let dir = hypellm_store::TempDir::new("fleet-key-off");
+        let state = dir.join("state");
+        let path = dir.join("hypellm.conf");
+        let text = format!(
+            // Port 0 so the test does not race the default listener with
+            // whatever else the suite is running.
+            "settings state_dir={} fleet_enabled=false \
+             inference_listen=127.0.0.1:0 admin_listen=127.0.0.1:0\n\
+             tenant id=acme\n\
+             provider id=local family=llamacpp scheme=http host=127.0.0.1 port=8080 \
+             egress=local\n\
+             target id=local:m provider=local model=m local=true operations=chat \
+             context=1000 max_output=100\n\
+             alias id=a targets=local:m\n\
+             grant scope=tenant:acme allow=true\n\
+             binding id=b scope=tenant:acme prefer=local:m\n\
+             fleet_agent id=local socket=\"/run/hypellm/fleet.sock\"\n\
+             host id=h agent=local arch=x86_64\n\
+             accelerator host=h id=gpu0 kind=cuda memory_bytes=8589934592\n\
+             deployment id=d target=local:m accelerator=gpu0 memory_bytes=1073741824\n",
+            state.display()
+        );
+        std::fs::write(&path, text).expect("write");
+
+        let mut secrets = Secrets::generate().expect("entropy");
+        secrets.fleet = None;
+        let router = Router::assemble(&path, secrets, Severity::Warn).expect("assembles");
+        assert!(
+            router.state.fleet().is_none(),
+            "a disabled fleet must produce no runtime"
+        );
+        assert_eq!(
+            router.state.config().fleet.deployments.len(),
+            1,
+            "and must still be parsed and validated"
+        );
+    }
+
+    #[test]
+    fn generated_secrets_include_a_fleet_key_and_it_is_owner_only() {
+        let dir = hypellm_store::TempDir::new("fleet-secrets");
+        let secrets = Secrets::generate().expect("entropy");
+        secrets.write_to(dir.path()).expect("write");
+        let key = dir.join("fleet.key");
+        assert!(key.is_file(), "--generate-secrets must write fleet.key");
+        assert!(
+            std::fs::read(&key).expect("read").len() >= 32,
+            "a short key would silently weaken the handshake"
+        );
+        let reread = Secrets::from_dir(dir.path()).expect("reads back");
+        assert!(reread.fleet.is_some());
+    }
+
 }

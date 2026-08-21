@@ -8,7 +8,7 @@ input/resource limits.
 |---|---|
 | Owner | Security (primary), Platform (secondary) |
 | Unsafe code | None. `#![forbid(unsafe_code)]` declared in `lib.rs` and inherited from the workspace. |
-| External dependencies | None. Workspace path dependencies only: `hypellm-core`, `hypellm-crypto`. Rust standard library otherwise. |
+| External dependencies | None. Workspace path dependencies only: `hypellm-core`, `hypellm-crypto`, `hypellm-fleet`. Rust standard library otherwise. |
 | Fuzz targets | `tests/fuzz.rs` — 7 targets over the grammar, driven by `hypellm-test-corpus::fuzz`. See [Fuzz targets](#fuzz-targets). |
 
 ## Scope and the "no evaluation step" rule

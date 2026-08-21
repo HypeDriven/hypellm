@@ -43,6 +43,25 @@ The boundary matters as much as the contents. This module does **not**:
 - **Decide policy.** `Activatable<T>` is generic and holds no routing knowledge;
   it is a pointer with bounded history.
 
+### Fleet records
+
+Three kinds join the log for fleet orchestration (specification 26.6):
+`FleetLease`, `FleetActivation` and `FleetFlap`. Two of them are **protected**,
+and the reason is worth stating: a lease authorises stopping a production model,
+so an unprotected one could be forged on disk between a crash and a restart and
+the router would reconcile against it — re-issuing a verb nobody asked for. Flap
+counters are protected for the same reason inverted: clearing one on disk would
+grant a fresh burst of exactly the thrash the backoff exists to stop.
+
+`FleetActivation` is an outcome record, recomputable from the audit trail and
+high-volume, so it is unprotected — the same judgement `UsageAggregate` already
+carries.
+
+The payload codec is `hypellm_fleet::durable`, not this crate: a record that
+fails any range check on the way back in is **skipped rather than adopted**,
+because a corrupt lease the router acted on would send a verb nobody asked for
+while a skipped one merely expires and is audited.
+
 ## Threat notes
 
 **Two integrity mechanisms for two different adversaries.** CRC-32 covers header

@@ -52,7 +52,8 @@ use crate::contract::{
     ValidationFailure, ValidationResult, class_for_status, sanitize_provider_code,
 };
 use hypellm_core::canonical::{
-    CanonicalRequest, ContentPart, ImageSource, Operation, ResponseFormat, Role, ToolChoice,
+    CanonicalRequest, ContentPart, DocumentSource, ImageSource, Operation, ReasoningEffort,
+    ResponseFormat, Role, ToolChoice,
 };
 use hypellm_core::event::{
     CanonicalEvent, CanonicalUsage, FinishReason, ToolCallDelta, UpstreamErrorClass,
@@ -616,6 +617,30 @@ fn push_chat_sampling(body: &mut Object, request: &CanonicalRequest) {
         "max_tokens",
         request.limits.max_output_tokens.map(Value::from),
     );
+    // The reasoning tier, in the Chat Completions spelling. Typed conversion
+    // and nothing more: the routing decision was already made against the
+    // target's declared `reasoning_efforts`, and this adapter does not
+    // second-guess it. `Unset` emits no field, so a caller who said nothing
+    // gets the provider's own default.
+    if let Some(effort) = chat_reasoning_effort(request.reasoning_effort) {
+        body.push("reasoning_effort", Value::from(effort));
+    }
+}
+
+/// The OpenAI-family spelling of a reasoning tier.
+///
+/// `None` for [`ReasoningEffort::Unset`], because the field must then be
+/// absent — sending `"unset"` would be a value the provider rejects, and
+/// sending `"minimal"` would silently answer a question the caller did not
+/// ask.
+const fn chat_reasoning_effort(effort: ReasoningEffort) -> Option<&'static str> {
+    match effort {
+        ReasoningEffort::Unset => None,
+        ReasoningEffort::Minimal => Some("minimal"),
+        ReasoningEffort::Low => Some("low"),
+        ReasoningEffort::Medium => Some("medium"),
+        ReasoningEffort::High => Some("high"),
+    }
 }
 
 // -- The Responses dialect -------------------------------------------------
@@ -676,6 +701,13 @@ fn encode_responses_body(
         "max_output_tokens",
         request.limits.max_output_tokens.map(Value::from),
     );
+    // This dialect nests the tier under `reasoning` rather than carrying a
+    // flat `reasoning_effort`.
+    if let Some(effort) = chat_reasoning_effort(request.reasoning_effort) {
+        let mut reasoning = Object::new();
+        reasoning.push("effort", Value::from(effort));
+        body.push("reasoning", Value::Object(reasoning));
+    }
     // `seed`, the two penalties, and `stop` have no counterpart in this
     // dialect. They are dropped rather than translated: there is nothing to
     // translate them into, and inventing an approximation would change the
@@ -797,6 +829,21 @@ fn encode_responses_content_part(
             audio.push("data", Value::from(base64_data.as_str()));
             audio.push("format", Value::from(format.as_str()));
             object.push("input_audio", Value::Object(audio));
+        }
+        // The Responses surface names this `input_file`, and takes the bytes
+        // as a `data:` URI or the document as a URL. Neither is dereferenced
+        // here.
+        ContentPart::Document { media_type, source } => {
+            object.push("type", Value::from("input_file"));
+            match source {
+                DocumentSource::Inline { base64_data } => object.push(
+                    "file_data",
+                    Value::from(format!("data:{media_type};base64,{base64_data}")),
+                ),
+                DocumentSource::Url(url) => {
+                    object.push("file_url", Value::from(url.as_str()));
+                }
+            }
         }
         // Handled by the caller as its own top-level item; reaching here would
         // mean a tool result had been flattened into a message, which loses the
@@ -1261,6 +1308,21 @@ fn encode_content_part(part: &ContentPart) -> Result<Value, ValidationFailure> {
             audio.push("data", Value::from(base64_data.as_str()));
             audio.push("format", Value::from(format.as_str()));
             object.push("input_audio", Value::Object(audio));
+        }
+        // The `file` part OpenAI's chat surface uses for documents. Inline
+        // bytes become a `data:` URI and a URL is passed through unfetched,
+        // exactly as images already are.
+        ContentPart::Document { media_type, source } => {
+            object.push("type", Value::from("file"));
+            let mut file = Object::new();
+            match source {
+                DocumentSource::Inline { base64_data } => file.push(
+                    "file_data",
+                    Value::from(format!("data:{media_type};base64,{base64_data}")),
+                ),
+                DocumentSource::Url(url) => file.push("file_url", Value::from(url.as_str())),
+            }
+            object.push("file", Value::Object(file));
         }
         ContentPart::ToolResult { content, .. } => {
             object.push("type", Value::from("text"));

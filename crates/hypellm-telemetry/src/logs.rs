@@ -120,6 +120,14 @@ pub enum Field {
     AuditHead,
     /// A component name, for lifecycle events.
     Component,
+    /// A fleet host.
+    Host,
+    /// A fleet deployment.
+    Deployment,
+    /// A capability verb.
+    Capability,
+    /// A duration in milliseconds, for fleet work.
+    DurationMs,
 }
 
 impl Field {
@@ -153,6 +161,10 @@ impl Field {
             Self::Bytes => "bytes",
             Self::AuditHead => "audit_head",
             Self::Component => "component",
+            Self::Host => "host",
+            Self::Deployment => "deployment",
+            Self::Capability => "capability",
+            Self::DurationMs => "duration_ms",
         }
     }
 

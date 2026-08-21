@@ -8,7 +8,7 @@ input/resource limits.
 |---|---|
 | Owner | Platform (primary), Security (secondary) |
 | Unsafe code | None. `#![forbid(unsafe_code)]` is declared in both `lib.rs` and `main.rs` and inherited from the workspace lint table. |
-| External dependencies | None. Rust standard library plus workspace path dependencies: `hypellm-adapters`, `hypellm-admin-api`, `hypellm-auth`, `hypellm-config`, `hypellm-core`, `hypellm-crypto`, `hypellm-net`, `hypellm-store`, `hypellm-telemetry`, `wire-http1`, `wire-json`, `wire-sse`. |
+| External dependencies | None. Rust standard library plus workspace path dependencies: `hypellm-adapters`, `hypellm-admin-api`, `hypellm-auth`, `hypellm-config`, `hypellm-core`, `hypellm-crypto`, `hypellm-fleet`, `hypellm-net`, `hypellm-store`, `hypellm-telemetry`, `wire-http1`, `wire-json`, `wire-sse`. |
 | Fuzz targets | Implemented in `tests/fuzz.rs`: nine seeded mutation properties over the client protocol parsers and their trust boundaries. |
 
 Ownership is Platform-primary because the crate's centre of gravity is the
@@ -68,6 +68,30 @@ needs either `unsafe` FFI, which specification 18.2 forbids workspace-wide, or a
 approved crate under specification 4's exception profile. Every bound, deadline,
 and cancellation path is still enforced; what is lost is the 20,000-concurrent-
 stream target of specification 2.1.
+
+### The fleet runtime
+
+`fleet.rs` is where a plan becomes an action. `hypellm-fleet` decides and holds
+no socket; this executes and makes no decision that is not already in the plan.
+
+The ordering is the load-bearing part: admission is reserved before the
+activation lease, the lease is written to the durable log before the mutating
+verb is sent, and both release exactly once on success, failure, timeout,
+cancellation and expiry. `Drop` is not trusted for either. A leaked lease pins a
+host out of service until it expires — a slow, confusing outage that reads as a
+capacity problem.
+
+Readiness is confirmed by *observation*, not by the verb returning. A TCP
+connect is not readiness and neither is an accepted `ACTIVATE`, so the executor
+re-observes and checks the inventory before it believes an activation succeeded.
+
+Activation failure occurs strictly before upstream acceptance, so specification
+6.5 failover applies unchanged: the pipeline records an exclusion, drops the
+reservation, and moves to the next candidate.
+
+The router still executes no process. Every fleet verb is a line on an
+owner-only Unix socket carrying opaque identifiers and bounded integers; the
+process that runs `ssh` and `docker` is `agent/`, outside this workspace.
 
 ## Threat notes
 

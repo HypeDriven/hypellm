@@ -224,6 +224,23 @@ function summaryPanel(trace) {
 }
 
 /**
+ * Tone for a residency class.
+ *
+ * Warm is good, cold is neutral rather than bad: a cold target is a perfectly
+ * ordinary candidate that the router would have started. Only an outright
+ * refusal is a problem, and a refused target is in the exclusions table rather
+ * than this one.
+ *
+ * @param {string} residency
+ * @returns {string}
+ */
+function residencyTone(residency) {
+  if (residency === 'resident' || residency === 'unmanaged') return 'good';
+  if (residency === 'resident_busy' || residency === 'activating') return 'warn';
+  return 'neutral';
+}
+
+/**
  * The ranked candidates and their score breakdown.
  *
  * One table rather than two: a second table repeating the same targets would
@@ -253,6 +270,14 @@ function candidatesPanel(trace) {
           : mono(row.target),
     },
     { label: 'Pref. rank', numeric: true, cell: (row) => integer(row.rank) },
+    // Without this column the affinity total is unexplainable: an operator can
+    // see that one target scored higher and not that it was the only warm one.
+    // `unmanaged` means the target has no deployment record, so the fleet had
+    // nothing to say about it.
+    {
+      label: 'Residency',
+      cell: (row) => (row.residency ? pill(row.residency, residencyTone(row.residency)) : '—'),
+    },
     { label: 'Score', numeric: true, cell: (row) => integer(row.score) },
     ...SCORE_TERMS.map((term) => ({
       label: term.label,
@@ -263,7 +288,7 @@ function candidatesPanel(trace) {
 
   return panel({
     title: 'Ranked candidates',
-    note: 'Best first, in the order the router produced. Penalties are negative and bonuses positive; a better priority rank dominates every other term by construction, so a lower-ranked target never wins on health or cost alone.',
+    note: 'Best first, in the order the router produced. Penalties are negative and bonuses positive; a better priority rank dominates every other term by construction, so a lower-ranked target never wins on health or cost alone. Residency feeds the affinity term under a bounded slice, so a warm target outranks a cold one at equal rank — and a cold rank-0 target still outranks a warm rank-1 one.',
     content: table({
       caption:
         'Targets that passed every eligibility filter, with the integer score terms of specification 6.3.',

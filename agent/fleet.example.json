@@ -1,0 +1,114 @@
+{
+  "_comment": [
+    "The fleet agent's own allowlist, matching docs/examples/fleet.conf.",
+    "",
+    "This file is the trust boundary. The router names an identifier; the agent",
+    "looks it up here and runs what *this* file says. Nothing the router sends",
+    "is ever interpolated into a command line, so a fully compromised router can",
+    "reorder these rows and cannot add one.",
+    "",
+    "Keep it in step with the router's configuration. The two sides compute a",
+    "digest independently over the identifiers, placement, and architectures",
+    "below; when they disagree the router issues no mutating verb and every",
+    "orchestrated target becomes ineligible. Compare them before enabling:",
+    "",
+    "    agent/fleet-agent --config agent/fleet.example.json --print-digest",
+    "    cargo run -q -p hypellm-router -- --check --config docs/examples/fleet.conf"
+  ],
+
+  "hosts": [
+    {
+      "id": "spark",
+      "arch": "aarch64",
+      "ssh": "hypellm@10.0.0.105",
+      "disk_path": "/",
+      "max_activations_per_hour": 6,
+      "accelerators": [{ "id": "spark-gb10", "index": 0 }]
+    },
+    {
+      "id": "spark2",
+      "arch": "aarch64",
+      "ssh": "hypellm@10.0.0.185",
+      "disk_path": "/",
+      "max_activations_per_hour": 12,
+      "accelerators": [{ "id": "spark2-gb10", "index": 0 }]
+    },
+    {
+      "id": "node0",
+      "arch": "x86_64",
+      "ssh": "hypellm@10.0.0.182",
+      "disk_path": "/",
+      "max_activations_per_hour": 12,
+      "accelerators": [
+        { "id": "node0-gt1030", "index": 0 },
+        { "id": "node0-gtx1080ti", "index": 1 }
+      ]
+    },
+    {
+      "id": "rtx5090",
+      "arch": "x86_64",
+      "ssh": "hypellm@10.0.0.121",
+      "disk_path": "/",
+      "max_activations_per_hour": 4,
+      "accelerators": [{ "id": "rtx5090-0", "index": 0 }]
+    },
+    {
+      "id": "cache",
+      "arch": "x86_64",
+      "ssh": "hypellm@10.0.0.108",
+      "disk_path": "/",
+      "max_activations_per_hour": 4,
+      "accelerators": [{ "id": "cache-gt1030", "index": 0 }]
+    }
+  ],
+
+  "deployments": [
+    {
+      "id": "spark-qwen38",
+      "host": "spark",
+      "accelerator": "spark-gb10",
+      "container": "qwen38-27b-mtp",
+      "start": ["docker", "start", "qwen38-27b-mtp"],
+      "stop": ["docker", "stop", "--timeout", "30", "qwen38-27b-mtp"],
+      "probe": ["curl", "-fsS", "--max-time", "5", "http://127.0.0.1:8000/v1/models"]
+    },
+    {
+      "id": "spark2-qwen38",
+      "host": "spark2",
+      "accelerator": "spark2-gb10",
+      "container": "qwen38-27b-mtp",
+      "start": ["docker", "start", "qwen38-27b-mtp"],
+      "stop": ["docker", "stop", "--timeout", "30", "qwen38-27b-mtp"],
+      "probe": ["curl", "-fsS", "--max-time", "5", "http://127.0.0.1:8000/v1/models"]
+    },
+    {
+      "id": "node0-vision",
+      "host": "node0",
+      "accelerator": "node0-gtx1080ti",
+      "container": "ai-qwen35-9b-vision",
+      "start": ["docker", "start", "ai-qwen35-9b-vision"],
+      "stop": ["docker", "stop", "--timeout", "20", "ai-qwen35-9b-vision"],
+      "probe": ["curl", "-fsS", "--max-time", "5", "http://127.0.0.1:8895/v1/models"]
+    },
+    {
+      "id": "spark-music3",
+      "host": "spark",
+      "accelerator": "spark-gb10",
+      "container": "minimax-music3",
+      "start": ["docker", "start", "minimax-music3"],
+      "stop": ["docker", "stop", "--timeout", "30", "minimax-music3"],
+      "probe": ["curl", "-fsS", "--max-time", "5", "http://127.0.0.1:7861/"]
+    },
+    {
+      "id": "spark-h3",
+      "host": "spark",
+      "accelerator": "spark-gb10",
+      "container": "minimax-h3-audio-to-video",
+      "start": ["docker", "start", "minimax-h3-audio-to-video"],
+      "stop": ["docker", "stop", "--timeout", "30", "minimax-h3-audio-to-video"],
+      "probe": ["curl", "-fsS", "--max-time", "5", "http://127.0.0.1:7860/"]
+    }
+  ],
+
+  "artifacts": []
+}

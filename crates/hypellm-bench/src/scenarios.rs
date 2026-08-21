@@ -286,6 +286,7 @@ pub fn routing_decision(plan: Plan) -> ScenarioReport {
         groups: &groups,
         tenant: &fixture.request.tenant,
         attempted: &attempted,
+        now_millis: 0,
     };
 
     let mut route = Samples::new("route", Unit::Micros, plan.iterations);
@@ -411,11 +412,23 @@ fn end_to_end(
         let total_start = clock.now_micros();
         let (outcome, delivered) = if fixture.request.stream.enabled {
             let mut sink = CountingSink::default();
-            let outcome = pipeline::execute(state, &fixture.request, &groups, &mut sink);
+            let outcome = pipeline::execute(
+                state,
+                &fixture.request,
+                &groups,
+                hypellm_core::rbac::PermissionSet::empty(),
+                &mut sink,
+            );
             (outcome, sink.events)
         } else {
             let mut sink = AccumulatingSink::default();
-            let outcome = pipeline::execute(state, &fixture.request, &groups, &mut sink);
+            let outcome = pipeline::execute(
+                state,
+                &fixture.request,
+                &groups,
+                hypellm_core::rbac::PermissionSet::empty(),
+                &mut sink,
+            );
             // The accumulator does not count events; a buffered response that
             // succeeded delivered one by definition.
             (outcome, 1)

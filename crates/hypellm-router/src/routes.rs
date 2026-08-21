@@ -252,6 +252,12 @@ impl InferenceHandler {
                 .has(hypellm_core::rbac::Permission::OperateTargets),
             residency: tenant_config.and_then(|t| t.residency.clone()),
             max_cost_class: tenant_config.and_then(|t| t.max_cost_class),
+            min_quality_class: tenant_config.and_then(|t| t.min_quality_class),
+            document_limits: crate::protocol::DocumentLimits {
+                max_documents: config.settings.max_documents_per_request,
+                max_document_bytes: config.settings.max_document_bytes,
+                max_inline_bytes: config.settings.max_inline_document_bytes,
+            },
         };
 
         let limits = JsonLimits::DEFAULT
@@ -278,6 +284,15 @@ impl InferenceHandler {
             Err(error) => return respond_error(writer, &error, Some(request_id), protocol),
         };
 
+        // After parsing, before routing: the count and size bounds are a
+        // property of the request rather than of the dialect it arrived in, so
+        // they are checked once here instead of in each parser.
+        if let Err(error) =
+            crate::protocol::enforce_document_limits(&request, &context.document_limits)
+        {
+            return respond_error(writer, &error, Some(request_id), protocol);
+        }
+
         if request.stream.enabled {
             self.stream(&request, principal, writer, started)
         } else {
@@ -294,7 +309,7 @@ impl InferenceHandler {
     ) -> io::Result<Disposition> {
         let state = &self.state;
         let mut sink = AccumulatingSink::default();
-        let outcome = pipeline::execute(state, request, &principal.groups, &mut sink);
+        let outcome = pipeline::execute(state, request, &principal.groups, principal.permissions(), &mut sink);
         let total = state.clock.now_millis().saturating_sub(started);
         // The key, not just the principal: specification 22.3 step 20 searches
         // usage by *key*, and one principal can hold several.
@@ -369,7 +384,7 @@ impl InferenceHandler {
             wall_seconds(state.clock.as_ref()),
             state.clock.as_ref(),
         );
-        let outcome = pipeline::execute(state, request, &principal.groups, &mut sink);
+        let outcome = pipeline::execute(state, request, &principal.groups, principal.permissions(), &mut sink);
         let total = state.clock.now_millis().saturating_sub(started);
         // The key, not just the principal: specification 22.3 step 20 searches
         // usage by *key*, and one principal can hold several.
@@ -729,6 +744,7 @@ fn list_models(
         groups: &principal.groups,
         tenant: &principal.tenant,
         attempted: &attempted,
+        now_millis: 0,
     };
 
     // Appendix B: "The models endpoint reveals only authorized aliases."

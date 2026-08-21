@@ -8,6 +8,8 @@ The project is a Rust workspace with a dependency-free static administration UI.
 
 - **Compatible inference APIs** for OpenAI chat, responses, embeddings and Anthropic messages workflows.
 - **Policy-based routing** through client-facing model aliases, grants, denies, preferences, hard pins, residency requirements and capability filters.
+- **Capability-contract requests**: a caller states a verb, the modalities they are sending (including opaque documents), a reasoning tier and a quality floor, and each is an eligibility filter rather than a hint.
+- **Fleet orchestration.** The router models the accelerator hosts behind its targets and starts and stops declared containers to serve demand — under dwell floors, hysteresis margins, per-host activation budgets and durable leases, through a separate out-of-process agent. It never executes a process itself.
 - **Provider support** for llama.cpp, OpenAI, Anthropic, DeepSeek and Moonshot/Kimi, plus an explicitly enabled generic OpenAI-compatible adapter.
 - **Bounded admission** with concurrency, queue, request-rate, token-rate, byte-rate and spend controls.
 - **Streaming and failover** with backpressure, deadlines, circuit breakers and deterministic candidate ordering.
@@ -30,9 +32,13 @@ Coding tools ──OpenAI/Anthropic API──▶ inference listener
 Operators ─────────HTTPS edge────────▶ management listener
                                            │
                               admin API and static web UI
+
+                     ┌──── owner-only Unix socket, identifiers only
+                     ▼
+              fleet agent ──ssh──▶ accelerator hosts
 ```
 
-Inference and management use separate listeners, handlers, authentication methods and resource limits. The router speaks HTTP/1.1 internally. Production deployments place a platform TLS edge in front of inbound listeners and use local platform helpers for outbound TLS and OIDC token verification; the router does not implement TLS or asymmetric signature verification itself.
+Inference and management use separate listeners, handlers, authentication methods and resource limits. Starting and stopping containers happens in a separate agent process, because the router must not execute a subprocess: the socket between them carries opaque identifiers and bounded integers, and the agent resolves each against its own allowlist. The router speaks HTTP/1.1 internally. Production deployments place a platform TLS edge in front of inbound listeners and use local platform helpers for outbound TLS and OIDC token verification; the router does not implement TLS or asymmetric signature verification itself.
 
 ## Build and verify
 
@@ -82,6 +88,7 @@ Inference requests require a router API key created through the management API. 
 - [Documentation index](docs/README.md)
 - [Deployment and configuration](docs/deployment.md)
 - [Operational runbooks](docs/runbooks.md)
+- [Fleet orchestration](docs/orchestration.md) and the [fleet agent](agent/README.md)
 - [Threat model](docs/threat-model.md)
 - [Current limitations](docs/deferred-issues.md)
 - [Detailed specification](secure_llm_router_specification.md)
@@ -90,7 +97,11 @@ The specification defines the intended security and protocol contract. The opera
 
 ## Current deployment scope
 
-The supported production shape is a hardened single node, or several independent nodes with conservative quota partitioning and separate state directories. HypeLLM Router does not currently provide state replication, leader election or a distributed configuration service. Review [current limitations](docs/deferred-issues.md) before deployment.
+The supported production shape is a hardened single node, or several independent nodes with conservative quota partitioning and separate state directories. HypeLLM Router does not currently provide state replication, leader election or a distributed configuration service.
+
+Fleet orchestration is single-router by design: one router manages a host, enforced agent-side. Four parts of the orchestration design are deliberately not built — a jobs API for long generations, predictive pre-warm, resumable artifact fetches and Windows-host actuation — and are listed rather than approximated.
+
+Review [current limitations](docs/deferred-issues.md) before deployment.
 
 ## License
 

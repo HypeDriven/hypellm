@@ -74,6 +74,39 @@ pub enum ExclusionReason {
     AlreadyAttempted,
     /// No preference or default made this target reachable.
     NotSelectedByAnyBinding,
+
+    // -- Capability contract, independent of the fleet --------------------
+    /// The target does not declare the alias's capability verb.
+    CapabilityUnsupported,
+    /// The target does not support the requested reasoning tier.
+    ReasoningEffortUnsupported,
+    /// The target's quality class is below the request's floor.
+    QualityFloorNotMet,
+
+    // -- Fleet -------------------------------------------------------------
+    /// Effort-adjusted time-to-ready exceeds what remains of the deadline.
+    ActivationExceedsDeadline,
+    /// The host's activation budget for this period is exhausted.
+    ActivationBudgetExhausted,
+    /// The principal may not cause activation, or the deployment is not
+    /// `autostart`.
+    ActivationNotPermitted,
+    /// The artifact is absent and acquisition is not permitted, budgeted, or
+    /// feasible.
+    ArtifactUnavailable,
+    /// No admissible eviction set frees enough memory on the host.
+    HostCapacityInsufficient,
+    /// Fleet belief is older than `observation_max_age_ms`.
+    FleetStateStale,
+    /// The fleet agent socket is unreachable.
+    FleetAgentUnavailable,
+    /// Router and agent disagree about the fleet configuration digest.
+    FleetConfigurationMismatch,
+    /// Serving would require evicting a deployment inside its dwell window.
+    DeploymentInDwell,
+    /// An admissible eviction set exists, but incoming demand does not exceed
+    /// its retention value by the configured margin.
+    EvictionValueInsufficient,
 }
 
 impl ExclusionReason {
@@ -109,7 +142,44 @@ impl ExclusionReason {
             Self::FamilyFailoverNotAllowed => "family_failover_not_allowed",
             Self::AlreadyAttempted => "already_attempted",
             Self::NotSelectedByAnyBinding => "not_selected_by_any_binding",
+            Self::CapabilityUnsupported => "capability_unsupported",
+            Self::ReasoningEffortUnsupported => "reasoning_effort_unsupported",
+            Self::QualityFloorNotMet => "quality_floor_not_met",
+            Self::ActivationExceedsDeadline => "activation_exceeds_deadline",
+            Self::ActivationBudgetExhausted => "activation_budget_exhausted",
+            Self::ActivationNotPermitted => "activation_not_permitted",
+            Self::ArtifactUnavailable => "artifact_unavailable",
+            Self::HostCapacityInsufficient => "host_capacity_insufficient",
+            Self::FleetStateStale => "fleet_state_stale",
+            Self::FleetAgentUnavailable => "fleet_agent_unavailable",
+            Self::FleetConfigurationMismatch => "fleet_configuration_mismatch",
+            Self::DeploymentInDwell => "deployment_in_dwell",
+            Self::EvictionValueInsufficient => "eviction_value_insufficient",
         }
+    }
+
+    /// Whether this exclusion is a fleet-orchestration outcome.
+    ///
+    /// Data-plane errors derived from these must say "capability unavailable"
+    /// and never name a host, an accelerator, or what else is loaded:
+    /// specification 10 makes fleet topology management-plane data, and an
+    /// unauthenticated caller learning which models are resident is a
+    /// cross-tenant disclosure by another name.
+    #[must_use]
+    pub const fn is_fleet_constraint(self) -> bool {
+        matches!(
+            self,
+            Self::ActivationExceedsDeadline
+                | Self::ActivationBudgetExhausted
+                | Self::ActivationNotPermitted
+                | Self::ArtifactUnavailable
+                | Self::HostCapacityInsufficient
+                | Self::FleetStateStale
+                | Self::FleetAgentUnavailable
+                | Self::FleetConfigurationMismatch
+                | Self::DeploymentInDwell
+                | Self::EvictionValueInsufficient
+        )
     }
 
     /// Whether this exclusion is a security or compliance decision.
@@ -130,6 +200,12 @@ impl ExclusionReason {
                 | Self::TargetQuarantined
                 | Self::FamilyFailoverNotAllowed
                 | Self::LocalRequired
+                // An activation the principal may not cause is an
+                // authorization decision, not a capacity one. It has to be a
+                // filter for the same reason every other one is: a permission
+                // expressed as a penalty is a permission that a cheap enough
+                // target overcomes.
+                | Self::ActivationNotPermitted
         )
     }
 
@@ -165,6 +241,19 @@ impl ExclusionReason {
             Self::FamilyFailoverNotAllowed,
             Self::AlreadyAttempted,
             Self::NotSelectedByAnyBinding,
+            Self::CapabilityUnsupported,
+            Self::ReasoningEffortUnsupported,
+            Self::QualityFloorNotMet,
+            Self::ActivationExceedsDeadline,
+            Self::ActivationBudgetExhausted,
+            Self::ActivationNotPermitted,
+            Self::ArtifactUnavailable,
+            Self::HostCapacityInsufficient,
+            Self::FleetStateStale,
+            Self::FleetAgentUnavailable,
+            Self::FleetConfigurationMismatch,
+            Self::DeploymentInDwell,
+            Self::EvictionValueInsufficient,
         ]
     }
 }
@@ -174,6 +263,112 @@ impl fmt::Display for ExclusionReason {
         f.write_str(self.code())
     }
 }
+
+/// Where a target stands in relation to the fleet.
+///
+/// Exactly one class per target per decision, sampled once from an immutable
+/// snapshot and never re-read mid-scoring, so that equal (request, policy
+/// snapshot, live state) still produce equal ordered candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResidencyClass {
+    /// The target has no deployment record. The fleet has nothing to say.
+    #[default]
+    Unmanaged,
+    /// Ready to serve now, and idle.
+    Resident,
+    /// Ready to serve now, and already carrying work.
+    ///
+    /// One rung below [`ResidencyClass::Resident`] so that, given two warm
+    /// copies of a model, the idle one is preferred. The queue penalty
+    /// expresses the same observation with more precision; this rung exists so
+    /// that the ladder's spacing is uniform, which is what the hint-cannot-beat-
+    /// warmth property depends on.
+    ResidentBusy,
+    /// Coming up under an existing lease; the ETA is known.
+    Activating,
+    /// Not resident, and free pool memory suffices.
+    ColdFits,
+    /// Not resident, and starting it requires stopping a computed set.
+    ColdRequiresEviction,
+    /// Not resident, and its artifact is absent from the host.
+    ColdRequiresFetch,
+    /// Cannot be made ready, for the stated reason.
+    Infeasible(ExclusionReason),
+}
+
+impl ResidencyClass {
+    /// Stable token for traces and the decision explorer.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unmanaged => "unmanaged",
+            Self::Resident => "resident",
+            Self::ResidentBusy => "resident_busy",
+            Self::Activating => "activating",
+            Self::ColdFits => "cold_fits",
+            Self::ColdRequiresEviction => "cold_requires_eviction",
+            Self::ColdRequiresFetch => "cold_requires_fetch",
+            Self::Infeasible(_) => "infeasible",
+        }
+    }
+
+    /// The reason this class excludes the target, if it does.
+    #[must_use]
+    pub const fn exclusion(self) -> Option<ExclusionReason> {
+        match self {
+            Self::Infeasible(reason) => Some(reason),
+            _ => None,
+        }
+    }
+
+    /// Whether serving this target requires starting something first.
+    #[must_use]
+    pub const fn requires_activation(self) -> bool {
+        matches!(
+            self,
+            Self::ColdFits | Self::ColdRequiresEviction | Self::ColdRequiresFetch
+        )
+    }
+
+    /// The warmness contribution to `affinity_term`.
+    ///
+    /// A ladder whose adjacent gap is [`ScoreTerms::WARMTH_LADDER_STEP`],
+    /// spaced so that no permitted client hint can move a target between
+    /// rungs (specification-extension 7.2). `Unmanaged` sits at the top with
+    /// `Resident`: a target with no deployment record is running because an
+    /// operator runs it, and demoting it below an orchestrated one would make
+    /// adding a deployment record to a neighbour change where unrelated
+    /// traffic goes.
+    #[must_use]
+    pub const fn warmth_bonus(self) -> i64 {
+        let rung = match self {
+            Self::Unmanaged | Self::Resident => 5,
+            Self::ResidentBusy => 4,
+            Self::Activating => 3,
+            Self::ColdFits => 2,
+            Self::ColdRequiresEviction => 1,
+            Self::ColdRequiresFetch | Self::Infeasible(_) => 0,
+        };
+        ScoreTerms::WARMTH_LADDER_STEP.saturating_mul(rung)
+    }
+
+    /// The classes that make a target a candidate, coldest last.
+    ///
+    /// Ordered, so a test can walk adjacent pairs and assert the ladder's
+    /// spacing rather than restating the constants it is checking.
+    #[must_use]
+    pub const fn all_ready_classes() -> &'static [Self] {
+        &[
+            Self::Resident,
+            Self::ResidentBusy,
+            Self::Activating,
+            Self::ColdFits,
+            Self::ColdRequiresEviction,
+            Self::ColdRequiresFetch,
+        ]
+    }
+}
+
 
 /// The integer score terms of specification 6.3.
 ///
@@ -225,6 +420,31 @@ impl ScoreTerms {
     pub const LOCALITY_RANGE: (i64, i64) = (0, 50_000);
     /// Affinity bonus range.
     pub const AFFINITY_RANGE: (i64, i64) = (0, 50_000);
+
+    // The affinity term has more than one contributor, so its range is
+    // **split** into disjoint slices rather than contended for. Specification
+    // 6.3 defines the term as "short-lived cache/model warmness or conversation
+    // affinity", which is exactly what fleet warmness needs — so no new score
+    // term is introduced and the proven rank-dominance bound is untouched.
+    //
+    // The slices sum to the term's range, and there is a test.
+
+    /// The slice of `affinity` that model warmness may occupy.
+    pub const WARMTH_SLICE: i64 = 40_000;
+    /// The slice a permitted client hint may occupy.
+    pub const HINT_SLICE: i64 = 6_000;
+    /// The slice reserved for conversation affinity. Not implemented.
+    pub const CONVERSATION_SLICE: i64 = 4_000;
+
+    /// The gap between adjacent rungs of the warmth ladder.
+    ///
+    /// Chosen to exceed [`ScoreTerms::HINT_SLICE`], which is what makes "a
+    /// client hint can break a tie between equally-warm targets but can never
+    /// promote a colder one over a warmer one" arithmetic rather than
+    /// aspiration. A property test asserts the relationship, because changing
+    /// either number in isolation silently converts a preference into a
+    /// destination control.
+    pub const WARMTH_LADDER_STEP: i64 = 8_000;
     /// Jitter range.
     pub const JITTER_RANGE: (i64, i64) = (0, 999);
 
@@ -314,6 +534,15 @@ pub struct Candidate {
     /// optimization terms: an emergency fallback that happened to be local and
     /// cheap would still outrank the pin once the bonus was outweighed.
     pub pin_rank: u8,
+    /// Where the fleet stood in relation to this target at decision time.
+    ///
+    /// Carried on the candidate rather than recomputed, for two reasons. The
+    /// dispatcher has to know whether the target it picked needs starting
+    /// before it can be used, and re-asking would consult a snapshot that may
+    /// have moved. And an operator reading the decision explorer needs to see
+    /// *why* a colder target was passed over, which is not reconstructable
+    /// from the affinity total alone.
+    pub residency: ResidencyClass,
 }
 
 impl Candidate {
@@ -657,6 +886,7 @@ mod tests {
                 binding_precedence: 1,
                 rank: 0,
                 pin_rank: Candidate::PIN_TARGET,
+                residency: ResidencyClass::Unmanaged,
             }],
             exclusions: vec![
                 Exclusion {

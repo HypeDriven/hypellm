@@ -446,6 +446,14 @@ pub struct AdminState {
     /// credential endpoints refuse rather than reporting a rotation that did
     /// not happen.
     pub credentials: Option<Arc<dyn CredentialSink>>,
+    /// The live fleet, when orchestration is configured and enabled.
+    ///
+    /// `None` disables the whole `/admin/v1/fleet` surface with a stated
+    /// reason rather than serving plausible-looking empty rows. Per the honesty
+    /// rule: a screen with no backing endpoint renders "not available yet", and
+    /// an idle-looking fleet that is in fact absent is exactly the kind of
+    /// plausible emptiness that stops an operator from going to look.
+    pub fleet: Option<Arc<dyn crate::fleet::FleetControl>>,
 }
 
 /// Somewhere a provider credential can be put.
@@ -828,6 +836,35 @@ impl AdminApi {
             (Method::Get, "/admin/v1/settings") => self.settings_view(session),
 
             (Method::Get, "/admin/v1/usage") => self.list_usage(session),
+
+            (Method::Get, "/admin/v1/fleet") => self.fleet_overview(session),
+            (Method::Get, "/admin/v1/fleet/activations") => self.fleet_activations(session),
+            (Method::Post, "/admin/v1/fleet:simulate") => self.fleet_simulate(request, session),
+            (Method::Patch, _) if path.starts_with("/admin/v1/fleet/deployments/") => {
+                let id = suffix(path, "/admin/v1/fleet/deployments/")?;
+                self.patch_deployment(request, session, &id)
+            }
+            (Method::Post, _) if path.starts_with("/admin/v1/fleet/deployments/") => {
+                let rest = suffix(path, "/admin/v1/fleet/deployments/")?;
+                match rest.split_once(':') {
+                    Some((id, "activate")) => self.fleet_activate(session, id),
+                    Some((id, "deactivate")) => self.fleet_deactivate(session, id),
+                    _ => Err(ApiError::new(
+                        ApiErrorCode::NotFound,
+                        "no such deployment action; expected :activate or :deactivate",
+                    )),
+                }
+            }
+            (Method::Post, _) if path.starts_with("/admin/v1/fleet/artifacts/") => {
+                let rest = suffix(path, "/admin/v1/fleet/artifacts/")?;
+                match rest.split_once(':') {
+                    Some((id, "fetch")) => self.fleet_fetch(request, session, id),
+                    _ => Err(ApiError::new(
+                        ApiErrorCode::NotFound,
+                        "no such artifact action; expected :fetch",
+                    )),
+                }
+            }
 
             (Method::Get, "/admin/v1/audit") => self.list_audit(request, session),
             (Method::Get, "/admin/v1/audit/export") => self.export_audit(request, session),
@@ -1723,6 +1760,14 @@ impl AdminApi {
                         object.push("target", Value::from(candidate.target.as_str()));
                         object.push("rank", Value::from(u64::from(candidate.rank)));
                         object.push("score", Value::from(candidate.score()));
+                        // Where the fleet stood in relation to this target when
+                        // the decision was made. Without it the affinity total
+                        // is unexplainable: an operator can see that one target
+                        // scored higher and not that it was the only warm one.
+                        object.push(
+                            "residency",
+                            Value::from(candidate.residency.as_str()),
+                        );
                         let terms = &candidate.terms;
                         let mut breakdown = Object::new();
                         breakdown.push("priority_rank", Value::from(terms.priority_rank));
@@ -2714,6 +2759,7 @@ impl AdminApi {
             groups: &groups,
             tenant: &scenario.tenant,
             attempted: &attempted,
+            now_millis: 0,
         };
 
         let ideal = hypellm_core::policy::IdealLiveState;
@@ -2751,6 +2797,14 @@ impl AdminApi {
                         object.push("target", Value::from(candidate.target.as_str()));
                         object.push("rank", Value::from(u64::from(candidate.rank)));
                         object.push("score", Value::from(candidate.score()));
+                        // Where the fleet stood in relation to this target when
+                        // the decision was made. Without it the affinity total
+                        // is unexplainable: an operator can see that one target
+                        // scored higher and not that it was the only warm one.
+                        object.push(
+                            "residency",
+                            Value::from(candidate.residency.as_str()),
+                        );
                         Value::Object(object)
                     })
                     .collect(),
@@ -3917,6 +3971,168 @@ impl AdminApi {
         Ok(ApiResponse::ok(&Value::Object(root)))
     }
 
+    // -- Fleet --------------------------------------------------------------
+
+    /// The configured fleet, or the reason there is nothing to show.
+    fn fleet(&self) -> Result<&Arc<dyn crate::fleet::FleetControl>, ApiError> {
+        self.state.fleet.as_ref().ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::NotFound,
+                "fleet orchestration is not configured on this router",
+            )
+        })
+    }
+
+    fn fleet_overview(&self, session: &Session) -> Result<ApiResponse, ApiError> {
+        self.require(session, Permission::ReadFleet)?;
+        Ok(ApiResponse::ok(&crate::fleet::render_fleet(
+            self.fleet()?.as_ref(),
+        )))
+    }
+
+    fn fleet_activations(&self, session: &Session) -> Result<ApiResponse, ApiError> {
+        self.require(session, Permission::ReadFleet)?;
+        Ok(ApiResponse::ok(&crate::fleet::render_activations(
+            self.fleet()?.as_ref(),
+        )))
+    }
+
+    /// `POST /admin/v1/fleet:simulate` — what would you do, and why.
+    ///
+    /// Requires only `SimulatePolicy`, the permission that already governs
+    /// asking the router a hypothetical. It has no side effects by
+    /// construction: the planner is a pure function of a snapshot.
+    fn fleet_simulate(
+        &self,
+        request: &AdminRequest<'_>,
+        session: &Session,
+    ) -> Result<ApiResponse, ApiError> {
+        self.require(session, Permission::SimulatePolicy)?;
+        let fleet = self.fleet()?;
+        let body = request.json(&Limits::SMALL)?;
+        let target = body.field_str("target").map_err(|_| {
+            ApiError::new(
+                ApiErrorCode::InvalidRequest,
+                "a simulation requires a 'target'",
+            )
+        })?;
+        let patience_ms = body
+            .opt_field_i64("patience_ms")
+            .ok()
+            .flatten()
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(120_000);
+        let outcome = fleet
+            .simulate(target, patience_ms)
+            .map_err(crate::fleet::control_error)?;
+        Ok(ApiResponse::ok(&crate::fleet::render_plan(&outcome)))
+    }
+
+    fn fleet_activate(&self, session: &Session, deployment: &str) -> Result<ApiResponse, ApiError> {
+        self.require(session, Permission::FleetActivate)?;
+        let activation = self
+            .fleet()?
+            .activate(deployment)
+            .map_err(crate::fleet::control_error)?;
+        // Audited before the response, and through `record_audit`, so an action
+        // whose record did not reach disk is not reported as having happened.
+        self.record_audit(self.fleet_event(
+            session,
+            AuditAction::FleetActivate,
+            deployment,
+        ))?;
+        Ok(crate::fleet::render_accepted(&activation))
+    }
+
+    fn fleet_deactivate(
+        &self,
+        session: &Session,
+        deployment: &str,
+    ) -> Result<ApiResponse, ApiError> {
+        self.require(session, Permission::FleetActivate)?;
+        let activation = self
+            .fleet()?
+            .deactivate(deployment)
+            .map_err(crate::fleet::control_error)?;
+        self.record_audit(self.fleet_event(
+            session,
+            AuditAction::FleetDeactivate,
+            deployment,
+        ))?;
+        Ok(crate::fleet::render_accepted(&activation))
+    }
+
+    fn fleet_fetch(
+        &self,
+        request: &AdminRequest<'_>,
+        session: &Session,
+        artifact: &str,
+    ) -> Result<ApiResponse, ApiError> {
+        // The one permission on which a single action can cost the fleet hours
+        // of bandwidth and hundreds of gigabytes of disk, so it is separate
+        // from activation and requires a fresh authentication.
+        self.require(session, Permission::FleetFetch)?;
+        let body = request.json(&Limits::SMALL)?;
+        let host = body.field_str("host").map_err(|_| {
+            ApiError::new(
+                ApiErrorCode::InvalidRequest,
+                "a fetch requires the 'host' to place the artifact on",
+            )
+        })?;
+        let activation = self
+            .fleet()?
+            .fetch(artifact, host)
+            .map_err(crate::fleet::control_error)?;
+        self.record_audit(self.fleet_event(session, AuditAction::FleetFetch, artifact))?;
+        Ok(crate::fleet::render_accepted(&activation))
+    }
+
+    fn patch_deployment(
+        &self,
+        request: &AdminRequest<'_>,
+        session: &Session,
+        deployment: &str,
+    ) -> Result<ApiResponse, ApiError> {
+        self.require(session, Permission::OperateTargets)?;
+        let body = request.json(&Limits::SMALL)?;
+        let patch = crate::fleet::DeploymentPatch {
+            pinned: body.opt_field_bool("pinned").ok().flatten(),
+            evictable: body.opt_field_bool("evictable").ok().flatten(),
+            autostart: body.opt_field_bool("autostart").ok().flatten(),
+        };
+        if patch.is_empty() {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidRequest,
+                "a deployment patch must set at least one of pinned, evictable, or autostart",
+            ));
+        }
+        self.fleet()?
+            .patch(deployment, patch)
+            .map_err(crate::fleet::control_error)?;
+        self.record_audit(self.fleet_event(
+            session,
+            AuditAction::TargetStateChanged,
+            deployment,
+        ))?;
+        Ok(ApiResponse::ok(&crate::fleet::render_fleet(
+            self.fleet()?.as_ref(),
+        )))
+    }
+
+    fn fleet_event(&self, session: &Session, action: AuditAction, object: &str) -> AuditEvent {
+        AuditEvent {
+            timestamp_millis: self.state.clock.wall_millis(),
+            actor: session.principal.as_str().to_owned(),
+            tenant: Some(session.tenant.as_str().to_owned()),
+            action,
+            object: Some(object.to_owned()),
+            outcome: AuditOutcome::Success,
+            reason: None,
+            request_id: None,
+            source: None,
+        }
+    }
+
     // -- Helpers ------------------------------------------------------------
 
     fn require(&self, session: &Session, permission: Permission) -> Result<(), ApiError> {
@@ -4047,6 +4263,17 @@ fn build_scenario(
             tool_choice: None,
             response_format: None,
             sampling: Sampling::default(),
+            // An unrecognised tier is dropped rather than rejected: a
+            // simulation is an operator exploring, and refusing the whole
+            // request over a typo in an optional field would be unhelpful.
+            // The tier that reaches routing is the one that would reach it in
+            // production, which is what makes the simulation worth running.
+            reasoning_effort: body
+                .opt_field_str("reasoning_effort")
+                .ok()
+                .flatten()
+                .and_then(|v| hypellm_core::canonical::ReasoningEffort::parse(&v))
+                .unwrap_or_default(),
             limits: RequestLimits {
                 max_output_tokens: body
                     .opt_field_i64("max_output_tokens")
@@ -4055,6 +4282,12 @@ fn build_scenario(
                     .and_then(|v| u32::try_from(v).ok()),
                 deadline: hypellm_core::time::Deadline::at(u64::MAX),
                 max_cost_class: None,
+                min_quality_class: body
+                    .opt_field_i64("min_quality")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| u8::try_from(v).ok())
+                    .map(hypellm_core::canonical::QualityClass::new),
                 residency: body
                     .opt_field_str("residency")
                     .ok()
@@ -4100,6 +4333,7 @@ fn visible_targets(
         groups: &groups,
         tenant: &session.tenant,
         attempted: &attempted,
+        now_millis: 0,
     };
 
     let mut visible = std::collections::BTreeSet::new();

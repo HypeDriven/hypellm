@@ -8,6 +8,7 @@ members = [
     "crates/hypellm-core",
     "crates/hypellm-config",
     "crates/hypellm-store",
+    "crates/hypellm-fleet",
     "crates/hypellm-net",
     "crates/hypellm-auth",
     "crates/hypellm-adapters",

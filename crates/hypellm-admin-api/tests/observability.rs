@@ -136,6 +136,7 @@ fn detailed_trace(admin: &Harness, id: u128) -> DecisionTrace {
                 binding_precedence: 3,
                 rank: 0,
                 pin_rank: Candidate::PIN_TARGET,
+                residency: Default::default(),
             },
             Candidate {
                 target: remote.clone(),
@@ -147,6 +148,7 @@ fn detailed_trace(admin: &Harness, id: u128) -> DecisionTrace {
                 binding_precedence: 3,
                 rank: 1,
                 pin_rank: Candidate::PIN_TARGET,
+                residency: Default::default(),
             },
         ],
         exclusions: vec![Exclusion {

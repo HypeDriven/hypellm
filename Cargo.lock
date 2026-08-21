@@ -21,6 +21,7 @@ dependencies = [
  "hypellm-config",
  "hypellm-core",
  "hypellm-crypto",
+ "hypellm-fleet",
  "hypellm-store",
  "hypellm-telemetry",
  "hypellm-test-corpus",
@@ -52,6 +53,7 @@ version = "1.0.0"
 dependencies = [
  "hypellm-core",
  "hypellm-crypto",
+ "hypellm-fleet",
  "hypellm-test-corpus",
 ]
 
@@ -74,11 +76,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "hypellm-fleet"
+version = "1.0.0"
+dependencies = [
+ "hypellm-core",
+ "hypellm-crypto",
+ "hypellm-test-corpus",
+ "wire-json",
+]
+
+[[package]]
 name = "hypellm-net"
 version = "1.0.0"
 dependencies = [
  "hypellm-auth",
  "hypellm-core",
+ "hypellm-crypto",
+ "hypellm-fleet",
+ "hypellm-net",
  "hypellm-store",
  "wire-http1",
  "wire-json",
@@ -95,6 +110,7 @@ dependencies = [
  "hypellm-config",
  "hypellm-core",
  "hypellm-crypto",
+ "hypellm-fleet",
  "hypellm-net",
  "hypellm-router",
  "hypellm-store",

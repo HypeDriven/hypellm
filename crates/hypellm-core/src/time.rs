@@ -54,6 +54,21 @@ pub trait Clock: Send + Sync + fmt::Debug {
     /// For timestamps in audit records and expiry comparisons that must survive
     /// a restart. Never for measuring an interval.
     fn wall_millis(&self) -> u64;
+
+    /// Wait for `duration`.
+    ///
+    /// On the trait rather than as a bare `std::thread::sleep` call so that a
+    /// test can drive a polling loop without spending real time in it. A fleet
+    /// activation is measured in minutes; an integration test that actually
+    /// waited would be a test nobody runs.
+    ///
+    /// The default is a real sleep, which is correct for every production
+    /// implementation. [`TestClock`] overrides it to advance its own reading
+    /// instead, so a loop that polls until a deadline terminates immediately
+    /// and deterministically.
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
 }
 
 /// The production clock.
@@ -156,6 +171,13 @@ impl Default for TestClock {
 }
 
 impl Clock for TestClock {
+    fn sleep(&self, duration: Duration) {
+        // Time passes because the test says so, not because the thread
+        // blocked. A poll loop therefore converges at full speed and a
+        // deadline is reached exactly when the arithmetic says it is.
+        self.advance(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+    }
+
     // Truncating microseconds to whole milliseconds is the intended unit
     // conversion, not a lost-precision accident: `now_micros` is the exact
     // reading and callers that need sub-millisecond resolution use it.

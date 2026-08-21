@@ -8,7 +8,7 @@ input/resource limits.
 |---|---|
 | Owner | Security (primary), Platform (secondary) |
 | Unsafe code | None. `#![forbid(unsafe_code)]` declared in `lib.rs` and inherited from the workspace. |
-| External dependencies | None. Rust standard library plus the workspace path dependencies `hypellm-auth`, `hypellm-config`, `hypellm-core`, `hypellm-crypto`, `hypellm-store`, `hypellm-telemetry`, `wire-http1`, `wire-json`. |
+| External dependencies | None. Rust standard library plus the workspace path dependencies `hypellm-auth`, `hypellm-config`, `hypellm-core`, `hypellm-crypto`, `hypellm-fleet`, `hypellm-store`, `hypellm-telemetry`, `wire-http1`, `wire-json`. |
 | Fuzz targets | Implemented in `tests/fuzz.rs`: nine seeded mutation properties over authentication, authorization, CSRF, tenant isolation, error redaction and bounded request handling. |
 
 ## Scope and the control-plane boundary
@@ -46,6 +46,31 @@ refuses anything outside an identifier alphabet (`is_configuration_token`)
 rather than escaping it. The grammar is line-oriented and space-separated, so an
 unchecked value adds records rather than a field — and a draft is approved by a
 second person who reads what they were shown (`DI-047`).
+
+### The fleet surface
+
+Seven endpoints under `/admin/v1/fleet` (specification 26). The live fleet is
+reached through the `FleetControl` trait, the same shape `CredentialSink`
+already uses and for the same reason: the router depends on this crate rather
+than the other way round, so the management API knows *what* it may ask for and
+the router knows *how*.
+
+Three properties are worth naming, because each is easy to lose:
+
+- **No sentence an operator reads is authored by the router or the agent.**
+  `FleetControl` returns a `&'static str` code; `fleet::control_error` maps it to
+  the one message, written in this crate. An implementation that could return
+  prose would be a path for agent-supplied strings to reach a browser.
+- **An absent fleet answers "not configured on this router", not an empty list.**
+  Per the honesty rule, a screen with no backing endpoint says so; a plausible
+  empty fleet is exactly what stops an operator going to look.
+- **An action is reported as successful only if it was also recorded.** Operator
+  activations and deactivations go through `record_audit`, which fails the
+  request when the audit record does not reach disk.
+
+`fleet_activate` and `fleet_fetch` are separate permissions, and `fleet_fetch`
+requires a fresh authentication: it is the one action on which a single request
+can cost the fleet hours of bandwidth and hundreds of gigabytes of disk.
 
 ## Threat notes
 

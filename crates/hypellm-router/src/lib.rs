@@ -50,6 +50,7 @@
 
 pub mod admin;
 pub mod dispatch;
+pub mod fleet;
 pub mod hardening;
 pub mod pipeline;
 pub mod protocol;

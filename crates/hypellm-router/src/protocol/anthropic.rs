@@ -20,8 +20,9 @@
 //! events and the frame discipline is enforced in one place.
 
 use hypellm_core::canonical::{
-    CanonicalRequest, ClientProtocol, ContentPart, ImageSource, Message, Operation, RequestLimits,
-    Role, RoutingHints, Sampling, StreamOptions, ToolCall, ToolChoice, ToolDef,
+    CanonicalRequest, ClientProtocol, ContentPart, DocumentSource, DocumentType, ImageSource,
+    Message, Operation, ReasoningEffort, RequestLimits, Role, Sampling,
+    StreamOptions, ToolCall, ToolChoice, ToolDef,
 };
 use hypellm_core::error::{ErrorCode, RouterError};
 use hypellm_core::event::{CanonicalEvent, FinishReason, ResponseAccumulator};
@@ -152,17 +153,78 @@ pub fn parse_messages_request(
         tool_choice: parse_tool_choice(&value)?,
         response_format: None,
         sampling,
+        reasoning_effort: parse_thinking_effort(&value, max_output_tokens)?,
         limits: RequestLimits {
             max_output_tokens: Some(max_output_tokens),
             deadline: context.deadline,
             max_cost_class: context.max_cost_class,
+            min_quality_class: context.min_quality_class,
             residency: context.residency.clone(),
         },
         stream: StreamOptions {
             enabled: value.opt_field_bool("stream").map_err(type_error)?.unwrap_or(false),
             include_usage: true,
         },
-        hints: RoutingHints::default(),
+        // The same allowlisted hints, read from the same key and behind the
+        // same permission gate. A hint honoured on one dialect and dropped on
+        // another is a difference no caller can see and every operator has to
+        // remember.
+        hints: super::openai::parse_hints(&value, context)?,
+    })
+}
+
+/// Match a declared document media type against the closed allowlist.
+fn document_type(raw: &str, param: &str) -> Result<DocumentType, RouterError> {
+    DocumentType::parse(raw).ok_or_else(|| {
+        // Deliberately not echoing the caller's string into the error body.
+        RouterError::invalid_request("that document media type is not supported")
+            .with_param(param)
+    })
+}
+
+/// Map this dialect's `thinking` block onto a canonical reasoning tier.
+///
+/// This family expresses reasoning as a token budget rather than a named
+/// level, so the budget is read as a fraction of `max_tokens`: up to an eighth
+/// is `low`, up to a quarter `medium`, and more than that `high`. The
+/// thresholds mirror `hypellm_adapters::anthropic::thinking_budget`, which
+/// performs the inverse mapping on the way out, so a request that arrives in
+/// this dialect and leaves in it again lands on a comparable budget rather
+/// than drifting each time it crosses the canonical model.
+///
+/// `thinking.type` other than `"enabled"` — the documented `"disabled"` — maps
+/// to `Minimal` rather than `Unset`: the caller made an explicit statement, and
+/// collapsing it to "said nothing" would let a target that refuses `minimal`
+/// serve a request that asked for the least possible reasoning.
+fn parse_thinking_effort(
+    value: &Value,
+    max_output_tokens: u32,
+) -> Result<ReasoningEffort, RouterError> {
+    let Some(thinking) = value.get_present("thinking") else {
+        return Ok(ReasoningEffort::Unset);
+    };
+    let kind = thinking
+        .opt_field_str("type")
+        .map_err(type_error)?
+        .unwrap_or("enabled");
+    if kind != "enabled" {
+        return Ok(ReasoningEffort::Minimal);
+    }
+    let budget = thinking
+        .opt_field_i64("budget_tokens")
+        .map_err(type_error)?
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(0);
+    if budget == 0 {
+        return Ok(ReasoningEffort::Medium);
+    }
+    let eighth = max_output_tokens.div_euclid(8);
+    Ok(if budget <= eighth {
+        ReasoningEffort::Low
+    } else if budget <= eighth.saturating_mul(2) {
+        ReasoningEffort::Medium
+    } else {
+        ReasoningEffort::High
     })
 }
 
@@ -223,6 +285,51 @@ fn parse_message(raw: &Value, index: usize) -> Result<Message, RouterError> {
                                     .unwrap_or("")
                                     .to_owned(),
                             })),
+                        }
+                    }
+                    // This family's document block. The bytes are opaque to
+                    // the router, and a URL-form document is forwarded rather
+                    // than fetched — the same rule images already follow.
+                    "document" => {
+                        let source = block.get("source").ok_or_else(|| {
+                            RouterError::invalid_request("a document block requires 'source'")
+                                .with_param(&param)
+                        })?;
+                        let declared = source
+                            .opt_field_str("media_type")
+                            .map_err(type_error)?
+                            .unwrap_or("");
+                        match source.opt_field_str("type").map_err(type_error)? {
+                            Some("url") => {
+                                // The media type is mandatory for a URL: the
+                                // router will not fetch the document to find
+                                // out what it is, and will not guess from the
+                                // path, which the caller controls.
+                                let media_type = document_type(declared, &param)?;
+                                content.push(ContentPart::Document {
+                                    media_type,
+                                    source: DocumentSource::Url(
+                                        source
+                                            .opt_field_str("url")
+                                            .map_err(type_error)?
+                                            .unwrap_or("")
+                                            .to_owned(),
+                                    ),
+                                });
+                            }
+                            _ => {
+                                let media_type = document_type(declared, &param)?;
+                                content.push(ContentPart::Document {
+                                    media_type,
+                                    source: DocumentSource::Inline {
+                                        base64_data: source
+                                            .opt_field_str("data")
+                                            .map_err(type_error)?
+                                            .unwrap_or("")
+                                            .to_owned(),
+                                    },
+                                });
+                            }
                         }
                     }
                     "tool_use" => tool_calls.push(ToolCall {
@@ -716,6 +823,8 @@ mod tests {
             principal: PrincipalId::new("user:42").unwrap(),
             deadline: Deadline::after(&clock, Duration::from_secs(60)),
             hints_permitted: false,
+            min_quality_class: None,
+            document_limits: crate::protocol::openai::DocumentLimits::DEFAULT,
             residency: None,
             max_cost_class: None,
         }

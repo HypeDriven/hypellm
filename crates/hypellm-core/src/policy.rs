@@ -18,7 +18,7 @@
 //!   optional request-id-seeded jitter.
 
 use crate::canonical::{CanonicalRequest, Operation, ResponseFormat};
-use crate::decision::{Candidate, Exclusion, ExclusionReason, ScoreTerms};
+use crate::decision::{Candidate, Exclusion, ExclusionReason, ResidencyClass, ScoreTerms};
 use crate::ids::{AliasId, BindingId, GroupId, PrincipalId, ProviderId, RequestId, TargetId, TenantId};
 use crate::target::{Alias, AdminState, Provider, Target};
 use hypellm_crypto::Digest;
@@ -255,6 +255,46 @@ pub trait LiveState {
         let _ = target;
         0
     }
+
+    /// How the fleet stands in relation to this target right now.
+    ///
+    /// [`ResidencyClass::Unmanaged`] — the default — means the target has no
+    /// deployment record, so nothing about the fleet applies to it and routing
+    /// behaves exactly as it did before orchestration existed. Every current
+    /// implementor therefore compiles unchanged, which is the same reason
+    /// [`LiveState::admin_override`] and [`LiveState::failure_percent`] are
+    /// defaulted.
+    ///
+    /// Only [`ResidencyClass::Infeasible`] excludes. The other classes remain
+    /// candidates and are ordered by warmth — this is the central decision of
+    /// the design and the easiest one to get wrong: **if "not currently
+    /// running" excluded a target, no target would ever start.**
+    fn residency_class(&self, target: &TargetId) -> ResidencyClass {
+        let _ = target;
+        ResidencyClass::Unmanaged
+    }
+
+    /// Estimated milliseconds until the target can serve, from now.
+    ///
+    /// Zero for anything already resident. For a cold target this is the sum
+    /// of the drain, stop, fetch, start, and probe costs the planner computed,
+    /// and it is what the deadline check of specification-extension 7.3
+    /// compares against: a 90-second model load cannot serve a 30-second
+    /// deadline, and pretending otherwise converts a fast failure into a slow
+    /// one.
+    fn activation_eta_ms(&self, target: &TargetId) -> u64 {
+        let _ = target;
+        0
+    }
+
+    /// Age of the newest valid fleet observation, in milliseconds.
+    ///
+    /// `None` means no fleet is configured. A router acting on stale belief
+    /// stops a container something else already restarted, or starts one
+    /// twice — so the classifier fails closed on age rather than guessing.
+    fn fleet_observation_age_ms(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Live state that reports every target as healthy, idle, and available.
@@ -299,6 +339,25 @@ pub struct RoutingContext<'a> {
     pub tenant: &'a TenantId,
     /// Targets already tried in this request's retry chain.
     pub attempted: &'a [TargetId],
+    /// The caller's monotonic clock reading, in milliseconds.
+    ///
+    /// Sampled once by the caller and passed in, because this crate performs
+    /// no I/O and holds no clock (specification 18.3). It exists so that
+    /// deadline-versus-time-to-ready can be decided during eligibility rather
+    /// than discovered after a container has been started: a 90-second model
+    /// load cannot serve a 30-second deadline.
+    ///
+    /// Routing stays deterministic in the sense Appendix B requires — equal
+    /// inputs, including this one, produce equal ordered candidates.
+    pub now_millis: u64,
+}
+
+impl RoutingContext<'_> {
+    /// Milliseconds left before `deadline`, saturating at zero.
+    #[must_use]
+    pub const fn remaining_ms(&self, deadline: crate::time::Deadline) -> u64 {
+        deadline.as_millis().saturating_sub(self.now_millis)
+    }
 }
 
 /// The result of routing.
@@ -361,6 +420,21 @@ pub struct PolicySnapshot {
     /// targets on an operator's first day, because of a threshold nobody chose,
     /// is worse than one that relies on the circuit breaker alone.
     pub max_failure_percent: u32,
+    /// Tokens charged per document part when a target declares no figure.
+    pub default_document_token_estimate: u32,
+    /// Milliseconds of generation time, per unit of effort multiplier, that a
+    /// cold target must leave inside the deadline after it becomes ready.
+    ///
+    /// Time-to-ready alone is not the whole cost of choosing a cold target: a
+    /// request that finishes loading a model with two seconds of deadline left
+    /// has not been served. This is the operator's statement of how much of
+    /// the deadline generation itself needs, scaled by the reasoning tier's
+    /// multiplier, and it is why a high-effort request behind a three-minute
+    /// load is a different proposition from a minimal-effort one.
+    ///
+    /// Zero disables the headroom and compares time-to-ready against the
+    /// deadline alone.
+    pub activation_effort_headroom_ms: u64,
 }
 
 impl PolicySnapshot {
@@ -379,6 +453,8 @@ impl PolicySnapshot {
             allowlisted_targets: BTreeSet::new(),
             weighted_tie_break: false,
             max_failure_percent: 100,
+            default_document_token_estimate: crate::canonical::DEFAULT_DOCUMENT_TOKEN_ESTIMATE,
+            activation_effort_headroom_ms: 5_000,
         }
     }
 
@@ -661,8 +737,23 @@ impl PolicySnapshot {
         if !caps.supports_operation(req.operation) {
             return Err(ExclusionReason::OperationUnsupported);
         }
+        // The capability verb, when the alias declares one. `Operation` is the
+        // wire shape the client used; `Capability` is the work the model does,
+        // and no combination of operation and modality distinguishes a music
+        // model from a speech model.
+        if let Some(verb) = alias.capability {
+            if !caps.supports_capability(verb) {
+                return Err(ExclusionReason::CapabilityUnsupported);
+            }
+        }
         if !caps.supports_modalities(&req.required_modalities()) {
             return Err(ExclusionReason::ModalityUnsupported);
+        }
+        // Excluded rather than downgraded. A target that quietly serves a
+        // `high` request at whatever it does support returns a cheaper answer
+        // than the caller asked for and tells nobody.
+        if !caps.supports_effort(req.reasoning_effort) {
+            return Err(ExclusionReason::ReasoningEffortUnsupported);
         }
         if req.stream.enabled && !caps.streaming {
             return Err(ExclusionReason::StreamingUnsupported);
@@ -680,7 +771,12 @@ impl PolicySnapshot {
             _ => {}
         }
 
-        let estimated_input = req.estimated_input_tokens();
+        // The document constant this target declares, not the byte-derived
+        // figure: a scanned PDF is megabytes and few tokens, and a dense text
+        // one is the reverse.
+        let estimate =
+            target.token_estimate(req.reasoning_effort, self.default_document_token_estimate);
+        let estimated_input = req.estimated_input_tokens_with(estimate.document_token_estimate);
         if estimated_input > u64::from(caps.max_context_tokens) {
             return Err(ExclusionReason::ContextWindowTooSmall);
         }
@@ -690,10 +786,16 @@ impl PolicySnapshot {
             }
         }
 
-        // -- Cost and capacity ----------------------------------------------
+        // -- Cost, quality, and capacity -------------------------------------
 
         if !target.within_cost_ceiling(req.limits.max_cost_class) {
             return Err(ExclusionReason::CostCeilingExceeded);
+        }
+        // A floor, and independent of the ceiling above. A local Q5 may be
+        // cheaper *and* better than a remote Q4, so neither bound is derivable
+        // from the other.
+        if !target.meets_quality_floor(req.limits.min_quality_class) {
+            return Err(ExclusionReason::QualityFloorNotMet);
         }
         if live.circuit_open(&target.id) {
             return Err(ExclusionReason::CircuitOpen);
@@ -711,6 +813,30 @@ impl PolicySnapshot {
             return Err(ExclusionReason::CapacityExhausted);
         }
 
+        // -- Fleet residency --------------------------------------------------
+
+        // Sampled once, here, and reused for scoring below. Re-reading it
+        // mid-decision would let a target be filtered under one belief and
+        // ranked under another.
+        let residency = live.residency_class(&target.id);
+        if let Some(reason) = residency.exclusion() {
+            return Err(reason);
+        }
+        if residency.requires_activation() {
+            // Time-to-ready plus the generation headroom the tier implies,
+            // against what is left of the deadline. Offering a cold target
+            // that cannot finish converts a fast, explained failure into a
+            // slow, expensive one — and on this path the expense is minutes of
+            // fleet time, not milliseconds of router time.
+            let required = live.activation_eta_ms(&target.id).saturating_add(
+                self.activation_effort_headroom_ms
+                    .saturating_mul(u64::from(estimate.output_multiplier)),
+            );
+            if required > ctx.remaining_ms(req.limits.deadline) {
+                return Err(ExclusionReason::ActivationExceedsDeadline);
+            }
+        }
+
         // -- Reachability by preference --------------------------------------
 
         // Standing relative to an active pin. With no pin every candidate is
@@ -726,14 +852,28 @@ impl PolicySnapshot {
             if merged.pin.as_ref() == Some(&target.id)
                 || merged.pin_fallback.contains(&target.id)
             {
-                return Ok(self.score(req, target, 0, 0, pin_rank, live));
+                return Ok(self.score(req, target, 0, 0, pin_rank, residency, live));
             }
             return Err(ExclusionReason::NotSelectedByAnyBinding);
         };
 
-        Ok(self.score(req, target, pref.rank, pref.weight, pin_rank, live))
+        Ok(self.score(
+            req,
+            target,
+            pref.rank,
+            pref.weight,
+            pin_rank,
+            residency,
+            live,
+        ))
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "every argument is a distinct, already-computed input to one \
+                  formula; bundling them into a struct would move the same \
+                  values behind a name that adds nothing"
+    )]
     fn score(
         &self,
         req: &CanonicalRequest,
@@ -741,6 +881,7 @@ impl PolicySnapshot {
         rank: u16,
         weight: i64,
         pin_rank: u8,
+        residency: ResidencyClass,
         live: &dyn LiveState,
     ) -> Candidate {
         let cost_penalty = -(i64::from(target.cost_class.0) * 5_000);
@@ -751,6 +892,30 @@ impl PolicySnapshot {
             0
         };
 
+        // The affinity term carries three contributors in disjoint slices
+        // (specification-extension 7.2). Splitting rather than contending is
+        // what keeps the guarantee readable: warmth occupies a ladder whose
+        // step exceeds the whole hint slice, so a hint can break a tie between
+        // two equally-warm targets and can never promote a colder one.
+        //
+        // The hint is permission-gated *before* it reaches this crate: the
+        // protocol layer drops `prefer_target` unless the principal may supply
+        // one, so a hint present here is one policy already admitted. It still
+        // cannot create eligibility — it is read only after every filter above
+        // has passed — and it cannot outrank a binding, because rank is a
+        // separate term two orders of magnitude larger.
+        let warmth = residency.warmth_bonus();
+        let hint_bonus = if req.hints.prefer_target.as_ref() == Some(&target.id) {
+            ScoreTerms::HINT_SLICE
+        } else {
+            0
+        };
+        let affinity = live
+            .affinity_bonus(&target.id)
+            .clamp(0, ScoreTerms::CONVERSATION_SLICE)
+            .saturating_add(warmth)
+            .saturating_add(hint_bonus);
+
         let terms = ScoreTerms {
             priority_rank: ScoreTerms::rank_term(rank),
             policy_weight: weight,
@@ -759,7 +924,7 @@ impl PolicySnapshot {
             queue: live.queue_penalty(&target.id),
             cost: cost_penalty,
             locality: locality_bonus,
-            affinity: live.affinity_bonus(&target.id),
+            affinity,
             jitter,
         }
         .clamped();
@@ -770,6 +935,7 @@ impl PolicySnapshot {
             binding_precedence: 0,
             rank,
             pin_rank,
+            residency,
         }
     }
 }
@@ -991,6 +1157,8 @@ mod tests {
                 ..Capabilities::default()
             },
             cost_class: CostClass::new(cost),
+            quality_class: Default::default(),
+            document_token_estimate: None,
             residency: Some(Residency::new("eu")),
             is_local: local,
             admin_state: AdminState::Enabled,
@@ -1029,6 +1197,7 @@ mod tests {
             aid("code-premium"),
             Alias {
                 id: aid("code-premium"),
+                capability: None,
                 permitted_targets: vec![
                     tid("local:qwen"),
                     tid("anthropic:claude"),
@@ -1067,10 +1236,12 @@ mod tests {
             tool_choice: None,
             response_format: None,
             sampling: Sampling::default(),
+            reasoning_effort: Default::default(),
             limits: RequestLimits {
                 max_output_tokens: Some(512),
                 deadline: Deadline::after(&clock, Duration::from_secs(60)),
                 max_cost_class: None,
+                min_quality_class: None,
                 residency: None,
             },
             stream: StreamOptions {
@@ -1092,6 +1263,7 @@ mod tests {
             groups,
             tenant,
             attempted,
+            now_millis: 0,
         }
     }
 
@@ -2030,6 +2202,7 @@ mod tests {
             Alias {
                 id: aid("secret-model"),
                 permitted_targets: vec![tid("local:qwen")],
+                capability: None,
                 allow_family_failover: false,
                 description: None,
             },

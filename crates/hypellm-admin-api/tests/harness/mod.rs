@@ -92,6 +92,16 @@ pub const CREDENTIAL: &str = "provider-secret";
 
 /// An origin on the default CORS allowlist.
 pub const ALLOWED_ORIGIN: &str = "https://admin.test";
+
+/// The `POST` method, for tests that build a request by hand.
+///
+/// A function rather than a re-export of the enum: `wire_http1::Method` is an
+/// implementation detail of the transport, and a test that named it directly
+/// would couple every suite to it.
+#[must_use]
+pub fn method_post() -> Method {
+    Method::Post
+}
 /// An origin that is not, and never should be, permitted.
 pub const HOSTILE_ORIGIN: &str = "https://admin.test.evil.example";
 
@@ -1095,6 +1105,8 @@ pub struct HarnessBuilder {
     cors: CorsPolicy,
     session_policy: SessionPolicy,
     with_credential_sink: bool,
+    /// The fleet control this harness serves, when a test supplies one.
+    fleet: Option<Arc<dyn hypellm_admin_api::FleetControl>>,
     oidc_config: Option<oidc::OidcConfig>,
     verifier: Option<Arc<dyn oidc::TokenVerifier>>,
 }
@@ -1127,9 +1139,20 @@ impl HarnessBuilder {
             break_glass: None,
             session_policy: SessionPolicy::DEFAULT,
             with_credential_sink: true,
+            fleet: None,
             oidc_config: None,
             verifier: None,
         }
+    }
+
+    /// Serve `/admin/v1/fleet` from this control.
+    ///
+    /// Absent, the surface answers "not configured on this router" — which is
+    /// itself a behaviour worth testing, so it stays the default.
+    #[must_use]
+    pub fn fleet(mut self, control: Arc<dyn hypellm_admin_api::FleetControl>) -> Self {
+        self.fleet = Some(control);
+        self
     }
 
     /// Use explicit configuration text.
@@ -1251,6 +1274,7 @@ impl HarnessBuilder {
             next_version: AtomicU64::new(version + 1),
             break_glass: self.break_glass,
             credentials: sink,
+            fleet: self.fleet.clone(),
         });
 
         Harness {

@@ -25,9 +25,9 @@ What this module owns:
 |---|---|---|
 | Canonical request shape | `canonical` | 5.1 |
 | Identifier newtypes and their alphabet | `ids` | 5, 10.1 |
-| Providers, targets, declared capabilities | `target` | 5, 23 |
+| Providers, targets, declared capabilities, capability verbs | `target` | 5, 23, 26.1 |
 | Precedence, deny/pin, eligibility, scoring | `policy` | 6.1–6.3 |
-| Candidates, exclusions, score terms, traces | `decision` | 6.3, 17 |
+| Candidates, exclusions, score terms, residency class, traces | `decision` | 6.3, 17, 26.4 |
 | Hierarchical token buckets and reservations | `admission` | 12 |
 | Circuit breakers, EWMA, live state | `health` | 13 |
 | Canonical stream events and the failover gate | `event` | 6.5, 14 |
@@ -253,7 +253,10 @@ This crate's obligation under specification 18.2 is the *property* half —
 "router selection has property tests for determinism, precedence, deny/pin
 behavior, and overflow" — and that layer exists: `tests/properties.rs`, 14
 properties over Appendix B, each run across 400 seeded cases from a
-deterministic generator.
+deterministic generator. `tests/capability.rs` adds sixteen more over the
+specification 26.1 contract and the 26.4 warmth ladder — the document-modality
+filter, the effort multiplier at reservation, the quality floor, and the three
+guarantees about what a client hint cannot do.
 
 | Property | Invariant |
 |---|---|
@@ -271,6 +274,27 @@ deterministic generator.
 | `every_reservation_is_released_exactly_once` | Reservation conservation |
 | `committing_and_dropping_the_same_reservation_releases_it_once` | — |
 | `concurrency_is_never_exceeded_under_interleaved_reservations` | — |
+
+The capability contract's own properties, in `tests/capability.rs`:
+
+| Property | Invariant |
+|---|---|
+| `a_document_request_is_excluded_from_a_target_without_the_document_modality` | Modality is a filter, and it is applied before anything is started |
+| `a_document_url_is_never_dereferenced_and_never_influences_routing` | Two requests differing only in a document URL produce identical decisions |
+| `a_document_costs_a_configured_constant_rather_than_its_byte_length` | The estimate does not depend on a document's size |
+| `a_reasoning_effort_reserves_its_multiplied_output_budget` | The multiplier is applied at reservation, not after |
+| `an_unsupported_effort_tier_excludes_rather_than_downgrades` | No silent downgrade |
+| `an_unset_effort_is_never_refused_by_a_target_that_declares_tiers` | `Unset` is the absence of a request, not a tier |
+| `a_quality_floor_excludes_a_lower_tier_target_even_when_it_is_cheaper` | A floor is a filter, not a preference |
+| `a_quality_floor_and_a_cost_ceiling_are_independent` | Neither is derived from the other |
+| `a_target_that_does_not_declare_the_aliases_verb_is_excluded` | The verb cannot be derived from operation and modality |
+| `an_alias_that_declares_no_verb_routes_exactly_as_it_did_before` | The compatibility promise |
+| `the_warmth_ladder_spacing_exceeds_the_maximum_hint_bonus` | The arithmetic every hint guarantee rests on |
+| `a_client_hint_never_makes_an_ineligible_target_eligible` | — |
+| `a_client_hint_never_outranks_a_warmer_target` | …and does break a tie between equally warm ones |
+| `a_client_hint_never_outranks_a_priority_binding` | Rank dominates |
+| `a_cold_rank_zero_target_still_outranks_a_warm_rank_one_target` | Warmth is a preference, not a filter |
+| `an_infeasible_residency_class_excludes_and_every_other_class_does_not` | If "not running" excluded, nothing would ever start |
 
 Fuzz targets this module still needs:
 

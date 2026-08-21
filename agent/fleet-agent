@@ -1,0 +1,788 @@
+#!/usr/bin/env python3
+"""The HypeLLM reference fleet agent.
+
+This is the process that actually starts and stops containers on slave
+machines. It is **not** part of the HypeLLM workspace and is not built by
+`cargo build --workspace`: specification 4.1 forbids the router from executing
+a subprocess, and `depscan`'s `forbidden-api` rule fails the build on
+`process::Command`. Actuation therefore happens here, out of process, behind a
+narrow authenticated local socket — the same shape specification 4 uses for the
+TLS helper and 9.1 for the identity verifier.
+
+It is in the trusted computing base, and it is the most privileged component in
+the system: it holds SSH keys to every slave. Read `agent/README.md` before
+deploying it.
+
+The design rules it exists to keep
+----------------------------------
+
+1. **Router input selects a row; it never becomes an argument.** A verb names a
+   `deployment-id`. That identifier is looked up in this agent's own table, and
+   the command that runs is built from the *table's* fields. Nothing the router
+   sends is ever interpolated into a command line, so a fully compromised router
+   can reorder declared deployments and cannot introduce one.
+2. **Everything is a list, never a shell string.** `subprocess.run` is called
+   with an argument vector and `shell=False`, so there is no quoting to get
+   wrong.
+3. **Bounded output.** Every command's output is read with a byte cap and a
+   timeout; every reported field is truncated.
+4. **Its own rate limit.** A router bug must not be able to exhaust the fleet
+   through this agent, so activations are limited here as well as there.
+5. **Digest agreement, not digest trust.** The digest is computed from this
+   agent's own table, in the same canonical form the router uses. A mismatch is
+   reported and the router refuses to act; the agent does not adopt the
+   router's view.
+
+Only the standard library is used.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import hmac
+import json
+import os
+import re
+import socket
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+PROTOCOL_VERSION = "1"
+AGENT_VERSION = "hypellm-fleet-agent-1"
+
+# Bounds. Each mirrors one the router enforces on its side, so a violation is
+# refused by whichever side notices first rather than by neither.
+MAX_LINE = 512
+MAX_INVENTORY_BYTES = 256 * 1024
+MAX_FIELD = 64
+MAX_COMMAND_OUTPUT = 64 * 1024
+DEFAULT_COMMAND_TIMEOUT = 120
+
+# The identifier alphabet the router validates on its side. Anything else is
+# refused before it is looked up, so a malformed identifier cannot reach a
+# dictionary key, a log line, or a command.
+IDENTIFIER = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+# States both sides agree on. An agent that invented one would have its whole
+# observation refused by the router, which is the correct outcome: two
+# processes that disagree about what a state means must not act on it.
+STATES = {
+    "pending",
+    "draining",
+    "stopping",
+    "fetching",
+    "starting",
+    "probing",
+    "ready",
+    "failed",
+    "stopped",
+    "cancelled",
+}
+
+
+def truncate(value: Any, limit: int = MAX_FIELD) -> str:
+    """Bound and narrow a value before it reaches the wire.
+
+    The router sanitises what it receives as well. Doing it on both sides is
+    not redundant: this side knows the value's origin and can keep the log
+    readable, and that side cannot trust this one.
+    """
+    text = str(value)
+    out = []
+    for ch in text[:limit]:
+        out.append(ch if (ch.isalnum() or ch in "_-.") else "_")
+    return "".join(out)
+
+
+@dataclass
+class Deployment:
+    """One row of the allowlist.
+
+    Everything needed to act is here. The router supplies only the key.
+    """
+
+    id: str
+    host: str
+    accelerator: str
+    # How to start and stop it. A list of arguments, run on the host over SSH.
+    start: list[str]
+    stop: list[str]
+    # How to tell whether it is serving. A TCP connect is not readiness.
+    probe: list[str] = field(default_factory=list)
+    # Optional: the container name, so `docker ps` can report residency.
+    container: str = ""
+    artifact: str = ""
+
+
+@dataclass
+class Host:
+    """A machine this agent can reach."""
+
+    id: str
+    arch: str
+    ssh: str  # user@address, from the agent's own configuration
+    # Extra ssh arguments, from configuration. Never from the router.
+    ssh_options: list[str] = field(default_factory=list)
+    disk_path: str = "/"
+    accelerators: list[dict[str, Any]] = field(default_factory=list)
+    # Per-host activation rate limit, independent of the router's.
+    max_activations_per_hour: int = 12
+
+
+@dataclass
+class Artifact:
+    """A distributable image or set of weights."""
+
+    id: str
+    arch: str
+    digest: str
+    host_pull: dict[str, list[str]] = field(default_factory=dict)
+
+
+class Fleet:
+    """The agent's own view of what exists.
+
+    This is the allowlist. The router cannot extend it, and nothing here is
+    derived from anything the router sends.
+    """
+
+    def __init__(self, document: dict[str, Any]) -> None:
+        self.hosts: dict[str, Host] = {}
+        self.deployments: dict[str, Deployment] = {}
+        self.artifacts: dict[str, Artifact] = {}
+
+        for raw in document.get("hosts", []):
+            host = Host(
+                id=raw["id"],
+                arch=raw["arch"],
+                ssh=raw["ssh"],
+                ssh_options=list(raw.get("ssh_options", [])),
+                disk_path=raw.get("disk_path", "/"),
+                accelerators=list(raw.get("accelerators", [])),
+                max_activations_per_hour=int(raw.get("max_activations_per_hour", 12)),
+            )
+            self.hosts[host.id] = host
+
+        for raw in document.get("deployments", []):
+            deployment = Deployment(
+                id=raw["id"],
+                host=raw["host"],
+                accelerator=raw["accelerator"],
+                start=list(raw["start"]),
+                stop=list(raw["stop"]),
+                probe=list(raw.get("probe", [])),
+                container=raw.get("container", ""),
+                artifact=raw.get("artifact", ""),
+            )
+            if deployment.host not in self.hosts:
+                raise ValueError(
+                    f"deployment {deployment.id} names host {deployment.host}, "
+                    "which is not declared"
+                )
+            self.deployments[deployment.id] = deployment
+
+        for raw in document.get("artifacts", []):
+            artifact = Artifact(
+                id=raw["id"],
+                arch=raw["arch"],
+                digest=raw["digest"],
+                host_pull={k: list(v) for k, v in raw.get("host_pull", {}).items()},
+            )
+            self.artifacts[artifact.id] = artifact
+
+    def canonical_form(self) -> str:
+        """The text the fleet digest is computed over.
+
+        Must match `hypellm_fleet::model::FleetConfig::canonical_form` exactly,
+        including sort order — the two sides compute it independently and
+        compare, which is the whole point. Only identifiers, placement, and
+        architecture appear: timings and governance are the router's business,
+        so retuning a dwell floor does not force an agent restart.
+        """
+        lines: list[str] = []
+        for host in sorted(self.hosts.values(), key=lambda h: h.id):
+            lines.append(f"host {host.id} {host.arch} {host_agent_name()}")
+        accelerators = [
+            (a["id"], host.id)
+            for host in self.hosts.values()
+            for a in host.accelerators
+        ]
+        for accelerator_id, host_id in sorted(accelerators):
+            lines.append(f"accelerator {accelerator_id} {host_id}")
+        for deployment in sorted(self.deployments.values(), key=lambda d: d.id):
+            lines.append(f"deployment {deployment.id} {deployment.accelerator}")
+        for artifact in sorted(self.artifacts.values(), key=lambda a: a.id):
+            lines.append(f"artifact {artifact.id} {artifact.arch} {artifact.digest}")
+        return "".join(line + "\n" for line in lines)
+
+    def digest(self) -> str:
+        return hashlib.sha256(self.canonical_form().encode("utf-8")).hexdigest()
+
+
+_AGENT_NAME = "local"
+
+
+def host_agent_name() -> str:
+    """The identifier the router uses for this agent.
+
+    Part of the canonical form, so both sides must agree on it. It comes from
+    this agent's configuration, not from the router.
+    """
+    return _AGENT_NAME
+
+
+class RateLimiter:
+    """A sliding-window limit, per host.
+
+    Independent of the router's. If the router's own accounting is wrong, this
+    is what stops the mistake from reaching the hardware.
+    """
+
+    def __init__(self) -> None:
+        self._events: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, host: str, limit: int) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            window = [t for t in self._events.get(host, []) if now - t < 3600.0]
+            if len(window) >= limit:
+                self._events[host] = window
+                return False
+            window.append(now)
+            self._events[host] = window
+            return True
+
+
+class Activation:
+    """One in-flight verb."""
+
+    def __init__(self, activation_id: str, deployment: str, starting: bool) -> None:
+        self.id = activation_id
+        self.deployment = deployment
+        self.starting = starting
+        self.state = "pending"
+        self.detail = "queued"
+        self.progress = 0
+        self.cancelled = threading.Event()
+
+
+class Agent:
+    """The agent's state and behaviour."""
+
+    def __init__(self, fleet: Fleet, key: bytes, command_timeout: int) -> None:
+        self.fleet = fleet
+        self.key = key
+        self.command_timeout = command_timeout
+        self.digest = fleet.digest()
+        self.limiter = RateLimiter()
+        self._activations: dict[str, Activation] = {}
+        self._leases: dict[str, str] = {}  # lease -> activation id
+        self._states: dict[str, str] = {}
+        self._nonces: set[str] = set()
+        self._lock = threading.Lock()
+        self._next = 1
+
+    # -- Command execution -------------------------------------------------
+
+    def run_on(self, host: Host, argv: list[str]) -> tuple[int, str]:
+        """Run an argument vector on a host, bounded and deadlined.
+
+        `argv` comes from this agent's own table. It is passed as a list with
+        `shell=False`, so there is nothing to quote and no way for a value to
+        become a second command.
+        """
+        command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
+        command.extend(host.ssh_options)
+        command.append(host.ssh)
+        command.extend(argv)
+        try:
+            completed = subprocess.run(  # noqa: S603 - argv is from the agent's own table
+                command,
+                capture_output=True,
+                timeout=self.command_timeout,
+                check=False,
+                shell=False,
+            )
+        except subprocess.TimeoutExpired:
+            return (124, "timeout")
+        except OSError as error:
+            return (125, truncate(error.__class__.__name__))
+        output = completed.stdout[:MAX_COMMAND_OUTPUT].decode("utf-8", "replace")
+        return (completed.returncode, output)
+
+    # -- Verbs -------------------------------------------------------------
+
+    def hello(self, version: str, nonce: str, claimed: str, tag: str) -> str:
+        if version != PROTOCOL_VERSION:
+            return "ERR unsupported_version"
+        if not IDENTIFIER.match(nonce or "") or len(nonce) > 128:
+            return "ERR malformed"
+        with self._lock:
+            if nonce in self._nonces:
+                # A captured handshake cannot be replayed. Defence in depth:
+                # reaching this socket already needs the owner's privileges.
+                return "ERR replayed_nonce"
+            if len(self._nonces) > 65536:
+                self._nonces.clear()
+            self._nonces.add(nonce)
+        expected = hmac.new(
+            self.key,
+            (version + nonce + claimed).encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(expected, tag or ""):
+            return "ERR unauthenticated"
+        # Authenticated whether or not the digests agree: the router proved it
+        # holds the key, and it is the router that refuses to issue a mutating
+        # verb when the two views differ. Reporting the mismatch is more useful
+        # than refusing the session, because a refused session looks exactly
+        # like a wrong key.
+        return f"OK {AGENT_VERSION} {self.digest}"
+
+    def observe(self) -> bytes:
+        """Report what is actually running, from the hardware."""
+        deployments = []
+        hosts = []
+        accelerators = []
+        artifacts = []
+
+        for host in self.fleet.hosts.values():
+            reachable = True
+            free_disk = 0
+            code, output = self.run_on(host, ["df", "-B1", "--output=avail", host.disk_path])
+            if code != 0:
+                reachable = False
+            else:
+                for line in output.splitlines()[1:]:
+                    try:
+                        free_disk = int(line.strip())
+                    except ValueError:
+                        free_disk = 0
+                    break
+            hosts.append(
+                {
+                    "id": host.id,
+                    "reachable": reachable,
+                    "free_disk_bytes": max(free_disk, 0),
+                    "arch": host.arch,
+                }
+            )
+            if not reachable:
+                continue
+
+            # Accelerator memory, observed rather than configured, so the
+            # router can detect drift between declarations and the machine.
+            code, output = self.run_on(
+                host,
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,memory.used,memory.total",
+                    "--format=csv,noheader,nounits",
+                ],
+            )
+            if code == 0:
+                for line in output.splitlines():
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) != 3:
+                        continue
+                    index, used_mib, total_mib = parts
+                    match = next(
+                        (
+                            a
+                            for a in host.accelerators
+                            if str(a.get("index", "")) == index
+                        ),
+                        None,
+                    )
+                    if not match:
+                        continue
+                    try:
+                        used = int(used_mib) * 1024 * 1024
+                        total = int(total_mib) * 1024 * 1024
+                    except ValueError:
+                        continue
+                    accelerators.append(
+                        {
+                            "id": match["id"],
+                            "used_memory_bytes": used,
+                            "total_memory_bytes": total,
+                        }
+                    )
+
+            # Residency, from the container runtime.
+            code, output = self.run_on(
+                host, ["docker", "ps", "--format", "{{.Names}}\t{{.Status}}"]
+            )
+            running: dict[str, str] = {}
+            if code == 0:
+                for line in output.splitlines():
+                    name, _, status = line.partition("\t")
+                    running[name.strip()] = status.strip()
+
+            for deployment in self.fleet.deployments.values():
+                if deployment.host != host.id:
+                    continue
+                with self._lock:
+                    in_flight = self._states.get(deployment.id)
+                if in_flight in {"starting", "probing", "stopping", "draining", "fetching"}:
+                    state = in_flight
+                elif deployment.container and deployment.container in running:
+                    state = "ready" if self.probe(deployment) else "probing"
+                else:
+                    state = "stopped"
+                deployments.append(
+                    {
+                        "id": deployment.id,
+                        "state": state,
+                        "memory_bytes": 0,
+                        "state_age_ms": 0,
+                        "inflight": 0,
+                    }
+                )
+
+            for artifact in self.fleet.artifacts.values():
+                if artifact.arch != host.arch:
+                    continue
+                artifacts.append(
+                    {
+                        "id": artifact.id,
+                        "host": host.id,
+                        "present": self.artifact_present(host, artifact),
+                        "verified": self.artifact_present(host, artifact),
+                        "bytes_present": 0,
+                    }
+                )
+
+        payload = json.dumps(
+            {
+                "hosts": hosts,
+                "accelerators": accelerators,
+                "deployments": deployments,
+                "artifacts": artifacts,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(payload) > MAX_INVENTORY_BYTES:
+            # Bounded on this side too. A report the router would refuse is a
+            # report better not sent: it would age belief out for no reason.
+            payload = json.dumps({"hosts": hosts}, separators=(",", ":")).encode("utf-8")
+        return payload
+
+    def probe(self, deployment: Deployment) -> bool:
+        """Whether the deployment is actually serving.
+
+        A TCP connect is not readiness: a llama.cpp server accepts connections
+        long before it has finished mapping twenty gigabytes of weights. The
+        probe is a command from this agent's table.
+        """
+        if not deployment.probe:
+            return True
+        host = self.fleet.hosts[deployment.host]
+        code, _ = self.run_on(host, deployment.probe)
+        return code == 0
+
+    def artifact_present(self, host: Host, artifact: Artifact) -> bool:
+        code, output = self.run_on(
+            host, ["docker", "image", "inspect", "--format", "{{.Id}}", artifact.id]
+        )
+        return code == 0 and bool(output.strip())
+
+    def start_verb(self, deployment_id: str, lease: str, starting: bool) -> str:
+        if not IDENTIFIER.match(deployment_id or ""):
+            return "ERR malformed"
+        if not IDENTIFIER.match(lease or ""):
+            return "ERR malformed"
+        deployment = self.fleet.deployments.get(deployment_id)
+        if deployment is None:
+            # The allowlist. This is the trust boundary in one line.
+            return "ERR unknown_deployment"
+        host = self.fleet.hosts[deployment.host]
+
+        with self._lock:
+            # Idempotent per lease: re-sending returns the same activation
+            # rather than starting a second one, which is what makes the
+            # router's crash recovery tractable.
+            existing = self._leases.get(lease)
+            if existing:
+                return f"ACCEPTED {existing}"
+            if starting and not self.limiter.allow(host.id, host.max_activations_per_hour):
+                return "ERR rate_limited"
+            activation_id = f"act-{self._next}"
+            self._next += 1
+            activation = Activation(activation_id, deployment_id, starting)
+            self._activations[activation_id] = activation
+            self._leases[lease] = activation_id
+            self._states[deployment_id] = "starting" if starting else "stopping"
+
+        thread = threading.Thread(
+            target=self._run_activation, args=(activation, deployment, host), daemon=True
+        )
+        thread.start()
+        return f"ACCEPTED {activation_id}"
+
+    def _run_activation(
+        self, activation: Activation, deployment: Deployment, host: Host
+    ) -> None:
+        argv = deployment.start if activation.starting else deployment.stop
+        activation.state = "starting" if activation.starting else "stopping"
+        activation.detail = "running"
+        activation.progress = 100
+        code, _ = self.run_on(host, argv)
+        if activation.cancelled.is_set():
+            activation.state = "cancelled"
+            activation.detail = "cancelled"
+        elif code != 0:
+            activation.state = "failed"
+            activation.detail = f"exit_{code}"
+        elif activation.starting:
+            activation.state = "probing"
+            activation.detail = "probing"
+            activation.progress = 750
+            deadline = time.monotonic() + self.command_timeout
+            while time.monotonic() < deadline and not activation.cancelled.is_set():
+                if self.probe(deployment):
+                    activation.state = "ready"
+                    activation.detail = "ready"
+                    activation.progress = 1000
+                    break
+                time.sleep(2.0)
+            else:
+                if activation.state != "ready":
+                    activation.state = "failed"
+                    activation.detail = "probe_timeout"
+        else:
+            activation.state = "stopped"
+            activation.detail = "stopped"
+            activation.progress = 1000
+
+        with self._lock:
+            self._states[deployment.id] = activation.state
+
+    def fetch(self, artifact_id: str, host_id: str) -> str:
+        if not IDENTIFIER.match(artifact_id or "") or not IDENTIFIER.match(host_id or ""):
+            return "ERR malformed"
+        artifact = self.fleet.artifacts.get(artifact_id)
+        host = self.fleet.hosts.get(host_id)
+        if artifact is None:
+            return "ERR unknown_artifact"
+        if host is None:
+            return "ERR unknown_host"
+        if artifact.arch != host.arch:
+            # An x86-64 image will never run on an ARM64 host, and hours of
+            # bandwidth spent proving that is the most expensive way to learn it.
+            return "ERR arch_mismatch"
+        argv = artifact.host_pull.get(host_id)
+        if not argv:
+            return "ERR unknown_artifact"
+
+        with self._lock:
+            activation_id = f"act-{self._next}"
+            self._next += 1
+            activation = Activation(activation_id, artifact_id, True)
+            activation.state = "fetching"
+            self._activations[activation_id] = activation
+
+        def run() -> None:
+            code, _ = self.run_on(host, argv)
+            if code != 0:
+                activation.state = "failed"
+                activation.detail = f"exit_{code}"
+                return
+            # Verified before the artifact becomes usable. An unverified
+            # artifact must never be activated.
+            if self.verify(host, artifact):
+                activation.state = "ready"
+                activation.detail = "verified"
+                activation.progress = 1000
+            else:
+                activation.state = "failed"
+                activation.detail = "digest_mismatch"
+
+        threading.Thread(target=run, daemon=True).start()
+        return f"ACCEPTED {activation_id}"
+
+    def verify(self, host: Host, artifact: Artifact) -> bool:
+        code, output = self.run_on(
+            host, ["docker", "image", "inspect", "--format", "{{index .RepoDigests 0}}", artifact.id]
+        )
+        if code != 0:
+            return False
+        return artifact.digest.split(":")[-1] in output
+
+    def status(self, activation_id: str) -> str:
+        if not IDENTIFIER.match(activation_id or ""):
+            return "ERR malformed"
+        with self._lock:
+            activation = self._activations.get(activation_id)
+        if activation is None:
+            # Not "ready": a router that read an unknown activation as success
+            # would dispatch to a model that never started.
+            return "ERR unknown_activation"
+        state = activation.state if activation.state in STATES else "failed"
+        return f"OK {state} {truncate(activation.detail)} {activation.progress}"
+
+    def cancel(self, activation_id: str) -> str:
+        if not IDENTIFIER.match(activation_id or ""):
+            return "ERR malformed"
+        with self._lock:
+            activation = self._activations.get(activation_id)
+        if activation is None:
+            return "ERR unknown_activation"
+        activation.cancelled.set()
+        return "OK"
+
+
+class Handler(socketserver.BaseRequestHandler):
+    """One connection."""
+
+    def handle(self) -> None:
+        agent: Agent = self.server.agent  # type: ignore[attr-defined]
+        authenticated = False
+        buffer = b""
+        self.request.settimeout(300.0)
+
+        while True:
+            try:
+                chunk = self.request.recv(4096)
+            except (TimeoutError, socket.timeout, OSError):
+                return
+            if not chunk:
+                return
+            buffer += chunk
+            while b"\n" in buffer:
+                raw, _, buffer = buffer.partition(b"\n")
+                if len(raw) > MAX_LINE:
+                    self.send(b"ERR malformed\n")
+                    return
+                line = raw.decode("utf-8", "replace").strip()
+                if not line:
+                    return
+                reply, body = self.dispatch(agent, line, authenticated)
+                if line.startswith("HELLO ") and reply.startswith("OK "):
+                    authenticated = True
+                self.send(reply.encode("utf-8") + b"\n")
+                if body is not None:
+                    self.send(body)
+
+    def dispatch(
+        self, agent: Agent, line: str, authenticated: bool
+    ) -> tuple[str, bytes | None]:
+        parts = line.split(" ")
+        verb = parts[0]
+
+        if verb == "HELLO":
+            if len(parts) != 5:
+                return ("ERR malformed", None)
+            return (agent.hello(parts[1], parts[2], parts[3], parts[4]), None)
+
+        if not authenticated:
+            # Nothing before the handshake. An agent that answered OBSERVE to an
+            # unauthenticated caller would leak the fleet's shape to anyone who
+            # could reach the socket.
+            return ("ERR unauthenticated", None)
+
+        if verb == "OBSERVE" and len(parts) == 1:
+            payload = agent.observe()
+            return (f"OK {len(payload)}", payload)
+        if verb == "ACTIVATE" and len(parts) == 4:
+            return (agent.start_verb(parts[1], parts[2], True), None)
+        if verb == "DEACTIVATE" and len(parts) == 4:
+            return (agent.start_verb(parts[1], parts[2], False), None)
+        if verb == "FETCH" and len(parts) == 4:
+            return (agent.fetch(parts[1], parts[2]), None)
+        if verb == "STATUS" and len(parts) == 2:
+            return (agent.status(parts[1]), None)
+        if verb == "CANCEL" and len(parts) == 2:
+            return (agent.cancel(parts[1]), None)
+        return ("ERR unknown_verb", None)
+
+    def send(self, data: bytes) -> None:
+        try:
+            self.request.sendall(data)
+        except OSError:
+            pass
+
+
+class Server(socketserver.ThreadingUnixStreamServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="HypeLLM reference fleet agent")
+    parser.add_argument("--config", required=True, help="the agent's own fleet table, as JSON")
+    # Not required, because `--print-digest` needs neither: an operator
+    # comparing digests before deployment should not have to invent a socket
+    # path and a key to do it.
+    parser.add_argument("--socket", help="Unix socket to listen on")
+    parser.add_argument("--key", help="path to fleet.key")
+    parser.add_argument("--agent-id", default="local", help="the identifier the router uses")
+    parser.add_argument(
+        "--command-timeout",
+        type=int,
+        default=DEFAULT_COMMAND_TIMEOUT,
+        help="seconds any one remote command may take",
+    )
+    parser.add_argument("--print-digest", action="store_true", help="print the digest and exit")
+    args = parser.parse_args()
+
+    global _AGENT_NAME
+    _AGENT_NAME = args.agent_id
+
+    with open(args.config, "rb") as handle:
+        fleet = Fleet(json.load(handle))
+
+    if args.print_digest:
+        print(fleet.digest())
+        return 0
+
+    if not args.socket or not args.key:
+        print("--socket and --key are required to serve", file=sys.stderr)
+        return 2
+
+    with open(args.key, "rb") as handle:
+        key = handle.read()
+    if len(key) < 32:
+        print("fleet.key must be at least 32 bytes", file=sys.stderr)
+        return 2
+
+    agent = Agent(fleet, key, args.command_timeout)
+
+    if os.path.exists(args.socket):
+        os.unlink(args.socket)
+    # Owner-only, set before the socket can be connected to. The permission is
+    # the first control and the HMAC is the second, because a permission that
+    # depends on a deployment getting a directory mode right is one mistake away
+    # from letting any local account stop production models.
+    previous = os.umask(0o177)
+    try:
+        server = Server(args.socket, Handler)
+    finally:
+        os.umask(previous)
+    os.chmod(args.socket, 0o600)
+    server.agent = agent  # type: ignore[attr-defined]
+
+    print(
+        f"fleet agent listening on {args.socket}; digest {fleet.digest()}",
+        file=sys.stderr,
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+        if os.path.exists(args.socket):
+            os.unlink(args.socket)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

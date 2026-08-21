@@ -247,7 +247,7 @@ Conceptual configuration (the implementation uses the native config grammar and 
 
 | **Selector**      | **Requested model** | **Preference**                                                                   |
 |-------------------|---------------------|----------------------------------------------------------------------------------|
-| user:albert       | code-premium        | 1 local:qwen-coder; 2 anthropic:claude-code; 3 openai:gpt-code; deny deepseek:\* |
+| user:operator       | code-premium        | 1 local:qwen-coder; 2 anthropic:claude-code; 3 openai:gpt-code; deny deepseek:\* |
 | group:engineering | code-fast           | 1 local:\*; 2 deepseek:coder; 3 kimi:code                                        |
 | tenant:default    | \*                  | 1 local healthy targets; 2 remote targets by cost/latency                        |
 
@@ -754,6 +754,85 @@ Migration is compatibility-led, not configuration emulation. Inventory actual cl
 | Group source for Google users | Local role bindings or separately provisioned directory sync; do not infer Google group membership from email domain.    |
 | Generic adapter               | Disabled by default; fixed endpoint and explicit capabilities required.                                                  |
 
+# 26. Fleet orchestration
+
+The router routes to targets that are *already running*. This section makes "already running" a decision rather than an assumption: the router models the machines behind its targets, decides what the fleet must become to satisfy a request, and starts and stops declared deployments through an out-of-process agent.
+
+The design reasoning is in `docs/orchestration.md`. What follows is normative; where the two disagree, this section wins.
+
+## 26.1 The capability contract
+
+A request is matched against a target on four independent axes, each an eligibility filter (§6.2) and never a score term.
+
+- **Verb** — the kind of work the model does, from a closed vocabulary. Distinct from `Operation`, which is the wire shape the caller used: a music model and a speech model both take text and emit audio, and no combination of modalities distinguishes them. An alias may declare a `capability`; a target that does not declare it is excluded with `capability_unsupported`.
+- **Modality** — extended with `document`. Documents are opaque bounded bytes. **The router MUST NOT parse a document**: no page counting, no text extraction, no rendering, and no format validation beyond matching a declared media type against a closed allowlist. A document URL is forwarded and never dereferenced, following the rule §10 already establishes for images.
+- **Feature** — tools, structured output, streaming, as before.
+- **Tier** — context, output, cost ceiling, and now a `quality_class` floor and a `reasoning_efforts` list. A request naming a tier no target supports is excluded with `reasoning_effort_unsupported` rather than silently downgraded.
+
+Token estimation MUST NOT be byte-derived for documents. Each document part contributes a configured constant, declared per target with a router-wide default, erring high. A reasoning tier's `output_multiplier` MUST be applied **at reservation**, before outbound I/O; reserving unmultiplied would let a single JSON field consume several times the held allowance.
+
+Inline document limits MUST be validated against `max_body_bytes` with base64 inflation applied, so a limit set that parses cannot then be refused by the body reader.
+
+## 26.2 Trust boundary
+
+The router MUST NOT execute a process. Actuation happens in a separate **fleet agent** across a narrow authenticated Unix socket, the third member of the family §4 (TLS helper) and §9.1 (identity verifier) already establish. The agent is platform-supplied and is part of the trusted computing base.
+
+The socket carries **identifiers and bounded integers only** — no image name, host address, file path, container name, flag, shell fragment, or URL. The agent holds its own allowlist mapping each identifier to a machine and a command, and the router cannot extend it. A fully compromised router can reorder declared deployments; it cannot introduce one.
+
+The handshake carries `HMAC-SHA-256(fleet.key, protocol-version ‖ nonce ‖ fleet-digest)` and the digest each side computes independently over the canonical fleet. On mismatch the router MUST issue no mutating verb and MUST exclude every orchestrated target with `fleet_configuration_mismatch`. The agent MUST reject a nonce it has already accepted.
+
+The agent's inventory is untrusted input. It MUST be parsed under explicit limits; identifiers the configuration does not declare MUST be dropped and counted, never adopted; numeric fields MUST be range-checked; and a reply violating a bound MUST fail the whole observation rather than partially updating belief.
+
+## 26.3 Belief, and what it gates
+
+Configuration is authoritative for what may exist; observation is the only source of what does; the router's durable leases are authoritative for what it asked for; belief is the last valid observation plus its age, and it **expires**.
+
+When the newest valid observation is older than `observation_max_age_ms`, cold orchestrated targets MUST become ineligible with `fleet_state_stale` and no plan may execute. Warm targets already serving continue under §13. A router that has never observed successfully MUST NOT be treated as having observed at age zero.
+
+Divergence between observation and intent MUST be audited and re-planned **from observation**, not corrected by re-asserting intent. A deployment observed running that the router did not start is adopted as resident for routing and is **not** router-owned: it is never placed in an eviction set unless the operator opts in.
+
+## 26.4 Planning
+
+Planning is a pure function of an immutable snapshot: no I/O, no secrets, no clock. Equal fleet, demand, and policy snapshots MUST produce equal plans, and the same function MUST serve both the request path and `POST /admin/v1/fleet:simulate`.
+
+Only an infeasible classification excludes. A target that is merely not running remains a candidate, ranked below a warm one — if "not currently running" excluded a target, no target would ever start.
+
+Warmness contributes to the existing `affinity_term` (§6.3) under a split budget. No new score term is introduced and `MAX_NON_RANK_MAGNITUDE` is unchanged, so priority rank still dominates: a cold rank-0 target outranks a warm rank-1 target and the swap happens.
+
+Eviction-set selection MUST be bounded and deterministic: exclude operator anchors, deployments inside their dwell window, busy deployments and deployments the router does not own; sort by retention value ascending with an identifier tie-break; take the smallest sufficient prefix, capped by `max_eviction_set`.
+
+## 26.5 Governance
+
+Five mechanisms, layered:
+
+1. **Dwell floor.** Once ready, a deployment MUST NOT be evicted by the planner for `min_resident_ms`. This is the only hard floor and the one that bounds the worst case.
+2. **Hysteresis margin.** Eviction requires incoming demand to *exceed* the evicted set's summed retention value by a configured margin, not merely equal it.
+3. **Demand batching.** Requests for a cold capability accumulate in a bounded per-capability queue; one activation serves all of them.
+4. **Cooldown and flap backoff.** After eviction a deployment MUST NOT be re-activated for `reactivation_cooldown_ms`, with exponential backoff on repetition, persisted across restart.
+5. **Activation budget.** A sliding window per host on activations per hour. It MUST be a window rather than a token bucket: a bucket that starts full permits twice its hourly rate in the first hour, and this is the mechanism the safety claim rests on. When exhausted, cold targets on that host MUST be refused with `activation_budget_exhausted` rather than queued indefinitely.
+
+Artifact acquisition MUST require a permission distinct from activation, MUST be off by default, and MUST verify a content digest before the artifact is activatable.
+
+## 26.6 Ordering and accounting
+
+The §3.1 lifecycle gains one step, placed between reservation and dispatch:
+
+1–3. Unchanged.
+4. Compute eligible targets, including the capability contract and residency classification.
+5. Rank; **reserve admission capacity** using the effort- and document-adjusted estimate.
+6. **New** — if the chosen candidate is not resident: acquire the activation lease, execute the plan, await readiness or fail over.
+7–9. Unchanged.
+
+Admission MUST be reserved before the activation lease. Both MUST be released exactly once on success, error, timeout, cancellation, client disconnect, deadline expiry, plan abandonment and shutdown; `Drop` alone is not trusted for either. A lease MUST be written durably **before** the mutating verb is sent, and agent verbs MUST be idempotent per lease so that re-issuing after a restart is safe.
+
+Activation failure occurs strictly before upstream acceptance, so §6.5 failover applies unchanged and the prohibition on splicing after semantic output is untouched.
+
+## 26.7 Disclosure
+
+Host identifiers, memory figures, residency and activation history are management-plane data. Data-plane errors derived from a fleet decision MUST say that the capability is unavailable and MUST NOT name a host, an accelerator, or what else is loaded. Management visibility MUST NOT exceed the caller's tenant and permissions.
+
+No prompt, tool argument, message or document may name a host, deployment, container, image, artifact or accelerator, or influence a plan by any path other than the resolved alias and its declared capability contract.
+
 # Appendix A — Example route decision
 
 | **Step**    | **Result**                                                                                                                                            |
@@ -786,6 +865,36 @@ Migration is compatibility-led, not configuration emulation. Inventory actual cl
 - The models endpoint reveals only authorized aliases.
 
 - No client-controlled value influences an upstream destination or credential handle.
+
+Fleet orchestration (§26) adds:
+
+- Every axis of the capability contract is an eligibility filter; none is a score term.
+
+- The router never parses a document, never fetches a document URL, and document bytes never influence routing.
+
+- A reasoning tier's output multiplier is applied at reservation, before outbound I/O.
+
+- A client hint never creates eligibility, never beats warmth, and never outranks a binding. The warmth ladder's minimum adjacent gap exceeds the maximum hint bonus.
+
+- The router never executes a process, and no identifier crossing the agent socket originates from a client.
+
+- A deployment inside its dwell window is never evicted by the planner, and a pinned or non-evictable deployment never appears in an eviction set.
+
+- No eviction occurs without exceeding the configured hysteresis margin, and an eviction set frees at least the required memory or the plan is refused.
+
+- Equal fleet, demand and policy snapshots produce equal plans.
+
+- Admission is reserved before an activation lease; both are released exactly once on every path.
+
+- No plan executes on an observation older than its configured maximum age.
+
+- The activation budget is a hard ceiling: when exhausted, requests are refused with a reason rather than queued indefinitely.
+
+- No artifact is activated before its digest is verified.
+
+- The agent handshake binds the protocol version and the fleet digest, and no nonce is accepted twice.
+
+- Data-plane errors reveal no host, accelerator or co-resident deployment.
 
 # Appendix C — Definition of done
 

@@ -7,9 +7,138 @@
 //! guess fails at the provider after the request has already been admitted,
 //! metered, and possibly streamed.
 
-use crate::canonical::{CostClass, Modality, Operation, Residency};
+use crate::canonical::{
+    CostClass, Modality, Operation, QualityClass, ReasoningEffort, Residency, TokenEstimate,
+};
 use crate::ids::{AliasId, CredentialRef, ProviderId, TargetId};
 use core::fmt;
+
+/// The kind of work a model does.
+///
+/// A closed vocabulary — never a client-supplied string, both because
+/// specification 10 forbids client-controlled routing inputs and because
+/// specification 17 forbids unbounded metric labels. Adding one is a code
+/// change and a review, not a configuration string.
+///
+/// `Capability` is distinct from [`Operation`]. `Operation` is the wire shape
+/// the client used; `Capability` is the work the model does. A music model and
+/// a text-to-speech model both take text and emit audio, and no combination of
+/// modalities distinguishes them — which is why the verb cannot be derived and
+/// must be declared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Capability {
+    /// Conversational text generation.
+    Chat,
+    /// Image understanding.
+    Vision,
+    /// Document understanding.
+    Document,
+    /// Embedding generation.
+    Embeddings,
+    /// Reranking.
+    Rerank,
+    /// Speech synthesis.
+    TextToSpeech,
+    /// Music generation.
+    TextToMusic,
+    /// Sound-effect generation.
+    TextToSfx,
+    /// Image generation.
+    TextToImage,
+    /// Video generation from text.
+    TextToVideo,
+    /// Video generation from an image.
+    ImageToVideo,
+    /// Video generation from audio.
+    AudioToVideo,
+    /// Lip synchronisation.
+    Lipsync,
+}
+
+impl Capability {
+    /// Stable configuration and metric token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Vision => "vision",
+            Self::Document => "document",
+            Self::Embeddings => "embeddings",
+            Self::Rerank => "rerank",
+            Self::TextToSpeech => "text-to-speech",
+            Self::TextToMusic => "text-to-music",
+            Self::TextToSfx => "text-to-sfx",
+            Self::TextToImage => "text-to-image",
+            Self::TextToVideo => "text-to-video",
+            Self::ImageToVideo => "image-to-video",
+            Self::AudioToVideo => "audio-to-video",
+            Self::Lipsync => "lipsync",
+        }
+    }
+
+    /// Parse from configuration.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "chat" => Self::Chat,
+            "vision" => Self::Vision,
+            "document" => Self::Document,
+            "embeddings" => Self::Embeddings,
+            "rerank" => Self::Rerank,
+            "text-to-speech" => Self::TextToSpeech,
+            "text-to-music" => Self::TextToMusic,
+            "text-to-sfx" => Self::TextToSfx,
+            "text-to-image" => Self::TextToImage,
+            "text-to-video" => Self::TextToVideo,
+            "image-to-video" => Self::ImageToVideo,
+            "audio-to-video" => Self::AudioToVideo,
+            "lipsync" => Self::Lipsync,
+            _ => return None,
+        })
+    }
+
+    /// Every verb, for exhaustiveness tests and the management API.
+    #[must_use]
+    pub const fn all() -> &'static [Self] {
+        &[
+            Self::Chat,
+            Self::Vision,
+            Self::Document,
+            Self::Embeddings,
+            Self::Rerank,
+            Self::TextToSpeech,
+            Self::TextToMusic,
+            Self::TextToSfx,
+            Self::TextToImage,
+            Self::TextToVideo,
+            Self::ImageToVideo,
+            Self::AudioToVideo,
+            Self::Lipsync,
+        ]
+    }
+
+    /// Whether work of this kind runs long enough to need job semantics.
+    ///
+    /// Advisory: it selects a default `patience` for the jobs endpoint and
+    /// nothing else. Eligibility never depends on it.
+    #[must_use]
+    pub const fn is_long_running(self) -> bool {
+        matches!(
+            self,
+            Self::TextToMusic
+                | Self::TextToVideo
+                | Self::ImageToVideo
+                | Self::AudioToVideo
+                | Self::Lipsync
+        )
+    }
+}
+
+impl fmt::Display for Capability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// The provider family an adapter is compiled for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -205,8 +334,26 @@ pub struct Provider {
 pub struct Capabilities {
     /// Operations the target serves.
     pub operations: Vec<Operation>,
+    /// Kinds of work the target does.
+    ///
+    /// Named `verbs` in Rust and `capabilities` in configuration, because
+    /// `target.capabilities.capabilities` would read as a typo at every call
+    /// site. A target declaring no verb is excluded from any alias that
+    /// declares one, which is the same fail-closed default the rest of this
+    /// struct takes.
+    pub verbs: Vec<Capability>,
     /// Input modalities it accepts.
     pub modalities: Vec<Modality>,
+    /// Reasoning tiers it supports.
+    ///
+    /// A list rather than a boolean: a target may serve `low` and `medium` and
+    /// refuse `high`. Empty means the target has nothing to say about effort,
+    /// and a request naming a tier is excluded rather than silently downgraded
+    /// — a downgrade produces a cheaper answer than the caller paid for and
+    /// tells nobody.
+    pub reasoning_efforts: Vec<ReasoningEffort>,
+    /// Per-tier output multipliers, overriding the defaults.
+    pub effort_multipliers: EffortMultipliers,
     /// Whether it supports streaming.
     pub streaming: bool,
     /// Whether it supports tool calling.
@@ -244,7 +391,10 @@ impl Default for Capabilities {
     fn default() -> Self {
         Self {
             operations: Vec::new(),
+            verbs: Vec::new(),
             modalities: vec![Modality::Text],
+            reasoning_efforts: Vec::new(),
+            effort_multipliers: EffortMultipliers::DEFAULT,
             streaming: false,
             tools: false,
             parallel_tool_calls: false,
@@ -271,6 +421,79 @@ impl Capabilities {
     #[must_use]
     pub fn supports_modalities(&self, required: &[Modality]) -> bool {
         required.iter().all(|m| self.modalities.contains(m))
+    }
+
+    /// Whether the target does this kind of work.
+    ///
+    /// A target that declares no verb at all supports none. Aliases that
+    /// declare no capability do not consult this, so a deployment-free,
+    /// verb-free configuration routes exactly as it did before the axis
+    /// existed.
+    #[must_use]
+    pub fn supports_capability(&self, verb: Capability) -> bool {
+        self.verbs.contains(&verb)
+    }
+
+    /// Whether the target supports a requested reasoning tier.
+    ///
+    /// [`ReasoningEffort::Unset`] is always supported: the caller asked for
+    /// nothing, so there is nothing to refuse.
+    #[must_use]
+    pub fn supports_effort(&self, effort: ReasoningEffort) -> bool {
+        effort == ReasoningEffort::Unset || self.reasoning_efforts.contains(&effort)
+    }
+}
+
+/// Per-tier multipliers applied to reserved output tokens.
+///
+/// One field per declarable tier rather than a map, so that every tier has a
+/// value by construction and a configuration cannot leave one undefined and
+/// discover at reservation time that it defaulted to something.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffortMultipliers {
+    /// Multiplier for [`ReasoningEffort::Minimal`].
+    pub minimal: u32,
+    /// Multiplier for [`ReasoningEffort::Low`].
+    pub low: u32,
+    /// Multiplier for [`ReasoningEffort::Medium`].
+    pub medium: u32,
+    /// Multiplier for [`ReasoningEffort::High`].
+    pub high: u32,
+}
+
+impl EffortMultipliers {
+    /// The specification's defaults: 1 / 2 / 4 / 8.
+    pub const DEFAULT: Self = Self {
+        minimal: 1,
+        low: 2,
+        medium: 4,
+        high: 8,
+    };
+
+    /// The largest multiplier an administrator may declare.
+    ///
+    /// A bound rather than a suggestion: the multiplier scales a reservation,
+    /// so an unbounded one is an unbounded hold on a tenant's quota taken out
+    /// by a single request.
+    pub const MAX: u32 = 64;
+
+    /// The multiplier for a tier.
+    #[must_use]
+    pub const fn for_effort(&self, effort: ReasoningEffort) -> u32 {
+        match effort {
+            // Nothing was requested, so nothing is scaled.
+            ReasoningEffort::Unset => 1,
+            ReasoningEffort::Minimal => self.minimal,
+            ReasoningEffort::Low => self.low,
+            ReasoningEffort::Medium => self.medium,
+            ReasoningEffort::High => self.high,
+        }
+    }
+}
+
+impl Default for EffortMultipliers {
+    fn default() -> Self {
+        Self::DEFAULT
     }
 }
 
@@ -327,6 +550,17 @@ pub struct Target {
     pub capabilities: Capabilities,
     /// Relative cost class, administrator-assigned.
     pub cost_class: CostClass,
+    /// Relative quality class, administrator-assigned.
+    ///
+    /// Independent of `cost_class`. Defaults to the lowest class, so a target
+    /// that never declared one does not satisfy a floor.
+    pub quality_class: QualityClass,
+    /// Tokens charged per document part when reserving for this target.
+    ///
+    /// `None` uses the router-wide default. Declared per target because the
+    /// same document costs a page-image model and a text-extracting model
+    /// quite different amounts.
+    pub document_token_estimate: Option<u32>,
     /// Data region this target's inference happens in.
     pub residency: Option<Residency>,
     /// Whether inference is local to this deployment.
@@ -367,6 +601,24 @@ impl Target {
         }
     }
 
+    /// Whether the target's quality class meets a floor.
+    #[must_use]
+    pub fn meets_quality_floor(&self, floor: Option<QualityClass>) -> bool {
+        match floor {
+            None => true,
+            Some(min) => self.quality_class >= min,
+        }
+    }
+
+    /// The token-estimate inputs this target declares for a reasoning tier.
+    #[must_use]
+    pub fn token_estimate(&self, effort: ReasoningEffort, default_document: u32) -> TokenEstimate {
+        TokenEstimate {
+            document_token_estimate: self.document_token_estimate.unwrap_or(default_document),
+            output_multiplier: self.capabilities.effort_multipliers.for_effort(effort),
+        }
+    }
+
     /// Whether the target publishes this alias.
     #[must_use]
     pub fn has_alias(&self, alias: &AliasId) -> bool {
@@ -379,6 +631,13 @@ impl Target {
 pub struct Alias {
     /// The client-visible name.
     pub id: AliasId,
+    /// The kind of work this alias asks for.
+    ///
+    /// `None` means the alias predates the capability axis and is routed
+    /// exactly as before, which is what keeps every existing configuration
+    /// byte-identical in behaviour. Declaring it excludes any target that does
+    /// not declare the same verb.
+    pub capability: Option<Capability>,
     /// Targets permitted for this alias.
     pub permitted_targets: Vec<TargetId>,
     /// Whether failover across model families is allowed.
@@ -403,6 +662,9 @@ mod tests {
             capabilities: Capabilities {
                 operations: vec![Operation::Chat],
                 modalities: vec![Modality::Text],
+                verbs: Vec::new(),
+                reasoning_efforts: Vec::new(),
+                effort_multipliers: Default::default(),
                 streaming: true,
                 tools: true,
                 max_context_tokens: 65_536,
@@ -410,6 +672,8 @@ mod tests {
                 ..Capabilities::default()
             },
             cost_class: CostClass::CHEAPEST,
+            quality_class: Default::default(),
+            document_token_estimate: None,
             residency: Some(Residency::new("eu")),
             is_local: true,
             admin_state: AdminState::Enabled,
@@ -439,6 +703,9 @@ mod tests {
     fn modality_support_requires_every_requested_modality() {
         let c = Capabilities {
             modalities: vec![Modality::Text],
+            verbs: Vec::new(),
+            reasoning_efforts: Vec::new(),
+            effort_multipliers: Default::default(),
             ..Capabilities::default()
         };
         assert!(c.supports_modalities(&[Modality::Text]));
@@ -447,6 +714,9 @@ mod tests {
 
         let c = Capabilities {
             modalities: vec![Modality::Text, Modality::Image],
+            verbs: Vec::new(),
+            reasoning_efforts: Vec::new(),
+            effort_multipliers: Default::default(),
             ..Capabilities::default()
         };
         assert!(c.supports_modalities(&[Modality::Text, Modality::Image]));

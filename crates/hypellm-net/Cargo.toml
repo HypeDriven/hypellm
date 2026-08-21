@@ -7,11 +7,20 @@ license.workspace = true
 publish.workspace = true
 description = "Egress guard, DNS policy, connection pools, TLS helper boundary."
 
+[features]
+# Test scaffolding: the simulated fleet agent. It binds sockets, uses `expect`,
+# and holds a fixed key, which specification 18.2 permits in tests and nowhere
+# else. Off by default so it is not part of the library a non-test consumer
+# sees.
+test-harness = []
+
 [lints]
 workspace = true
 
 [dependencies]
 hypellm-core = { path = "../hypellm-core" }
+hypellm-crypto = { path = "../hypellm-crypto" }
+hypellm-fleet = { path = "../hypellm-fleet" }
 hypellm-auth = { path = "../hypellm-auth" }
 wire-http1 = { path = "../wire-http1" }
 wire-json = { path = "../wire-json" }
@@ -21,3 +30,6 @@ wire-sse = { path = "../wire-sse" }
 # `TempDir` is behind `test-harness` (specification 18.2), and this crate's
 # helper-socket tests need one.
 hypellm-store = { path = "../hypellm-store", features = ["test-harness"] }
+# The simulated fleet agent, so this crate's own tests exercise the client
+# against a conformant server rather than a scripted byte stream.
+hypellm-net = { path = ".", features = ["test-harness"] }

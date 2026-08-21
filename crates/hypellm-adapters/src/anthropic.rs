@@ -27,7 +27,8 @@ use crate::contract::{
     ValidationFailure, ValidationResult, class_for_status, sanitize_provider_code,
 };
 use hypellm_core::canonical::{
-    CanonicalRequest, ContentPart, ImageSource, Operation, ResponseFormat, Role, ToolChoice,
+    CanonicalRequest, ContentPart, DocumentSource, ImageSource, Operation, ReasoningEffort,
+    ResponseFormat, Role, ToolChoice,
 };
 use hypellm_core::event::{
     CanonicalEvent, CanonicalUsage, FinishReason, ToolCallDelta, UpstreamErrorClass, UsageSource,
@@ -223,6 +224,18 @@ impl Adapter for AnthropicAdapter {
         }
         if let Some(choice) = &request.tool_choice {
             body.push_opt("tool_choice", encode_tool_choice(choice));
+        }
+
+        // This family expresses a reasoning tier as a token budget rather than
+        // a named level, so the tier maps to a fraction of `max_tokens`. The
+        // budget must stay strictly below `max_tokens` — the provider rejects a
+        // budget that equals or exceeds it — and a tier that would leave no
+        // room for an answer sends nothing at all rather than a budget of one.
+        if let Some(budget) = thinking_budget(request.reasoning_effort, max_tokens) {
+            let mut thinking = Object::new();
+            thinking.push("type", Value::from("enabled"));
+            thinking.push("budget_tokens", Value::from(budget));
+            body.push("thinking", Value::Object(thinking));
         }
 
         let sampling = &request.sampling;
@@ -589,6 +602,37 @@ fn encode_messages(request: &CanonicalRequest) -> Result<Value, ValidationFailur
     Ok(Value::Array(messages))
 }
 
+/// The thinking budget a reasoning tier implies, given the output limit.
+///
+/// Anthropic's minimum is 1,024 tokens, so anything that would fall below it
+/// sends no `thinking` block at all: a budget the provider refuses turns a
+/// tier the router already validated into a 4xx after admission.
+///
+/// The fractions are eighths of `max_tokens` — 1, 2, 4 — so the arithmetic
+/// stays integer and the budget scales with what the caller asked for rather
+/// than with a constant that is wrong for both a 256-token and a 32,000-token
+/// request.
+fn thinking_budget(effort: ReasoningEffort, max_tokens: u32) -> Option<u32> {
+    /// The provider's documented floor.
+    const MINIMUM: u32 = 1_024;
+    /// Leave at least this much of `max_tokens` for the answer itself.
+    const ANSWER_RESERVE: u32 = 512;
+
+    let eighths = match effort {
+        ReasoningEffort::Unset => return None,
+        // A tier was named but this family has no "as little as possible"
+        // setting below its own minimum, so `minimal` takes the floor.
+        ReasoningEffort::Minimal | ReasoningEffort::Low => 1,
+        ReasoningEffort::Medium => 2,
+        ReasoningEffort::High => 4,
+    };
+    let budget = max_tokens.div_euclid(8).saturating_mul(eighths).max(MINIMUM);
+    if budget.saturating_add(ANSWER_RESERVE) >= max_tokens {
+        return None;
+    }
+    Some(budget)
+}
+
 fn encode_content_part(part: &ContentPart) -> Result<Value, ValidationFailure> {
     let mut object = Object::new();
     match part {
@@ -613,6 +657,26 @@ fn encode_content_part(part: &ContentPart) -> Result<Value, ValidationFailure> {
             source.push("type", Value::from("url"));
             source.push("url", Value::from(url.as_str()));
             object.push("source", Value::Object(source));
+        }
+        // Anthropic's document block, which is the shape the family already
+        // uses for PDFs. The bytes are forwarded exactly as received: the
+        // router does not decode them, does not inspect them, and does not
+        // fetch a URL-form document.
+        ContentPart::Document { media_type, source } => {
+            object.push("type", Value::from("document"));
+            let mut src = Object::new();
+            match source {
+                DocumentSource::Inline { base64_data } => {
+                    src.push("type", Value::from("base64"));
+                    src.push("media_type", Value::from(media_type.as_str()));
+                    src.push("data", Value::from(base64_data.as_str()));
+                }
+                DocumentSource::Url(url) => {
+                    src.push("type", Value::from("url"));
+                    src.push("url", Value::from(url.as_str()));
+                }
+            }
+            object.push("source", Value::Object(src));
         }
         ContentPart::Audio { .. } => {
             return Err(ValidationFailure::new(

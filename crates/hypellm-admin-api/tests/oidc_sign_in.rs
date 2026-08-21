@@ -97,7 +97,7 @@ impl FakeVerifier {
             exp: now_secs + 3600,
             iat: now_secs,
             nonce: self.nonce.lock().unwrap().clone(),
-            email: Some("albert@example.com".to_owned()),
+            email: Some("operator@example.com".to_owned()),
             email_verified: true,
             hd: Some("example.com".to_owned()),
             name: Some("Albert".to_owned()),
@@ -152,8 +152,8 @@ target id=local:model provider=local model=m local=true operations=chat \\
        streaming=true context=1000 max_output=100
 alias id=test-alias targets=local:model
 grant scope=tenant:globex model=* allow=true
-identity issuer={ISSUER} subject={SUBJECT} principal=user:albert tenant=globex
-role_binding subject=principal:user:albert role=operator
+identity issuer={ISSUER} subject={SUBJECT} principal=user:operator tenant=globex
+role_binding subject=principal:user:operator role=operator
 "
     )
 }
@@ -238,7 +238,7 @@ fn a_complete_sign_in_establishes_a_session_in_the_bound_tenant() {
         .expect("the issued session validates");
 
     assert_eq!(session.tenant.as_str(), "globex");
-    assert_eq!(session.principal.as_str(), "user:albert");
+    assert_eq!(session.principal.as_str(), "user:operator");
     assert_eq!(session.method, hypellm_auth::AuthMethod::Oidc);
 }
 

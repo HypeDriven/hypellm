@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The specification is `secure_llm_router_specification.md` (v1.0, "HypeLLM Router"). It is the authority: when this file and the specification disagree, the specification wins.
 
-The implementation is a Rust workspace of 16 crates plus a static admin SPA under `web/`. It is **not** feature-complete against the specification; `docs/deferred-issues.md` lists only the current limitations and accepted deviations.
+The implementation is a Rust workspace of 17 crates, a static admin SPA under `web/`, and a reference fleet agent under `agent/` that is deliberately **not** a workspace member. It is **not** feature-complete against the specification; `docs/deferred-issues.md` lists only the current limitations and accepted deviations.
 
 The repository uses Git. Do not assume an edited working tree is disposable.
 
@@ -26,7 +26,7 @@ Running the router:
 
 ```bash
 cargo run -p hypellm-router -- --generate-secrets <dir>      # creates the key bundle and credentials/
-cargo run -p hypellm-router -- --check --config <path>       # validate configuration and exit
+cargo run -p hypellm-router -- --check --config <path>       # validate configuration; prints the fleet digest too
 cargo run -p hypellm-router -- --config <path> --secrets <dir> [--static web] [--log info]
 cargo run -p hypellm-router -- --shutdown --config <path> --secrets <dir>   # graceful stop
 ```
@@ -58,13 +58,14 @@ These are the spec's defining decisions. Most "obvious" implementation choices v
 - **`#![forbid(unsafe_code)]` workspace-wide**; `unwrap`/`expect` are forbidden outside startup invariants and tests; no panics on data-plane input; all integer conversions checked (§18.2).
 - **Configuration is a custom line-oriented grammar, not YAML/TOML** — records of the form `type key=value …`, JSON-style quoted strings, `#` comments, unknown fields are errors. No includes, env-var expansion, anchors, or templates (§11.1).
 - **The SPA has no `vendor/` directory.** First-party HTML/CSS/ES-modules/SVG only; no eval, no inline handlers, no HTML string injection (build DOM nodes), no service-worker code execution, strict CSP (§15).
-- **Everything is bounded.** No unbounded thread, task, buffer, channel, queue, retry loop, or log entry may originate from a request. Header/body/JSON-depth/stream-buffer limits are in §3.2; every I/O has a deadline and cancellation path.
+- **Everything is bounded.** No unbounded thread, task, buffer, channel, queue, retry loop, or log entry may originate from a request. Header/body/JSON-depth/stream-buffer limits are in §3.2; every I/O has a deadline and cancellation path. A request may not create an unbounded amount of *fleet work* either: activation queues, plan sizes, eviction sets and leases all carry finite maxima.
+- **The router never executes a process.** Starting a container means `ssh` and `docker`, which happens in `agent/` across a narrow authenticated Unix socket carrying opaque identifiers and bounded integers only. `depscan`'s `forbidden-api` rule fails the build on `process::Command`; do not work around it (§26.2).
 
 ## Architecture shape
 
 Two artifacts: the `hypellm-router` binary and a directory of immutable static web assets. The data path (inference listener) and management path (`/admin/v1`) are separated in code, scheduling, rate limits, auth scopes, and listeners — even while in one process — so they can split later without API changes.
 
-Workspace crates as built. §18.1 names most of these; the five marked *(addition)* are not in the specification's list and each has a stated reason in its `MODULE.md`.
+Workspace crates as built. §18.1 names most of these; the six marked *(addition)* are not in the specification's list and each has a stated reason in its `MODULE.md`.
 
 | Crate | Responsibility |
 |---|---|
@@ -72,6 +73,7 @@ Workspace crates as built. §18.1 names most of these; the five marked *(additio
 | `hypellm-core` | Canonical types, routing policy, scoring, admission, health/breakers, decision traces. Pure: no I/O, no secrets |
 | `hypellm-config` | The §11.1 line-oriented grammar, schema, reference resolution, digest *(addition)* |
 | `hypellm-store` | Append-only framed log, snapshots, atomic activation, audit hash chain |
+| `hypellm-fleet` | Fleet domain model, observation, the pure planner, anti-thrash governance, activation state machine, agent protocol codec *(addition)* |
 | `hypellm-auth` | API keys, OIDC transactions and sessions, peer/edge identity |
 | `hypellm-adapters` | Compile-time provider families. The only code that touches provider credentials |
 | `hypellm-net` | Egress guard, bounded upstream client, connection pool, DNS pool, TLS/verifier helpers *(addition)* |
@@ -90,6 +92,7 @@ Layer responsibilities that matter when placing new code:
 - **Router core** decides; it holds no secrets and does no I/O. `PolicySnapshot::route(ctx, req, live)` returns ranked candidates plus exclusion reasons.
 - **Adapters** are the *only* code that touches provider credentials. They do typed conversion, endpoint paths, auth header construction, stream decoding, error mapping — and nothing else. They make no routing decisions, read no files, resolve no arbitrary hosts.
 - **Store** owns the append-only framed log + snapshots. Config activation is: validate off-path → durable commit → atomic pointer swap. In-flight requests keep their prior snapshot; partial mutation is never visible.
+- **Fleet** decides what the fleet must *become*; it holds no socket, no clock and no secret. `plan(&FleetSnapshot, &DemandSnapshot, &TargetId, &PlanContext)` is pure, so the same function serves the request path and `POST /admin/v1/fleet:simulate`. The socket lives in `hypellm-net::fleet`, the runtime in `hypellm-router::fleet`, and the process that runs `ssh` and `docker` is in `agent/`, outside the build.
 
 ## Invariants to preserve in any change
 
@@ -100,6 +103,9 @@ Appendix B is the checklist; the ones most easily broken by ordinary edits:
 - Equal (request, policy snapshot, live state) ⇒ equal ordered candidates. The only permitted nondeterminism is a `request_id`-seeded tie-break; never map iteration order.
 - Every selection holds an admission reservation *before* outbound I/O, and every reservation is released exactly once on success, error, timeout, and cancellation. `Drop` alone is not trusted for accounting.
 - **Never splice failover output after client-visible semantic bytes.** Fail over freely before upstream acceptance; only for idempotent requests after acceptance; never after the first content or tool delta — emit a normalized error and close (§6.5).
+- **Fleet: only `Infeasible` excludes.** A target that is merely not running is still a candidate, ranked below a warm one. If "not currently running" excluded a target, no target would ever start (§26.4).
+- **Fleet: admission is reserved before the activation lease**, and both release exactly once on every path. Evicting a running model and *then* discovering the tenant is over quota is the unforced error the ordering exists to prevent.
+- **Fleet: no plan executes on stale belief.** Past `observation_max_age_ms` cold targets are ineligible; warm ones keep serving. A stale-state swap costs minutes of fleet time and can cascade.
 - No client-controlled value may influence an upstream destination, Host/SNI, credential handle, file path, or socket. Destinations are administrator-configured tuples; redirects off; proxy env vars ignored (§10).
 - The models endpoint and all management responses reveal only what the caller's tenant and permissions allow.
 - Prompts are inert data — never interpreted as configuration, destination, credential, or admin instruction.
@@ -114,15 +120,17 @@ Credentials live behind opaque handles resolved only inside the adapter boundary
 
 All layers except a few fuzz rows now exist:
 
-- **Property** — `crates/hypellm-core/tests/properties.rs`: 14 properties over Appendix B (routing determinism, deny monotonicity, pin semantics, reservation conservation, score overflow), each across 400 seeded cases.
-- **Fuzz** — `tests/fuzz.rs` in `wire-json` (6), `wire-http1` (7), `wire-sse` (8), `hypellm-config` (7), `hypellm-store` (7), `hypellm-adapters` (9), `hypellm-admin-api` (9), and `hypellm-router` (9). That is all seven areas §21 names, plus the client protocol parsers. There is **no `fuzz/` directory and no libFuzzer** — §4 admits no such dependency. The engine is a seeded deterministic mutator in `hypellm-test-corpus::fuzz`, driven from ordinary `#[test]` functions so `cargo test` runs it and a failure is reproducible by seed number.
+- **Property** — `crates/hypellm-core/tests/properties.rs`: 14 properties over Appendix B (routing determinism, deny monotonicity, pin semantics, reservation conservation, score overflow), each across 400 seeded cases. `crates/hypellm-core/tests/capability.rs` adds 16 over the §26.1 contract, and `crates/hypellm-fleet/tests/properties.rs` 12 over the §26.4/§26.5 fleet invariants.
+- **Fuzz** — `tests/fuzz.rs` in `wire-json` (6), `wire-http1` (7), `wire-sse` (8), `hypellm-config` (7), `hypellm-store` (7), `hypellm-adapters` (9), `hypellm-admin-api` (9), `hypellm-router` (9), and `hypellm-fleet` (8: agent inventory, agent replies, lease accounting). That is all seven areas §21 names, plus the client protocol parsers. There is **no `fuzz/` directory and no libFuzzer** — §4 admits no such dependency. The engine is a seeded deterministic mutator in `hypellm-test-corpus::fuzz`, driven from ordinary `#[test]` functions so `cargo test` runs it and a failure is reproducible by seed number.
 - **What that does not mean.** It is not coverage-guided and does not shrink, so it finds what its seeds and mutation strategies reach. A failing case prints at whatever size it was generated.
 
 A fuzz target that only asserts "does not panic" is close to worthless here. Each of these asserts a property the code could plausibly violate — no silent widening, no leaked body, no identity taken from a caller, no unauthenticated success — and three of them have found real defects. When adding one, write the property first.
 
 Keep fuzz documentation aligned with the suites that exist. The required seven areas are present; module-specific optional targets may still be absent and must not be claimed as implemented.
 
-Two-person review is required for changes to auth, parsers, adapter credential handling, policy activation, and storage integrity.
+- **Fleet integration** — `crates/hypellm-router/tests/fleet.rs` drives the real client over a real Unix socket against `hypellm_net::fleet_sim::SimulatedAgent`, which verifies the handshake HMAC and enforces its own allowlist. `Clock::sleep` advances a `TestClock` rather than blocking, so a three-minute model load takes microseconds and the deadline arithmetic is exact. No SSH, no Docker, no network.
+
+Two-person review is required for changes to auth, parsers, adapter credential handling, policy activation, storage integrity, the fleet agent protocol, lease accounting, and the eviction path.
 
 ### What a test here is for
 

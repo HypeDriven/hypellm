@@ -8,13 +8,13 @@ input/resource limits.
 |---|---|
 | Owner | Security (primary), Platform (secondary) |
 | Unsafe code | None. `#![forbid(unsafe_code)]` declared in `lib.rs` and inherited from the workspace lint table. |
-| External dependencies | None. Rust standard library plus workspace path dependencies: `hypellm-core`, `hypellm-crypto`, `hypellm-auth`, `wire-http1`, `wire-json`, `wire-sse`; `hypellm-store` for tests only. |
+| External dependencies | None. Rust standard library plus workspace path dependencies: `hypellm-core`, `hypellm-crypto`, `hypellm-fleet`, `hypellm-auth`, `wire-http1`, `wire-json`, `wire-sse`; `hypellm-store` for tests only. |
 | Fuzz targets | **None for this crate yet.** Four are required — see [Fuzz targets](#fuzz-targets). |
 
-Two declared dependencies are not used by `src/` today: `wire-sse` appears only
-in a streaming integration test, and `hypellm-crypto` is unreferenced. Neither is
-a supply-chain concern (both are workspace crates), but the manifest overstates
-the real coupling.
+One declared dependency is not used by `src/` today: `wire-sse` appears only in a
+streaming integration test. Not a supply-chain concern — it is a workspace crate
+— but the manifest overstates the real coupling. `hypellm-crypto` is now used, by
+the fleet handshake.
 
 ## Scope
 
@@ -27,6 +27,8 @@ things:
 | One bounded, deadline-driven upstream HTTP/1.1 exchange | `client` | 14, 18.2 |
 | Connection reuse keyed for credential isolation | `pool` | 19, 22.2 |
 | Clients for the platform TLS helper and the identity verifier | `helper` | 4, 9.1 |
+| Client for the fleet agent | `fleet` | 26.2 |
+| A conformant simulated fleet agent, behind `test-harness` | `fleet_sim` | 26.2 |
 
 ### What this module deliberately does not do
 
@@ -47,7 +49,13 @@ the line at the same place, and this crate sits on the router's side of it.
   "controlled resolver" of specification 10 is the classification that follows,
   not a bespoke DNS parser in the trusted computing base.
 - **No routing decisions.** Nothing here ranks, scores, or selects a target.
-  `Egress::acquire` takes an already-chosen `Endpoint` and `EgressProfile`.
+  `Egress::acquire` takes an already-chosen `Endpoint` and `EgressProfile`, and
+  `FleetSession` takes an already-chosen deployment identifier.
+- **No fleet decisions, and no process execution.** `fleet` is a socket, not a
+  planner: what a line means and what a reply may contain is
+  `hypellm_fleet::protocol`, which is pure and fuzzed. Nothing here decides what
+  to start, and nothing here runs `ssh` or `docker` — that is `agent/`, outside
+  the workspace, for the reason specification 4.1 gives.
 - **No credentials.** No type in this crate holds, reads, or constructs a
   provider credential. Authorization headers are built inside the adapter
   boundary and arrive here as opaque request bytes. The pool key carries a
@@ -173,6 +181,8 @@ Enforced within this crate:
 | Verifier claims document | 64 KiB | `helper::MAX_CLAIMS_BYTES`, checked against the declared length before allocating |
 | Token submitted for verification | 16 KiB | `helper::MAX_TOKEN_BYTES`, checked before any socket is opened |
 | Helper-supplied error code | 64 chars, `[A-Za-z0-9_-]` | `helper::sanitize_code` |
+| Fleet reply line | 512 bytes | `fleet::MAX_LINE`, byte-at-a-time against a fixed ceiling |
+| Fleet inventory payload | 256 KiB | `hypellm_fleet::state::MAX_INVENTORY_BYTES`, checked against the declared length before allocation |
 | Idle connections per pool key | 32 (default) | `PoolConfig::max_idle_per_key` |
 | Idle connections overall | 512 (default) | `PoolConfig::max_idle_total` |
 | Idle connection lifetime | 60 s (default) | `PoolConfig::idle_timeout_millis`, checked in `take` and `sweep` |

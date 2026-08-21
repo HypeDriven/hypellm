@@ -38,6 +38,7 @@ pub mod audit_index;
 pub mod cors;
 pub mod decisions;
 pub mod drafts;
+pub mod fleet;
 pub mod handlers;
 pub mod response;
 pub mod usage;
@@ -46,6 +47,7 @@ pub use audit_index::AuditIndex;
 pub use cors::{CorsPolicy, PreflightOutcome, security_headers};
 pub use decisions::DecisionCache;
 pub use drafts::{Draft, DraftStore, PublishRefusal};
+pub use fleet::{DeploymentPatch, FleetControl};
 pub use handlers::{
     AdminApi, AdminRequest, AdminState, BreakGlassPolicy, CredentialSink, ProbeOutcome,
 };

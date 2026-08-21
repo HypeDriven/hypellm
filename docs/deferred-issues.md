@@ -12,8 +12,31 @@ This page lists limitations that matter when evaluating or operating the current
 | Shutdown | The router has no signal handler. | Use the authenticated control socket through `hypellm-router --shutdown`; configure the supervisor's stop command accordingly. |
 | Streaming | Backpressure is bounded by synchronous flow control but there is no configurable stream high/low watermark. | Monitor `hypellm_stream_backpressure_milliseconds`; slow clients occupy their connection worker until a deadline or write timeout. |
 | Token estimation | Admission uses a conservative byte-based estimate rather than the selected model's tokenizer. | Expect some requests near token limits to be rejected conservatively. Provider `/v1/tokenize` support does not feed admission estimates. |
+| Routing hints | `prefer_target` now reorders eligible targets, within a bounded slice of the affinity term. It cannot create eligibility, beat a warmer target or outrank a binding. | Express hard preference through aliases and priority bindings; use the hint only to break ties between comparable targets. |
+| Long-running generative work | There is no `/v1/jobs` endpoint. Long generations are served through ordinary synchronous requests with a long deadline. | Set a generous `default_deadline_ms` for aliases whose targets take minutes, and expect the client to hold the connection. |
+| Predictive pre-warm | The router starts a deployment when demand arrives, never in anticipation of it. | Pin or pre-activate the models a shift depends on rather than relying on prediction. |
+| Artifact acquisition | `FETCH` exists and is digest-verified, but the reference agent's implementation restarts rather than resumes an interrupted download. | Pre-place large artifacts out of band; keep `allow_fetch=false` unless a fetch is being supervised. |
+| Cleartext to slaves | Plain HTTP is permitted to a private address under `egress=private_network`. Prompts and completions to an orchestrated slave are unencrypted on the operator's own network. | Treat the fleet network as trusted, or terminate TLS in front of each slave and use `scheme=https`. |
 | Optional data lifecycle fields | `capture_bodies` and tenant `retention_days` are accepted by the grammar but have no runtime effect. | Do not rely on body capture or automatic retention. Keep capture disabled and apply retention to exported operational data externally. |
 | Backups and audit export | Backup and immutable audit shipping are not scheduled automatically. | Quiesce and copy the state directory or use `Store::backup_to`; periodically call the audit export endpoint and store the result immutably. |
+
+## Fleet orchestration
+
+**Specification:** [orchestration.md](orchestration.md) §4–§10, §13, §17–§19. **Implementation:** `crates/hypellm-fleet`, `crates/hypellm-net/src/fleet.rs`, `crates/hypellm-router/src/fleet.rs`, `agent/`.
+
+The router observes a declared fleet, plans against it, and starts and stops declared deployments through an out-of-process agent. What is present: the capability contract, residency classification and warmth ranking, the planner with dwell floors, hysteresis, eviction sets and activation budgets, leases with exactly-once release and crash recovery, the management surface, and the Fleet and Activations screens.
+
+Four parts of the design are deliberately not implemented, and are listed rather than approximated:
+
+- **`POST /v1/jobs` (§11).** Long generations use ordinary synchronous requests with a long deadline. A job API would need a durable job store, resumable progress streams and an expiring result spool; none of that exists, and building it against services that are not yet routable would be building on speculation.
+- **Predictive pre-warm (§9.8).** Shipped disabled in the design and absent here. Starting a model before it is asked for is genuinely valuable and genuinely capable of doubling the swap rate when the prediction is poor.
+- **Resumable fetches (§12).** The reference agent's `FETCH` runs a pull and verifies the digest afterwards. A 40 GB download that fails partway restarts.
+- **Windows-host actuation.** Four of the six machines in the validated fleet are Windows hosts whose SSH lands in WSL. Driving `powershell.exe` interop from there is entirely the agent's concern — the router must never learn that some hosts need it — but the reference agent does not do it.
+
+Two deviations from the design document are worth naming, because both were found by building it:
+
+- **`HELLO` carries the fleet digest as well as covering it.** The design had the router send only a nonce and a tag computed over its own digest. An agent whose fleet file differs computes a different tag, so the handshake fails as `unauthenticated` — collapsing the two failures an operator most needs to tell apart. Sending the digest and covering it with the tag keeps the binding and makes a mismatch diagnosable.
+- **The activation budget is a sliding window, not a token bucket.** A bucket of twelve tokens refilling at twelve an hour permits twenty-four activations in the first hour, because it starts full. The safety claim the feature rests on is "twelve swaps per host per hour regardless of the attacker's rate", and only a window that counts actual activations in the trailing hour delivers it.
 
 ## Connection model
 
@@ -60,6 +83,14 @@ The command authenticates to the owner-only control socket with `control.key`, s
 Provider reads and client writes are synchronously coupled. If a client stops reading, its worker stops consuming the provider stream, which supplies backpressure without an additional unbounded queue. There is consequently no intermediate buffer on which configurable watermarks could operate.
 
 Use request deadlines, write timeouts and the backpressure metric to detect slow consumers. Raising the connection cap does not make an individual stalled stream cheaper.
+
+## The `prefer_target` routing hint has no effect
+
+**Specification:** §5.1. **Implementation:** `hypellm_core::canonical::RoutingHints` and `crates/hypellm-router/src/protocol/openai.rs`.
+
+`hypellm_routing.prefer_target` is parsed from the request body, validated as a target identifier, and correctly dropped unless the principal is permitted to supply hints. It is then never read by `PolicySnapshot::route`, which consults only `require_local`. The field's documentation comment states that it prefers the named target when that target is already eligible; no such preference is applied.
+
+The behaviour fails safe — an unhonoured hint cannot influence a destination — so this is a functionality gap rather than a security one. Callers that send the hint receive ordinary policy-ranked selection.
 
 ## Conservative token estimation
 

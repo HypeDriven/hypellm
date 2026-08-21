@@ -319,6 +319,35 @@ pub fn router_for(upstream: &FakeUpstream) -> TestRouter {
     router_with_config(upstream, &default_config_text(upstream.address.port()))
 }
 
+/// Attach a fleet runtime to a test router.
+///
+/// The runtime is built after the state, exactly as startup does, and published
+/// into the same `OnceLock` every holder of the `Arc` reads. A test that wants
+/// the *whole* path — request in, container started, response out — needs this
+/// plus a `SimulatedAgent` on the socket the configuration names.
+///
+/// # Panics
+///
+/// Panics if the configuration declares no active fleet, or if the runtime has
+/// already been attached: both mean the fixture is wrong.
+pub fn attach_fleet(router: &TestRouter, key: &[u8]) {
+    let config = router.state.config();
+    let runtime = crate::fleet::FleetRuntime::new(
+        Arc::clone(&config.fleet),
+        key.to_vec(),
+        Arc::clone(&router.state.clock),
+        Arc::clone(&router.state.telemetry),
+        Arc::clone(&router.state.store),
+    )
+    .expect("the test configuration must declare an enabled fleet with deployments");
+    runtime.adopt_policy(&config.snapshot);
+    runtime.observe();
+    assert!(
+        router.state.fleet.set(Arc::new(runtime)).is_ok(),
+        "a fleet runtime was already attached"
+    );
+}
+
 /// The configuration a test router uses by default.
 #[must_use]
 pub fn default_config_text(port: u16) -> String {
@@ -441,7 +470,12 @@ pub fn router_with_config(_upstream: &FakeUpstream, config_text: &str) -> TestRo
                 hypellm_auth::Scope::Models,
                 hypellm_auth::Scope::Tokenize,
             ],
-            Vec::new(),
+            // The operator role, so the harness key may cause fleet work. A
+            // plain inference key deliberately may not: `fleet.activate` is
+            // permission to make the *fleet* do something, not permission to
+            // reach a model, and the fleet tests below rely on that distinction
+            // being real.
+            vec![hypellm_core::rbac::Role::Operator],
             None,
             hypellm_auth::SourceRestriction::Any,
             Some("integration test key".to_owned()),
@@ -469,6 +503,7 @@ pub fn router_with_config(_upstream: &FakeUpstream, config_text: &str) -> TestRo
         trusted_edge: TrustedEdge::none(),
         decisions: Arc::new(hypellm_admin_api::DecisionCache::default()),
         usage: Arc::new(hypellm_admin_api::UsageAggregate::default()),
+        fleet: std::sync::OnceLock::new(),
     };
 
     TestRouter {

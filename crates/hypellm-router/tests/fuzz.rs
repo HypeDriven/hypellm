@@ -31,7 +31,7 @@
 use hypellm_core::ids::{PrincipalId, RequestId, TenantId};
 use hypellm_core::canonical::{CostClass, Residency};
 use hypellm_core::time::{Deadline, SystemClock};
-use hypellm_router::protocol::openai::ParseContext;
+use hypellm_router::protocol::openai::{DocumentLimits, ParseContext};
 use hypellm_router::protocol::{anthropic, openai};
 use hypellm_test_corpus::fuzz::{self, Rng};
 use std::time::Duration;
@@ -49,6 +49,8 @@ fn context() -> ParseContext {
         principal: PrincipalId::new(PRINCIPAL).expect("principal"),
         deadline: Deadline::after(&clock, Duration::from_secs(30)),
         hints_permitted: false,
+        min_quality_class: None,
+        document_limits: DocumentLimits::DEFAULT,
         residency: Some(Residency::new("eu")),
         max_cost_class: Some(CostClass::new(3)),
     }
@@ -180,21 +182,30 @@ fn a_hint_is_ignored_unless_the_principal_may_supply_one() {
     // permission". A hint that survived would let a caller narrow — and
     // therefore influence — selection.
     let mut rng = Rng::new(0x0c11_0003);
+    // Built from the constant the parser reads, not from a literal. These
+    // cases were planted under `"hypellm"` while `parse_hints` looked up
+    // `"hypellm_routing"`, so every one of them returned on the key lookup and
+    // never reached the permission gate: the target would have passed with the
+    // gate deleted. Deriving the key from `HINTS_KEY` makes that class of
+    // vacuous assertion impossible to reintroduce.
+    let key = hypellm_router::protocol::openai::HINTS_KEY;
     let hints = [
-        r#","hypellm":{"prefer_target":"local:model"}"#,
-        r#","hypellm":{"idempotency_key":"k"}"#,
-        r#","hypellm":{"session_affinity":"s"}"#,
+        format!(r#","{key}":{{"prefer_target":"local:model"}}"#),
+        format!(r#","{key}":{{"prefer_target":"openai:gpt","require_local":true}}"#),
+        format!(r#","{key}":{{"idempotency_key":"k"}}"#),
     ];
 
     for (name, parse, seeds) in parsers() {
         let mut asserted = 0u32;
+        let mut honoured_when_permitted = 0u32;
         for _ in 0..1_000 {
             let seed = rng.pick(seeds).copied().unwrap_or(b"{}");
             let Some(cut) = seed.iter().rposition(|b| *b == b'}') else {
                 continue;
             };
+            let hint = rng.pick(&hints).cloned().unwrap_or_default();
             let mut case = seed[..cut].to_vec();
-            case.extend_from_slice(rng.pick(&hints).copied().unwrap_or("").as_bytes());
+            case.extend_from_slice(hint.as_bytes());
             case.extend_from_slice(&seed[cut..]);
 
             let mut context = context();
@@ -206,11 +217,32 @@ fn a_hint_is_ignored_unless_the_principal_may_supply_one() {
                 request.hints.prefer_target.is_none(),
                 "{name} honoured a target hint from a principal not permitted one"
             );
+            assert!(
+                !request.hints.require_local,
+                "{name} honoured a locality hint from a principal not permitted one"
+            );
             asserted += 1;
+
+            // The other half of the property, and the half that makes the
+            // first half mean something: the same body *with* the permission
+            // must produce the hint. Without this, a parser that dropped every
+            // hint unconditionally would pass.
+            let mut permitted = context.clone();
+            permitted.hints_permitted = true;
+            if let Ok(request) = parse(&case, &permitted, &Limits::DEFAULT) {
+                if request.hints.prefer_target.is_some() || request.hints.require_local {
+                    honoured_when_permitted += 1;
+                }
+            }
         }
         assert!(
             asserted > 0,
             "{name}: no hinted body ever parsed, so nothing was asserted"
+        );
+        assert!(
+            honoured_when_permitted > 0,
+            "{name}: no hint was ever honoured even with permission, so the gate above \
+             asserts nothing"
         );
     }
 }

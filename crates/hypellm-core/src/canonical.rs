@@ -155,6 +155,103 @@ impl fmt::Debug for ImageSource {
     }
 }
 
+/// A declared document media type, from a closed allowlist.
+///
+/// Closed because the router forwards documents to providers that declared the
+/// modality and must never be talked into forwarding something else — and
+/// because the value reaches a metric label, which specification 17 requires to
+/// have a bounded vocabulary.
+///
+/// The router does **not** verify that the bytes match the declaration. It
+/// cannot: doing so would mean parsing the document, which is exactly what the
+/// data plane must not do. The declaration selects which targets are eligible;
+/// the provider is what interprets the bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DocumentType {
+    /// `application/pdf`
+    Pdf,
+    /// `text/plain`
+    PlainText,
+    /// `text/markdown`
+    Markdown,
+    /// `text/csv`
+    Csv,
+}
+
+impl DocumentType {
+    /// The media type string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pdf => "application/pdf",
+            Self::PlainText => "text/plain",
+            Self::Markdown => "text/markdown",
+            Self::Csv => "text/csv",
+        }
+    }
+
+    /// Parse a client-supplied media type.
+    ///
+    /// Parameters after a `;` — `text/plain; charset=utf-8` — are ignored, and
+    /// the type is matched case-insensitively, because both are ordinary in
+    /// real clients. Anything not on the list is rejected rather than passed
+    /// through.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        let base = s.split(';').next().unwrap_or(s).trim().to_ascii_lowercase();
+        Some(match base.as_str() {
+            "application/pdf" => Self::Pdf,
+            "text/plain" => Self::PlainText,
+            "text/markdown" | "text/x-markdown" => Self::Markdown,
+            "text/csv" => Self::Csv,
+            _ => return None,
+        })
+    }
+
+    /// Every type, for exhaustiveness tests.
+    #[must_use]
+    pub const fn all() -> &'static [Self] {
+        &[Self::Pdf, Self::PlainText, Self::Markdown, Self::Csv]
+    }
+}
+
+impl fmt::Display for DocumentType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A reference to document data.
+///
+/// Mirrors [`ImageSource`] exactly, including the rule its comment already
+/// states: a URL is **forwarded to the provider and never fetched by the
+/// router**. Fetching a caller-named URL would make the router an SSRF proxy
+/// (specification 10). Reusing the shape rather than inventing an upload
+/// endpoint means documents inherit a boundary that is already reasoned about
+/// and tested.
+#[derive(Clone, PartialEq, Eq)]
+pub enum DocumentSource {
+    /// Inline base64 document bytes.
+    Inline {
+        /// Base64 payload, exactly as received. Never decoded by the router.
+        base64_data: String,
+    },
+    /// An absolute URL, forwarded and never dereferenced here.
+    Url(String),
+}
+
+impl fmt::Debug for DocumentSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inline { base64_data } => {
+                write!(f, "Inline {{ base64_data: {} bytes }}", base64_data.len())
+            }
+            // The URL is caller-supplied and may itself be sensitive.
+            Self::Url(_) => f.write_str("Url([redacted])"),
+        }
+    }
+}
+
 /// One part of a message's content.
 #[derive(Clone, PartialEq)]
 pub enum ContentPart {
@@ -162,6 +259,20 @@ pub enum ContentPart {
     Text(String),
     /// An image.
     Image(ImageSource),
+    /// A document.
+    ///
+    /// Opaque bounded bytes. The router performs no page counting, no text
+    /// extraction, no rendering, and no format validation beyond matching the
+    /// declared media type against [`DocumentType`]'s allowlist. Adding a PDF
+    /// parser to the data plane would put a notoriously hostile format in front
+    /// of untrusted input, in a codebase whose entire parser strategy is small,
+    /// strict, in-repository, and fuzzed.
+    Document {
+        /// The declared media type.
+        media_type: DocumentType,
+        /// Where the bytes are.
+        source: DocumentSource,
+    },
     /// Audio, as base64 with a declared format.
     Audio {
         /// Format token such as `wav` or `mp3`.
@@ -190,6 +301,10 @@ impl ContentPart {
             Self::Image(ImageSource::Url(u)) => u.len(),
             Self::Audio { base64_data, .. } => base64_data.len(),
             Self::ToolResult { content, .. } => content.len(),
+            Self::Document { source, .. } => match source {
+                DocumentSource::Inline { base64_data } => base64_data.len(),
+                DocumentSource::Url(u) => u.len(),
+            },
         }
     }
 
@@ -200,7 +315,49 @@ impl ContentPart {
             Self::Text(_) | Self::ToolResult { .. } => Modality::Text,
             Self::Image(_) => Modality::Image,
             Self::Audio { .. } => Modality::Audio,
+            Self::Document { .. } => Modality::Document,
         }
+    }
+
+    /// Whether this part is a document.
+    ///
+    /// Documents are counted and budgeted separately from every other part
+    /// because their byte length says nothing about their token cost: a scanned
+    /// PDF is megabytes and few tokens, a dense text PDF is the reverse, and a
+    /// URL-form document has no length the router can see at all.
+    #[must_use]
+    pub const fn is_document(&self) -> bool {
+        matches!(self, Self::Document { .. })
+    }
+
+    /// The decoded byte length of an inline document part.
+    ///
+    /// Base64 carries three bytes in every four characters, minus padding.
+    /// Computed from the encoded length rather than by decoding: the router
+    /// never decodes a document, and a length check that had to allocate the
+    /// decoded form first would be a denial-of-service vector of its own.
+    /// Returns `None` for a URL-form document, whose size the router cannot
+    /// know and must not try to learn.
+    #[must_use]
+    pub fn inline_document_bytes(&self) -> Option<usize> {
+        let Self::Document {
+            source: DocumentSource::Inline { base64_data },
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let padding = base64_data
+            .as_bytes()
+            .iter()
+            .rev()
+            .take_while(|b| **b == b'=')
+            .count();
+        // `div_euclid` rather than `/`: this crate denies `integer_division`
+        // so that an accidental truncating divide in a score or a quota is a
+        // build failure, and the exemptions are named rather than assumed.
+        let decoded = base64_data.len().div_euclid(4).saturating_mul(3);
+        Some(decoded.saturating_sub(padding.min(2)))
     }
 }
 
@@ -221,6 +378,9 @@ impl fmt::Debug for ContentPart {
                 "ToolResult {{ tool_call_id: {tool_call_id:?}, {} bytes, is_error: {is_error} }}",
                 content.len()
             ),
+            Self::Document { media_type, source } => {
+                write!(f, "Document {{ media_type: {media_type}, {source:?} }}")
+            }
         }
     }
 }
@@ -234,6 +394,13 @@ pub enum Modality {
     Image,
     /// Audio.
     Audio,
+    /// Documents, forwarded opaquely.
+    ///
+    /// A distinct modality rather than a flavour of `Image` because it decides
+    /// eligibility on its own: the fleet's Qwen3.8 deployments run without the
+    /// vision projector deliberately, so they accept neither, while a target
+    /// may accept images and refuse documents.
+    Document,
 }
 
 impl Modality {
@@ -244,6 +411,7 @@ impl Modality {
             Self::Text => "text",
             Self::Image => "image",
             Self::Audio => "audio",
+            Self::Document => "document",
         }
     }
 
@@ -254,8 +422,15 @@ impl Modality {
             "text" => Self::Text,
             "image" => Self::Image,
             "audio" => Self::Audio,
+            "document" => Self::Document,
             _ => return None,
         })
+    }
+
+    /// Every modality, for exhaustiveness tests.
+    #[must_use]
+    pub const fn all() -> &'static [Self] {
+        &[Self::Text, Self::Image, Self::Audio, Self::Document]
     }
 }
 
@@ -501,6 +676,151 @@ impl fmt::Display for CostClass {
     }
 }
 
+/// An administrator-assigned quality class, ordered, higher is better.
+///
+/// Exactly symmetric with [`CostClass`], and deliberately independent of it.
+/// Cost and quality are not one axis: a local Q5 model may be cheaper *and*
+/// better than a remote Q4 one, and expressing "better" through `cost_class`
+/// makes that target either unreachable or mispriced.
+///
+/// Quantization itself stays unmodelled. What routing needs is memory,
+/// context, quality, and cost — all of which are declared. "Q5" is the
+/// operator's label in a target identifier, not a concept the router reasons
+/// about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct QualityClass(pub u8);
+
+impl QualityClass {
+    /// The lowest class.
+    pub const LOWEST: Self = Self(0);
+    /// The highest class the scale allows.
+    pub const HIGHEST: Self = Self(9);
+
+    /// Construct, clamping into range.
+    #[must_use]
+    pub const fn new(v: u8) -> Self {
+        Self(if v > 9 { 9 } else { v })
+    }
+}
+
+impl Default for QualityClass {
+    /// The default is the *lowest* class, not the middle one.
+    ///
+    /// A target whose configuration omits `quality` must not satisfy a floor
+    /// its operator never claimed it met. The same argument as
+    /// [`crate::target::Capabilities::default`]: an under-specified target does
+    /// not acquire a property by omission.
+    fn default() -> Self {
+        Self::LOWEST
+    }
+}
+
+impl fmt::Display for QualityClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// How much reasoning the caller is asking for.
+///
+/// [`ReasoningEffort::Unset`] is distinct from [`ReasoningEffort::Minimal`],
+/// per specification 5.1's existing rule that an explicit unset is distinct
+/// from zero. `Capabilities::reasoning` is a different question — it means
+/// "exposes reasoning content" — and is unchanged by this.
+///
+/// Effort is a routing input, not a provider passthrough. It multiplies
+/// expected output tokens, so it changes the admission reservation; it raises
+/// expected time to completion, so it changes the cold-start feasibility check;
+/// and each adapter family maps the tier to its own parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub enum ReasoningEffort {
+    /// The client said nothing. The provider's own default applies.
+    #[default]
+    Unset,
+    /// As little as the model supports.
+    Minimal,
+    /// Low.
+    Low,
+    /// Medium.
+    Medium,
+    /// High.
+    High,
+}
+
+impl ReasoningEffort {
+    /// Stable token for configuration, traces, and the closed metric label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unset => "unset",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
+    /// Parse from a client request or a capability declaration.
+    ///
+    /// Provider-specific spellings are not accepted here. A family that calls
+    /// this something else maps it inside its adapter, which is where
+    /// specification 7.1 puts typed conversion.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "unset" | "none" => Self::Unset,
+            "minimal" => Self::Minimal,
+            "low" => Self::Low,
+            "medium" => Self::Medium,
+            "high" => Self::High,
+            _ => return None,
+        })
+    }
+
+    /// Every tier a target may declare support for.
+    ///
+    /// Excludes [`ReasoningEffort::Unset`], which is the absence of a request
+    /// rather than a tier: a target cannot "not support" a caller saying
+    /// nothing.
+    #[must_use]
+    pub const fn declarable() -> &'static [Self] {
+        &[Self::Minimal, Self::Low, Self::Medium, Self::High]
+    }
+
+    /// Every value, for exhaustiveness tests.
+    #[must_use]
+    pub const fn all() -> &'static [Self] {
+        &[
+            Self::Unset,
+            Self::Minimal,
+            Self::Low,
+            Self::Medium,
+            Self::High,
+        ]
+    }
+
+    /// The default output multiplier for this tier.
+    ///
+    /// 1 / 2 / 4 / 8 for minimal / low / medium / high, and 1 for `Unset`. A
+    /// target may override the four declarable tiers; nothing may override
+    /// `Unset`, because there is no request to scale.
+    #[must_use]
+    pub const fn default_output_multiplier(self) -> u32 {
+        match self {
+            Self::Unset | Self::Minimal => 1,
+            Self::Low => 2,
+            Self::Medium => 4,
+            Self::High => 8,
+        }
+    }
+}
+
+impl fmt::Display for ReasoningEffort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A data residency requirement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Residency(String);
@@ -534,6 +854,11 @@ pub struct RequestLimits {
     pub deadline: Deadline,
     /// The most expensive class the request may select.
     pub max_cost_class: Option<CostClass>,
+    /// The lowest quality class the request will accept.
+    ///
+    /// A floor, exactly symmetric with `max_cost_class`'s ceiling and
+    /// independent of it. Neither is derived from the other.
+    pub min_quality_class: Option<QualityClass>,
     /// Required data residency.
     pub residency: Option<Residency>,
 }
@@ -631,6 +956,12 @@ pub struct CanonicalRequest {
     pub response_format: Option<ResponseFormat>,
     /// Sampling parameters.
     pub sampling: Sampling,
+    /// How much reasoning the caller asked for.
+    ///
+    /// Part of the capability contract, not a sampling parameter: it filters
+    /// targets that do not declare the tier and multiplies the admission
+    /// reservation before any outbound I/O.
+    pub reasoning_effort: ReasoningEffort,
     /// Request limits.
     pub limits: RequestLimits,
     /// Streaming options.
@@ -690,30 +1021,154 @@ impl CanonicalRequest {
         )
     }
 
+    /// Input bytes excluding document parts.
+    ///
+    /// The basis for the byte-derived half of the estimate. Documents are
+    /// excluded because their byte length says nothing about their token cost
+    /// in either direction, and a URL-form document has no length at all.
+    #[must_use]
+    pub fn non_document_input_byte_len(&self) -> usize {
+        let document_bytes: usize = self
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(|p| p.is_document())
+            .map(ContentPart::byte_len)
+            .sum();
+        self.input_byte_len().saturating_sub(document_bytes)
+    }
+
+    /// How many document parts the request carries.
+    #[must_use]
+    pub fn document_parts(&self) -> usize {
+        self.messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(|p| p.is_document())
+            .count()
+    }
+
+    /// Total decoded bytes across inline document parts.
+    ///
+    /// URL-form documents contribute nothing: the router never fetches them and
+    /// cannot know their size.
+    #[must_use]
+    pub fn inline_document_bytes(&self) -> u64 {
+        self.messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(ContentPart::inline_document_bytes)
+            .map(|b| u64::try_from(b).unwrap_or(u64::MAX))
+            .fold(0u64, u64::saturating_add)
+    }
+
     /// Conservative upper bound on input tokens.
     ///
     /// Specification 12: "Estimated input tokens use the selected target
     /// tokenizer when available; otherwise a conservative byte-based upper
     /// bound." Two bytes per token is deliberately pessimistic — under-counting
     /// would let a request slip past a quota it should have been held by.
+    ///
+    /// Uses the compiled-in default document constant. Prefer
+    /// [`CanonicalRequest::estimated_input_tokens_with`] on the routing path,
+    /// where the selected target's declaration is available.
     #[must_use]
     pub fn estimated_input_tokens(&self) -> u64 {
+        self.estimated_input_tokens_with(DEFAULT_DOCUMENT_TOKEN_ESTIMATE)
+    }
+
+    /// Conservative upper bound on input tokens, given a document constant.
+    ///
+    /// A document contributes `document_token_estimate` tokens regardless of
+    /// its size, because the router cannot count pages without parsing it and
+    /// parsing it is exactly what the data plane must not do. An operator
+    /// tuning this constant is choosing between rejecting large documents and
+    /// admitting them past a quota, and the number should err high.
+    #[must_use]
+    pub fn estimated_input_tokens_with(&self, document_token_estimate: u32) -> u64 {
         // Saturating rather than truncating: this is an upper bound feeding a
         // quota check, so a value too large holds the request, while a
         // wrapped-around small value would let it slip past.
-        let bytes = u64::try_from(self.input_byte_len()).unwrap_or(u64::MAX);
+        let bytes = u64::try_from(self.non_document_input_byte_len()).unwrap_or(u64::MAX);
         // Per-message framing overhead that every provider adds.
         let framing = u64::try_from(self.messages.len())
             .unwrap_or(u64::MAX)
             .saturating_mul(8);
-        bytes.div_ceil(2).saturating_add(framing)
+        let documents = u64::try_from(self.document_parts())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::from(document_token_estimate));
+        bytes
+            .div_ceil(2)
+            .saturating_add(framing)
+            .saturating_add(documents)
+    }
+
+    /// Reserved output tokens, after the reasoning tier's multiplier.
+    ///
+    /// Applied **at reservation**, not after completion. Reserving unmultiplied
+    /// would let a high-effort request consume several times what it was held
+    /// to — a quota bypass that needs no malformed input at all, just a JSON
+    /// field. The figure is reconciled against provider-reported usage on
+    /// completion through the existing `Reservation::commit` path.
+    #[must_use]
+    pub fn estimated_output_tokens_with(&self, output_multiplier: u32) -> u64 {
+        u64::from(self.limits.max_output_tokens.unwrap_or(0))
+            .saturating_mul(u64::from(output_multiplier.max(1)))
     }
 
     /// Total token budget the request could consume.
+    ///
+    /// The compiled-in defaults: no target declaration, so the default
+    /// document constant and the tier's default multiplier apply.
     #[must_use]
     pub fn estimated_total_tokens(&self) -> u64 {
-        self.estimated_input_tokens()
-            .saturating_add(u64::from(self.limits.max_output_tokens.unwrap_or(0)))
+        self.estimated_total_tokens_with(&TokenEstimate::for_effort(self.reasoning_effort))
+    }
+
+    /// Total token budget under a specific target's declarations.
+    #[must_use]
+    pub fn estimated_total_tokens_with(&self, estimate: &TokenEstimate) -> u64 {
+        self.estimated_input_tokens_with(estimate.document_token_estimate)
+            .saturating_add(self.estimated_output_tokens_with(estimate.output_multiplier))
+    }
+}
+
+/// The compiled-in per-document token constant.
+///
+/// Deliberately larger than a page of dense text and larger than the fixed cost
+/// of a rendered page image, because over-estimation is the correct failure
+/// direction here: it holds a request that might have fitted, where
+/// under-estimation admits one that should have been held. Operators raise or
+/// lower it per target, or router-wide through `default_document_token_estimate`.
+pub const DEFAULT_DOCUMENT_TOKEN_ESTIMATE: u32 = 4_096;
+
+/// The two target-declared inputs to a token estimate.
+///
+/// Bundled rather than passed as two integers because they are read together
+/// at exactly one place — the reservation — and a transposed pair would be a
+/// silently wrong quota rather than a type error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenEstimate {
+    /// Tokens charged per document part.
+    pub document_token_estimate: u32,
+    /// Multiplier applied to the requested output length.
+    pub output_multiplier: u32,
+}
+
+impl TokenEstimate {
+    /// The estimate for a request with no target declaration available.
+    #[must_use]
+    pub const fn for_effort(effort: ReasoningEffort) -> Self {
+        Self {
+            document_token_estimate: DEFAULT_DOCUMENT_TOKEN_ESTIMATE,
+            output_multiplier: effort.default_output_multiplier(),
+        }
+    }
+}
+
+impl Default for TokenEstimate {
+    fn default() -> Self {
+        Self::for_effort(ReasoningEffort::Unset)
     }
 }
 
@@ -760,10 +1215,12 @@ mod tests {
             tool_choice: None,
             response_format: None,
             sampling: Sampling::default(),
+            reasoning_effort: Default::default(),
             limits: RequestLimits {
                 max_output_tokens: Some(512),
                 deadline: Deadline::after(&clock, Duration::from_secs(60)),
                 max_cost_class: None,
+                min_quality_class: None,
                 residency: None,
             },
             stream: StreamOptions {

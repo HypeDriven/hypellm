@@ -472,9 +472,102 @@ pub struct RouterState {
     pub decisions: Arc<hypellm_admin_api::DecisionCache>,
     /// Usage aggregates, shared with the management plane.
     pub usage: Arc<hypellm_admin_api::UsageAggregate>,
+    /// Fleet orchestration, when a fleet is declared and enabled.
+    ///
+    /// Unset is not a degraded mode. A router with no fleet classifies every
+    /// target `Unmanaged`, which sits at the top of the warmth ladder, so
+    /// routing is byte-identical to what it was before orchestration existed.
+    ///
+    /// A `OnceLock` because the runtime is built *after* the state it shares —
+    /// it needs the same store, clock, and telemetry — and must then be visible
+    /// to every holder of the `Arc`. Set exactly once at startup, and never
+    /// replaced: a configuration reload swaps the fleet *inside* the runtime
+    /// through `FleetRuntime::adopt_fleet`, so in-flight activations keep the
+    /// ledger that authorised them.
+    pub fleet: std::sync::OnceLock<Arc<crate::fleet::FleetRuntime>>,
 }
 
 impl RouterState {
+    /// The fleet runtime, if one was configured.
+    #[must_use]
+    pub fn fleet(&self) -> Option<&Arc<crate::fleet::FleetRuntime>> {
+        self.fleet.get()
+    }
+
+    /// A fleet view for one routing decision, or an empty one.
+    ///
+    /// Computed once per request, before routing, and borrowed by
+    /// [`crate::fleet::FleetAwareLiveState`] for the whole decision. Sampling
+    /// twice would let a target be filtered under one belief and ranked under
+    /// another, which is exactly the determinism Appendix B requires once fleet
+    /// state is live state.
+    #[must_use]
+    pub fn fleet_view(
+        &self,
+        request: &hypellm_core::canonical::CanonicalRequest,
+        permissions: &hypellm_core::rbac::PermissionSet,
+    ) -> crate::fleet::FleetView {
+        let Some(fleet) = self.fleet() else {
+            return crate::fleet::FleetView::default();
+        };
+        let config = self.config();
+        let snapshot = &config.snapshot;
+        let Some(alias) = snapshot.aliases.get(&request.requested_model) else {
+            return crate::fleet::FleetView::default();
+        };
+        if let Some(capability) = alias.capability {
+            fleet.record_request(capability);
+        }
+
+        // The effort multiplier used for the feasibility check is the *largest*
+        // any permitted target declares. Using a specific target's would mean
+        // classifying each one against a different deadline, and the check must
+        // be conservative: a cold target offered on the strength of a cheap
+        // multiplier and then dispatched under an expensive one would miss its
+        // deadline after paying for an eviction.
+        let multiplier = alias
+            .permitted_targets
+            .iter()
+            .filter_map(|t| snapshot.targets.get(t))
+            .map(|t| {
+                t.capabilities
+                    .effort_multipliers
+                    .for_effort(request.reasoning_effort)
+            })
+            .max()
+            .unwrap_or(1);
+
+        let remaining = request
+            .limits
+            .deadline
+            .remaining(self.clock.as_ref())
+            .as_millis();
+        let remaining_ms = u64::try_from(remaining).unwrap_or(u64::MAX);
+
+        let context = hypellm_fleet::plan::PlanContext {
+            now_ms: fleet.now_ms(),
+            deadline_remaining_ms: remaining_ms,
+            effort_multiplier: multiplier,
+            effort_headroom_ms: snapshot.activation_effort_headroom_ms,
+            may_activate: permissions.has(hypellm_core::rbac::Permission::FleetActivate),
+            may_fetch: permissions.has(hypellm_core::rbac::Permission::FleetFetch),
+            capability: alias.capability,
+            // Tenant priority would enter here. It is zero until a tenant
+            // priority class exists to read: a bonus derived from nothing would
+            // be a number in a trace that means nothing.
+            priority_bonus: 0,
+        };
+        let mut view = fleet.view_for(&alias.permitted_targets, &context);
+        for target in &alias.permitted_targets {
+            let in_flight = self
+                .health
+                .entry(target, request.operation)
+                .in_flight();
+            fleet.mark_busy(&mut view, target, in_flight);
+        }
+        view
+    }
+
     /// The active configuration.
     #[must_use]
     pub fn config(&self) -> Arc<ValidatedConfig> {
@@ -586,12 +679,14 @@ fn probe_credential(
         tool_choice: None,
         response_format: None,
         sampling: Sampling::default(),
+        reasoning_effort: Default::default(),
         limits: RequestLimits {
             // One token: enough to prove the credential was accepted, and as
             // close to free as the provider's billing allows.
             max_output_tokens: Some(1),
             deadline,
             max_cost_class: None,
+            min_quality_class: None,
             residency: None,
         },
         stream: StreamOptions::default(),

@@ -89,12 +89,13 @@ pub mod target;
 pub mod time;
 
 pub use canonical::{
-    CanonicalRequest, ClientProtocol, ContentPart, CostClass, Message, Modality, Operation,
-    RequestLimits, Residency, ResponseFormat, Role, RoutingHints, Sampling, StreamOptions, ToolCall,
-    ToolChoice, ToolDef,
+    CanonicalRequest, ClientProtocol, ContentPart, CostClass, DocumentSource, DocumentType, Message,
+    Modality, Operation, QualityClass, ReasoningEffort, RequestLimits, Residency, ResponseFormat,
+    Role, RoutingHints, Sampling, StreamOptions, TokenEstimate, ToolCall, ToolChoice, ToolDef,
 };
 pub use decision::{
-    Attempt, AttemptOutcome, Candidate, DecisionTrace, Exclusion, ExclusionReason, ScoreTerms,
+    Attempt, AttemptOutcome, Candidate, DecisionTrace, Exclusion, ExclusionReason, ResidencyClass,
+    ScoreTerms,
 };
 pub use error::{ErrorCode, RouterError};
 pub use event::{
@@ -102,8 +103,9 @@ pub use event::{
     UpstreamErrorClass, UsageSource,
 };
 pub use ids::{
-    AliasId, BindingId, CredentialRef, GroupId, KeyId, PolicyId, PrincipalId, ProviderId, RequestId,
-    TargetId, TenantId,
+    AcceleratorId, AgentId, AliasId, ArtifactId, BindingId, CredentialRef, DeploymentId, GroupId,
+    HostId, KeyId, LeaseId, PolicyId, PoolId, PrincipalId, ProviderId, RequestId, TargetId,
+    TenantId,
 };
 pub use policy::{
     AliasGrant, Binding, BindingScope, LiveState, ModelSelector, PolicySnapshot, RouteOutcome,
@@ -116,7 +118,8 @@ pub use netaddr::{AddressClass, EgressDenial, EgressProfile, check_destination, 
 pub use rbac::{Permission, PermissionSet, Role as ManagementRole};
 pub use sensitive::{Capped, Sensitive};
 pub use target::{
-    AdminState, Alias, Capabilities, Endpoint, EndpointScheme, Provider, ProviderFamily, Target,
+    AdminState, Alias, Capabilities, Capability, EffortMultipliers, Endpoint, EndpointScheme,
+    Provider, ProviderFamily, Target,
 };
 pub use time::{Clock, Deadline, SystemClock};
 
@@ -170,6 +173,8 @@ mod invariant_tests {
                     ..Capabilities::default()
                 },
                 cost_class: CostClass::CHEAPEST,
+                quality_class: Default::default(),
+                document_token_estimate: None,
                 residency: None,
                 is_local: true,
                 admin_state: AdminState::Enabled,
@@ -184,6 +189,7 @@ mod invariant_tests {
             Alias {
                 id: AliasId::new("code").unwrap(),
                 permitted_targets: vec![tid("local:qwen")],
+                capability: None,
                 allow_family_failover: false,
                 description: None,
             },
@@ -227,10 +233,12 @@ mod invariant_tests {
             tool_choice: None,
             response_format: None,
             sampling: Sampling::default(),
+            reasoning_effort: Default::default(),
             limits: RequestLimits {
                 max_output_tokens: Some(128),
                 deadline: Deadline::after(&clock, Duration::from_secs(30)),
                 max_cost_class: None,
+                min_quality_class: None,
                 residency: None,
             },
             stream: StreamOptions {
@@ -257,6 +265,7 @@ mod invariant_tests {
             groups: &groups,
             tenant: &tenant,
             attempted: &attempted,
+            now_millis: 0,
         };
 
         let outcome = snapshot.route(&ctx, &req, &IdealLiveState);
@@ -359,6 +368,14 @@ mod invariant_tests {
             ExclusionReason::FamilyFailoverNotAllowed,
             ExclusionReason::AlreadyAttempted,
             ExclusionReason::NotSelectedByAnyBinding,
+            // The capability contract, evaluated in the same filter phase.
+            ExclusionReason::CapabilityUnsupported,
+            ExclusionReason::ReasoningEffortUnsupported,
+            ExclusionReason::QualityFloorNotMet,
+            // The one fleet reason the filter phase itself produces: every
+            // other fleet reason arrives as `ResidencyClass::Infeasible`,
+            // computed by the planner and reported through `LiveState`.
+            ExclusionReason::ActivationExceedsDeadline,
         ]
         .into_iter()
         .collect();
@@ -369,9 +386,25 @@ mod invariant_tests {
                 .into_iter()
                 .collect();
 
+        // The fleet planner is the producer for the rest. It lives in
+        // `hypellm-fleet`, which depends on this crate rather than the other
+        // way round, so the registry names them here and
+        // `hypellm_fleet::plan` has the matching test that every one is
+        // actually reachable from a plan.
+        let produced_by_fleet: BTreeSet<ExclusionReason> = ExclusionReason::all()
+            .iter()
+            .copied()
+            .filter(|r| {
+                r.is_fleet_constraint() && *r != ExclusionReason::ActivationExceedsDeadline
+            })
+            .collect();
+
         let all: BTreeSet<ExclusionReason> = ExclusionReason::all().iter().copied().collect();
         let covered: BTreeSet<ExclusionReason> = produced_by_routing
             .union(&produced_by_admission)
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .union(&produced_by_fleet)
             .copied()
             .collect();
         let uncovered: Vec<&ExclusionReason> = all.difference(&covered).collect();

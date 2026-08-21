@@ -50,6 +50,7 @@
 #![cfg_attr(not(test), deny(clippy::indexing_slicing, clippy::as_conversions))]
 
 pub mod build;
+pub mod fleet;
 pub mod parse;
 pub mod schema;
 
@@ -846,14 +847,14 @@ tenant id=other
 tenant id=acme
 tenant id=other
 identity issuer=https://accounts.google.com subject=1234567890 \\
-         principal=user:albert tenant=other description=\"the on-call engineer\"
+         principal=user:operator tenant=other description=\"the on-call engineer\"
 ";
         let c = load_ok(text);
         assert_eq!(c.identities.len(), 1);
         let identity = c.identities.first().expect("the binding");
         assert_eq!(identity.issuer, "https://accounts.google.com");
         assert_eq!(identity.subject, "1234567890");
-        assert_eq!(identity.principal.as_str(), "user:albert");
+        assert_eq!(identity.principal.as_str(), "user:operator");
         // The tenant is the one named, not whichever sorts first — "acme"
         // would win a map-order lookup and is deliberately not the answer.
         assert_eq!(identity.tenant.as_str(), "other");
@@ -1107,6 +1108,7 @@ alias id=a targets=t
             groups: &groups,
             tenant: &tenant,
             attempted: &attempted,
+            now_millis: 0,
         };
 
         let req = CanonicalRequest {
@@ -1122,10 +1124,12 @@ alias id=a targets=t
             tool_choice: None,
             response_format: None,
             sampling: Sampling::default(),
+            reasoning_effort: Default::default(),
             limits: RequestLimits {
                 max_output_tokens: Some(1024),
                 deadline: Deadline::after(&clock, Duration::from_secs(60)),
                 max_cost_class: None,
+                min_quality_class: None,
                 residency: None,
             },
             stream: StreamOptions {

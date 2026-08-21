@@ -14,6 +14,7 @@ workspace = true
 hypellm-auth = { path = "../hypellm-auth" }
 hypellm-config = { path = "../hypellm-config" }
 hypellm-core = { path = "../hypellm-core" }
+hypellm-fleet = { path = "../hypellm-fleet" }
 hypellm-crypto = { path = "../hypellm-crypto" }
 hypellm-store = { path = "../hypellm-store" }
 hypellm-telemetry = { path = "../hypellm-telemetry" }

@@ -86,10 +86,12 @@ fn chat_request(tenant: &TenantId, principal: &PrincipalId) -> CanonicalRequest 
         tool_choice: None,
         response_format: None,
         sampling: Sampling::default(),
+        reasoning_effort: Default::default(),
         limits: RequestLimits {
             max_output_tokens: None,
             deadline: Deadline::at(u64::MAX),
             max_cost_class: None,
+            min_quality_class: None,
             residency: None,
         },
         stream: StreamOptions::default(),
@@ -114,6 +116,7 @@ fn route_for(admin: &Harness, tenant: &str, principal: &str) -> RouteOutcome {
         groups: &groups,
         tenant: &tenant,
         attempted: &attempted,
+        now_millis: 0,
     };
     admin
         .config()

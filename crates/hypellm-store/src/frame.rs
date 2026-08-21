@@ -78,6 +78,20 @@ pub enum RecordKind {
     PolicyDraft,
     /// A policy draft that was published or discarded.
     PolicyDraftClosed,
+    /// An activation lease, written **before** the mutating verb is sent.
+    ///
+    /// The basis of crash recovery: on restart the router replays leases,
+    /// queries the agent for each activation's status, and reconciles. Because
+    /// agent verbs are idempotent per lease, re-issuing is safe.
+    FleetLease,
+    /// The outcome of an activation, for the cost model and the audit view.
+    FleetActivation,
+    /// A deployment's accrued flap backoff.
+    ///
+    /// Persisted deliberately: a router bounce that reset accrued backoff
+    /// would permit a fresh burst of exactly the thrash the backoff exists to
+    /// stop.
+    FleetFlap,
     /// An unrecognised kind, preserved so that a newer writer's records survive
     /// a rollback to an older reader rather than being dropped.
     Unknown(u16),
@@ -99,6 +113,9 @@ impl RecordKind {
             Self::SnapshotMarker => 9,
             Self::PolicyDraft => 10,
             Self::PolicyDraftClosed => 11,
+            Self::FleetLease => 12,
+            Self::FleetActivation => 13,
+            Self::FleetFlap => 14,
             Self::Unknown(v) => v,
         }
     }
@@ -118,6 +135,9 @@ impl RecordKind {
             9 => Self::SnapshotMarker,
             10 => Self::PolicyDraft,
             11 => Self::PolicyDraftClosed,
+            12 => Self::FleetLease,
+            13 => Self::FleetActivation,
+            14 => Self::FleetFlap,
             other => Self::Unknown(other),
         }
     }
@@ -145,6 +165,12 @@ impl RecordKind {
                 // document and publish another.
                 | Self::PolicyDraft
                 | Self::PolicyDraftClosed
+                // A lease authorises stopping a production model. An
+                // unprotected one could be forged on disk between a crash and
+                // a restart, and the router would reconcile against it —
+                // re-issuing a verb nobody asked for.
+                | Self::FleetLease
+                | Self::FleetFlap
         )
     }
 
@@ -163,6 +189,9 @@ impl RecordKind {
             Self::SnapshotMarker => "snapshot_marker",
             Self::PolicyDraft => "policy_draft",
             Self::PolicyDraftClosed => "policy_draft_closed",
+            Self::FleetLease => "fleet_lease",
+            Self::FleetActivation => "fleet_activation",
+            Self::FleetFlap => "fleet_flap",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -182,6 +211,9 @@ impl RecordKind {
             Self::SnapshotMarker,
             Self::PolicyDraft,
             Self::PolicyDraftClosed,
+            Self::FleetLease,
+            Self::FleetActivation,
+            Self::FleetFlap,
         ]
     }
 }

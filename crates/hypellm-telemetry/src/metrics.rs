@@ -50,6 +50,18 @@ pub enum LabelName {
     Listener,
     /// Whether usage was provider-reported or router-estimated.
     UsageSource,
+    /// A fleet host. Administrator-configured, therefore bounded.
+    Host,
+    /// A fleet deployment. Administrator-configured, therefore bounded.
+    Deployment,
+    /// An accelerator. Administrator-configured, therefore bounded.
+    Accelerator,
+    /// A fleet agent. Administrator-configured, therefore bounded.
+    Agent,
+    /// A capability verb. A closed enum in the router.
+    Capability,
+    /// A reasoning tier. Five values, closed.
+    Effort,
     /// Reserved: marks the series that absorbed a cardinality overflow.
     ///
     /// Its own name rather than a value of [`LabelName::Outcome`], because an
@@ -77,6 +89,12 @@ impl LabelName {
             Self::StatusClass => "status_class",
             Self::Listener => "listener",
             Self::UsageSource => "usage_source",
+            Self::Host => "host",
+            Self::Deployment => "deployment",
+            Self::Accelerator => "accelerator",
+            Self::Agent => "agent",
+            Self::Capability => "capability",
+            Self::Effort => "effort",
             Self::Overflow => "hypellm_overflow",
         }
     }
@@ -97,6 +115,12 @@ impl LabelName {
             Self::StatusClass,
             Self::Listener,
             Self::UsageSource,
+            Self::Host,
+            Self::Deployment,
+            Self::Accelerator,
+            Self::Agent,
+            Self::Capability,
+            Self::Effort,
             Self::Overflow,
         ]
     }
@@ -749,6 +773,41 @@ pub mod names {
     pub const SERIES_EVICTED: &str = "hypellm_metric_series_evicted_total";
     /// Observations that exceeded a metric's cardinality budget.
     pub const SERIES_OVERFLOWED: &str = "hypellm_metric_series_overflowed_total";
+
+    // -- Fleet orchestration (specification-extension 18) -------------------
+    //
+    // `host`, `deployment`, `accelerator`, `agent`, `capability`, and `effort`
+    // are administrator-configured identifiers or closed enums, so they are
+    // bounded by construction and admissible as labels — unlike a user id, a
+    // request id, or a prompt, which remain forbidden.
+
+    /// Activations attempted, by host and outcome.
+    pub const FLEET_ACTIVATIONS: &str = "hypellm_fleet_activations_total";
+    /// Deployments displaced, by host and reason.
+    pub const FLEET_EVICTIONS: &str = "hypellm_fleet_evictions_total";
+    /// Time from decision to ready, as a distribution.
+    pub const FLEET_TIME_TO_READY_MS: &str = "hypellm_fleet_time_to_ready_milliseconds";
+    /// Memory committed on an accelerator.
+    pub const FLEET_RESIDENT_BYTES: &str = "hypellm_fleet_resident_bytes";
+    /// Activations left in a host's hourly allowance.
+    pub const FLEET_BUDGET_REMAINING: &str = "hypellm_fleet_activation_budget_remaining";
+    /// How long requests waited for a cold capability, as experienced.
+    pub const FLEET_QUEUE_WAIT_MS: &str = "hypellm_fleet_queue_wait_milliseconds";
+    /// Age of the newest valid observation, which gates everything.
+    pub const FLEET_OBSERVATION_AGE_MS: &str = "hypellm_fleet_observation_age_milliseconds";
+    /// **The KPI**: activations divided by requests served from activated
+    /// deployments, in permille.
+    ///
+    /// A healthy fleet trends toward zero as batching amortises each swap. A
+    /// ratio near 1,000 means every request costs a swap and the configuration
+    /// is wrong. Publishing it turns "relatively intelligent about it" from an
+    /// aspiration into something an operator can check.
+    pub const FLEET_THRASH_RATIO: &str = "hypellm_fleet_thrash_ratio_permille";
+    /// Requests by reasoning tier and outcome.
+    pub const REQUESTS_BY_EFFORT: &str = "hypellm_requests_by_effort_total";
+    /// Reserved minus reconciled tokens, validating the effort multipliers and
+    /// the document constants.
+    pub const TOKEN_ESTIMATE_ERROR: &str = "hypellm_token_estimate_error";
 }
 
 #[cfg(test)]
