@@ -1,0 +1,206 @@
+# HypeLLM Router — local development stack.
+#
+# Two containers sharing one network namespace: a Tailscale node, and the
+# router inside it. Bring it up with `just up`.
+#
+# Why a sidecar rather than publishing a port on the host's Tailscale address:
+# Docker Desktop accepts `-p 100.64.x.x:...` and binds nothing — the daemon
+# runs in its own VM, which has no `tailscale0` — and a container on a bridge
+# network has no route to the tailnet either. The sidecar makes the *container*
+# a tailnet node, so neither limitation applies. On a host running Docker
+# natively you could instead use `network_mode: host`; this arrangement works
+# in both places and keeps the router off the host's interfaces.
+
+name: hypellm
+
+services:
+  # The tailnet node. Owns the network namespace that the router runs in, so
+  # `tailscale0`, the bridge address and loopback are all the same namespace
+  # for both containers.
+  tailscale:
+    image: tailscale/tailscale:stable
+    container_name: hypellm-tailscale
+    hostname: hypellm-router
+
+    environment:
+      # The name this node takes on the tailnet, and therefore its MagicDNS
+      # name: hypellm-router.<tailnet>.ts.net.
+      TS_HOSTNAME: hypellm-router
+
+      # Kernel networking, not userspace. Userspace mode gives a SOCKS5 proxy
+      # and nothing else — the router would have no transparent route to the
+      # tailnet, and `--accept-routes` would have nowhere to install a route.
+      # This is what `/dev/net/tun` and NET_ADMIN below are for.
+      TS_USERSPACE: "false"
+
+      # Persisted across restarts, so the node keeps its identity and the auth
+      # key is needed once rather than every start.
+      TS_STATE_DIR: /var/lib/tailscale
+
+      # Set by `just` from run/secrets/tailscale.authkey when that file exists.
+      # Empty is a supported state: the node prints a login URL instead, and
+      # `just up` surfaces it.
+      TS_AUTHKEY: ${HYPELLM_TS_AUTHKEY:-}
+
+      # `--accept-routes` is what makes the LAN slaves reachable. A subnet
+      # router on the slaves' network advertises their CIDR, and the route is
+      # installed in this namespace with the destination address *preserved* —
+      # so the router still dials 192.168.x.y and `egress=private_network`
+      # still describes what it is talking to. Without an advertised route
+      # there is no path from this container to that LAN at all.
+      #
+      # `--accept-dns=false` deliberately: MagicDNS would rewrite the resolver
+      # for the router as well, and the router resolves provider hostnames.
+      # Nothing here needs a tailnet name — the config addresses slaves by IP.
+      TS_ACCEPT_DNS: "false"
+
+      # `--timeout=15m` is what makes an interactive login usable. Without it
+      # `tailscale up` gives up after about a minute, containerboot exits 1,
+      # and the network namespace goes with it — so a person who walks to
+      # another machine to open the URL comes back to a stack that tore itself
+      # down. Fifteen minutes is a human walking away and returning; the flag
+      # bounds the wait rather than removing it.
+      #
+      # Irrelevant once run/secrets/tailscale.authkey exists: with a key the
+      # node authenticates in seconds and never reaches this path.
+      TS_EXTRA_ARGS: --accept-routes --timeout=15m
+
+    volumes:
+      - ./run/tailscale:/var/lib/tailscale
+
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+
+    # A fixed bridge address, because the router binds its management and
+    # metrics listeners to it by name in docker/hypellm.conf. That is the whole
+    # mechanism keeping those two planes off the tailnet: a listener bound to
+    # 10.89.7.2 is reachable through the published ports below and is not
+    # bound on `tailscale0`, so a tailnet peer connecting to this node's
+    # 100.64.x.x finds nothing listening. Fail-closed, and it does not depend
+    # on an ACL being written correctly somewhere else.
+    networks:
+      hypellm:
+        ipv4_address: 10.89.7.2
+
+    # Loopback on this host only. These reach the bridge address, never the
+    # tailnet, and are how `just status` and a browser on this machine get to
+    # the management plane.
+    ports:
+      - "127.0.0.1:18000:18000"   # inference  (also on the tailnet, see below)
+      - "127.0.0.1:18001:18001"   # management + admin SPA  (this host only)
+      - "127.0.0.1:18002:18002"   # metrics                 (this host only)
+
+    # True only once the node is logged in and has an address, which is
+    # exactly the condition the router needs before it attaches to this
+    # namespace. `start_period` is generous because a cold state directory
+    # takes ~25s to register with the control plane before it even prints a
+    # login URL.
+    healthcheck:
+      test: ["CMD", "tailscale", "status", "--peers=false"]
+      interval: 3s
+      timeout: 3s
+      retries: 3
+      start_period: 90s
+
+    restart: "no"
+
+  router:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: hypellm-router:local
+    container_name: hypellm-router
+
+    # Inside the sidecar's namespace. The router therefore has no `ports:` and
+    # no `networks:` of its own — both belong to the service above.
+    network_mode: service:tailscale
+
+    # `service_healthy`, and it has to be. The router has no network namespace
+    # of its own: if the sidecar exits, the namespace goes with it and the
+    # router keeps running while reaching nothing and being reachable by
+    # nothing — `docker ps` still says Up. containerboot *does* exit when an
+    # interactive login is not completed inside its deadline, so this is a
+    # state that happens rather than a theoretical one. Gating here means the
+    # router never attaches to a namespace that is about to disappear.
+    #
+    # It also means an unauthenticated tailnet node keeps the router down.
+    # That is the honest trade: the alternative is not "the router still serves
+    # this host", it is "the router appears to serve this host and does not".
+    depends_on:
+      tailscale:
+        condition: service_healthy
+
+    command:
+      - --config
+      - /etc/hypellm/hypellm.conf
+      - --secrets
+      - /etc/hypellm/secrets
+      - --static
+      - /srv/hypellm/web
+      - --log
+      - info
+
+    # The invoking user, so the bind-mounted state and secrets are readable
+    # from the host without `sudo`. `just` exports these; the fallback is the
+    # usual first non-system uid.
+    user: "${HYPELLM_UID:-1000}:${HYPELLM_GID:-1000}"
+
+    # The router checks its own sandbox at startup and logs `critical`
+    # `startup.hardening_missing` for each property it lacks
+    # (crates/hypellm-router/src/hardening.rs). Docker's defaults already supply
+    # the unprivileged uid, the empty capability set, the disabled core dump and
+    # the seccomp filter; `no_new_privs` is the one that has to be asked for, and
+    # without these lines every start prints a critical log line that is
+    # entirely correct.
+    #
+    # NET_ADMIN is held by the sidecar, not here. The router does not configure
+    # networking; it only binds sockets in a namespace someone else built.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    # Nothing is written outside the two bind mounts, so the image layer can be
+    # immutable. It also means a `--generate-secrets` aimed at the wrong path
+    # fails loudly instead of writing a bundle into a container layer that
+    # disappears on the next `just up`.
+    read_only: true
+
+    volumes:
+      # Read-only: the router never rewrites its own configuration, and a
+      # writable mount would let a compromised process persist policy.
+      - ./docker/hypellm.conf:/etc/hypellm/hypellm.conf:ro
+      - ./run/secrets:/etc/hypellm/secrets
+      # Also holds `control.sock`, which is where `just down` sends `shutdown`.
+      - ./run/state:/var/lib/hypellm
+
+    # The router does not install a signal handler: specification 18.2 forbids
+    # the `unsafe` FFI that `sigaction` needs, so `shutdown` arrives over the
+    # control socket instead. `just down` sends it and waits. A plain
+    # `docker compose down` therefore ends in SIGKILL — which the store is
+    # designed to survive (a torn log tail is truncated on the next start), but
+    # it drops in-flight streams.
+    stop_grace_period: 10s
+
+    # No restart policy on purpose: after a graceful `--shutdown` the process
+    # exits 0, and `unless-stopped` would immediately start it again.
+    restart: "no"
+
+# A pinned subnet, so the management and metrics bind addresses in
+# docker/hypellm.conf mean the same thing on every machine. Under Docker's
+# default allocation they would not.
+#
+# 10.89.7.0/24 rather than the usual 172.16/12, which is where Docker allocates
+# by default and where a developer machine with a dozen compose projects has
+# already run out.
+networks:
+  hypellm:
+    name: hypellm
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.89.7.0/24
+          gateway: 10.89.7.1

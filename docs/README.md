@@ -6,17 +6,19 @@ HypeLLM Router is a self-hosted policy and routing gateway between coding tools 
 
 | Document | Audience | Contents |
 |---|---|---|
+| [Using the router](using-the-router.md) | Application and agent developers | Pointing a project at a running router: getting an API key, base URL, the OpenAI and Anthropic endpoints, streaming, errors, limits and what to do when a request is refused. |
 | [Deployment](deployment.md) | Platform engineers | Runtime profiles, TLS boundaries, secrets, state, listeners, configuration, startup, shutdown and system hardening. |
 | [Operational runbooks](runbooks.md) | On-call operators | Provider outages, provider credential rotation, compromised client API keys, identity-provider outages and fleet incidents. |
 | [Fleet orchestration](orchestration.md) | Platform engineers, reviewers | How the router decides what a fleet of accelerator hosts must become to serve a request, and starts and stops containers to get there. The reasoning behind specification §26. |
 | [Fleet agent](../agent/README.md) | Platform engineers | The out-of-process component that reaches the slaves: its obligations, its allowlist, and what it deliberately does not do. |
-| [Example fleet configuration](examples/fleet.conf) | Platform engineers | A working five-host declaration, annotated. |
+| [Example fleet configuration](examples/fleet.conf) | Platform engineers | A working two-host declaration, annotated, paired with the agent allowlist it must agree with. |
 | [Threat model](threat-model.md) | Security and design reviewers | Trust boundaries, protected assets, attacker capabilities, controls and abuse cases. |
 | [Current limitations](deferred-issues.md) | Evaluators and operators | Capabilities and deployment properties that are not currently provided, with their operational impact. |
 | [Specification](../secure_llm_router_specification.md) | Implementers and reviewers | The complete normative design and protocol contract. |
 
 ## Recommended reading paths
 
+- **Sending inference to a router someone else runs:** [using the router](using-the-router.md). Nothing else is needed.
 - **Evaluating the project:** [README](../README.md) → [current limitations](deferred-issues.md) → [threat model](threat-model.md).
 - **Deploying a node:** [deployment](deployment.md) → [current limitations](deferred-issues.md) → [runbooks](runbooks.md).
 - **Deploying a fleet:** [fleet orchestration](orchestration.md) → [fleet agent](../agent/README.md) → [example configuration](examples/fleet.conf) → the fleet section of [current limitations](deferred-issues.md).

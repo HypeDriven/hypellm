@@ -397,9 +397,10 @@ pub enum Modality {
     /// Documents, forwarded opaquely.
     ///
     /// A distinct modality rather than a flavour of `Image` because it decides
-    /// eligibility on its own: the fleet's Qwen3.8 deployments run without the
-    /// vision projector deliberately, so they accept neither, while a target
-    /// may accept images and refuse documents.
+    /// eligibility on its own: a target may accept images and refuse
+    /// documents, which is exactly the fleet's Qwen3.8 deployments — the
+    /// vision projector reads an image, and a document is forwarded opaquely
+    /// to a server that has no path for one.
     Document,
 }
 

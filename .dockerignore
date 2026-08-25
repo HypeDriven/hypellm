@@ -1,0 +1,15 @@
+# `target/` is ~9 GB and is rebuilt inside the image from a cache mount.
+# Sending it as build context is the single most expensive mistake here.
+target/
+dist/
+
+# Runtime state, secrets and sockets. The secret bundle in particular must
+# never enter an image layer: layers are readable by anyone who can pull it.
+run/
+state/
+secrets/
+
+.git/
+.claude/
+*.Zone.Identifier
+*:Zone.Identifier

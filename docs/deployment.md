@@ -74,6 +74,59 @@ Cleartext `http` is permitted **only** to a loopback literal or the name
 (`crates/hypellm-config/src/build.rs`, `validate_endpoint`). A remote provider in
 this profile still needs the TLS helper.
 
+### Behind an overlay network (Tailscale, WireGuard)
+
+Two facts decide the shape of this deployment, and both surprise people.
+
+**Overlay addresses are refused as destinations.** Tailscale assigns from
+`100.64.0.0/10`, which classifies as `shared_address_space`, and
+`EgressProfile::permits` refuses that class under **every** profile including
+`local` (`crates/hypellm-core/src/netaddr.rs`; see the
+[threat model](threat-model.md)). Carrier-grade NAT space is a well-known SSRF
+pivot and the router denies it outright. A `provider` naming a `100.64.x.y`
+address fails at load time and there is no profile that permits it.
+
+The way to reach a provider across a tailnet is therefore a **subnet route**,
+not a node address. A subnet router on the provider's network advertises its
+RFC 1918 CIDR; the client accepts it with `--accept-routes`; the destination
+address is preserved end to end. The router dials `192.168.x.y` and
+`egress=private_network` remains an accurate description of what it is talking
+to. Nothing in the router needs to know an overlay is involved, which is the
+point.
+
+```
+provider id=slave-1 family=llamacpp scheme=http host=192.168.1.50 port=8080 \
+         egress=private_network
+```
+
+`tailscale status --json | jq '.Peer[].PrimaryRoutes'` lists what is advertised.
+If it is empty, no such path exists yet.
+
+**Inbound exposure is decided by bind address.** Where the router runs inside a
+namespace that has an overlay interface, a listener bound to `0.0.0.0` accepts
+on it and a listener bound to a specific address does not. That is the whole
+control, it is visible in `netstat`, and it fails closed — unlike an ACL or a
+firewall rule maintained somewhere else.
+
+```
+settings inference_listen=0.0.0.0:18000 \
+         admin_listen=10.89.7.2:18001 \
+         metrics_listen=10.89.7.2:18002
+```
+
+Here the inference plane is reachable over the overlay and the management and
+metrics planes are not, while all three stay reachable at the namespace's other
+addresses. Reaching a listener is not authenticating to it: inference still
+requires a router API key, and being on the tailnet grants nothing by itself.
+
+`compose.yaml` and [`docker/hypellm.conf`](../docker/hypellm.conf) in this
+repository are a worked example, using a `tailscale/tailscale` sidecar that owns
+the namespace the router runs in. That arrangement also sidesteps a Docker
+Desktop limitation worth knowing about: it accepts `-p 100.64.x.y:port:port`
+and binds nothing, because its daemon runs in a VM that has no overlay
+interface, and a container on a bridge network has no route to the tailnet
+either. Making the container itself a node avoids both.
+
 ### Single secure node
 
 TLS edge on the same host, admin listener on a separate socket or network,
@@ -135,9 +188,12 @@ returns an error rather than falling back to a cleartext socket
 Omitting the OIDC settings disables Google sign-in completely, which for an
 air-gapped deployment is the point. Break-glass is the management plane there:
 set `break_glass_principal`, `break_glass_tenant`, and a `role_binding`, keep the
-token from `--generate-secrets`, and sign in through
-`POST /admin/v1/auth/break-glass` (see
+token, and sign in through `POST /admin/v1/auth/break-glass` (see
 [`runbooks.md` 22.4](runbooks.md#break-glass-access)).
+
+**Capture the token when the bundle is generated.** It is printed once and
+cannot be recovered, and on this profile it is the only way into the management
+plane.
 
 Two consequences worth planning for. Every session is time-limited to
 `break_glass_ttl_secs`, so an air-gapped operator signs in per task rather than

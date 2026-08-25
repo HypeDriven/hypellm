@@ -44,13 +44,20 @@ Validated against a real five-host fleet. Hosts are named by their configured
 identifier throughout — an address is a deployment detail, and the design turns
 on what each machine *is*:
 
+> This table is the design's provenance, not the current configuration.
+> [`examples/fleet.conf`](examples/fleet.conf) now declares the two Sparks and
+> nothing else. The heterogeneous cases below — two accelerators of different
+> capability on one host, unified memory that is not VRAM, a GPU carrying
+> unrelated production work — are why the model is shaped as it is, and they
+> remain the cases it must keep handling.
+
 | Host | Accelerator | Memory | Constraint that matters |
 |---|---|---|---|
 | `rtx4090` | RTX 4090 Laptop | 16 GB VRAM | Four services at once; MOSS-SoundEffect v2 is on-disk, un-containerised, and consumes nearly the whole GPU. |
 | `node0` | GT 1030 (idx 0) + GTX 1080 Ti (idx 1) | 4 GB + 11 GB | **Two accelerators of very different capability.** Placement must select `device=1`, not merely "the host". Hosts the fleet's only vision model. |
 | `cache` | GT 1030 | 2 GB | CPU/RAM/disk host (Threadripper, 101 GB, 5.9 TB free). Not an inference target; the natural artifact cache. |
 | `rtx5090` | RTX 5090 | 32 GB VRAM | Best discrete GPU; also runs unrelated production services that must never be evicted. |
-| `spark` | NVIDIA GB10 | ~140 GB **unified** | **ARM64.** Unified memory is shared with the host, so a VRAM-only model is wrong. Three large models contend. Vision deliberately not loaded. |
+| `spark` | NVIDIA GB10 | ~140 GB **unified** | **ARM64.** Unified memory is shared with the host, so a VRAM-only model is wrong. Three large models contend. Serves images; documents are not declared. |
 
 Four consequences are load-bearing below: accelerators are addressed individually (§5.2); memory is a per-pool quantity with a host reservation, because unified memory is not VRAM (§5.2); artifacts are architecture-scoped, because an x86-64 image will never run on the Spark (§12); and **the same weights can back two targets with different capability declarations** — Qwen3.8 with and without the vision projector are different memory footprints and different eligibility (§1.3).
 
@@ -923,11 +930,11 @@ Extending spec §25. Each has a recommended default; none should be settled by i
 
 The request that motivated this rework: *Qwen 3.8 at Q5, medium effort, reading a PDF.*
 
-**Configuration.** `alias id=qwen3.8-27b-q5 capability=chat targets=spark:qwen38-q5,rtx5090:qwen38-q5`. The Spark target declares `modalities=text` — its deployment runs without the vision projector, deliberately, to preserve unified-memory headroom. A separate alias `vision-standard` covers `node0:qwen35-9b-vision`, which declares `modalities=text,image,document`.
+**Configuration.** `alias id=qwen3.8-27b-q5 capability=chat targets=spark:qwen38-q5,rtx5090:qwen38-q5`. The Spark target declares `modalities=text,image` — the vision projector is loaded, so it reads images — but **not** `document`: a document is forwarded opaquely and llama.cpp has no PDF path. `node0:qwen35-9b-vision` is the only target declaring `modalities=text,image,document`.
 
 **Request.** `POST /v1/chat/completions`, `"model": "qwen3.8-27b-q5"`, one text part and one `Document` part, `reasoning_effort: "medium"`.
 
-**Contract evaluation.** Verb `chat`: both targets pass. Modality: the request requires `Document`; neither Qwen3.8 target declares it. Both are excluded with `modality_unsupported`. **No container starts.** The caller receives a 4xx naming the unsupported modality — not a 5xx after a three-minute model load, and not a provider error after admission and metering.
+**Contract evaluation.** Verb `chat`: both targets pass. Modality: the request requires `Document`; neither Qwen3.8 target declares it — declaring `image` does not imply it. Both are excluded with `modality_unsupported`. **No container starts.** The caller receives a 4xx naming the unsupported modality — not a 5xx after a three-minute model load, and not a provider error after admission and metering.
 
 This is the design working. The alternative — starting a model because the caller named it, then failing at the provider — is the failure mode the capability contract exists to prevent.
 

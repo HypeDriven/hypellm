@@ -896,16 +896,27 @@ impl Router {
         })
     }
 
-    /// Handles that stop both listeners.
+    /// Handles that stop every bound listener.
+    ///
+    /// A collection rather than a tuple because the set is not fixed: the
+    /// metrics listener exists only when `settings metrics_listen` names an
+    /// address. `serve` joins every listener thread it spawned, so a listener
+    /// missing from this set is one nothing ever signals — and the join then
+    /// blocks forever, leaving a router that acknowledged `shutdown`, drained
+    /// the planes it knew about, and never exited.
     #[must_use]
-    pub fn shutdown_handles(&self) -> (ShutdownHandle, ShutdownHandle) {
-        (
+    pub fn shutdown_handles(&self) -> Vec<ShutdownHandle> {
+        let mut handles = vec![
             self.inference.shutdown_handle(),
             self.management.shutdown_handle(),
-        )
+        ];
+        if let Some(metrics) = &self.metrics {
+            handles.push(metrics.shutdown_handle());
+        }
+        handles
     }
 
-    /// Serve until both listeners stop.
+    /// Serve until every listener stops.
     ///
     /// # Errors
     ///
@@ -2024,6 +2035,124 @@ binding id=b scope=tenant:acme model=* prefer=local:m
         // though no explicit quota named it.
         let target = hypellm_core::ids::TargetId::new("local:m").unwrap();
         assert!(router.state.admission.target_scope(&target).is_some());
+    }
+
+    #[test]
+    fn a_generated_bundle_carries_a_token_that_satisfies_the_verifier_it_wrote() {
+        // `generate` mints the break-glass token, derives the verifier, and
+        // writes only the verifier — so the token it returns is the whole of
+        // that credential's distribution. `main` prints it and nothing else
+        // reads it.
+        //
+        // The field went unread for a while, which is not a failure any test
+        // of the verifier could catch: the verifier was correct and nothing
+        // could satisfy it. On a deployment with no OIDC that leaves no way
+        // into the management plane, and therefore no way to mint the API key
+        // that inference requires.
+        let dir = TempDir::new("startup-break-glass-token");
+        let secrets = Secrets::generate().expect("entropy");
+
+        let token = secrets
+            .break_glass_token
+            .clone()
+            .expect("a generated bundle must carry its token, or it cannot be handed to anyone");
+        assert!(
+            token.len() >= 32,
+            "a 256-bit token encodes to more than 32 characters, got {}",
+            token.len()
+        );
+
+        let path = dir.join("secrets");
+        secrets.write_to(&path).expect("write bundle");
+
+        // What the router will actually check the presented token against is
+        // the file, not the in-memory copy.
+        let written = std::fs::read(path.join("break_glass.verifier")).expect("verifier written");
+        assert_eq!(
+            written,
+            break_glass_verifier(&token),
+            "the printed token must verify against the verifier that was written beside it"
+        );
+        assert_ne!(
+            written,
+            break_glass_verifier(&format!("{token}x")),
+            "the verifier must not accept a token it was not derived from"
+        );
+
+        // And the token itself is not on disk anywhere in the bundle:
+        // specification 22.4 requires it to live offline.
+        for entry in std::fs::read_dir(&path).expect("read bundle") {
+            let entry = entry.expect("entry");
+            if entry.path().is_dir() {
+                continue;
+            }
+            let bytes = std::fs::read(entry.path()).expect("read file");
+            assert!(
+                !bytes.windows(token.len()).any(|w| w == token.as_bytes()),
+                "the token must not be written to {}",
+                entry.path().display()
+            );
+        }
+    }
+
+    #[test]
+    fn shutting_down_stops_the_metrics_listener_too() {
+        // `serve` joins every listener thread it spawned, and the only thing
+        // that ends a listener's accept loop is its own shutdown handle. When
+        // `shutdown_handles` returned the inference and management pair and
+        // nothing else, a router configured with `metrics_listen` answered
+        // `shutdown` on the control socket, drained both planes, and then
+        // blocked forever joining a metrics thread nobody had asked to stop.
+        //
+        // A deployment that scrapes metrics on their own address — which is
+        // the reason the setting exists — therefore could not be stopped
+        // gracefully at all, only killed.
+        let dir = TempDir::new("startup-shutdown-metrics");
+        let text = MINIMAL
+            .replace("STATE_DIR", &dir.path().display().to_string())
+            .replace(
+                "admin_listen=127.0.0.1:0",
+                "admin_listen=127.0.0.1:0 metrics_listen=127.0.0.1:0",
+            );
+        let path = write_config(&dir, &text);
+        let secrets = Secrets::generate().expect("entropy");
+        let router = Router::assemble(&path, secrets, Severity::Warn).expect("assembles");
+
+        assert!(
+            router.metrics.is_some(),
+            "the fixture must actually bind a third listener, or this proves nothing"
+        );
+        let handles = router.shutdown_handles();
+        assert_eq!(
+            handles.len(),
+            3,
+            "one handle per bound listener: inference, management, metrics"
+        );
+
+        let (finished, waiting) = std::sync::mpsc::channel();
+        let served = std::thread::spawn(move || {
+            let outcome = router.serve(
+                CorsPolicy::with_origins(Vec::new()),
+                None,
+                None,
+                vec![7u8; 32],
+                None,
+            );
+            let _ = finished.send(());
+            outcome
+        });
+
+        for handle in &handles {
+            handle.shutdown();
+        }
+
+        assert!(
+            waiting
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_ok(),
+            "serve did not return within 10s of every handle being signalled"
+        );
+        assert!(served.join().expect("serve thread").is_ok());
     }
 
     #[test]

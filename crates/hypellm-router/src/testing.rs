@@ -330,6 +330,12 @@ pub fn router_for(upstream: &FakeUpstream) -> TestRouter {
 ///
 /// Panics if the configuration declares no active fleet, or if the runtime has
 /// already been attached: both mean the fixture is wrong.
+#[allow(
+    clippy::expect_used,
+    reason = "test scaffolding: a harness whose fixture does not build has \
+              nothing to assert, so it fails loudly; not reachable from the \
+              request path"
+)]
 pub fn attach_fleet(router: &TestRouter, key: &[u8]) {
     let config = router.state.config();
     let runtime = crate::fleet::FleetRuntime::new(

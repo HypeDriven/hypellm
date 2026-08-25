@@ -220,10 +220,15 @@ fn main() -> ExitCode {
             .and_then(|secrets| {
                 secrets
                     .write_to(&dir)
-                    .map_err(|e| format!("cannot write to {}: {e}", dir.display()))
+                    .map_err(|e| format!("cannot write to {}: {e}", dir.display()))?;
+                // Returned rather than dropped. `Secrets::generate` mints the
+                // break-glass token and writes only the verifier derived from
+                // it, so this is the one moment the token exists anywhere. It
+                // is carried out of the closure to be printed below.
+                Ok(secrets.break_glass_token.clone())
             });
         return match generated {
-            Ok(()) => {
+            Ok(token) => {
                 println!("wrote a secret bundle to {}", dir.display());
                 println!(
                     "these files are the router's root of trust: \
@@ -233,6 +238,25 @@ fn main() -> ExitCode {
                     "control.key authenticates `--shutdown` and `--ping`; \
                      anyone who can read it can stop this router"
                 );
+                // Specification 22.4: the token lives offline and the router
+                // keeps only its verifier. Printing it here is therefore the
+                // whole of its distribution — there is no second chance and no
+                // recovery from the verifier, and a bundle whose token was
+                // never read has a break-glass path that nothing can satisfy.
+                //
+                // Written to stdout, once, and never to the log: the telemetry
+                // layer is not started yet and this deliberately does not use
+                // it.
+                if let Some(token) = token {
+                    println!();
+                    println!("break-glass token: {token}");
+                    println!(
+                        "this is printed once and stored nowhere. Save it offline now; \
+                         it cannot be recovered, and without it \
+                         POST /admin/v1/auth/break-glass has no credential that \
+                         satisfies the verifier just written"
+                    );
+                }
                 ExitCode::SUCCESS
             }
             Err(message) => {
@@ -361,7 +385,7 @@ fn main() -> ExitCode {
 
     // The control socket is the shutdown mechanism. See the module comment for
     // why it is not a signal handler.
-    let (inference_shutdown, management_shutdown) = router.shutdown_handles();
+    let shutdown_handles = router.shutdown_handles();
     let control_path = match hypellm_router::startup::control_socket_path(&config) {
         Ok(path) => path,
         Err(message) => {
@@ -385,8 +409,7 @@ fn main() -> ExitCode {
                 return ExitCode::from(exit::STATE);
             }
 
-            let inference_shutdown = inference_shutdown.clone();
-            let management_shutdown = management_shutdown.clone();
+            let shutdown_handles = shutdown_handles.clone();
             let thread_path = control_path.clone();
             // Hex, so the token is a single whitespace-free word an operator
             // can paste, and so the comparison is over a fixed-width string
@@ -417,8 +440,9 @@ fn main() -> ExitCode {
                         match command {
                             "shutdown" | "drain" => {
                                 let _ = reply.write_all(b"shutting down\n");
-                                inference_shutdown.shutdown();
-                                management_shutdown.shutdown();
+                                for handle in &shutdown_handles {
+                                    handle.shutdown();
+                                }
                                 break;
                             }
                             "ping" => {

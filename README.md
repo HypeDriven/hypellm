@@ -79,13 +79,48 @@ cargo run -p hypellm-router -- \
   --config ./hypellm.conf --secrets ./secrets --static ./web
 ```
 
-`--generate-secrets` prints the break-glass token once. Store it offline; only its verifier remains on the router.
+`--generate-secrets` prints the break-glass token once and stores only its verifier. Save it offline: it cannot be recovered, and with no OIDC configured it is the only way into the management plane — and therefore the only way to mint the API key inference requires.
 
-Inference requests require a router API key created through the management API. See the [deployment guide](docs/deployment.md) for HTTPS/OIDC setup, credentials, configuration and service hardening.
+Inference requests require a router API key created through the management API. [Using the router](docs/using-the-router.md) is the client-side guide — how to mint that key and point a project at the endpoint. See the [deployment guide](docs/deployment.md) for HTTPS/OIDC setup, credentials, configuration and service hardening.
+
+## Run it in a container
+
+A [`justfile`](justfile) and [`compose.yaml`](compose.yaml) build the router and start it locally. Requirements: Docker and [`just`](https://github.com/casey/just).
+
+```bash
+just bootstrap  # first run: secrets, router, and a key to call it with
+just status     # is it running, and does it answer
+just logs       # follow the structured log
+just key        # mint another API key
+just down       # drain over the control socket, then remove the container
+```
+
+`just bootstrap` is `just up` plus the two steps that otherwise happen by hand. It captures the break-glass token from `--generate-secrets` — printed once, stored nowhere — spends it minting the first API key, and prints the token at the end to be stored offline. Without a key the router answers `/health` and refuses everything else, and with no OIDC provider configured break-glass is the only credential the management plane accepts.
+
+`just up` prints the inference, management and metrics endpoints when the router answers `/health/live`. The image build runs `depscan` and the release build offline; the router container gets no capabilities, a read-only root filesystem, and the invoking user's uid. Configuration is [`docker/hypellm.conf`](docker/hypellm.conf); state and secrets are bind-mounted under `run/`.
+
+### Reaching it over Tailscale
+
+The stack is two containers: a `tailscale/tailscale` node and the router running inside its network namespace. The router therefore *is* a tailnet node — `hypellm-router.<tailnet>.ts.net` — rather than a port published on the host, which also avoids Docker Desktop's inability to bind a host's Tailscale address.
+
+Which planes the tailnet can reach is decided by bind address, in `docker/hypellm.conf`:
+
+| Listener | Bound to | Tailnet | This host |
+|---|---|---|---|
+| Inference | `0.0.0.0:18000` | yes | yes |
+| Management + SPA | `10.89.7.2:18001` | no | yes |
+| Metrics | `10.89.7.2:18002` | no | yes |
+
+`10.89.7.2` is the compose bridge address, pinned in `compose.yaml`. A listener bound to it is reachable through the published loopback ports and is not bound on `tailscale0`, so a tailnet peer finds nothing listening. This fails closed and does not depend on a Tailscale ACL or a firewall rule elsewhere. Tailnet reachability is not authentication — inference still requires a router API key.
+
+First run needs the node authenticated: put a key in `run/secrets/tailscale.authkey`, or let `just up` print the login URL. `just tailnet` shows the node's address and its learned routes.
+
+Slaves are reached by their **LAN address**, over a Tailscale subnet route advertised from their network — `--accept-routes` installs it and the RFC 1918 destination is preserved, so `egress=private_network` still describes the connection. Do not point a provider at a slave's `100.64.0.0/10` address: that classifies as `shared_address_space`, which `EgressProfile::permits` refuses under every profile, because carrier-grade NAT space is a well-known SSRF pivot.
 
 ## Documentation
 
 - [Documentation index](docs/README.md)
+- [Using the router](docs/using-the-router.md) — pointing a project at a running instance
 - [Deployment and configuration](docs/deployment.md)
 - [Operational runbooks](docs/runbooks.md)
 - [Fleet orchestration](docs/orchestration.md) and the [fleet agent](agent/README.md)

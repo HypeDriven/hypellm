@@ -10,6 +10,8 @@ This page lists limitations that matter when evaluating or operating the current
 | Process isolation | The process cannot drop privileges, install a sandbox, lock secret pages or scrub its inherited environment. | Start it as an unprivileged user and apply sandboxing, core-dump restrictions and filesystem controls in the service manager or container runtime. |
 | Multi-node operation | No state replication, leader election or distributed configuration service is included. | Give every node a separate local state directory. Use `quota_partitions` when independently deployed nodes share traffic. |
 | Shutdown | The router has no signal handler. | Use the authenticated control socket through `hypellm-router --shutdown`; configure the supervisor's stop command accordingly. |
+| Management authentication | `/admin/v1` accepts a session cookie and nothing else. The `management:read` and `management:write` API-key scopes parse and are stored, but no handler consults them, so a key carrying them has no management access. | Mint keys from an operator session — Google OIDC, or break-glass where no provider is configured. Do not build automation that expects to authenticate to `/admin/v1` with an API key. |
+| State lock in a container | The lock file records the process id, which is `1` in a PID namespace and always looks alive. A container killed rather than drained leaves a lock no later start can reclaim. | Stop the router with `--shutdown`. After a kill, delete `<state_dir>/lock` once no router process is running; `just up` does this when no container is up. |
 | Streaming | Backpressure is bounded by synchronous flow control but there is no configurable stream high/low watermark. | Monitor `hypellm_stream_backpressure_milliseconds`; slow clients occupy their connection worker until a deadline or write timeout. |
 | Token estimation | Admission uses a conservative byte-based estimate rather than the selected model's tokenizer. | Expect some requests near token limits to be rejected conservatively. Provider `/v1/tokenize` support does not feed admission estimates. |
 | Routing hints | `prefer_target` now reorders eligible targets, within a bounded slice of the affinity term. It cannot create eligibility, beat a warmer target or outrank a binding. | Express hard preference through aliases and priority bindings; use the hint only to break ties between comparable targets. |
@@ -61,6 +63,18 @@ The router reports detectable missing Linux hardening at startup, including root
 Several router instances may serve the same upstream providers if each has its own state and secret directories. `settings quota_partitions=N` conservatively divides configured quotas so N independently deployed nodes do not multiply a tenant's aggregate allowance.
 
 This does not synchronize API keys, sessions, audit chains, policy activation, decision traces or health state. Never point two running processes at one state directory; the PID-file lock is not a distributed lock and is unsuitable for shared or network filesystems.
+
+## The state lock records a namespaced process id
+
+**Specification:** §11.2. **Implementation:** `hypellm-store::ProcessLock` (`crates/hypellm-store/src/durable.rs`).
+
+The single-writer lock is a PID file: `acquire` writes `std::process::id()`, and a later start reclaims the lock only if `/proc/<pid>` is gone. Both halves are relative to the caller's PID namespace, and inside a container the router is pid 1.
+
+The consequence is specific to containers. A router that exits through `--shutdown` removes its lock and nothing is left behind. A router whose container is killed — `docker kill`, a `docker compose down` that reaches its grace period, an OOM kill — leaves a lock file containing `1`. The next container reads it, asks whether pid 1 is alive, finds itself, and refuses to start with `the state directory is locked by a running process (pid 1)`. The refusal is permanent until the file is deleted, and it is indistinguishable from the case the lock exists to prevent.
+
+Deleting `<state_dir>/lock` when no router is running is safe and is what the reclaim path would have done. `just up` does it as a preflight, having first established that no router container exists.
+
+`flock` would be namespace-independent and would release on process death, and it is not used: it needs `unsafe` FFI, which §18.2 forbids workspace-wide. See also [independent nodes are not a cluster](#independent-nodes-are-not-a-cluster).
 
 ## Graceful shutdown uses the control socket
 
