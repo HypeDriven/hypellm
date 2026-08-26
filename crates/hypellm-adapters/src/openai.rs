@@ -236,13 +236,15 @@ impl Adapter for OpenAiAdapter {
                 if let Some(dims) = meta.target.capabilities.embedding_dimensions {
                     body.push("dimensions", Value::from(dims));
                 }
-                push_chat_sampling(&mut body, request);
+                push_chat_sampling(&mut body, request, None);
             }
             // A separate shape, not a Chat Completions body sent to another
             // path: see the dialect table in the module documentation. A real
             // deployment rejects the Chat shape here, so "close enough" is a
             // 400 for every request the router sends.
-            Operation::Responses => encode_responses_body(&mut body, request)?,
+            Operation::Responses => {
+                encode_responses_body(&mut body, request, declared_output_limit(meta))?;
+            }
             _ => {
                 body.push("messages", encode_messages(request)?);
                 if request.stream.enabled {
@@ -262,7 +264,7 @@ impl Adapter for OpenAiAdapter {
                 if let Some(format) = &request.response_format {
                     body.push_opt("response_format", encode_response_format(format)?);
                 }
-                push_chat_sampling(&mut body, request);
+                push_chat_sampling(&mut body, request, declared_output_limit(meta));
             }
         }
 
@@ -588,13 +590,26 @@ fn decode_tool_call(call: &Value, index: u32) -> ToolCallDelta {
     }
 }
 
+/// The target's declared output ceiling, or `None` where it declares none.
+///
+/// `max_output` is 0 by default in configuration, and 0 means undeclared. Sending it as a limit
+/// would ask every provider for a zero-token completion.
+fn declared_output_limit(meta: &RequestMeta<'_>) -> Option<u32> {
+    let declared = meta.target.capabilities.max_output_tokens;
+    (declared != 0).then_some(declared)
+}
+
 /// The sampling tail Chat Completions and embeddings share.
 ///
 /// Only what the client actually set. Specification 5.1's "explicit unset
 /// distinct from zero" is the whole reason these are `push_opt` rather than
 /// defaulted. The Responses dialect spells the same knobs differently and
 /// accepts fewer of them, so it emits its own tail rather than reusing this.
-fn push_chat_sampling(body: &mut Object, request: &CanonicalRequest) {
+fn push_chat_sampling(
+    body: &mut Object,
+    request: &CanonicalRequest,
+    default_max_output_tokens: Option<u32>,
+) {
     let sampling = &request.sampling;
     body.push_opt("temperature", sampling.temperature.map(Value::from));
     body.push_opt("top_p", sampling.top_p.map(Value::from));
@@ -613,9 +628,22 @@ fn push_chat_sampling(body: &mut Object, request: &CanonicalRequest) {
             Value::Array(sampling.stop.iter().map(|s| Value::from(s.as_str())).collect()),
         );
     }
+    // Falling back to the target's declared limit where the caller named none.
+    //
+    // An absent limit is not "the provider picks something sensible": a llama.cpp target started
+    // without `-n` reports `n_predict: -1` and generates until its slot context fills, holding a
+    // concurrency slot long after whoever asked has gone. The router is the only party that knows
+    // what the target declared, so it is the only one that can close that.
+    //
+    // Chat only — `max_tokens` on an embeddings body is a 400 — and never invented from nothing:
+    // `max_output` defaults to 0, which means undeclared, not unlimited.
     body.push_opt(
         "max_tokens",
-        request.limits.max_output_tokens.map(Value::from),
+        request
+            .limits
+            .max_output_tokens
+            .or(default_max_output_tokens)
+            .map(Value::from),
     );
     // The reasoning tier, in the Chat Completions spelling. Typed conversion
     // and nothing more: the routing decision was already made against the
@@ -657,6 +685,7 @@ const fn chat_reasoning_effort(effort: ReasoningEffort) -> Option<&'static str> 
 fn encode_responses_body(
     body: &mut Object,
     request: &CanonicalRequest,
+    default_max_output_tokens: Option<u32>,
 ) -> Result<(), ValidationFailure> {
     // Canonical system messages are a top-level field in this dialect rather
     // than a turn in the conversation, exactly as in the Anthropic protocol.
@@ -699,7 +728,11 @@ fn encode_responses_body(
     // named for the thing it limits, which is why nothing here has to guess.
     body.push_opt(
         "max_output_tokens",
-        request.limits.max_output_tokens.map(Value::from),
+        request
+            .limits
+            .max_output_tokens
+            .or(default_max_output_tokens)
+            .map(Value::from),
     );
     // This dialect nests the tier under `reasoning` rather than carrying a
     // flat `reasoning_effort`.
@@ -1667,6 +1700,65 @@ mod tests {
         let body = encoded(&request);
         assert_eq!(body.field_array("input").unwrap().len(), 2);
         assert!(body.get("messages").is_none());
+    }
+
+    // -- The declared output limit ------------------------------------------
+
+    /// An absent `max_tokens` is not "the provider picks something sensible". A llama.cpp target
+    /// started without `-n` reports `n_predict: -1` and generates until its slot context fills,
+    /// holding a concurrency slot long after whoever asked has gone. The router is the only party
+    /// that knows what the target declared.
+    #[test]
+    fn a_chat_request_that_names_no_limit_gets_the_targets_declared_one() {
+        let mut request = request_fixture();
+        request.limits.max_output_tokens = None;
+        let body = encoded(&request);
+        assert_eq!(body.field_i64("max_tokens").ok(), Some(16_384));
+    }
+
+    #[test]
+    fn a_caller_that_names_a_limit_keeps_it() {
+        let request = request_fixture();
+        assert_eq!(request.limits.max_output_tokens, Some(512));
+        assert_eq!(encoded(&request).field_i64("max_tokens").ok(), Some(512));
+    }
+
+    /// The Responses dialect spells it differently and had the same hole.
+    #[test]
+    fn a_responses_request_that_names_no_limit_gets_it_too() {
+        let mut request = request_fixture();
+        request.operation = Operation::Responses;
+        request.limits.max_output_tokens = None;
+        let body = encoded(&request);
+        assert_eq!(body.field_i64("max_output_tokens").ok(), Some(16_384));
+    }
+
+    /// `max_tokens` on an embeddings body is a 400 at OpenAI proper, and the same helper builds
+    /// both — so the fallback has to stop at the chat branch.
+    #[test]
+    fn an_embeddings_request_is_given_no_limit() {
+        let mut request = request_fixture();
+        request.operation = Operation::Embeddings;
+        request.messages.clear();
+        request.inputs = vec!["one".to_owned()];
+        request.limits.max_output_tokens = None;
+        assert!(encoded(&request).get("max_tokens").is_none());
+    }
+
+    /// Zero is how configuration spells "undeclared", not "no tokens please".
+    #[test]
+    fn a_target_declaring_no_limit_invents_none() {
+        let mut target = target_fixture();
+        target.capabilities.max_output_tokens = 0;
+        let endpoint = target_fixture_endpoint();
+        let mut request = request_fixture();
+        request.limits.max_output_tokens = None;
+        let meta = meta_fixture(&target, &endpoint, request.stream.enabled);
+
+        let bytes = adapter().encode_request(&request, &meta).expect("encodes");
+        let body = parse(&bytes, &Limits::DEFAULT).expect("valid JSON");
+
+        assert!(body.get("max_tokens").is_none());
     }
 
     // -- Headers ------------------------------------------------------------

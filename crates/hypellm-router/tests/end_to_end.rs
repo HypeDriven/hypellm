@@ -893,7 +893,16 @@ fn the_upstream_receives_the_native_model_not_the_alias() {
     assert_eq!(json.field_array("messages").unwrap().len(), 1);
     // The router does not invent parameters the client did not set.
     assert!(json.get("temperature").is_none());
-    assert!(json.get("max_tokens").is_none());
+
+    // `max_tokens` is the exception, and deliberately so: an absent output
+    // limit is not "the provider picks something sensible". A llama.cpp target
+    // started without `-n` reports `n_predict: -1` and generates until its slot
+    // context fills, holding a concurrency slot long after whoever asked has
+    // gone. `declared_output_limit` in the OpenAI adapter falls back to what
+    // the target declared — `max_output=8192` in `default_config_text` — and
+    // only where the target declares one, since `max_output` defaults to 0
+    // meaning undeclared rather than unlimited.
+    assert_eq!(json.field_i64("max_tokens").ok(), Some(8192));
 }
 
 #[test]
