@@ -35,6 +35,14 @@ state_dir     := justfile_directory() / "run" / "state"
 secrets_dir   := justfile_directory() / "run" / "secrets"
 tailscale_dir := justfile_directory() / "run" / "tailscale"
 
+# The identity verifier's two directories, created empty and used only under
+# the `oidc` compose profile (see verifier/README.md). `verify` is the socket
+# the router reaches it on and is shared with the router container; `verifier`
+# holds verifier.json and the OAuth client secret, so it is 0700 and never
+# committed.
+verify_dir    := justfile_directory() / "run" / "verify"
+verifier_dir  := justfile_directory() / "run" / "verifier"
+
 # Tailscale authenticates once and persists its node identity in
 # run/tailscale. A key is needed only for that first login; after it, the file
 # can be deleted. Absent, the node prints a login URL instead and `just up`
@@ -301,6 +309,24 @@ check: build
         -v "{{config}}:/etc/hypellm/hypellm.conf:ro" \
         hypellm-router:local --check --config /etc/hypellm/hypellm.conf
 
+# The identity verifier's two test layers.
+#
+# `--selftest` is the JOSE logic in-process — algorithm confusion, key
+# selection, tampering, bounds — and needs only openssl. `acceptance` stands the
+# real process up behind a local TLS key-set server and drives it twice: once
+# over a re-derived copy of the router's framing, once through the router's own
+# `VerifierClient`. Neither reaches the network.
+#
+# The client half lives in `crates/hypellm-net/tests/verifier_acceptance.rs` and
+# is `#[ignore]`d, because starting a process is what specification 4.1 forbids
+# the router from doing — so the harness starts it and the tests only connect.
+# `cargo test --workspace` therefore stays hermetic and skips them.
+[doc('Run the identity verifier self-test and end-to-end acceptance')]
+verifier-acceptance:
+    @verifier/hypellm-verifier --selftest
+    @echo
+    @verifier/acceptance
+
 # Stop the router the way it is meant to be stopped: `shutdown` over the
 # authenticated control socket, which stops admission and drains in-flight
 # requests. Falls back to compose's SIGTERM/SIGKILL if the socket is gone.
@@ -496,8 +522,8 @@ _ports:
 # Bind-mount targets have to exist and be owned by the invoking user before
 # Docker creates them itself as root.
 _dirs:
-    @mkdir -p "{{state_dir}}" "{{secrets_dir}}" "{{tailscale_dir}}"
-    @chmod 0700 "{{secrets_dir}}" "{{tailscale_dir}}"
+    @mkdir -p "{{state_dir}}" "{{secrets_dir}}" "{{tailscale_dir}}" "{{verify_dir}}" "{{verifier_dir}}"
+    @chmod 0700 "{{secrets_dir}}" "{{tailscale_dir}}" "{{verifier_dir}}"
 
 # Generate the secret bundle once. A missing key is a startup failure by
 # design (exit 5) and is never silently regenerated: a router that invents its

@@ -188,8 +188,11 @@ returns an error rather than falling back to a cleartext socket
 Omitting the OIDC settings disables Google sign-in completely, which for an
 air-gapped deployment is the point. Break-glass is the management plane there:
 set `break_glass_principal`, `break_glass_tenant`, and a `role_binding`, keep the
-token, and sign in through `POST /admin/v1/auth/break-glass` (see
-[`runbooks.md` 22.4](runbooks.md#break-glass-access)).
+token, and sign in through the admin application's sign-in screen or
+`POST /admin/v1/auth/break-glass` directly (see
+[`runbooks.md` 22.4](runbooks.md#break-glass-access)). With no `oidc` record the
+sign-in screen reveals the break-glass panel on its own, because Google sign-in
+answers `not_found` on this profile.
 
 **Capture the token when the bundle is generated.** It is printed once and
 cannot be recovered, and on this profile it is the only way into the management
@@ -269,6 +272,13 @@ The verifier checks the signature; it must **not** validate `iss`, `aud`, `exp`,
 or `nonce` — those are checked in exactly one place,
 `hypellm_auth::oidc::validate_claims`, so that a check cannot be skipped on one of
 two paths (`crates/hypellm-net/src/helper.rs`, `crates/hypellm-auth/src/oidc.rs`).
+
+A reference implementation is in `verifier/`, outside the workspace for the same
+reason `agent/` is. It performs no cryptography of its own: the RSA check is
+`openssl dgst -verify` and the HTTPS is the platform's, which is what
+specification 4's "never write novel signature or TLS code" requires. See
+[`verifier/README.md`](../verifier/README.md) for setup, the obligations it
+keeps, and the procedure for enrolling the first administrator.
 
 Both helper sockets are Unix sockets; their access control is filesystem
 permission on the containing directory, which the router does not set.

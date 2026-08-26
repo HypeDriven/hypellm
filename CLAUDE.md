@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The specification is `secure_llm_router_specification.md` (v1.0, "HypeLLM Router"). It is the authority: when this file and the specification disagree, the specification wins.
 
-The implementation is a Rust workspace of 17 crates, a static admin SPA under `web/`, and a reference fleet agent under `agent/` that is deliberately **not** a workspace member. It is **not** feature-complete against the specification; `docs/deferred-issues.md` lists only the current limitations and accepted deviations.
+The implementation is a Rust workspace of 17 crates, a static admin SPA under `web/`, and two reference out-of-process services that are deliberately **not** workspace members: the fleet agent under `agent/` and the identity verifier under `verifier/`. It is **not** feature-complete against the specification; `docs/deferred-issues.md` lists only the current limitations and accepted deviations.
 
 The repository uses Git. Do not assume an edited working tree is disposable.
 
@@ -60,6 +60,7 @@ These are the spec's defining decisions. Most "obvious" implementation choices v
 - **The SPA has no `vendor/` directory.** First-party HTML/CSS/ES-modules/SVG only; no eval, no inline handlers, no HTML string injection (build DOM nodes), no service-worker code execution, strict CSP (§15).
 - **Everything is bounded.** No unbounded thread, task, buffer, channel, queue, retry loop, or log entry may originate from a request. Header/body/JSON-depth/stream-buffer limits are in §3.2; every I/O has a deadline and cancellation path. A request may not create an unbounded amount of *fleet work* either: activation queues, plan sizes, eviction sets and leases all carry finite maxima.
 - **The router never executes a process.** Starting a container means `ssh` and `docker`, which happens in `agent/` across a narrow authenticated Unix socket carrying opaque identifiers and bounded integers only. `depscan`'s `forbidden-api` rule fails the build on `process::Command`; do not work around it (§26.2).
+- **The router verifies no JWT and terminates no TLS.** §4 and §9.1 put both outside it, so `hypellm-net::helper` is a *client* for two platform services. `verifier/` is the reference identity verifier: it performs no cryptography of its own — `openssl dgst -verify` for the signature, the platform's TLS for the transport — and it validates the signature only, because `iss`/`aud`/`exp`/`nonce` are checked in exactly one place (`hypellm_auth::oidc::validate_claims`). Adding a claim check there would create the second path that design exists to prevent.
 
 ## Architecture shape
 
@@ -121,7 +122,7 @@ Credentials live behind opaque handles resolved only inside the adapter boundary
 All layers except a few fuzz rows now exist:
 
 - **Property** — `crates/hypellm-core/tests/properties.rs`: 14 properties over Appendix B (routing determinism, deny monotonicity, pin semantics, reservation conservation, score overflow), each across 400 seeded cases. `crates/hypellm-core/tests/capability.rs` adds 16 over the §26.1 contract, and `crates/hypellm-fleet/tests/properties.rs` 12 over the §26.4/§26.5 fleet invariants.
-- **Fuzz** — `tests/fuzz.rs` in `wire-json` (6), `wire-http1` (7), `wire-sse` (8), `hypellm-config` (7), `hypellm-store` (7), `hypellm-adapters` (9), `hypellm-admin-api` (9), `hypellm-router` (9), and `hypellm-fleet` (8: agent inventory, agent replies, lease accounting). That is all seven areas §21 names, plus the client protocol parsers. There is **no `fuzz/` directory and no libFuzzer** — §4 admits no such dependency. The engine is a seeded deterministic mutator in `hypellm-test-corpus::fuzz`, driven from ordinary `#[test]` functions so `cargo test` runs it and a failure is reproducible by seed number.
+- **Fuzz** — `tests/fuzz.rs` in `wire-json` (6), `wire-http1` (7), `wire-sse` (8), `hypellm-config` (7), `hypellm-store` (7), `hypellm-adapters` (9), `hypellm-admin-api` (9), `hypellm-router` (9), `hypellm-fleet` (8: agent inventory, agent replies, lease accounting), and `hypellm-net` (5: the identity verifier boundary — no claim fabricated from a malformed reply, no identity from a refusal). That is all seven areas §21 names, plus the client protocol parsers. There is **no `fuzz/` directory and no libFuzzer** — §4 admits no such dependency. The engine is a seeded deterministic mutator in `hypellm-test-corpus::fuzz`, driven from ordinary `#[test]` functions so `cargo test` runs it and a failure is reproducible by seed number.
 - **What that does not mean.** It is not coverage-guided and does not shrink, so it finds what its seeds and mutation strategies reach. A failing case prints at whatever size it was generated.
 
 A fuzz target that only asserts "does not panic" is close to worthless here. Each of these asserts a property the code could plausibly violate — no silent widening, no leaked body, no identity taken from a caller, no unauthenticated success — and three of them have found real defects. When adding one, write the property first.

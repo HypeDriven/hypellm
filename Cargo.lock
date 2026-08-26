@@ -95,6 +95,7 @@ dependencies = [
  "hypellm-fleet",
  "hypellm-net",
  "hypellm-store",
+ "hypellm-test-corpus",
  "wire-http1",
  "wire-json",
  "wire-sse",

@@ -126,6 +126,6 @@ These are design boundaries rather than defects, but they affect deployment:
 
 - Inbound TLS is supplied by a trusted edge; outbound TLS and OIDC signature verification are supplied by local platform helpers.
 - Possession of the secrets directory defeats keyed store-integrity and authentication controls. Protect it separately from state.
-- The TLS helper and OIDC verifier are part of the trusted computing base.
+- The TLS helper and OIDC verifier are part of the trusted computing base. The reference verifier in `verifier/` holds the OAuth client secret and decides which identity tokens are authentic; review it as such.
 - Availability against an attacker capable of filling the configured connection cap is bounded, not guaranteed.
 - API and module changes involving auth, parsers, credential handling, policy activation or storage integrity require two-person review.

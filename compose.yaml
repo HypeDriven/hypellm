@@ -176,6 +176,13 @@ services:
       - ./run/secrets:/etc/hypellm/secrets
       # Also holds `control.sock`, which is where `just down` sends `shutdown`.
       - ./run/state:/var/lib/hypellm
+      # Where the identity verifier puts its socket, when it is running. Mounted
+      # unconditionally and empty by default: a Unix socket is a filesystem
+      # object, so this is the whole channel between the two containers, and it
+      # works regardless of the network namespace the router is in. With the
+      # `oidc` profile down the directory is simply empty, and the router only
+      # looks for the socket if `oidc_verifier_socket` is configured.
+      - ./run/verify:/run/hypellm
 
     # The router does not install a signal handler: specification 18.2 forbids
     # the `unsafe` FFI that `sigaction` needs, so `shutdown` arrives over the
@@ -187,6 +194,68 @@ services:
 
     # No restart policy on purpose: after a graceful `--shutdown` the process
     # exits 0, and `unless-stopped` would immediately start it again.
+    restart: "no"
+
+  # The identity verifier (`verifier/README.md`), which is what makes Google
+  # sign-in possible: the router ships a client for it and no implementation,
+  # because specification 9.1 puts JWT signature verification outside the
+  # router. Without this service `oidc_callback` answers "the identity verifier
+  # is not configured" and only break-glass can reach the management plane.
+  #
+  # Behind a profile, so `just up` does not start it: it needs a Google OAuth
+  # client and a `run/verifier/verifier.json` that does not exist until someone
+  # creates one. Start it with `docker compose --profile oidc up -d verifier`.
+  verifier:
+    profiles: ["oidc"]
+    # A stock Python image rather than the router's, and not a build of its own.
+    # The router's image installs no packages by design (docker/Dockerfile), and
+    # this process needs a Python runtime and the `openssl` command — which this
+    # image has at /usr/bin/openssl. The script is mounted rather than copied in
+    # so that editing it does not mean rebuilding anything.
+    image: python:3.13-slim
+    container_name: hypellm-verifier
+
+    # On the bridge, not in the tailnet namespace. It needs outbound HTTPS to
+    # the issuer's key set and token endpoint, and it does not need to be
+    # reachable from anywhere: the router talks to it over the Unix socket in
+    # the shared volume below.
+    networks:
+      - hypellm
+
+    command:
+      - python3
+      - /opt/hypellm-verifier/hypellm-verifier
+      - --config
+      - /etc/hypellm/verifier/verifier.json
+      - --socket
+      - /run/hypellm/verify.sock
+      - --log
+      - info
+
+    # The same uid as the router, so the 0660 socket is readable by both without
+    # inventing a shared group inside two different images.
+    user: "${HYPELLM_UID:-1000}:${HYPELLM_GID:-1000}"
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+
+    # `openssl dgst -verify` reads its key, signature and data from files, so
+    # the verifier writes a private temporary directory per verification. With
+    # a read-only root filesystem that needs somewhere to go, and a tmpfs keeps
+    # it off disk — which is the right place for it anyway.
+    tmpfs:
+      - /tmp
+
+    volumes:
+      - ./verifier:/opt/hypellm-verifier:ro
+      # Holds `verifier.json` and the OAuth client secret. Read-only, and under
+      # run/ so neither is ever committed.
+      - ./run/verifier:/etc/hypellm/verifier:ro
+      - ./run/verify:/run/hypellm
+
     restart: "no"
 
 # A pinned subnet, so the management and metrics bind addresses in

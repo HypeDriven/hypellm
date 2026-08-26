@@ -1,0 +1,1149 @@
+#!/usr/bin/env python3
+"""The HypeLLM reference identity verifier.
+
+This is the process that checks OpenID Connect identity token signatures and
+redeems authorization codes. It is **not** part of the HypeLLM workspace and is
+not built by `cargo build --workspace`, for the same reason `agent/fleet-agent`
+is not: specification 4 and 9.1 place this work outside the router.
+
+    > **OIDC dependency boundary:** JWT signature verification and HTTPS are
+    > cryptographic security functions. Strict profile delegates them to an
+    > approved local identity/TLS verifier service over a narrow authenticated
+    > local interface. … Never write novel signature or TLS code merely to
+    > satisfy "no dependencies."
+
+That last sentence is the constraint this file is written under, and it is why
+**no cryptography is implemented here**:
+
+- The RSA signature check is performed by `openssl dgst -verify`, invoked with
+  an argument vector. OpenSSL is the platform's audited implementation; this
+  file does not compute a modular exponentiation, compare a digest, or
+  implement PKCS#1.
+- HTTPS to the issuer's key set and token endpoint is performed by the standard
+  library's `ssl` module against the system trust store. This file does not
+  implement TLS, does not disable verification, and has no code path that falls
+  back to cleartext.
+
+What is left here is the JOSE *envelope*: splitting the token, pinning the
+algorithm, selecting the key by `kid`, and encoding a public key so OpenSSL can
+read it. That is structure, not cryptography — but it is also where JWT
+verifiers historically go wrong, so every one of those decisions is stated
+below and each has a test in `--selftest`.
+
+The design rules it exists to keep
+----------------------------------
+
+1. **One algorithm, pinned, from the verifier's own configuration.** `alg` is
+   compared against a fixed allowlist before any key is selected. `none` is not
+   in it, no MAC algorithm is in it, and the header cannot widen it. Algorithm
+   confusion is the canonical JWT vulnerability and the only defence that works
+   is refusing to let the token choose.
+2. **Router input selects a row; it never becomes a destination.** `EXCHANGE`
+   carries `token_endpoint`, `client_id` and `redirect_uri`. Every one of them
+   is compared against this verifier's own configuration and a mismatch is
+   refused. A fully compromised router cannot point this process at an
+   attacker's token endpoint and cannot make it spend the client secret
+   somewhere new. The same rule as the fleet agent's, for the same reason.
+3. **The client secret lives here, not in the router.** The router's
+   configuration has no field for one and the SPA never sees one
+   (specification 9.1). This process holds it, reads it from a file, and never
+   logs it.
+4. **It validates the signature and nothing else.** `iss`, `aud`, `azp`, `exp`,
+   `iat`, `nonce`, `email_verified` and `hd` are checked by
+   `hypellm_auth::oidc::validate_claims`, in exactly one place, so a check
+   cannot be skipped on one of two paths. A verifier that also checked them
+   would create the second path.
+5. **Everything is bounded.** Token size, key-set size, response size, the
+   OpenSSL timeout, the HTTPS timeout, the connection timeout, and the number
+   of concurrent connections all have finite maxima.
+6. **Nothing sensitive is logged.** Not the token, not the claims, not the
+   email address, not the client secret. A log line names the `kid`, the verb
+   and the outcome.
+
+Only the standard library is used, plus the `openssl` command-line tool.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import json
+import logging
+import os
+import socket
+import socketserver
+import ssl
+import string
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+from typing import Any
+
+LOG = logging.getLogger("hypellm-verifier")
+
+# -- Bounds -------------------------------------------------------------------
+#
+# `MAX_TOKEN_BYTES` and `MAX_CLAIMS_BYTES` mirror `crates/hypellm-net/src/helper.rs`.
+# The router refuses to submit a token larger than the first and refuses to read
+# a reply larger than the second, so a verifier that accepted more would only be
+# generating replies the router discards.
+
+MAX_TOKEN_BYTES = 16 * 1024
+MAX_CLAIMS_BYTES = 64 * 1024
+MAX_STATUS_LINE = 256
+MAX_JWKS_BYTES = 256 * 1024
+MAX_TOKEN_RESPONSE_BYTES = 256 * 1024
+
+DEFAULT_JWKS_TTL_SECONDS = 3600
+DEFAULT_HTTP_TIMEOUT = 10.0
+DEFAULT_OPENSSL_TIMEOUT = 5.0
+DEFAULT_CONNECTION_TIMEOUT = 30.0
+
+# The algorithm allowlist. Rule 1: the token does not get to choose.
+#
+# RS256 is what Google signs identity tokens with. The other two are here so a
+# different issuer does not require a code change, and nothing else is: `none`
+# would make every token valid, and an HMAC algorithm would let a caller sign a
+# token with the *public* key this process is about to look up, which is the
+# textbook confusion attack.
+PERMITTED_ALGORITHMS = {
+    "RS256": "sha256",
+    "RS384": "sha384",
+    "RS512": "sha512",
+}
+
+
+class Refused(Exception):
+    """A request that must be answered `ERR <code>`.
+
+    The code is a short stable token, never a message and never anything
+    derived from the input: the router truncates it into an audit reason, and a
+    reason that echoed the caller would be a way to write to the audit log.
+    """
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+# -- base64url ----------------------------------------------------------------
+
+
+_B64URL_ALPHABET = frozenset(string.ascii_letters + string.digits + "-_")
+
+
+def is_b64url(value: str) -> bool:
+    """Whether a string is a non-empty unpadded base64url segment.
+
+    Checked explicitly because `base64.urlsafe_b64decode` *discards* characters
+    outside the alphabet rather than rejecting them, so `ab$$cd` and `abcd`
+    decode alike. No forgery follows from that here — the signature covers the
+    raw segment, so an altered one fails verification — but a decoder whose
+    input space is larger than its output space is the wrong primitive to build
+    a token parser on, and rejecting up front keeps the refusal accurate.
+    """
+    return bool(value) and all(character in _B64URL_ALPHABET for character in value)
+
+
+def b64url_decode(value: str) -> bytes:
+    """Decode unpadded base64url, refusing anything that is not exactly that."""
+    if not is_b64url(value):
+        raise Refused("malformed")
+    raw = value.encode("ascii")
+    padding = b"=" * (-len(raw) % 4)
+    try:
+        return base64.urlsafe_b64decode(raw + padding)
+    except (binascii.Error, ValueError) as exc:
+        raise Refused("malformed") from exc
+
+
+def b64url_uint(value: str) -> int:
+    """Decode a JWK's base64url big-endian unsigned integer."""
+    return int.from_bytes(b64url_decode(value), "big")
+
+
+# -- DER ----------------------------------------------------------------------
+#
+# Encoding, not cryptography: OpenSSL will not read a raw (modulus, exponent)
+# pair, so the JWK is wrapped in the SubjectPublicKeyInfo structure that
+# `-----BEGIN PUBLIC KEY-----` denotes. If any of this were wrong OpenSSL would
+# refuse to load the key and every verification would fail closed, which is
+# what the positive case in `--selftest` proves does not happen.
+
+# rsaEncryption (1.2.840.113549.1.1.1), then the mandatory NULL parameters.
+_RSA_ENCRYPTION_OID = bytes.fromhex("06092a864886f70d010101")
+_DER_NULL = bytes.fromhex("0500")
+
+
+def _der_length(count: int) -> bytes:
+    if count < 0x80:
+        return bytes([count])
+    raw = count.to_bytes((count.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(raw)]) + raw
+
+
+def _der_tlv(tag: int, value: bytes) -> bytes:
+    return bytes([tag]) + _der_length(len(value)) + value
+
+
+def _der_integer(number: int) -> bytes:
+    if number < 0:
+        raise Refused("malformed")
+    raw = number.to_bytes(max(1, (number.bit_length() + 7) // 8), "big")
+    # DER integers are signed, so a leading bit of 1 needs a zero byte in front
+    # or the value reads as negative.
+    if raw[0] & 0x80:
+        raw = b"\x00" + raw
+    return _der_tlv(0x02, raw)
+
+
+def rsa_public_key_pem(modulus: int, exponent: int) -> str:
+    """A PEM SubjectPublicKeyInfo for an RSA public key."""
+    rsa_public_key = _der_tlv(0x30, _der_integer(modulus) + _der_integer(exponent))
+    algorithm = _der_tlv(0x30, _RSA_ENCRYPTION_OID + _DER_NULL)
+    # The BIT STRING's leading byte is the count of unused bits, always zero here.
+    subject_public_key = _der_tlv(0x03, b"\x00" + rsa_public_key)
+    spki = _der_tlv(0x30, algorithm + subject_public_key)
+
+    body = base64.b64encode(spki).decode("ascii")
+    lines = [body[i : i + 64] for i in range(0, len(body), 64)]
+    return "-----BEGIN PUBLIC KEY-----\n" + "\n".join(lines) + "\n-----END PUBLIC KEY-----\n"
+
+
+# -- Key set ------------------------------------------------------------------
+
+
+@dataclass
+class KeySet:
+    """The issuer's signing keys, cached for a bounded lifetime.
+
+    Specification 9.1: "Validate signature using pinned issuer keys cached with
+    bounded lifetime." Bounded in both directions — an expired cache is
+    refetched, and a fetch that fails does *not* extend the life of what is
+    already held past its expiry. Serving an indefinitely stale key set would
+    keep accepting tokens signed by a key the issuer has revoked.
+    """
+
+    uri: str | None
+    ttl_seconds: int
+    timeout: float
+    # The floor between two fetches provoked by an unknown `kid`. Without it an
+    # unauthenticated caller decides how often this process talks to the
+    # issuer: every token bearing a random `kid` would miss the cache and cause
+    # a fetch, which is both an amplifier pointed at the issuer and a way to
+    # stall every concurrent sign-in behind the lock. Specification 3.2's rule
+    # that no request may create unbounded work applies out here too.
+    refetch_floor_seconds: float = 60.0
+    keys: dict[str, str] = field(default_factory=dict)
+    expires_at: float = 0.0
+    next_refetch_at: float = 0.0
+    fetches: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def public_key(self, kid: str, algorithm: str) -> str:
+        with self.lock:
+            if self.uri is not None and time.monotonic() >= self.expires_at:
+                self._refresh()
+            key = self.keys.get(kid)
+            if key is None and self.uri is not None and time.monotonic() >= self.next_refetch_at:
+                # One retry on an unknown `kid`, rate-limited: issuers rotate
+                # keys without warning, and refusing every sign-in until the
+                # TTL lapses would be an outage with a working fix sitting one
+                # fetch away. The floor is set before the fetch, so a fetch
+                # that raises still spends the allowance.
+                self.next_refetch_at = time.monotonic() + self.refetch_floor_seconds
+                self._refresh()
+                key = self.keys.get(kid)
+        if key is None:
+            raise Refused("unknown_kid")
+        # The algorithm was already pinned against the allowlist by the caller.
+        # This assertion is here so that adding an EC algorithm to the
+        # allowlist later cannot silently start handing RSA keys to it.
+        if algorithm not in PERMITTED_ALGORITHMS:
+            raise Refused("unsupported_alg")
+        return key
+
+    def _refresh(self) -> None:
+        if self.uri is None:
+            raise Refused("jwks_unavailable")
+        self.fetches += 1
+        document = fetch_json(self.uri, self.timeout, MAX_JWKS_BYTES)
+        keys: dict[str, str] = {}
+        for entry in document.get("keys", []):
+            if not isinstance(entry, dict):
+                continue
+            # Every filter here is a way a key could be used for something it
+            # was not published for. `kty` is the type, `use` is the purpose,
+            # and a key published for encryption must never verify a signature.
+            if entry.get("kty") != "RSA":
+                continue
+            if entry.get("use") not in (None, "sig"):
+                continue
+            if entry.get("alg") is not None and entry["alg"] not in PERMITTED_ALGORITHMS:
+                continue
+            kid = entry.get("kid")
+            if not isinstance(kid, str) or kid == "":
+                continue
+            n, e = entry.get("n"), entry.get("e")
+            if not isinstance(n, str) or not isinstance(e, str):
+                continue
+            try:
+                keys[kid] = rsa_public_key_pem(b64url_uint(n), b64url_uint(e))
+            except Refused:
+                continue
+
+        if not keys:
+            # Not cached: an empty key set would refuse every sign-in for the
+            # whole TTL, and the next request should try again rather than
+            # inherit a bad fetch.
+            raise Refused("jwks_unavailable")
+
+        self.keys = keys
+        self.expires_at = time.monotonic() + self.ttl_seconds
+        LOG.info("key set refreshed: %d keys", len(keys))
+
+    def preload(self, keys: dict[str, str]) -> None:
+        """Install a fixed key set and stop fetching entirely.
+
+        Clearing `uri` is the point, not a side effect: this makes the key set
+        static, so `--selftest` cannot reach the network no matter which case
+        misses the cache. A test that quietly fetched Google's live key set
+        would pass on a laptop and fail in the build.
+        """
+        with self.lock:
+            self.uri = None
+            self.keys = dict(keys)
+            self.expires_at = float("inf")
+
+
+# -- HTTPS --------------------------------------------------------------------
+
+
+def _https_context() -> ssl.SSLContext:
+    """The platform trust store, with verification on.
+
+    `create_default_context` sets `check_hostname` and `CERT_REQUIRED`. They are
+    asserted rather than set because the failure mode of getting this wrong is
+    silent: a context that does not verify still works perfectly until someone
+    is on the path.
+    """
+    context = ssl.create_default_context()
+    if not context.check_hostname or context.verify_mode != ssl.CERT_REQUIRED:
+        raise Refused("tls_unverified")
+    return context
+
+
+def _require_https(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise Refused("insecure_endpoint")
+    return url
+
+
+def fetch_json(url: str, timeout: float, limit: int) -> dict[str, Any]:
+    """GET a bounded JSON document over verified HTTPS."""
+    request = urllib.request.Request(_require_https(url), method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout, context=_https_context()) as response:
+            # `read(limit + 1)` rather than `read()`: a response with no
+            # `Content-Length` would otherwise be read until the peer stopped
+            # sending, which is an unbounded allocation driven by someone else.
+            body = response.read(limit + 1)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        LOG.warning("fetch failed: %s", type(exc).__name__)
+        raise Refused("jwks_unavailable") from exc
+    if len(body) > limit:
+        raise Refused("too_large")
+    try:
+        document = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise Refused("jwks_unavailable") from exc
+    if not isinstance(document, dict):
+        raise Refused("jwks_unavailable")
+    return document
+
+
+def post_form(url: str, form: dict[str, str], timeout: float, limit: int) -> dict[str, Any]:
+    """POST a form to a token endpoint over verified HTTPS."""
+    payload = urllib.parse.urlencode(form).encode("ascii")
+    request = urllib.request.Request(
+        _require_https(url),
+        data=payload,
+        method="POST",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout, context=_https_context()) as response:
+            body = response.read(limit + 1)
+    except urllib.error.HTTPError as exc:
+        # The provider refusing the code is a different outcome from the
+        # provider being unreachable, and the router distinguishes them: a
+        # refusal is a failed sign-in, unreachable is an outage.
+        LOG.warning("token endpoint refused the exchange: HTTP %s", exc.code)
+        raise Refused("exchange_refused") from exc
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        LOG.warning("token endpoint unreachable: %s", type(exc).__name__)
+        raise Refused("exchange_unavailable") from exc
+    if len(body) > limit:
+        raise Refused("too_large")
+    try:
+        document = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise Refused("exchange_refused") from exc
+    if not isinstance(document, dict):
+        raise Refused("exchange_refused")
+    return document
+
+
+# -- Verification -------------------------------------------------------------
+
+
+@dataclass
+class Config:
+    """This verifier's own view of the deployment.
+
+    Every destination the process will reach and every identifier it will
+    accept comes from here, never from the socket. See rule 2.
+    """
+
+    issuer: str
+    client_id: str
+    jwks_uri: str
+    token_endpoint: str
+    redirect_uri: str
+    client_secret: str = ""
+    jwks_ttl_seconds: int = DEFAULT_JWKS_TTL_SECONDS
+    http_timeout: float = DEFAULT_HTTP_TIMEOUT
+    openssl_timeout: float = DEFAULT_OPENSSL_TIMEOUT
+
+    @staticmethod
+    def load(path: str) -> "Config":
+        with open(path, "rb") as handle:
+            document = json.loads(handle.read().decode("utf-8"))
+        if not isinstance(document, dict):
+            raise SystemExit(f"hypellm-verifier: {path} is not a JSON object")
+
+        required = ("issuer", "client_id", "jwks_uri", "token_endpoint", "redirect_uri")
+        missing = [name for name in required if not isinstance(document.get(name), str)]
+        if missing:
+            raise SystemExit(f"hypellm-verifier: {path} is missing {', '.join(missing)}")
+
+        unknown = set(document) - set(required) - {
+            "client_secret_file",
+            "jwks_ttl_seconds",
+            "http_timeout_seconds",
+            "openssl_timeout_seconds",
+            "comment",
+        }
+        if unknown:
+            # The same posture as the router's configuration grammar
+            # (specification 11.1): an unknown field is an error, because the
+            # alternative is a misspelled `client_secret_file` that silently
+            # deploys a verifier with no secret.
+            raise SystemExit(f"hypellm-verifier: unknown field(s) {', '.join(sorted(unknown))}")
+
+        secret = ""
+        secret_file = document.get("client_secret_file")
+        if isinstance(secret_file, str) and secret_file:
+            # From a file, never from the configuration and never from a
+            # command-line argument: /proc/<pid>/cmdline is world-readable.
+            with open(secret_file, "rb") as handle:
+                secret = handle.read().decode("utf-8").strip()
+            if not secret:
+                raise SystemExit(f"hypellm-verifier: {secret_file} is empty")
+
+        return Config(
+            issuer=document["issuer"],
+            client_id=document["client_id"],
+            jwks_uri=_require_https(document["jwks_uri"]),
+            token_endpoint=_require_https(document["token_endpoint"]),
+            redirect_uri=document["redirect_uri"],
+            client_secret=secret,
+            jwks_ttl_seconds=int(document.get("jwks_ttl_seconds", DEFAULT_JWKS_TTL_SECONDS)),
+            http_timeout=float(document.get("http_timeout_seconds", DEFAULT_HTTP_TIMEOUT)),
+            openssl_timeout=float(document.get("openssl_timeout_seconds", DEFAULT_OPENSSL_TIMEOUT)),
+        )
+
+
+class Verifier:
+    """The two verbs the router's `VerifierClient` speaks."""
+
+    def __init__(self, config: Config, openssl: str = "openssl") -> None:
+        self.config = config
+        self.openssl = openssl
+        self.keys = KeySet(
+            uri=config.jwks_uri,
+            ttl_seconds=config.jwks_ttl_seconds,
+            timeout=config.http_timeout,
+        )
+
+    # -- VERIFY ---------------------------------------------------------------
+
+    def verify(self, id_token: str) -> bytes:
+        """Check an identity token's signature and return its claims.
+
+        Returns the claims document *as the token carried it*. Rule 4: this
+        method deliberately does not look at `iss`, `aud`, `exp`, `iat` or
+        `nonce`. It does require `iss` and `sub` to be present and to be
+        strings, because `parse_claims` in the router returns `None` without
+        them and the router maps that to `VerifierUnavailable` — an outage,
+        which is the wrong diagnosis for a malformed token.
+        """
+        if len(id_token) > MAX_TOKEN_BYTES:
+            raise Refused("too_large")
+
+        parts = id_token.split(".")
+        if len(parts) != 3:
+            raise Refused("malformed")
+        header_b64, payload_b64, signature_b64 = parts
+        # All three segments are shape-checked before any of them is decoded and
+        # long before OpenSSL is called. Cheap, and it keeps the refusal
+        # accurate: a token whose payload is not base64url at all should be
+        # reported as malformed rather than as a signature failure, which is
+        # what it would look like if the check waited until after verification.
+        if not all(is_b64url(segment) for segment in parts):
+            raise Refused("malformed")
+
+        header = self._json_segment(header_b64)
+
+        # Rule 1, and the order matters: the algorithm is pinned *before* a key
+        # is looked up, so there is no path on which an unexpected `alg` reaches
+        # key selection at all.
+        algorithm = header.get("alg")
+        if not isinstance(algorithm, str) or algorithm not in PERMITTED_ALGORITHMS:
+            LOG.warning("refused: alg not permitted")
+            raise Refused("unsupported_alg")
+
+        # `typ` is advisory in JOSE, but where it is present it must not claim
+        # to be something else. `crit` is not advisory: it declares extensions
+        # this verifier is required to understand, and it understands none.
+        typ = header.get("typ")
+        if isinstance(typ, str) and typ.upper() not in ("JWT", "JOSE"):
+            raise Refused("malformed")
+        if "crit" in header:
+            raise Refused("unsupported_crit")
+
+        kid = header.get("kid")
+        if not isinstance(kid, str) or kid == "":
+            raise Refused("malformed")
+
+        public_key = self.keys.public_key(kid, algorithm)
+        signature = b64url_decode(signature_b64)
+
+        # The signing input is the token's own bytes, spliced at the second dot
+        # rather than re-encoded from the parsed header and payload. Re-encoding
+        # would verify a document that is not the one that was signed.
+        signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
+
+        if not self._openssl_verify(
+            public_key, signing_input, signature, PERMITTED_ALGORITHMS[algorithm]
+        ):
+            LOG.warning("refused: signature invalid for kid %s", kid)
+            raise Refused("signature_invalid")
+
+        claims = self._json_segment(payload_b64)
+        if not isinstance(claims.get("iss"), str) or not isinstance(claims.get("sub"), str):
+            raise Refused("claims_invalid")
+
+        encoded = json.dumps(claims, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > MAX_CLAIMS_BYTES:
+            raise Refused("too_large")
+        LOG.info("verified a token signed by kid %s", kid)
+        return encoded
+
+    @staticmethod
+    def _json_segment(segment: str) -> dict[str, Any]:
+        try:
+            document = json.loads(b64url_decode(segment).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise Refused("malformed") from exc
+        if not isinstance(document, dict):
+            raise Refused("malformed")
+        return document
+
+    def _openssl_verify(
+        self, public_key_pem: str, signing_input: bytes, signature: bytes, digest: str
+    ) -> bool:
+        """Delegate the signature check to OpenSSL.
+
+        Everything reaches the tool as a file in a private directory rather than
+        on the command line, and the command is an argument vector with
+        `shell=False`, so nothing here can become a shell fragment. The
+        directory is created with mode 0700 by `mkdtemp` and removed on every
+        path.
+        """
+        with tempfile.TemporaryDirectory(prefix="hypellm-verify-") as workspace:
+            key_path = os.path.join(workspace, "key.pem")
+            signature_path = os.path.join(workspace, "sig.bin")
+            data_path = os.path.join(workspace, "data.bin")
+            with open(key_path, "w", encoding="ascii") as handle:
+                handle.write(public_key_pem)
+            with open(signature_path, "wb") as handle:
+                handle.write(signature)
+            with open(data_path, "wb") as handle:
+                handle.write(signing_input)
+
+            command = [
+                self.openssl,
+                "dgst",
+                f"-{digest}",
+                "-verify",
+                key_path,
+                "-signature",
+                signature_path,
+                data_path,
+            ]
+            try:
+                completed = subprocess.run(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=self.config.openssl_timeout,
+                    check=False,
+                    shell=False,
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                LOG.warning("openssl did not answer: %s", type(exc).__name__)
+                raise Refused("verifier_fault") from exc
+
+        # Both conditions, not either: `openssl dgst -verify` exits non-zero on
+        # a bad signature *and* on a missing file, and a future version that
+        # changed its exit code must not be read as a successful verification.
+        return completed.returncode == 0 and completed.stdout.strip() == b"Verified OK"
+
+    # -- EXCHANGE -------------------------------------------------------------
+
+    def exchange(self, payload: str) -> bytes:
+        """Redeem an authorization code and verify the identity token it returns.
+
+        Rule 2 is enforced here. The router sends `token_endpoint`, `client_id`
+        and `redirect_uri`; all three are compared against this verifier's own
+        configuration and a mismatch is refused rather than followed. The
+        router is not trusted to name a destination — that is the entire reason
+        this process exists rather than the router doing the exchange itself.
+        """
+        if len(payload) > MAX_TOKEN_BYTES:
+            raise Refused("too_large")
+        try:
+            request = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise Refused("malformed") from exc
+        if not isinstance(request, dict):
+            raise Refused("malformed")
+
+        code = request.get("code")
+        code_verifier = request.get("code_verifier")
+        if not isinstance(code, str) or not code:
+            raise Refused("malformed")
+        if not isinstance(code_verifier, str) or not code_verifier:
+            # PKCE is not optional (specification 9.1 requires S256), and an
+            # exchange without a verifier would silently downgrade to a plain
+            # authorization-code flow.
+            raise Refused("malformed")
+
+        for name, expected in (
+            ("token_endpoint", self.config.token_endpoint),
+            ("client_id", self.config.client_id),
+            ("redirect_uri", self.config.redirect_uri),
+        ):
+            if request.get(name) != expected:
+                LOG.warning("refused: %s does not match this verifier's configuration", name)
+                raise Refused("endpoint_mismatch")
+
+        form = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "code_verifier": code_verifier,
+            "client_id": self.config.client_id,
+            "redirect_uri": self.config.redirect_uri,
+        }
+        if self.config.client_secret:
+            form["client_secret"] = self.config.client_secret
+
+        document = post_form(
+            self.config.token_endpoint,
+            form,
+            self.config.http_timeout,
+            MAX_TOKEN_RESPONSE_BYTES,
+        )
+        id_token = document.get("id_token")
+        if not isinstance(id_token, str) or not id_token:
+            LOG.warning("the token endpoint returned no id_token")
+            raise Refused("exchange_refused")
+
+        # Verified, not trusted. The response arrived over verified TLS from the
+        # configured endpoint, which is good reason to believe it — and the
+        # signature check costs one subprocess and removes the need to.
+        return self.verify(id_token)
+
+
+# -- The socket ---------------------------------------------------------------
+
+
+class Handler(socketserver.BaseRequestHandler):
+    """One request, then close.
+
+    The router's `VerifierClient::request` opens a connection, writes one
+    framed request, reads one reply and drops the socket. Serving exactly that
+    keeps the state machine to a straight line.
+    """
+
+    def handle(self) -> None:
+        verifier: Verifier = self.server.verifier  # type: ignore[attr-defined]
+        self.request.settimeout(self.server.connection_timeout)  # type: ignore[attr-defined]
+
+        try:
+            verb, length = self._read_request_line()
+            body = self._read_exactly(length)
+        except Refused as refused:
+            self._send(f"ERR {refused.code}\n".encode("ascii"))
+            return
+        except (TimeoutError, socket.timeout, OSError):
+            return
+
+        try:
+            text = body.decode("utf-8")
+        except UnicodeDecodeError:
+            self._send(b"ERR malformed\n")
+            return
+
+        try:
+            if verb == "VERIFY":
+                claims = verifier.verify(text)
+            elif verb == "EXCHANGE":
+                claims = verifier.exchange(text)
+            else:
+                self._send(b"ERR unknown_verb\n")
+                return
+        except Refused as refused:
+            self._send(f"ERR {refused.code}\n".encode("ascii"))
+            return
+        except Exception:  # noqa: BLE001 - a fault must not leak a stack trace
+            # Deliberately broad and deliberately silent about the detail. An
+            # unexpected fault here is a bug in this process; the caller learns
+            # that the verifier failed, and the operator reads the log.
+            LOG.exception("unhandled fault while answering %s", verb)
+            self._send(b"ERR verifier_fault\n")
+            return
+
+        self._send(f"OK {len(claims)}\n".encode("ascii") + claims)
+
+    def _read_request_line(self) -> tuple[str, int]:
+        line = bytearray()
+        while True:
+            chunk = self.request.recv(1)
+            if not chunk:
+                raise Refused("malformed")
+            if chunk == b"\n":
+                break
+            line += chunk
+            if len(line) > MAX_STATUS_LINE:
+                raise Refused("too_large")
+
+        try:
+            verb, _, count = line.decode("ascii").partition(" ")
+        except UnicodeDecodeError as exc:
+            raise Refused("malformed") from exc
+        if not count.strip().isdigit():
+            raise Refused("malformed")
+        length = int(count.strip())
+        if length > MAX_TOKEN_BYTES:
+            raise Refused("too_large")
+        return verb, length
+
+    def _read_exactly(self, length: int) -> bytes:
+        body = bytearray()
+        while len(body) < length:
+            chunk = self.request.recv(min(4096, length - len(body)))
+            if not chunk:
+                raise Refused("malformed")
+            body += chunk
+        return bytes(body)
+
+    def _send(self, data: bytes) -> None:
+        try:
+            self.request.sendall(data)
+        except OSError:
+            pass
+
+
+class Server(socketserver.ThreadingUnixStreamServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    # Bounded, like everything else. Past this the kernel's backlog holds
+    # connections and the router's own read timeout applies; what must not
+    # happen is one thread per arriving connection without limit.
+    request_queue_size = 64
+
+
+def serve(verifier: Verifier, socket_path: str, mode: int, connection_timeout: float) -> int:
+    if os.path.exists(socket_path):
+        # A stale socket from a killed process. Removed rather than reported,
+        # because the alternative is a verifier that will not restart without
+        # an operator, during an identity outage.
+        os.unlink(socket_path)
+
+    server = Server(socket_path, Handler)
+    server.verifier = verifier  # type: ignore[attr-defined]
+    server.connection_timeout = connection_timeout  # type: ignore[attr-defined]
+    os.chmod(socket_path, mode)
+
+    LOG.info("listening on %s (mode %o)", socket_path, mode)
+    LOG.info("issuer %s, client %s", verifier.config.issuer, verifier.config.client_id)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        LOG.info("shutting down")
+    finally:
+        server.server_close()
+        if os.path.exists(socket_path):
+            os.unlink(socket_path)
+    return 0
+
+
+# -- Self-test ----------------------------------------------------------------
+#
+# Not a substitute for the router's own suite; this is the part that suite
+# cannot reach, because the router has no verifier to test against. Every case
+# is an attack this file's structure is supposed to refuse, and the reason each
+# one is here is that a JWT verifier which gets it wrong still passes a
+# "valid token is accepted" test.
+
+
+def selftest(openssl: str = "openssl") -> int:
+    import hashlib
+    import hmac
+
+    failures: list[str] = []
+
+    def check(name: str, condition: bool) -> None:
+        if condition:
+            print(f"  ok    {name}")
+        else:
+            print(f"  FAIL  {name}")
+            failures.append(name)
+
+    def refuses(name: str, token: str, expected: str | None = None) -> None:
+        try:
+            verifier.verify(token)
+        except Refused as refused:
+            if expected is not None and refused.code != expected:
+                check(f"{name} (expected {expected}, got {refused.code})", False)
+            else:
+                check(f"{name} -> {refused.code}", True)
+            return
+        check(f"{name} (ACCEPTED)", False)
+
+    with tempfile.TemporaryDirectory(prefix="hypellm-verifier-selftest-") as workspace:
+        key_path = os.path.join(workspace, "signing.pem")
+        other_path = os.path.join(workspace, "other.pem")
+        for path in (key_path, other_path):
+            subprocess.run(
+                [openssl, "genrsa", "-out", path, "2048"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+        def public_pem(path: str) -> str:
+            completed = subprocess.run(
+                [openssl, "rsa", "-in", path, "-pubout"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            return completed.stdout.decode("ascii")
+
+        def encode(document: dict[str, Any]) -> str:
+            raw = json.dumps(document, separators=(",", ":")).encode("utf-8")
+            return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+        def sign(path: str, signing_input: str) -> str:
+            data_path = os.path.join(workspace, "input.bin")
+            with open(data_path, "wb") as handle:
+                handle.write(signing_input.encode("ascii"))
+            completed = subprocess.run(
+                [openssl, "dgst", "-sha256", "-sign", path, data_path],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            return base64.urlsafe_b64encode(completed.stdout).decode("ascii").rstrip("=")
+
+        def token(header: dict[str, Any], claims: dict[str, Any], path: str = key_path) -> str:
+            signing_input = f"{encode(header)}.{encode(claims)}"
+            return f"{signing_input}.{sign(path, signing_input)}"
+
+        config = Config(
+            issuer="https://accounts.google.com",
+            client_id="client.apps.googleusercontent.com",
+            jwks_uri="https://www.googleapis.com/oauth2/v3/certs",
+            token_endpoint="https://oauth2.googleapis.com/token",
+            redirect_uri="https://admin.example/admin/v1/auth/google/callback",
+        )
+        verifier = Verifier(config, openssl=openssl)
+        # Preloaded, so the self-test needs no network. The PEMs come from
+        # OpenSSL rather than from this file's own encoder, so a bug in
+        # `rsa_public_key_pem` would show up as the positive case failing.
+        verifier.keys.preload({"live": public_pem(key_path), "other": public_pem(other_path)})
+
+        claims = {
+            "iss": "https://accounts.google.com",
+            "sub": "104729183746152938471",
+            "aud": "client.apps.googleusercontent.com",
+            "exp": 4102444800,
+            "iat": 1700000000,
+            "email": "operator@example.com",
+            "email_verified": True,
+            "nonce": "n-0S6_WzA2Mj",
+        }
+        header = {"alg": "RS256", "kid": "live", "typ": "JWT"}
+
+        print("hypellm-verifier self-test")
+
+        # The positive case. It also proves the DER encoder: OpenSSL would
+        # refuse to load a malformed SubjectPublicKeyInfo.
+        returned = verifier.verify(token(header, claims))
+        check("a correctly signed token is accepted", json.loads(returned)["sub"] == claims["sub"])
+        check(
+            "the claims are returned as the token carried them",
+            json.loads(returned)["email"] == "operator@example.com",
+        )
+
+        # Algorithm confusion, in all three of its usual shapes.
+        refuses(
+            "alg=none with an empty signature is refused",
+            f"{encode({'alg': 'none', 'kid': 'live'})}.{encode(claims)}.",
+            "malformed",
+        )
+        unsigned = f"{encode({'alg': 'none', 'kid': 'live'})}.{encode(claims)}"
+        refuses(
+            "alg=none with a token-shaped third segment is refused",
+            f"{unsigned}.{base64.urlsafe_b64encode(b'x').decode().rstrip('=')}",
+            "unsupported_alg",
+        )
+        hs_header = encode({"alg": "HS256", "kid": "live"})
+        hs_input = f"{hs_header}.{encode(claims)}"
+        forged = hmac.new(
+            public_pem(key_path).encode("ascii"), hs_input.encode("ascii"), hashlib.sha256
+        ).digest()
+        refuses(
+            "HS256 signed with the RSA public key is refused",
+            f"{hs_input}.{base64.urlsafe_b64encode(forged).decode().rstrip('=')}",
+            "unsupported_alg",
+        )
+
+        # Key selection.
+        refuses(
+            "an unknown kid is refused",
+            token({"alg": "RS256", "kid": "rotated-away"}, claims),
+            "unknown_kid",
+        )
+        refuses(
+            "a token signed by another key in the set is refused",
+            token(header, claims, path=other_path),
+            "signature_invalid",
+        )
+        refuses(
+            "a missing kid is refused",
+            token({"alg": "RS256"}, claims),
+            "malformed",
+        )
+
+        # Tampering. The signature covers the token's own bytes, so re-encoding
+        # the payload after signing must not verify.
+        valid = token(header, claims)
+        head, _, rest = valid.partition(".")
+        _, _, signature = rest.partition(".")
+        tampered_claims = dict(claims, sub="000000000000000000000")
+        refuses(
+            "a payload swapped after signing is refused",
+            f"{head}.{encode(tampered_claims)}.{signature}",
+            "signature_invalid",
+        )
+        refuses(
+            "a header swapped after signing is refused",
+            f"{encode({'alg': 'RS256', 'kid': 'live', 'typ': 'JWT', 'x': 1})}.{encode(claims)}.{signature}",
+            "signature_invalid",
+        )
+
+        # Shape.
+        refuses("a two-segment token is refused", "a.b", "malformed")
+        refuses("a four-segment token is refused", f"{valid}.extra", "malformed")
+        refuses("an empty token is refused", "", "malformed")
+        refuses(
+            "a non-base64url payload is refused before verification",
+            f"{head}.$$$.{signature}",
+            "malformed",
+        )
+        refuses(
+            "a non-base64url header is refused",
+            f"$$$.{encode(claims)}.{signature}",
+            "malformed",
+        )
+        refuses("an oversized token is refused", "x" * (MAX_TOKEN_BYTES + 1), "too_large")
+        refuses(
+            "a critical header extension is refused",
+            token({"alg": "RS256", "kid": "live", "crit": ["exp"]}, claims),
+            "unsupported_crit",
+        )
+
+        # Claims the router cannot use. Returning these would make the router
+        # report an outage for what is actually a malformed token.
+        refuses(
+            "a token with no sub is refused",
+            token(header, {k: v for k, v in claims.items() if k != "sub"}),
+            "claims_invalid",
+        )
+        refuses(
+            "a token with a non-string sub is refused",
+            token(header, dict(claims, sub=12345)),
+            "claims_invalid",
+        )
+
+        # Rule 4: the verifier does not judge these, the router does.
+        expired = verifier.verify(token(header, dict(claims, exp=1)))
+        check("an expired token is returned, not judged here", json.loads(expired)["exp"] == 1)
+        other_audience = verifier.verify(token(header, dict(claims, aud="someone.else")))
+        check(
+            "a wrong audience is returned, not judged here",
+            json.loads(other_audience)["aud"] == "someone.else",
+        )
+
+        # Rule 2: the router does not choose the destination.
+        def exchange_refuses(name: str, request: dict[str, Any]) -> None:
+            try:
+                verifier.exchange(json.dumps(request))
+            except Refused as refused:
+                check(f"{name} -> {refused.code}", refused.code == "endpoint_mismatch")
+                return
+            check(f"{name} (ACCEPTED)", False)
+
+        base_request = {
+            "code": "4/0Ax-code",
+            "code_verifier": "a-pkce-verifier-of-adequate-length-000000000",
+            "token_endpoint": config.token_endpoint,
+            "client_id": config.client_id,
+            "redirect_uri": config.redirect_uri,
+        }
+        exchange_refuses(
+            "an exchange against another token endpoint is refused",
+            dict(base_request, token_endpoint="https://tokens.evil.example/token"),
+        )
+        exchange_refuses(
+            "an exchange for another client id is refused",
+            dict(base_request, client_id="someone.else.apps.googleusercontent.com"),
+        )
+        exchange_refuses(
+            "an exchange with another redirect uri is refused",
+            dict(base_request, redirect_uri="https://evil.example/callback"),
+        )
+        try:
+            verifier.exchange(json.dumps({k: v for k, v in base_request.items() if k != "code_verifier"}))
+            check("an exchange without PKCE is refused (ACCEPTED)", False)
+        except Refused as refused:
+            check(f"an exchange without PKCE is refused -> {refused.code}", refused.code == "malformed")
+
+        # Transport.
+        for name, url in (
+            ("an http jwks uri is refused", "http://keys.example/jwks"),
+            ("a non-URL jwks uri is refused", "not-a-url"),
+        ):
+            try:
+                _require_https(url)
+                check(f"{name} (ACCEPTED)", False)
+            except Refused as refused:
+                check(f"{name} -> {refused.code}", refused.code == "insecure_endpoint")
+
+        # The whole suite must have run without touching the network. Asserted
+        # rather than assumed: the first draft of this file refetched the key
+        # set on every unknown `kid`, so these cases silently fetched Google's
+        # live key set and clobbered the preloaded one.
+        check("the self-test reached no network", verifier.keys.fetches == 0)
+
+    print()
+    if failures:
+        print(f"{len(failures)} case(s) FAILED")
+        return 1
+    print("all cases passed")
+    return 0
+
+
+# -- Entry point --------------------------------------------------------------
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="HypeLLM reference identity verifier")
+    parser.add_argument("--config", help="this verifier's own configuration, as JSON")
+    parser.add_argument("--socket", help="Unix socket to listen on")
+    parser.add_argument(
+        "--socket-mode",
+        default="660",
+        help="octal permissions for the socket (default 660: the router's user needs a shared group)",
+    )
+    parser.add_argument("--openssl", default="openssl", help="path to the openssl executable")
+    parser.add_argument(
+        "--connection-timeout",
+        type=float,
+        default=DEFAULT_CONNECTION_TIMEOUT,
+        help="seconds a single connection may take",
+    )
+    parser.add_argument("--log", default="info", choices=("debug", "info", "warning", "error"))
+    parser.add_argument(
+        "--selftest",
+        action="store_true",
+        help="run the signature and pinning cases and exit; needs openssl, needs no network",
+    )
+    parser.add_argument("--check", action="store_true", help="validate the configuration and exit")
+    arguments = parser.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, arguments.log.upper()),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+    if arguments.selftest:
+        return selftest(arguments.openssl)
+
+    if not arguments.config:
+        parser.error("--config is required")
+    config = Config.load(arguments.config)
+
+    if arguments.check:
+        print(f"configuration is valid: issuer {config.issuer}, client {config.client_id}")
+        print(f"jwks     {config.jwks_uri}")
+        print(f"token    {config.token_endpoint}")
+        print(f"redirect {config.redirect_uri}")
+        print(f"secret   {'loaded' if config.client_secret else 'none (public client)'}")
+        return 0
+
+    if not arguments.socket:
+        parser.error("--socket is required")
+    if os.geteuid() == 0:
+        # An obligation rather than a preference: this process holds the OAuth
+        # client secret and is reachable from another process's socket. It has
+        # no reason to be root and every reason not to be.
+        print("hypellm-verifier: refusing to run as root", file=sys.stderr)
+        return 1
+
+    try:
+        mode = int(arguments.socket_mode, 8)
+    except ValueError:
+        parser.error("--socket-mode must be octal, for example 660")
+
+    return serve(Verifier(config, openssl=arguments.openssl), arguments.socket, mode, arguments.connection_timeout)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -9,7 +9,7 @@ input/resource limits.
 | Owner | Security (primary), Platform (secondary) |
 | Unsafe code | None. `#![forbid(unsafe_code)]` declared in `lib.rs` and inherited from the workspace lint table. |
 | External dependencies | None. Rust standard library plus workspace path dependencies: `hypellm-core`, `hypellm-crypto`, `hypellm-fleet`, `hypellm-auth`, `wire-http1`, `wire-json`, `wire-sse`; `hypellm-store` for tests only. |
-| Fuzz targets | **None for this crate yet.** Four are required — see [Fuzz targets](#fuzz-targets). |
+| Fuzz targets | `verifier_claims`, in `tests/fuzz.rs`. Three of the four required targets remain — see [Fuzz targets](#fuzz-targets). |
 
 One declared dependency is not used by `src/` today: `wire-sse` appears only in a
 streaming integration test. Not a supply-chain concern — it is a workspace crate
@@ -218,19 +218,35 @@ than by corpus file. All seven areas specification 21 names have a suite; see
 `docs/deferred-issues.md`, `DI-002`, for the table. `hypellm-core` carries the
 property layer in `tests/properties.rs`.
 
-None cover this crate yet. The following are required by specification 21
-(Fuzz: HTTP, provider events, state recovery) and 18.2 ("configuration and
-protocol parsers are fuzzed"):
+`tests/fuzz.rs` covers the identity verifier boundary. The rest are required by
+specification 21 (Fuzz: HTTP, provider events, state recovery) and 18.2
+("configuration and protocol parsers are fuzzed"):
 
 | Target | Surface | Status |
 |---|---|---|
 | `upstream_response` | Arbitrary bytes, split at arbitrary offsets, through `UpstreamConnection::read_head` and `read_body`. Asserts bounded allocation and no panic. | Required, not yet implemented (§21) |
 | `helper_status_line` | Arbitrary helper replies through `read_status_line` and `sanitize_code`. Asserts the 256-byte bound and that no output escapes the identifier alphabet. | Required, not yet implemented (§21) |
-| `verifier_claims` | Arbitrary `VERIFY` replies through `VerifierClient::exchange` and `parse_claims`. Asserts no claim is fabricated from a malformed document. | Required, not yet implemented (§21) |
+| `verifier_claims` | Arbitrary `VERIFY` replies through `VerifierClient` and `parse_claims`, over a real Unix socket. Asserts no claim is fabricated from a malformed document. | **Implemented**, `tests/fuzz.rs` (5 cases) |
 | `egress_resolve` | Arbitrary host strings and resolver answers through `Resolver::resolve`. Asserts the invariant that no address whose class the profile refuses is ever pinned. | Required, not yet implemented (§21) |
 
 The `egress_resolve` invariant is also a property test obligation under 21
 (Property: bounded allocation) and 21.1 (Security: SSRF).
+
+### What `verifier_claims` asserts, and the faults it was checked against
+
+The verifier (`verifier/`) is a separate process in the trusted computing base.
+"Trusted" bounds what it is allowed to assert; it is not a licence for the
+router to believe a malformed reply, and identity is the one thing on this path
+that decides who a caller is. Each property was verified by reintroducing a
+fault and watching it fail:
+
+| Property | Fault it catches |
+|---|---|
+| Nothing in `IdTokenClaims` is absent from the document it came from | `email_verified` defaulting to `true` instead of `false` |
+| An unverified email never reads as verified | the same, isolated — `validate_claims` refuses an unverified email, so a `true` invented here is a sign-in that should not have happened |
+| The client returns exactly what the frame carried | reading the body to end-of-stream instead of to its declared length, which picks up whatever follows it |
+| A refusal never yields an identity | skipping a leading `ERR` line and reading the next status line, where a valid claims frame may be waiting |
+| A reply past the 64 KiB bound is refused | deleting the bound. The fixture is a *complete, valid, over-long* reply: a truncated one would be refused by `read_exact` even with the bound gone, and the test would prove nothing |
 
 ## Public API
 

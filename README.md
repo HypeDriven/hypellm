@@ -38,7 +38,7 @@ Operators ─────────HTTPS edge────────▶ manag
               fleet agent ──ssh──▶ accelerator hosts
 ```
 
-Inference and management use separate listeners, handlers, authentication methods and resource limits. Starting and stopping containers happens in a separate agent process, because the router must not execute a subprocess: the socket between them carries opaque identifiers and bounded integers, and the agent resolves each against its own allowlist. The router speaks HTTP/1.1 internally. Production deployments place a platform TLS edge in front of inbound listeners and use local platform helpers for outbound TLS and OIDC token verification; the router does not implement TLS or asymmetric signature verification itself.
+Inference and management use separate listeners, handlers, authentication methods and resource limits. Starting and stopping containers happens in a separate agent process, because the router must not execute a subprocess: the socket between them carries opaque identifiers and bounded integers, and the agent resolves each against its own allowlist. The router speaks HTTP/1.1 internally. Production deployments place a platform TLS edge in front of inbound listeners and use local platform helpers for outbound TLS and OIDC token verification; the router does not implement TLS or asymmetric signature verification itself. A reference identity verifier ships in `verifier/`, out of the workspace like the agent, and performs no cryptography of its own.
 
 ## Build and verify
 
@@ -124,6 +124,7 @@ Slaves are reached by their **LAN address**, over a Tailscale subnet route adver
 - [Deployment and configuration](docs/deployment.md)
 - [Operational runbooks](docs/runbooks.md)
 - [Fleet orchestration](docs/orchestration.md) and the [fleet agent](agent/README.md)
+- [The identity verifier](verifier/README.md) — Google sign-in, and enrolling the first administrator
 - [Threat model](docs/threat-model.md)
 - [Current limitations](docs/deferred-issues.md)
 - [Detailed specification](secure_llm_router_specification.md)

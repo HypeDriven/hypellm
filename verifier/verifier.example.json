@@ -1,0 +1,17 @@
+{
+  "comment": "The verifier's own view of the deployment. Every destination this process reaches comes from here, never from the router's socket. Copy, edit, and keep it readable only by the verifier's user.",
+
+  "issuer": "https://accounts.google.com",
+  "client_id": "REPLACE.apps.googleusercontent.com",
+
+  "jwks_uri": "https://www.googleapis.com/oauth2/v3/certs",
+  "token_endpoint": "https://oauth2.googleapis.com/token",
+
+  "redirect_uri": "https://admin.example/admin/v1/auth/google/callback",
+
+  "client_secret_file": "/etc/hypellm/verifier/client_secret",
+
+  "jwks_ttl_seconds": 3600,
+  "http_timeout_seconds": 10,
+  "openssl_timeout_seconds": 5
+}

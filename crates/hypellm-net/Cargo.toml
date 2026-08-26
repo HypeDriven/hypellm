@@ -33,3 +33,6 @@ hypellm-store = { path = "../hypellm-store", features = ["test-harness"] }
 # The simulated fleet agent, so this crate's own tests exercise the client
 # against a conformant server rather than a scripted byte stream.
 hypellm-net = { path = ".", features = ["test-harness"] }
+# The seeded mutator behind `tests/fuzz.rs`. Specification 4 admits no
+# libFuzzer, so the engine is in-repo and driven from ordinary `#[test]`s.
+hypellm-test-corpus = { path = "../hypellm-test-corpus" }
