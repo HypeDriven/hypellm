@@ -317,6 +317,51 @@ grant scope=tenant:acme model=* allow=true
             .all(|c| !c.contains("__Host-hypellm_session=")),
         "a session cookie was issued to an unbound identity"
     );
+
+    // And it says which identity, because otherwise nobody can enrol one. The
+    // `(iss, sub)` pair is what an `identity` record is keyed on, it is not the
+    // email address, and the audit record for this refusal carries no tenant so
+    // it is invisible in the tenant-filtered audit view. Without this the first
+    // administrator cannot be enrolled without decoding a token by hand.
+    assert!(
+        response.body.contains(SUBJECT),
+        "the refusal must name the subject an identity record would bind: {}",
+        response.body
+    );
+    assert!(
+        response.body.contains(ISSUER),
+        "the refusal must name the issuer too: {}",
+        response.body
+    );
+}
+
+#[test]
+fn the_refusal_names_only_the_callers_own_identity() {
+    // The other half: this is a fact about the caller, not a lookup service.
+    // They presented a signature-verified token for this subject, so they
+    // already control it — but the response must not become a way to ask the
+    // router about anyone else, and it must stay a refusal.
+    let verifier = Arc::new(FakeVerifier::new());
+    let admin = Harness::builder()
+        .config(&config_with_identity())
+        .oidc(oidc_config(), Arc::clone(&verifier) as Arc<dyn TokenVerifier>)
+        .build();
+
+    let (handle, state, nonce, _) = begin(&admin);
+    verifier.echo_nonce(&nonce);
+    let response = admin
+        .request(Method::Get, "/admin/v1/auth/google/callback")
+        .query(&format!("code=auth-code-xyz&state={state}"))
+        .cookie(&format!("__Host-hypellm_oidc={handle}"))
+        .send();
+
+    // This identity *is* bound in this configuration, so the enrolment hint
+    // must not appear at all: it belongs to the refusal, not to every callback.
+    assert!(
+        !response.body.contains("no identity record matches"),
+        "the enrolment hint leaked into a successful sign-in: {}",
+        response.body
+    );
 }
 
 #[test]

@@ -299,11 +299,13 @@ grant scope=tenant:{TENANT_A} model=* allow=true
 }
 
 #[test]
-fn the_settings_view_is_honest_about_break_glass() {
-    // The role can be bound, but no local break-glass sign-in exists, so
-    // specification 22.4's recovery path needs a session established
-    // beforehand. A screen that showed "break-glass: available" would be read
-    // as a working escape hatch during exactly the incident where it is not.
+fn a_router_with_no_preprovisioned_token_says_the_recovery_path_is_unusable() {
+    // The defect this replaces: the view reported
+    // `local_authentication_implemented: false` unconditionally, long after
+    // `POST /admin/v1/auth/break-glass` existed, so the Settings screen told
+    // operators the recovery path was absent during exactly the incident it
+    // exists for. The mechanism and the deployment are two facts. This harness
+    // preprovisions no token, so the second is false while the first is true.
     let admin = admin();
     let operator = admin.session(
         "user:manager-a",
@@ -313,14 +315,63 @@ fn the_settings_view_is_honest_about_break_glass() {
 
     let body = admin.get(&operator, "/admin/v1/settings").json();
     let break_glass = body.get("break_glass").expect("break_glass");
-    assert!(
-        !break_glass
+
+    assert_eq!(
+        break_glass
             .opt_field_bool("local_authentication_implemented")
             .ok()
-            .flatten()
-            .unwrap_or(true)
+            .flatten(),
+        Some(true),
+        "the sign-in is implemented; reporting otherwise is what made this wrong"
     );
-    assert!(break_glass.field_str("note").unwrap().contains("no local"));
+    assert_eq!(
+        break_glass.opt_field_bool("configured").ok().flatten(),
+        Some(false),
+        "no token is preprovisioned in this harness"
+    );
+    assert!(
+        break_glass.field_str("note").unwrap().contains("no break-glass token"),
+        "the note must name what is missing: {}",
+        break_glass.field_str("note").unwrap()
+    );
+    // Absent rather than zero: a window is only meaningful where there is a
+    // token to open one with, and a `0` would render as an expired session.
+    assert_eq!(
+        break_glass.opt_field_i64("session_ttl_seconds").ok().flatten(),
+        None
+    );
+}
+
+#[test]
+fn a_preprovisioned_router_reports_the_token_and_the_window_it_opens() {
+    // The other half. `with_break_glass` sets a fifteen-minute lifetime, and an
+    // operator needs it before starting work they cannot finish inside it.
+    let admin = Harness::builder()
+        .config(&config())
+        .with_break_glass("a-preprovisioned-token", "user:oncall", TENANT_A)
+        .build();
+    let operator = admin.session(
+        "user:manager-a",
+        TENANT_A,
+        &[hypellm_core::rbac::Role::BreakGlassAdmin],
+    );
+
+    let body = admin.get(&operator, "/admin/v1/settings").json();
+    let break_glass = body.get("break_glass").expect("break_glass");
+
+    assert_eq!(
+        break_glass.opt_field_bool("configured").ok().flatten(),
+        Some(true)
+    );
+    assert_eq!(
+        break_glass.opt_field_i64("session_ttl_seconds").ok().flatten(),
+        Some(15 * 60)
+    );
+    // The principal and tenant are deliberately not reported: the break-glass
+    // policy may name a tenant that is not the caller's, and management
+    // visibility never exceeds the caller's tenant (Appendix B).
+    assert!(break_glass.get("principal").is_none());
+    assert!(break_glass.get("tenant").is_none());
 }
 
 #[test]

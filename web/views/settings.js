@@ -26,11 +26,12 @@
  *   paths; the control socket in particular is unauthenticated, so anything
  *   that can open it can stop the router. The screen shows the booleans it is
  *   given and invents no path.
- * - **`break_glass.local_authentication_implemented` is `false`.** The role can
- *   be bound and grants its permissions, but this router has no local
- *   break-glass *sign-in*, so specification 22.4's recovery path needs a
- *   session established before the identity provider fails. That is given the
- *   weight of a banner rather than a table row: a screen that read as a working
+ * - **Break-glass is reported as two facts, not one.** The sign-in exists on
+ *   every router (`POST /admin/v1/auth/break-glass`, and the sign-in screen
+ *   offers it); whether *this* deployment preprovisioned a token is
+ *   `break_glass.configured`, and that is the one that decides whether the
+ *   recovery path can actually be used. The absent case is given the weight of
+ *   a banner rather than a table row, because a screen that read as a working
  *   escape hatch would be believed during exactly the incident where it is not.
  * - **Retention is the caller's own tenant's**, not a fleet-wide value, so the
  *   panel names the tenant it is reporting for.
@@ -453,6 +454,11 @@ function corsPanel(origins) {
  * @returns {HTMLElement}
  */
 function breakGlassPanel(breakGlass, session) {
+  const ttl =
+    typeof breakGlass.session_ttl_seconds === 'number'
+      ? formatDuration(breakGlass.session_ttl_seconds * 1000)
+      : null;
+
   return panel({
     title: 'Break-glass',
     note: 'Specification 9.3 and 22.4.',
@@ -478,6 +484,20 @@ function breakGlassPanel(breakGlass, session) {
               offTone: 'danger',
             }),
           ],
+          // The one that decides whether the recovery path works here. A token
+          // is preprovisioned by `--generate-secrets` and printed once; a
+          // router that never had one, or whose operator lost it, reports
+          // `false` and cannot be given another without a new key bundle.
+          [
+            'Token preprovisioned',
+            flag(breakGlass.configured, {
+              on: 'Yes',
+              off: 'No',
+              onTone: 'ok',
+              offTone: 'danger',
+            }),
+          ],
+          ['Session lifetime', ttl],
           ['What that means', breakGlass.note ? String(breakGlass.note) : null],
         ],
         { wide: true },
@@ -648,10 +668,14 @@ function paint(body, settings, error, ctx) {
           'Prompt and completion capture is enabled. Specification 10 keeps request and response bodies out of the logs by default; with this on, every prompt this tenant sends is within reach of whoever can read the router\'s logs, for the whole retention window.',
         )
       : null,
-    breakGlass.local_authentication_implemented === false
+    // Inverted from what this said before: the sign-in is implemented, so what
+    // is worth a banner is a deployment that cannot use it. Read together with
+    // the sign-in panel above, `configured: false` and `oidc.configured: false`
+    // mean nothing can establish a session at all once the current ones expire.
+    breakGlass.configured === false
       ? banner(
           'warn',
-          'There is no local break-glass sign-in on this router. The break-glass role can be bound and grants its permissions, but it is reached through the identity provider like any other session — so recovery during an identity outage needs a break-glass session that was already established before the outage.',
+          'No break-glass token is preprovisioned on this router, so specification 22.4\'s recovery path cannot be used. The token is printed once by --generate-secrets and stored nowhere; a router without one needs a new key bundle, and a new key bundle cannot read the state directory the current one authenticates.',
         )
       : null,
 

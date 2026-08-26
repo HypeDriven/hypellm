@@ -240,6 +240,39 @@ export class Api {
     const data = await response.json();
     return data.authorization_url;
   }
+
+  /**
+   * Sign in with the preprovisioned break-glass token.
+   *
+   * Specification 22.4's recovery path, and the only sign-in that must keep
+   * working when the identity provider does not. Like `beginSignIn` it runs
+   * before any session exists, so it carries no CSRF token; unlike it, there
+   * is no redirect and the session cookie arrives on this response.
+   *
+   * The token goes in the body and nowhere else. A query parameter would reach
+   * the router's access log and the browser's history, and this client keeps
+   * no copy of it after the call: the session cookie is what the browser holds
+   * afterwards, and that is `HttpOnly`.
+   *
+   * @param {string} token
+   * @param {string} reason
+   * @returns {Promise<{csrf_token: string, expires_in_seconds: number}>}
+   */
+  async breakGlassSignIn(token, reason) {
+    const response = await fetch(`${BASE}/auth/break-glass`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      redirect: 'error',
+      body: JSON.stringify({ token, reason }),
+    });
+    if (!response.ok) {
+      throw new ApiError(response.status, await response.json().catch(() => ({})));
+    }
+    const data = await response.json();
+    this.csrfToken = data.csrf_token || null;
+    return data;
+  }
 }
 
 /** The shared client instance. */

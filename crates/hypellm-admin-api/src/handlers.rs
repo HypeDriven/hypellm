@@ -1118,10 +1118,36 @@ impl AdminApi {
         let (principal, tenant, roles) = resolve_identity(&config_snapshot, &claims.iss, &claims.sub)
             .ok_or_else(|| {
                 self.audit_login_failure(request, "unknown_identity");
+                // The refusal names the caller's own `(iss, sub)`, which is
+                // exactly what an `identity` record needs and what an operator
+                // otherwise has no way to learn: the pair is not the email
+                // address, it is not shown by Google's account pages, and the
+                // audit record for this refusal is written without a tenant and
+                // so is invisible in the tenant-filtered audit view.
+                //
+                // It discloses nothing. The token was signature-verified and
+                // claim-validated before this line, so the caller has just
+                // proved they control this subject at this issuer; they are
+                // being told a fact about themselves. It is emphatically not an
+                // enumeration oracle — every response on this path is a refusal
+                // whether or not the identity is enrolled, and reaching it at
+                // all costs a valid identity token.
                 ApiError::new(
                     ApiErrorCode::Forbidden,
                     "this identity is not bound to a principal in this deployment",
                 )
+                .with_details(vec![ApiErrorDetail {
+                    code: "unknown_identity".to_owned(),
+                    location: "identity".to_owned(),
+                    // Bounded: an issuer other than Google may mint long
+                    // subjects, and a refusal is not a place to copy an
+                    // unbounded caller-influenced string into a response.
+                    message: format!(
+                        "no identity record matches issuer={} subject={}",
+                        bounded_claim(&claims.iss),
+                        bounded_claim(&claims.sub)
+                    ),
+                }])
             })?;
 
         let tenant_for_audit = tenant.clone();
@@ -3518,22 +3544,45 @@ impl AdminApi {
         );
 
         let mut break_glass = Object::new();
-        // Honest rather than encouraging: the role exists and grants the
-        // permissions, but no local break-glass *authentication* method is
-        // implemented, so specification 22.4's recovery path needs a session
-        // that already exists.
-        break_glass.push(
-            "role_available",
-            Value::from(true),
-        );
-        break_glass.push("local_authentication_implemented", Value::from(false));
+        // Two separate facts, and conflating them is what made this block wrong
+        // before: the *mechanism* exists unconditionally — `break_glass` below
+        // implements specification 22.4's sign-in, and the admin sign-in screen
+        // offers it — while whether *this* router can answer it depends on a
+        // preprovisioned verifier that a deployment may simply not have.
+        //
+        // Reporting the second here rather than from the endpoint is
+        // deliberate. This view is behind `manage_settings`, so an
+        // administrator is told; `break_glass` itself still answers an
+        // unauthenticated probe with the same `not_found` whether or not a
+        // token exists, which is the property that keeps it from advertising a
+        // live recovery path to a caller who has not proved anything.
+        let configured = self.state.break_glass.as_ref();
+        break_glass.push("role_available", Value::from(true));
+        break_glass.push("local_authentication_implemented", Value::from(true));
+        break_glass.push("configured", Value::from(configured.is_some()));
+        if let Some(policy) = configured {
+            // A deployment-wide parameter like the other bounds on this screen,
+            // and the one an operator needs before starting work they cannot
+            // finish inside the window. The principal and tenant are *not*
+            // reported: they may belong to a tenant that is not the caller's,
+            // and management visibility never exceeds the caller's tenant
+            // (Appendix B).
+            break_glass.push(
+                "session_ttl_seconds",
+                Value::from(Duration::from_millis(policy.ttl_millis).as_secs()),
+            );
+        }
         break_glass.push(
             "note",
-            Value::from(
-                "the break-glass role can be bound, but this router has no local \
-                 break-glass sign-in; recovery during an identity outage needs a \
-                 session established beforehand",
-            ),
+            Value::from(if configured.is_some() {
+                "break-glass sign-in is preprovisioned on this router and reachable \
+                 from the sign-in screen; every session is time-limited, requires a \
+                 recorded reason, and raises a critical alert on sign-in and sign-out"
+            } else {
+                "no break-glass token is preprovisioned on this router, so the \
+                 recovery path cannot be used; with no identity provider configured \
+                 there is no way into the management plane at all"
+            }),
         );
 
         let mut root = Object::new();
@@ -4445,6 +4494,26 @@ fn management_roles_for(
             _ => None,
         })
         .collect()
+}
+
+/// A claim value, bounded, for inclusion in an error message.
+///
+/// The value is signature-verified before it reaches here, so this is not a
+/// sanitizer — `wire_json` escapes the string and the admin application builds
+/// text nodes rather than markup, so neither a quote nor a tag can escape its
+/// context. It is a length bound: specification 3.2 admits no unbounded,
+/// caller-influenced string in a response, and `sub` is only short because
+/// Google chooses to make it so.
+fn bounded_claim(value: &str) -> String {
+    const MAX: usize = 128;
+    match value.char_indices().nth(MAX) {
+        None => value.to_owned(),
+        Some((index, _)) => {
+            let mut bounded = value[..index].to_owned();
+            bounded.push('\u{2026}');
+            bounded
+        }
+    }
 }
 
 fn resolve_identity(

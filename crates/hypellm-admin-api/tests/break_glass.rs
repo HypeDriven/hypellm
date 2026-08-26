@@ -21,7 +21,7 @@
 
 mod harness;
 
-use harness::Harness;
+use harness::{ALLOWED_ORIGIN, HOSTILE_ORIGIN, Harness};
 use wire_http1::Method;
 
 const TOKEN: &str = "a-preprovisioned-break-glass-token-value";
@@ -63,6 +63,52 @@ fn a_preprovisioned_token_establishes_a_session_without_the_identity_provider() 
     assert!(
         response.json().field_str("csrf_token").is_ok(),
         "the caller needs a CSRF token to do anything with the session"
+    );
+}
+
+#[test]
+fn the_sign_in_screen_can_reach_it_from_the_browser() {
+    // The property the admin application's break-glass form depends on, and
+    // the one an ordinary reordering would break: this endpoint runs *before*
+    // the session is established, so a browser POST carries an `Origin` header
+    // and cannot carry a session-bound CSRF token — there is no session to
+    // bind one to yet. If the CSRF check were ever hoisted above the
+    // pre-session match in `dispatch`, every `curl` in the runbook would keep
+    // working and the sign-in screen would fail for everyone, which is the
+    // failure that gets discovered during an outage.
+    let h = harness();
+    let response = h
+        .request(Method::Post, "/admin/v1/auth/break-glass")
+        .origin(ALLOWED_ORIGIN)
+        .json(&body(TOKEN, REASON))
+        .send();
+
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert!(
+        response.header("set-cookie").is_some(),
+        "the browser needs the session cookie from this response"
+    );
+}
+
+#[test]
+fn a_hostile_page_cannot_spend_a_token_the_browser_would_send_for_it() {
+    // The other side of the same door. Break-glass takes its token from the
+    // body rather than a cookie, so a cross-origin form post is not by itself
+    // an escalation — but the origin allowlist is checked before the endpoint
+    // is reached, and it must stay that way: this is the one endpoint an
+    // unauthenticated caller can reach, and the recovery path is the last one
+    // that should be reachable from an arbitrary page.
+    let h = harness();
+    let response = h
+        .request(Method::Post, "/admin/v1/auth/break-glass")
+        .origin(HOSTILE_ORIGIN)
+        .json(&body(TOKEN, REASON))
+        .send();
+
+    assert_ne!(response.status, 200, "{}", response.body);
+    assert!(
+        response.header("set-cookie").is_none(),
+        "a refused origin must not establish a session"
     );
 }
 

@@ -672,7 +672,13 @@ live. The `role_binding` is required too: the token establishes *who* you are,
 not *what* you may do, and a principal with no binding is refused rather than
 handed a session that fails at every endpoint.
 
-**Use.**
+**Use.** The admin application offers it on the sign-in screen, under
+**Use break-glass access** — and reveals it by itself when Google sign-in
+answers `not_found`, which is what a deployment with no `oidc` record answers.
+That is the path to prefer during an incident: it is the same endpoint, and it
+keeps the token out of a shell history.
+
+Directly, for automation and for a router serving no static assets:
 
 ```
 curl -X POST https://admin.example/admin/v1/auth/break-glass \
