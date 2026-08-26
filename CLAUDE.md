@@ -131,8 +131,6 @@ Keep fuzz documentation aligned with the suites that exist. The required seven a
 
 - **Fleet integration** — `crates/hypellm-router/tests/fleet.rs` drives the real client over a real Unix socket against `hypellm_net::fleet_sim::SimulatedAgent`, which verifies the handshake HMAC and enforces its own allowlist. `Clock::sleep` advances a `TestClock` rather than blocking, so a three-minute model load takes microseconds and the deadline arithmetic is exact. No SSH, no Docker, no network.
 
-Two-person review is required for changes to auth, parsers, adapter credential handling, policy activation, storage integrity, the fleet agent protocol, lease accounting, and the eviction path.
-
 ### What a test here is for
 
 The bar is not coverage, it is *would this catch the bug*. Assert the security or state property, not merely the response status. When adding a test:
