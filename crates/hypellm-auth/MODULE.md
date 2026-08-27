@@ -30,6 +30,14 @@ each has a home here:
 | Local peer credentials | `peer` | An administrator-declared uid → principal mapping |
 | Break-glass | `session::AuthMethod::BreakGlass` | A preprovisioned local credential handled exactly as an API key |
 
+A fifth method exists and is **not** one of the four: `AuthMethod::Password`, for
+`local_user` accounts. It is a recorded deviation (`docs/deferred-issues.md`)
+that lets a deployment be operated before an identity provider is configured. Its
+hashing is `hypellm_crypto::pbkdf2` and its handler, throttling and audit are in
+`hypellm-admin-api`; this crate contributes only the session method, so that an
+investigation is never told the identity provider vouched for someone it has
+never seen.
+
 What this crate deliberately does **not** do:
 
 - **No signature verification.** Specification 9.1's dependency boundary: "JWT

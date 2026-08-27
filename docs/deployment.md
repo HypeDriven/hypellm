@@ -186,7 +186,9 @@ returns an error rather than falling back to a cleartext socket
 (`crates/hypellm-net/src/egress.rs`).
 
 Omitting the OIDC settings disables Google sign-in completely, which for an
-air-gapped deployment is the point. Break-glass is the management plane there:
+air-gapped deployment is the point. A `local_user` password account or
+break-glass is the management plane there — and only break-glass carries
+`manage_keys`:
 set `break_glass_principal`, `break_glass_tenant`, and a `role_binding`, keep the
 token, and sign in through the admin application's sign-in screen or
 `POST /admin/v1/auth/break-glass` directly (see
@@ -205,6 +207,46 @@ record — correct for an emergency path, noisy as a daily one, so size the
 retention accordingly.
 
 ---
+
+## Local password sign-in
+
+**A deviation, not a supported steady state.** Specification 9.2 lists four ways
+a principal is established and a password is none of them; the reasoning and the
+full list of what it does and does not keep are in
+[`deferred-issues.md`](deferred-issues.md#local-password-sign-in-is-a-deviation).
+It exists so a deployment can be operated before an OAuth client, a redirect URI
+and a verifier process are in place. Use it to get started, then move to
+`identity` records.
+
+Declare an account with a derived verifier — never a password:
+
+```bash
+printf '%s' 'the-password' | hypellm-router --hash-password
+```
+
+```text
+local_user id=admin principal=user:admin tenant=local \
+           verifier=pbkdf2-sha256$210000$…$…
+role_binding subject=principal:user:admin role=operator
+```
+
+The password is read from stdin, never from an argument: `/proc/<pid>/cmdline`
+is world-readable. With no `local_user` record the endpoint answers 404 and the
+sign-in screen's local panel says so.
+
+Three things to know before relying on it:
+
+- **`manage_keys`, `manage_principals` and `manage_settings` belong to
+  `break_glass_admin` alone.** An `operator` password account can drive every
+  other screen but cannot mint an API key. Give the account
+  `break_glass_admin` if it needs to, and accept that the admin application will
+  then mark every session it opens as a break-glass session — which is accurate.
+- **Five failures lock one account for a minute.** The lockout is checked before
+  the password is hashed, so a locked account is cheap to refuse; the right
+  password does not reopen it early.
+- **`docker/hypellm.conf` ships `admin`/`admin`.** The router logs `critical`
+  `startup.default_password_in_use` for any account whose password is its own
+  username, on every start, until it is changed.
 
 ## The TLS boundary
 

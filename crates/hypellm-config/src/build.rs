@@ -499,6 +499,46 @@ pub struct IdentityBinding {
     pub description: Option<String>,
 }
 
+/// A local account that signs in with a username and a password.
+///
+/// **A deviation, recorded in `docs/deferred-issues.md`.** Specification 9.2
+/// lists four ways a principal is established and this is not one of them: a
+/// human is meant to arrive through the identity provider, and the path that
+/// works when the provider does not is the preprovisioned break-glass token of
+/// specification 22.4. This record exists so that a deployment can be operated
+/// before an OAuth client, a redirect URI and a verifier process have been set
+/// up — and it is the weakest authentication path the router has.
+///
+/// The record carries a *verifier*, never a password. Two reasons, and the
+/// second is the one that would be discovered late: the configuration file is
+/// read by anyone who can read the container's bind mount, and the canonical
+/// text is hashed into the configuration digest and served through
+/// `GET /admin/v1/policies` to every caller who may read the active policy.
+#[derive(Debug, Clone)]
+pub struct LocalUser {
+    /// The username, compared byte for byte.
+    ///
+    /// Not case-folded. Folding is locale-dependent above ASCII (the Turkish
+    /// dotless i is the standard example), and a comparison that is right in
+    /// one locale and wrong in another is worse here than one that is simply
+    /// exact.
+    pub id: String,
+    /// The local principal this account signs in as.
+    pub principal: PrincipalId,
+    /// The tenant that principal belongs to.
+    pub tenant: TenantId,
+    /// The parsed password verifier.
+    ///
+    /// Behind an `Arc` because [`ValidatedConfig`] is `Clone` and
+    /// `PasswordVerifier` deliberately is not: an activation clones the
+    /// snapshot, and the point of that rule is that the derived key should not
+    /// be copied from place to place. Sharing the one parsed verifier keeps
+    /// both properties.
+    pub verifier: std::sync::Arc<hypellm_crypto::PasswordVerifier>,
+    /// A description for the management API.
+    pub description: Option<String>,
+}
+
 /// A named set of principals, declared by an administrator.
 ///
 /// Specification 25 settles where membership comes from: "Local role bindings
@@ -551,6 +591,8 @@ pub struct ValidatedConfig {
     pub groups: Vec<Group>,
     /// External identities bound to local principals.
     pub identities: Vec<IdentityBinding>,
+    /// Local password accounts.
+    pub local_users: Vec<LocalUser>,
     /// Credential metadata.
     pub credentials: Vec<CredentialMeta>,
     /// Price schedule, for cost *reporting*.
@@ -819,6 +861,42 @@ pub fn build(document: &Document, version: u64) -> Result<ValidatedConfig, Vec<C
             ));
         }
     }
+    let local_users = collect(document, "local_user", &mut errors, build_local_user);
+
+    // The same two checks as `identity`, for the same two reasons: a duplicate
+    // username makes which principal signs in depend on record order, and a
+    // tenant that does not exist signs its holder into nothing.
+    if local_users.len() > MAX_LOCAL_USERS {
+        errors.push(ConfigError::new(
+            "too_many_records",
+            format!(
+                "{} local_user records: at most {MAX_LOCAL_USERS} may be declared",
+                local_users.len()
+            ),
+            Position { line: 0, column: 0 },
+        ));
+    }
+    let mut seen_users: BTreeSet<&str> = BTreeSet::new();
+    for user in &local_users {
+        if !seen_users.insert(user.id.as_str()) {
+            errors.push(ConfigError::new(
+                "duplicate_record",
+                format!("local user '{}' is declared more than once", user.id),
+                Position { line: 0, column: 0 },
+            ));
+        }
+        if !tenant_map.contains_key(&user.tenant) {
+            errors.push(ConfigError::new(
+                "unresolved_reference",
+                format!(
+                    "local user '{}' names tenant '{}', which is not defined",
+                    user.id, user.tenant
+                ),
+                Position { line: 0, column: 0 },
+            ));
+        }
+    }
+
     let credentials = collect(document, "credential", &mut errors, build_credential);
 
     // A price naming a target that does not exist is almost always a typo in
@@ -996,6 +1074,7 @@ pub fn build(document: &Document, version: u64) -> Result<ValidatedConfig, Vec<C
         roles,
         groups,
         identities,
+        local_users,
         credentials,
         prices,
         egress_profiles,
@@ -1846,6 +1925,68 @@ fn build_identity(f: &Fields<'_>) -> Result<IdentityBinding, ConfigError> {
         subject,
         principal: id_field!(f, "principal", PrincipalId)?,
         tenant: id_field!(f, "tenant", TenantId)?,
+        description: f.opt_str("description").map(str::to_owned),
+    })
+}
+
+/// The longest username accepted.
+///
+/// Specification 3.2 admits no unbounded caller-influenced string, and this one
+/// is compared against a value from a request body on the sign-in path.
+pub const MAX_USERNAME_LEN: usize = 64;
+
+/// The most local accounts a configuration may declare.
+///
+/// A bound rather than a policy. The sign-in path keeps a failure counter per
+/// configured account, so this is what makes that map finite — and a deployment
+/// that wants more than this many people in the management plane wants an
+/// identity provider, which is what the `identity` record is for.
+pub const MAX_LOCAL_USERS: usize = 64;
+
+fn build_local_user(f: &Fields<'_>) -> Result<LocalUser, ConfigError> {
+    let id = f.str_field("id")?;
+    if id.is_empty() || id.len() > MAX_USERNAME_LEN {
+        return Err(f.error(
+            "invalid_identifier",
+            format!("a local user's id must be 1 to {MAX_USERNAME_LEN} characters"),
+        ));
+    }
+    // Deliberately narrow. A username reaches an audit record, a log line and
+    // an error message; restricting it to a printable ASCII set means no
+    // caller-chosen byte can change how any of those three are read, and it
+    // costs nothing a deployment actually needs.
+    if !id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'@'))
+    {
+        return Err(f.error(
+            "invalid_identifier",
+            format!(
+                "local user '{id}' may contain only ASCII letters, digits, and '.', '-', '_', '@'"
+            ),
+        ));
+    }
+
+    // Parsed here rather than at sign-in. A verifier that cannot be parsed is a
+    // configuration error, and the alternative — discovering it the first time
+    // somebody tries to sign in — puts the failure in front of the one person
+    // who cannot then fix it.
+    let encoded = f.str_field("verifier")?;
+    let verifier = hypellm_crypto::PasswordVerifier::parse(encoded).map_err(|e| {
+        // The message names the format, never the value: a configuration error
+        // is rendered by `--check`, logged at startup, and returned by
+        // `POST /admin/v1/policies:validate` to any caller who may draft policy.
+        f.error(
+            "invalid_verifier",
+            format!("local user '{id}' has an unusable password verifier: {e}"),
+        )
+    })?;
+
+    Ok(LocalUser {
+        id: id.to_owned(),
+        principal: id_field!(f, "principal", PrincipalId)?,
+        tenant: id_field!(f, "tenant", TenantId)?,
+        verifier: std::sync::Arc::new(verifier),
         description: f.opt_str("description").map(str::to_owned),
     })
 }

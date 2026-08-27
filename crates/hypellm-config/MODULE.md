@@ -9,7 +9,7 @@ input/resource limits.
 | Owner | Security (primary), Platform (secondary) |
 | Unsafe code | None. `#![forbid(unsafe_code)]` declared in `lib.rs` and inherited from the workspace. |
 | External dependencies | None. Workspace path dependencies only: `hypellm-core`, `hypellm-crypto`, `hypellm-fleet`. Rust standard library otherwise. |
-| Fuzz targets | `tests/fuzz.rs` — 7 targets over the grammar, driven by `hypellm-test-corpus::fuzz`. See [Fuzz targets](#fuzz-targets). |
+| Fuzz targets | `tests/fuzz.rs` — 8 targets over the grammar, driven by `hypellm-test-corpus::fuzz`. See [Fuzz targets](#fuzz-targets). |
 
 ## Scope and the "no evaluation step" rule
 
@@ -151,7 +151,7 @@ Limits and validations that are **not** enforced here, and must not be assumed:
 
 ## Fuzz targets
 
-`tests/fuzz.rs` — seven targets, run by `cargo test -p hypellm-config`. The
+`tests/fuzz.rs` — eight targets, run by `cargo test -p hypellm-config`. The
 engine is `hypellm-test-corpus::fuzz`; there is no `fuzz/` directory and no
 libFuzzer harness, because specification 4 admits no such dependency.
 
@@ -171,6 +171,7 @@ widening it from one alias to every alias.
 | `a_very_long_line_is_refused_rather_than_consuming_the_process` | The line-oriented grammar's natural unbounded input |
 | `deeply_repeated_records_are_bounded` | The many-records shape of the same |
 | `random_text_is_rejected_without_panicking` | Unstructured input over the grammar's delimiters |
+| `no_mutated_verifier_ever_accepts_a_password_it_was_not_built_from` | The fail-open specific to `local_user`: a corrupted verifier must refuse, never default into a guessable credential |
 
 Still outstanding (§21, §18.2):
 

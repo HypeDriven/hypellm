@@ -457,6 +457,128 @@ function renderFacts() {
 }
 
 /**
+ * Username length, mirroring `MAX_USERNAME_LEN` in `hypellm-config`.
+ *
+ * A bound on the input rather than a validation: the router rejects an overlong
+ * name without comparing it, and this only stops the browser from sending one.
+ */
+const USERNAME_MAX = 64;
+
+/**
+ * Password length, mirroring `MAX_PASSWORD_LEN` in `hypellm_crypto::pbkdf2`.
+ */
+const PASSWORD_MAX = 1024;
+
+/**
+ * The local username-and-password sign-in panel.
+ *
+ * **This is not the supported way in.** Specification 9.2 lists four ways a
+ * principal is established and a local password is none of them; it exists so a
+ * deployment can be operated before an identity provider and a verifier process
+ * have been set up, and it is recorded as a deviation in
+ * `docs/deferred-issues.md`.
+ *
+ * Two decisions worth stating, both the same as the break-glass panel's:
+ *
+ * - **It is rendered whatever the router is configured with.** The form is
+ *   static UI shipped with the application, so it discloses nothing: a router
+ *   with no `local_user` record answers it with the same 404 it answers `curl`
+ *   with, which is the property `password_sign_in` in `handlers.rs`
+ *   deliberately has. The 404 is reported here as "not configured" rather than
+ *   as a failure, because on a router with an identity provider that is the
+ *   correct and expected answer.
+ * - **The inputs carry no `name`.** A `<form>` whose submit is not prevented
+ *   serializes named controls into a query string; nameless ones cannot be, so
+ *   the password has no path into the address bar, the browser's history, or
+ *   the router's access log even if the listener below never runs.
+ *
+ * @returns {{element: HTMLElement, focus: () => void}}
+ */
+function passwordPanel() {
+  const status = el('p', { class: 'field__hint', role: 'status', 'aria-live': 'polite' });
+
+  const username = el('input', {
+    type: 'text',
+    autocomplete: 'username',
+    autocapitalize: 'none',
+    spellcheck: 'false',
+    maxlength: String(USERNAME_MAX),
+  });
+  const password = el('input', {
+    type: 'password',
+    autocomplete: 'current-password',
+    autocapitalize: 'none',
+    spellcheck: 'false',
+    maxlength: String(PASSWORD_MAX),
+  });
+
+  const submit = actionButton('Sign in', signIn, { busyLabel: 'Signing in…' });
+
+  const form = el('form', { novalidate: true }, [
+    field({
+      id: 'local-username',
+      label: 'Username',
+      control: username,
+    }),
+    field({
+      id: 'local-password',
+      label: 'Password',
+      control: password,
+    }),
+    buttonRow([submit]),
+    status,
+  ]);
+
+  // Same shape as the break-glass form: the button is `type="button"`, so Enter
+  // routes through the one guarded handler rather than a second code path that
+  // is not disabled while a sign-in is in flight.
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    submit.click();
+  });
+
+  const element = card('Sign in with a local account', [form]);
+
+  return { element, focus: () => username.focus() };
+
+  /** Validate locally, sign in, and enter the application. */
+  async function signIn() {
+    status.textContent = '';
+
+    if (username.value === '' || password.value === '') {
+      status.textContent = 'A username and a password are required.';
+      (username.value === '' ? username : password).focus();
+      return;
+    }
+
+    try {
+      await api.passwordSignIn(username.value, password.value);
+    } catch (error) {
+      // Reported here rather than raised to the shell's error boundary: on this
+      // screen the boundary's answer to a 401 is to render the sign-in screen,
+      // which is where the operator already is.
+      if (error instanceof ApiError && error.status === 404) {
+        status.textContent =
+          'This router has no local accounts configured. Sign in with the identity provider, or use break-glass.';
+      } else {
+        status.textContent = describe(error);
+      }
+      password.value = '';
+      password.focus();
+      return;
+    }
+
+    // Cleared as soon as it has been spent, for the reason the break-glass
+    // panel clears its token: the value is still in the browser's memory until
+    // this node is collected, but leaving it in a live input is a copy that
+    // stays on screen for the whole session.
+    password.value = '';
+
+    await start();
+  }
+}
+
+/**
  * Reason length, mirroring `MIN_BREAK_GLASS_REASON`/`MAX_BREAK_GLASS_REASON`
  * in `crates/hypellm-admin-api/src/handlers.rs`.
  *
@@ -554,7 +676,7 @@ function breakGlassPanel() {
     el('p', {
       class: 'page-lede',
       text:
-        'The preprovisioned recovery path of specification 22.4. It does not involve the identity provider, which is the point of it: this is the sign-in that still works when the provider does not, and on a deployment with no OIDC configured it is the only one there is.',
+        'The preprovisioned recovery path of specification 22.4. It does not involve the identity provider, which is the point of it: this is the sign-in that still works when the provider does not, and the only one that carries permission to mint an API key.',
     }),
     banner(
       'warn',
@@ -645,9 +767,11 @@ function renderSignIn(message) {
 
   const status = el('p', { class: 'page-lede' }, [
     'The management interface requires a signed-in principal. ',
-    'Sign-in is delegated to the configured identity provider; this application never handles a password.',
+    'Sign-in is delegated to the configured identity provider, or to a local account on a ',
+    'deployment that has not configured one yet.',
   ]);
 
+  const password = passwordPanel();
   const breakGlass = breakGlassPanel();
 
   const button = el('button', { type: 'button', class: 'button' }, 'Sign in with Google');
@@ -678,7 +802,7 @@ function renderSignIn(message) {
         // and the next step is the panel directly below.
         if (error instanceof ApiError && error.status === 404) {
           breakGlass.reveal(
-            'This router has no identity provider configured, so Google sign-in cannot start. Break-glass is the way in.',
+            'This router has no identity provider configured, so Google sign-in cannot start. Sign in with a local account above, or use break-glass.',
           );
           notify('warn', 'No identity provider is configured on this router.');
           return;
@@ -696,6 +820,7 @@ function renderSignIn(message) {
   render(shell.view, [
     pageHeader('HypeLLM Router', 'Management interface'),
     card('Sign in', [status, buttonRow([button, reveal])]),
+    password.element,
     breakGlass.element,
   ]);
 

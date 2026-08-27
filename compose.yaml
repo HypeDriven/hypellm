@@ -200,7 +200,8 @@ services:
   # sign-in possible: the router ships a client for it and no implementation,
   # because specification 9.1 puts JWT signature verification outside the
   # router. Without this service `oidc_callback` answers "the identity verifier
-  # is not configured" and only break-glass can reach the management plane.
+  # is not configured", and the management plane is reachable only through a
+  # `local_user` password or break-glass.
   #
   # Behind a profile, so `just up` does not start it: it needs a Google OAuth
   # client and a `run/verifier/verifier.json` that does not exist until someone

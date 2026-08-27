@@ -31,9 +31,20 @@ test-vector-verifiable primitives the router cannot function without:
 | Base64 / Base64url | RFC 4648 | Key material encoding, OIDC PKCE/state, cookie values |
 | Hex | RFC 4648 §8 | Digest display in audit records and config digests |
 | Constant-time compare | — | Digest comparison without timing oracle |
+| PBKDF2-HMAC-SHA-256 | RFC 8018 §5.2 | `local_user` password verifiers on the management plane |
 
 Every primitive is validated against published vectors in the unit tests. A
 divergence from the reference is a build failure, not a runtime surprise.
+
+PBKDF2 is the newest entry and the one that needs justifying. It adds no
+primitive: it is the HMAC above, iterated, and RFC 8018 specifies it exactly, so
+it meets this module's admission test — the unit tests hold it against published
+vectors, cross-checked against `hashlib.pbkdf2_hmac`. It is **not** memory-hard.
+Argon2id or scrypt would resist GPU and ASIC attack materially better, and
+neither is deterministic-and-test-vector-verifiable in the narrow sense this
+module requires of in-repository code. The consequence is recorded in
+`docs/deferred-issues.md`: treat an offline copy of the configuration as an
+offline copy of the password hashes, and prefer an identity provider.
 
 ## Threat notes
 
@@ -49,6 +60,11 @@ divergence from the reference is a build failure, not a runtime surprise.
   path must fail closed. There is no user-space PRNG in this module by design.
 - **Length-extension.** Raw SHA-256 is length-extendable. Never authenticate a
   message with `sha256(secret || message)`; use `hmac_sha256`.
+- **Offline attack on a password verifier.** `PasswordVerifier` is an image of a
+  password that survives being copied. Its `Debug` prints no field and it is
+  deliberately not `Clone` — `hypellm_config::LocalUser` holds it behind an
+  `Arc` rather than duplicating it — but the file it was read from is the real
+  exposure. The iteration count is the only thing making that expensive.
 
 ## Limits
 
@@ -58,6 +74,9 @@ divergence from the reference is a build failure, not a runtime surprise.
 | HMAC key length | Unbounded input, hashed down to 32 bytes when > 64 |
 | Base64 decode input | Caller-supplied `max_output` (bytes), default callers use 8 KiB |
 | Hex decode input | Caller-supplied buffer size |
+| PBKDF2 password length | 1 024 bytes; longer is refused without hashing |
+| PBKDF2 iterations | 1 000 to 10 000 000; the default derivation uses 210 000 |
+| PBKDF2 salt | 8 to 64 bytes; 16 when derived here |
 
 ## Public API
 

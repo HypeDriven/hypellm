@@ -284,6 +284,16 @@ function signInPanel(oidc, sessions) {
             'No OIDC configuration is loaded, so this router cannot start a sign-in. Any session in use was established some other way.',
           )
         : null,
+      // Said where the operator is looking, rather than left to be discovered.
+      // A local password account is a deviation from specification 9.2 and the
+      // weakest way into this plane; a deployment that has one and has stopped
+      // noticing is the case this line exists for.
+      typeof oidc.local_accounts === 'number' && oidc.local_accounts > 0
+        ? banner(
+            'warn',
+            `${oidc.local_accounts} local password account(s) can sign in to this router. Local sign-in is a deviation intended for use before an identity provider is configured; prefer identity records once sign-in works.`,
+          )
+        : null,
       oidc.configured === true && oidc.verifier_configured === false
         ? banner(
             'warn',
@@ -311,6 +321,14 @@ function signInPanel(oidc, sessions) {
               : domains.length > 0
                 ? domains.join(', ')
                 : 'Any domain the issuer accepts — no hosted-domain restriction is configured',
+          ],
+          [
+            'Local password accounts',
+            // A count, never the names. Zero is the intended steady state, so
+            // it is rendered as the good outcome rather than as an absence.
+            typeof oidc.local_accounts === 'number'
+              ? String(oidc.local_accounts)
+              : null,
           ],
           [
             'Local identity verifier',

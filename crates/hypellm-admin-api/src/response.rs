@@ -38,6 +38,13 @@ pub enum ApiErrorCode {
     OriginNotPermitted,
     /// The configuration failed validation.
     ValidationFailed,
+    /// The caller must slow down.
+    ///
+    /// Used only by password sign-in, which is the one management endpoint
+    /// whose cost is deliberately high: a refusal here means either the account
+    /// is inside its failure window or the router is already checking as many
+    /// passwords at once as it will.
+    TooManyRequests,
     /// An internal fault.
     InternalFault,
 }
@@ -58,6 +65,7 @@ impl ApiErrorCode {
             Self::CsrfRequired => "csrf_required",
             Self::OriginNotPermitted => "origin_not_permitted",
             Self::ValidationFailed => "validation_failed",
+            Self::TooManyRequests => "too_many_requests",
             Self::InternalFault => "internal_fault",
         }
     }
@@ -76,6 +84,7 @@ impl ApiErrorCode {
             Self::Conflict => 409,
             Self::PreconditionFailed => 412,
             Self::PreconditionRequired => 428,
+            Self::TooManyRequests => 429,
             Self::InternalFault => 500,
         }
     }
@@ -95,6 +104,7 @@ impl ApiErrorCode {
             Self::CsrfRequired,
             Self::OriginNotPermitted,
             Self::ValidationFailed,
+            Self::TooManyRequests,
             Self::InternalFault,
         ]
     }

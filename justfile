@@ -74,7 +74,8 @@ up: _ports _dirs _lock build _secrets _lanroutes _tailnet_up
 # --- API keys --------------------------------------------------------------
 #
 # Everything here goes through break-glass, because with no OIDC provider
-# configured it is the only credential the management plane accepts. Three
+# configured it is the only credential that carries `manage_keys` — the shipped
+# `admin` password account reaches every other screen and not this one. Three
 # consequences worth knowing before reaching for these:
 #
 #   * The token is printed once by `--generate-secrets` and stored nowhere —
@@ -321,6 +322,22 @@ check: build
 # is `#[ignore]`d, because starting a process is what specification 4.1 forbids
 # the router from doing — so the harness starts it and the tests only connect.
 # `cargo test --workspace` therefore stays hermetic and skips them.
+# Derive a password verifier for a `local_user` record.
+#
+# The password is read from stdin, never from an argument: `/proc/<pid>/cmdline`
+# is readable by every account on this host. `read -rs` keeps it out of shell
+# history too, which a `just password the-secret` could not.
+[doc('Derive a local_user password verifier, reading the password from stdin')]
+password:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    printf 'password: ' >&2
+    read -rs value
+    printf '\n' >&2
+    [ -n "$value" ] || { echo "empty password" >&2; exit 1; }
+    printf '%s' "$value" | {{compose}} run --rm --no-deps -T \
+        --entrypoint /usr/local/bin/hypellm-router router --hash-password
+
 [doc('Run the identity verifier self-test and end-to-end acceptance')]
 verifier-acceptance:
     @verifier/hypellm-verifier --selftest
@@ -425,6 +442,7 @@ endpoints:
 
     head "Management — this host only" "$admin — session cookie + CSRF"
     row GET  "/"                     "admin SPA"
+    row POST "/admin/v1/auth/password"    "sign in as a local_user"
     row POST "/admin/v1/auth/break-glass" "sign in (no OIDC configured)"
     row GET  "/admin/v1/overview"    "fleet, targets, breakers"
     row GET  "/admin/v1/keys"        "API keys (POST to mint one)"

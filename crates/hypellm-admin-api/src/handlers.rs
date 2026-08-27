@@ -26,8 +26,9 @@ use hypellm_core::rbac::Permission;
 use hypellm_core::target::AdminState as TargetAdminState;
 use hypellm_core::time::Clock;
 use hypellm_store::{AuditAction, AuditEvent, AuditOutcome, Store};
+use std::collections::BTreeMap;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use wire_http1::{Headers, Method};
@@ -674,6 +675,147 @@ impl AnonymousAuditBudget {
     }
 }
 
+// -- Password sign-in throttling --------------------------------------------
+
+/// Consecutive failures an account tolerates before it stops being checked.
+const MAX_PASSWORD_FAILURES: u32 = 5;
+
+/// The window those failures are counted over, and the length of the lockout.
+const PASSWORD_LOCKOUT_WINDOW_MILLIS: u64 = 60_000;
+
+/// How many passwords the router will check at the same time.
+///
+/// Specification 3.2: no request may create unbounded work. A PBKDF2
+/// verification is deliberately expensive — around 100 ms of CPU at
+/// [`hypellm_crypto::pbkdf2::DEFAULT_ITERATIONS`] — and this endpoint runs
+/// before any session, so without a bound an unauthenticated caller who can
+/// reach the management listener owns every core the process has. Two is enough
+/// for the humans who actually sign in this way.
+const MAX_CONCURRENT_PASSWORD_CHECKS: u32 = 2;
+
+/// Bounds what a failed password attempt costs, per account and in total.
+///
+/// Two separate mechanisms, because they defend different things:
+///
+/// - **The per-account window** bounds guessing. Five attempts a minute makes
+///   an online attack on even a weak password hopeless, and it is checked
+///   *before* the hash is computed, so a locked account costs nothing.
+/// - **The concurrency bound** protects the CPU. The lockout alone does not:
+///   with enough configured accounts a caller could still start one expensive
+///   verification per account at once.
+///
+/// # What this does not hide
+///
+/// An unknown username is refused without hashing anything, so it is refused
+/// faster than a known one with a wrong password. That is a username oracle,
+/// and it is a deliberate trade: the alternative — hashing a dummy verifier so
+/// the two take the same time — hands an unauthenticated caller a CPU
+/// amplifier, and a management plane that stops answering is worse than one
+/// that confirms `admin` exists. Recorded in `docs/deferred-issues.md`.
+#[derive(Debug)]
+struct PasswordThrottle {
+    /// Recent failures, keyed by username.
+    ///
+    /// Bounded by the configuration: only a *configured* username is ever
+    /// inserted, and `hypellm-config` caps how many of those there may be. An
+    /// unknown name never reaches this map, so a caller cannot grow it.
+    accounts: Mutex<BTreeMap<String, AccountFailures>>,
+    /// Verifications currently running.
+    in_flight: AtomicU32,
+}
+
+/// Failures for one account inside one window.
+#[derive(Debug, Clone, Copy)]
+struct AccountFailures {
+    window_start_millis: u64,
+    failures: u32,
+}
+
+/// A permit to run one password verification, released on drop.
+///
+/// `Drop` is trusted here in a way the router deliberately does not trust it
+/// for admission reservations: this counter is process-local, is never handed
+/// across a task boundary, and its only consequence if it leaked would be a
+/// refusal to check passwords — it cannot over-admit anything.
+struct KdfSlot<'a>(&'a AtomicU32);
+
+impl Drop for KdfSlot<'_> {
+    fn drop(&mut self) {
+        // Saturating: the count must never wrap below zero and let the bound be
+        // exceeded on the next attempt.
+        let _ = self
+            .0
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                Some(n.saturating_sub(1))
+            });
+    }
+}
+
+impl PasswordThrottle {
+    const fn new() -> Self {
+        Self {
+            accounts: Mutex::new(BTreeMap::new()),
+            in_flight: AtomicU32::new(0),
+        }
+    }
+
+    /// A poisoned lock is recovered rather than propagated.
+    ///
+    /// Poisoning means a thread panicked while holding it, which this crate's
+    /// lints exist to prevent. If it happened anyway, the failure counters are
+    /// plain integers with no invariant to violate — and the alternative, a
+    /// permanent refusal to check any password, would turn one panic into a
+    /// lockout of the whole management plane.
+    fn accounts(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, AccountFailures>> {
+        match self.accounts.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Whether this account is inside its failure window.
+    fn locked(&self, username: &str, now_millis: u64) -> bool {
+        let map = self.accounts();
+        map.get(username).is_some_and(|entry| {
+            now_millis.saturating_sub(entry.window_start_millis)
+                < PASSWORD_LOCKOUT_WINDOW_MILLIS
+                && entry.failures >= MAX_PASSWORD_FAILURES
+        })
+    }
+
+    /// Count a failure, starting a new window if the last one has expired.
+    fn record_failure(&self, username: &str, now_millis: u64) {
+        let mut map = self.accounts();
+        let entry = map
+            .entry(username.to_owned())
+            .or_insert(AccountFailures {
+                window_start_millis: now_millis,
+                failures: 0,
+            });
+        if now_millis.saturating_sub(entry.window_start_millis) >= PASSWORD_LOCKOUT_WINDOW_MILLIS {
+            entry.window_start_millis = now_millis;
+            entry.failures = 0;
+        }
+        entry.failures = entry.failures.saturating_add(1);
+    }
+
+    /// Forget an account's failures, after a sign-in that worked.
+    fn clear(&self, username: &str) {
+        self.accounts().remove(username);
+    }
+
+    /// Take a verification permit, or `None` if the router is already at its
+    /// bound.
+    fn enter(&self) -> Option<KdfSlot<'_>> {
+        self.in_flight
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < MAX_CONCURRENT_PASSWORD_CHECKS).then(|| n.saturating_add(1))
+            })
+            .ok()
+            .map(|_| KdfSlot(&self.in_flight))
+    }
+}
+
 /// The management API.
 #[derive(Debug)]
 pub struct AdminApi {
@@ -687,6 +829,11 @@ pub struct AdminApi {
     /// an attack on the emergency path behind noise on the ordinary one. Two
     /// budgets cost one more record per window and remove that.
     break_glass_audits: AnonymousAuditBudget,
+    /// And a third for password sign-in, for the same reason: a flood on one
+    /// sign-in path must not suppress the records of an attack on another.
+    password_audits: AnonymousAuditBudget,
+    /// Failure counters and the verification concurrency bound.
+    passwords: PasswordThrottle,
 }
 
 impl AdminApi {
@@ -697,6 +844,8 @@ impl AdminApi {
             state,
             anonymous_audits: AnonymousAuditBudget::new(),
             break_glass_audits: AnonymousAuditBudget::new(),
+            password_audits: AnonymousAuditBudget::new(),
+            passwords: PasswordThrottle::new(),
         }
     }
 
@@ -778,6 +927,9 @@ impl AdminApi {
             // must keep working when the identity provider does not.
             (Method::Post, "/admin/v1/auth/break-glass") => {
                 return self.break_glass(request);
+            }
+            (Method::Post, "/admin/v1/auth/password") => {
+                return self.password_sign_in(request);
             }
             _ => {}
         }
@@ -1331,6 +1483,224 @@ impl AdminApi {
         root.push("expires_in_seconds", Value::from(seconds));
         Ok(ApiResponse::ok(&Value::Object(root))
             .with_header("Set-Cookie", issued.set_cookie_header(seconds)))
+    }
+
+    /// Local username-and-password sign-in.
+    ///
+    /// **Not one of specification 9.2's four authentication methods.** It is a
+    /// recorded deviation (`docs/deferred-issues.md`) that exists so a
+    /// deployment can be operated before an identity provider and a verifier
+    /// process have been set up, and it is the weakest way into the management
+    /// plane. Everything below is an attempt to keep "weakest" from meaning
+    /// "weak":
+    ///
+    /// - **Not advertised when it is not configured.** A router with no
+    ///   `local_user` record answers 404, exactly as break-glass does, rather
+    ///   than confirming the endpoint is live to whoever is probing it.
+    /// - **Bounded before it is expensive.** The lockout is checked before the
+    ///   hash is computed, so a locked account costs a map lookup, and the
+    ///   number of verifications running at once is capped.
+    /// - **One refusal for every way of being wrong.** An unknown username, a
+    ///   wrong password and a malformed body all produce the same 401 with the
+    ///   same message. The audit record distinguishes them; the response does
+    ///   not.
+    /// - **Recorded.** Success and failure both reach the audit chain, and the
+    ///   session names `password` as its method so an investigation is not told
+    ///   the identity provider vouched for someone it has never seen.
+    fn password_sign_in(&self, request: &AdminRequest<'_>) -> Result<ApiResponse, ApiError> {
+        let config = self.state.config();
+        if config.local_users.is_empty() {
+            return Err(ApiError::new(
+                ApiErrorCode::NotFound,
+                "password sign-in is not configured",
+            ));
+        }
+
+        // One error for every failure below, built fresh at each use. Sharing
+        // the text is the point: a caller must not be able to tell "no such
+        // account" from "wrong password" by reading it.
+        let refused = || {
+            ApiError::new(
+                ApiErrorCode::Unauthenticated,
+                "the username or password is incorrect",
+            )
+        };
+
+        let body = request.json(&Limits::SMALL).map_err(|_| {
+            ApiError::new(
+                ApiErrorCode::InvalidRequest,
+                "the request body is not valid JSON",
+            )
+        })?;
+        let username = body
+            .opt_field_str("username")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let password = body
+            .opt_field_str("password")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+
+        // Before the lookup, so an overlong name is neither compared nor
+        // written to an audit record.
+        if username.is_empty() || username.len() > hypellm_config::MAX_USERNAME_LEN {
+            self.audit_password_failure(request, None, "password_username_invalid");
+            return Err(refused());
+        }
+
+        let Some(user) = config.local_users.iter().find(|u| u.id == username) else {
+            // No hashing here — see `PasswordThrottle`'s note on what this does
+            // not hide.
+            self.audit_password_failure(request, None, "password_unknown_user");
+            return Err(refused());
+        };
+
+        let now = self.state.clock.now_millis();
+        if self.passwords.locked(&user.id, now) {
+            self.audit_password_failure(request, Some(user), "password_locked_out");
+            return Err(ApiError::new(
+                ApiErrorCode::TooManyRequests,
+                "too many failed sign-in attempts for this account; try again shortly",
+            ));
+        }
+
+        // Held for the whole verification and released on every path out,
+        // including the error ones, because the guard owns the decrement.
+        let Some(_slot) = self.passwords.enter() else {
+            // Deliberately not counted as a failure for the account: this is
+            // the router protecting itself, and letting it feed the lockout
+            // would let one caller lock an operator out by being noisy.
+            self.audit_password_failure(request, Some(user), "password_check_capacity");
+            return Err(ApiError::new(
+                ApiErrorCode::TooManyRequests,
+                "the router is checking as many passwords as it will at once; try again shortly",
+            ));
+        };
+
+        if !user.verifier.verify(password) {
+            self.passwords.record_failure(&user.id, now);
+            self.audit_password_failure(request, Some(user), "password_incorrect");
+            return Err(refused());
+        }
+
+        let roles = management_roles_for(&config, &user.principal);
+        if roles.is_empty() {
+            // Same refusal as break-glass, and the same reason: knowing the
+            // password proves who you are, not what you may do. A session with
+            // no role can reach no screen, which is a confusing way to fail.
+            self.audit_password_failure(request, Some(user), "password_principal_unbound");
+            return Err(ApiError::new(
+                ApiErrorCode::Forbidden,
+                "this local user has no role binding in this configuration",
+            ));
+        }
+
+        // Only now, and only on the path that actually authenticated. Clearing
+        // earlier would let a wrong password reset the counter.
+        self.passwords.clear(&user.id);
+
+        let issued = self
+            .state
+            .sessions
+            .issue(
+                user.principal.clone(),
+                user.tenant.clone(),
+                None,
+                None,
+                roles,
+                hypellm_auth::AuthMethod::Password,
+                now,
+            )
+            .map_err(|_| {
+                ApiError::new(ApiErrorCode::InternalFault, "cannot establish a session")
+            })?;
+
+        // Through `record_audit` and carrying the tenant, so the sign-in is
+        // visible in the audit view and not only in the durable chain — the
+        // DI-051 defect, which both other sign-in paths were fixed for.
+        let _ = self.record_audit(
+            AuditEvent::new(
+                self.state.clock.wall_millis(),
+                user.principal.as_str(),
+                AuditAction::Login,
+            )
+            .with_tenant(user.tenant.as_str())
+            .with_source(peer_text(request.peer)),
+        );
+
+        let mut root = Object::new();
+        root.push("csrf_token", Value::from(issued.csrf_token.as_str()));
+        root.push(
+            "expires_in_seconds",
+            Value::from(
+                Duration::from_millis(self.state.sessions.policy().absolute_millis).as_secs(),
+            ),
+        );
+        Ok(ApiResponse::ok(&Value::Object(root)).with_header(
+            "Set-Cookie",
+            issued.set_cookie_header(
+                Duration::from_millis(self.state.sessions.policy().absolute_millis).as_secs(),
+            ),
+        ))
+    }
+
+    /// A refused password attempt.
+    ///
+    /// The tenant is recorded when the account is known, for the reason
+    /// `audit_break_glass_failure` states: the audit view filters by tenant, so
+    /// a record written without one is invisible to every reviewer. An attempt
+    /// on an unknown username has no tenant to attribute — it is recorded
+    /// against `anonymous` and is visible to a reviewer of any tenant, which is
+    /// the honest answer to "who was this".
+    fn audit_password_failure(
+        &self,
+        request: &AdminRequest<'_>,
+        user: Option<&hypellm_config::LocalUser>,
+        reason: &str,
+    ) {
+        let now = self.state.clock.wall_millis();
+        // Bounded, and on its own budget: this endpoint runs before any
+        // session, so an unauthenticated caller decides how often it runs
+        // (specification 3.2, and DI-044 for what an unbounded one costs).
+        let (record, suppressed) = self.password_audits.admit(now);
+
+        if let Some(count) = suppressed {
+            let mut event = AuditEvent::new(now, "anonymous", AuditAction::LoginFailed)
+                .with_outcome(AuditOutcome::Denied)
+                .with_reason("further_failures_suppressed")
+                .with_source(&format!(
+                    "{count} further password failures in the last window"
+                ));
+            if let Some(user) = user {
+                event = event.with_tenant(user.tenant.as_str());
+            }
+            let _ = self.record_audit(event);
+        }
+
+        if record {
+            // The principal, not the username: an audit record names a
+            // principal everywhere else, and a reviewer correlating a sign-in
+            // failure with what that principal did next needs the same key.
+            let actor = user.map_or("anonymous", |u| u.principal.as_str());
+            let mut event = AuditEvent::new(now, actor, AuditAction::LoginFailed)
+                .with_outcome(AuditOutcome::Denied)
+                .with_reason(reason)
+                .with_source(peer_text(request.peer));
+            if let Some(user) = user {
+                event = event.with_tenant(user.tenant.as_str());
+            }
+            let _ = self.record_audit(event);
+        }
+
+        self.state.telemetry.count(
+            hypellm_telemetry::names::AUTH_FAILURES,
+            "Authentication failures.",
+            &hypellm_telemetry::Labels::new()
+                .with(hypellm_telemetry::LabelName::Listener, "admin")
+                .with(hypellm_telemetry::LabelName::Reason, reason),
+        );
     }
 
     /// A refused break-glass attempt.
@@ -3480,6 +3850,14 @@ impl AdminApi {
             "verifier_configured",
             Value::from(settings.oidc_verifier_socket.is_some()),
         );
+        // How many local password accounts exist, and no more than that. The
+        // usernames are not listed: this screen answers "can anyone sign in
+        // without the identity provider", which a count answers, and a list
+        // would be a set of names to try against `POST /auth/password`.
+        oidc.push(
+            "local_accounts",
+            Value::from(u64::try_from(config.local_users.len()).unwrap_or(u64::MAX)),
+        );
 
         let mut sessions = Object::new();
         sessions.push("idle_seconds", Value::from(settings.session_idle_secs));
@@ -4640,6 +5018,65 @@ fn peer_text(peer: Option<IpAddr>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_password_throttle_bounds_concurrent_verifications() {
+        // Not reachable from the HTTP suite, which is single-threaded: it takes
+        // two live permits to observe the bound at all. What it protects is the
+        // CPU — a PBKDF2 verification is ~100 ms of work, and this endpoint
+        // runs before any session, so without a ceiling an unauthenticated
+        // caller owns every core the process has (specification 3.2).
+        use super::{MAX_CONCURRENT_PASSWORD_CHECKS, PasswordThrottle};
+
+        let throttle = PasswordThrottle::new();
+        let held: Vec<_> = (0..MAX_CONCURRENT_PASSWORD_CHECKS)
+            .map(|n| {
+                throttle
+                    .enter()
+                    .unwrap_or_else(|| panic!("permit {n} must be available"))
+            })
+            .collect();
+        assert!(
+            throttle.enter().is_none(),
+            "the bound must refuse the next verification, not queue it"
+        );
+
+        // Released on drop, on every path out of the handler including the
+        // error ones. A permit that leaked would make the endpoint answer 429
+        // for the rest of the process's life.
+        drop(held);
+        assert!(
+            throttle.enter().is_some(),
+            "permits must be returned when the verification ends"
+        );
+    }
+
+    #[test]
+    fn the_password_throttle_locks_and_releases_one_account_at_a_time() {
+        use super::{
+            MAX_PASSWORD_FAILURES, PASSWORD_LOCKOUT_WINDOW_MILLIS, PasswordThrottle,
+        };
+
+        let throttle = PasswordThrottle::new();
+        assert!(!throttle.locked("admin", 0));
+
+        for _ in 0..MAX_PASSWORD_FAILURES {
+            throttle.record_failure("admin", 0);
+        }
+        assert!(throttle.locked("admin", 0));
+        assert!(
+            !throttle.locked("someone-else", 0),
+            "the counter is per account, not global"
+        );
+
+        // The window is a window, not a permanent state: five typos must not
+        // cost the management plane until a restart.
+        assert!(!throttle.locked("admin", PASSWORD_LOCKOUT_WINDOW_MILLIS));
+
+        // And a fresh window starts empty rather than resuming at five.
+        throttle.record_failure("admin", PASSWORD_LOCKOUT_WINDOW_MILLIS);
+        assert!(!throttle.locked("admin", PASSWORD_LOCKOUT_WINDOW_MILLIS));
+    }
+
     #[test]
     fn the_anonymous_audit_budget_bounds_records_and_reports_what_it_dropped() {
         use super::{

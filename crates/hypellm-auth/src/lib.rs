@@ -11,6 +11,7 @@
 //! |---|---|---|
 //! | Router API key | coding harnesses, services | [`apikey`] |
 //! | Google OIDC session | humans in the admin UI | [`oidc`], [`session`] |
+//! | Local password | humans, before OIDC is set up | [`session::AuthMethod::Password`] |
 //! | Local peer credentials | same-host tools | [`peer`] |
 //! | Break-glass | offline recovery | [`session::AuthMethod::BreakGlass`] |
 //!
@@ -18,12 +19,17 @@
 //! only by trusted edge", so it arrives as a header the edge sets and is
 //! handled by [`peer::TrustedEdge`].
 //!
+//! The password row is a **deviation**, not a fifth method the specification
+//! names: specification 9.2 lists four, and a local account is none of them. It
+//! is recorded in `docs/deferred-issues.md`, it exists so that a deployment can
+//! be operated before an identity provider is configured, and it is the weakest
+//! way into the management plane. The hashing it needs is
+//! `hypellm_crypto::pbkdf2`; the sign-in handler is in `hypellm-admin-api`.
+//!
 //! # What is deliberately absent
 //!
-//! No JWT signature verification, no TLS, no password hashing. Specification
-//! 9.1 delegates the first two to a platform verifier, and the router has no
-//! passwords to hash — the break-glass credential is a high-entropy secret
-//! handled exactly like an API key.
+//! No JWT signature verification and no TLS. Specification 9.1 delegates both
+//! to a platform verifier.
 
 #![forbid(unsafe_code)]
 // Specification 18.2: no panics on data-plane input, all integer conversions

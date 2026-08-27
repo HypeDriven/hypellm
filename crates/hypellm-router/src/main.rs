@@ -52,6 +52,7 @@ struct Arguments {
     log_level: Option<Severity>,
     check: bool,
     generate_secrets: Option<PathBuf>,
+    hash_password: bool,
     control: Option<&'static str>,
     adopt_config: Option<String>,
     version: bool,
@@ -99,6 +100,7 @@ fn parse_arguments() -> Result<Arguments, String> {
             // an argument.
             "--shutdown" => arguments.control = Some("shutdown"),
             "--ping" => arguments.control = Some("ping"),
+            "--hash-password" => arguments.hash_password = true,
             "--generate-secrets" => {
                 arguments.generate_secrets = Some(PathBuf::from(
                     argv.next().ok_or("--generate-secrets requires a directory")?,
@@ -119,6 +121,7 @@ USAGE:
     hypellm-router --config <path> --secrets <dir> [--static <dir>] [--log <level>]
     hypellm-router --check --config <path>
     hypellm-router --generate-secrets <dir>
+    hypellm-router --hash-password < a-file-holding-the-password
     hypellm-router --adopt-config REASON --config <path> --secrets <dir>
     hypellm-router --shutdown --config <path> --secrets <dir>
     hypellm-router --ping --config <path> --secrets <dir>
@@ -130,6 +133,9 @@ OPTIONS:
         --log <level>          debug | info | warn | error | critical
         --check                validate the configuration and exit
         --generate-secrets <d> write a fresh secret bundle and exit
+        --hash-password        read a password from stdin and print the verifier
+                               for a `local_user` record; the password is never
+                               taken from an argument
         --adopt-config <why>   start from the configuration file, overriding any
                                published policy; the reason is audited
         --shutdown             ask a running router to drain and stop
@@ -196,6 +202,75 @@ fn send_control_command(config_path: &std::path::Path, control_key: &[u8], comma
     ExitCode::SUCCESS
 }
 
+/// Derive a password verifier for a `local_user` record.
+///
+/// The password is read from **stdin**, never from an argument.
+/// `/proc/<pid>/cmdline` is world-readable, so a password on the command line
+/// is a password every account on the host can read for as long as the process
+/// lives — the same reason `--shutdown` reads the control token from a file
+/// rather than taking it as a flag.
+///
+/// Only the verifier goes to stdout, so the output can be pasted or piped
+/// directly into a configuration file. Everything else goes to stderr.
+fn hash_password() -> ExitCode {
+    use std::io::Read as _;
+
+    // Bounded: `read_to_string` on a pipe that never ends would otherwise be an
+    // unbounded buffer (specification 3.2), even from a friendly caller.
+    let limit = u64::try_from(hypellm_crypto::pbkdf2::MAX_PASSWORD_LEN.saturating_add(2))
+        .unwrap_or(u64::MAX);
+    let mut input = String::new();
+    if let Err(error) = std::io::stdin().take(limit).read_to_string(&mut input) {
+        eprintln!("hypellm-router: cannot read the password from stdin: {error}");
+        return ExitCode::from(exit::CONFIGURATION);
+    }
+
+    // Exactly one trailing line ending is removed, and nothing else is
+    // trimmed: a password may legitimately begin or end with a space, and a
+    // tool that silently discarded one would produce a verifier that refuses
+    // the password its operator thinks they set.
+    let password = input
+        .strip_suffix('\n')
+        .map_or(input.as_str(), |p| p.strip_suffix('\r').unwrap_or(p));
+
+    if password.is_empty() {
+        eprintln!("hypellm-router: the password is empty");
+        eprintln!("read it from a file or a shell variable, for example:");
+        eprintln!("    read -rs PASSWORD && printf '%s' \"$PASSWORD\" | hypellm-router --hash-password");
+        return ExitCode::from(exit::CONFIGURATION);
+    }
+    if password.len() > hypellm_crypto::pbkdf2::MAX_PASSWORD_LEN {
+        eprintln!(
+            "hypellm-router: the password is longer than {} bytes",
+            hypellm_crypto::pbkdf2::MAX_PASSWORD_LEN
+        );
+        return ExitCode::from(exit::CONFIGURATION);
+    }
+
+    let verifier = match hypellm_crypto::PasswordVerifier::derive(
+        password,
+        hypellm_crypto::pbkdf2::DEFAULT_ITERATIONS,
+    ) {
+        Ok(verifier) => verifier,
+        Err(error) => {
+            // Fails closed: a salt that is not random is not a salt.
+            eprintln!("hypellm-router: cannot generate a salt: {error}");
+            return ExitCode::from(exit::SECRETS);
+        }
+    };
+
+    println!("{}", verifier.encode());
+    eprintln!();
+    eprintln!("Put this in the configuration as a `local_user` record:");
+    eprintln!();
+    eprintln!("    local_user id=<username> principal=user:<username> tenant=<tenant> \\");
+    eprintln!("               verifier={}", verifier.encode());
+    eprintln!("    role_binding subject=principal:user:<username> role=operator");
+    eprintln!();
+    eprintln!("The record carries no password, and this verifier cannot be reversed into one.");
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     let arguments = match parse_arguments() {
         Ok(arguments) => arguments,
@@ -212,6 +287,10 @@ fn main() -> ExitCode {
     if arguments.version {
         println!("hypellm-router {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
+    }
+
+    if arguments.hash_password {
+        return hash_password();
     }
 
     if let Some(dir) = arguments.generate_secrets {

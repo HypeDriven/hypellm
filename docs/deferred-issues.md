@@ -10,7 +10,8 @@ This page lists limitations that matter when evaluating or operating the current
 | Process isolation | The process cannot drop privileges, install a sandbox, lock secret pages or scrub its inherited environment. | Start it as an unprivileged user and apply sandboxing, core-dump restrictions and filesystem controls in the service manager or container runtime. |
 | Multi-node operation | No state replication, leader election or distributed configuration service is included. | Give every node a separate local state directory. Use `quota_partitions` when independently deployed nodes share traffic. |
 | Shutdown | The router has no signal handler. | Use the authenticated control socket through `hypellm-router --shutdown`; configure the supervisor's stop command accordingly. |
-| Management authentication | `/admin/v1` accepts a session cookie and nothing else. The `management:read` and `management:write` API-key scopes parse and are stored, but no handler consults them, so a key carrying them has no management access. | Mint keys from an operator session — Google OIDC, or break-glass where no provider is configured. Do not build automation that expects to authenticate to `/admin/v1` with an API key. |
+| Management authentication | `/admin/v1` accepts a session cookie and nothing else. The `management:read` and `management:write` API-key scopes parse and are stored, but no handler consults them, so a key carrying them has no management access. | Mint keys from an operator session — Google OIDC, a `local_user` password, or break-glass where no provider is configured. Do not build automation that expects to authenticate to `/admin/v1` with an API key. |
+| Local password sign-in | `local_user` accounts are a deviation from the specification's four authentication methods. Passwords are hashed with PBKDF2-HMAC-SHA-256, which is not memory-hard, and an unknown username is refused faster than a known one with a wrong password. | Use it to operate a deployment before an identity provider is configured, not as the steady state. Keep the management listener off untrusted networks and move to `identity` records once OIDC works. |
 | State lock in a container | The lock file records the process id, which is `1` in a PID namespace and always looks alive. A container killed rather than drained leaves a lock no later start can reclaim. | Stop the router with `--shutdown`. After a kill, delete `<state_dir>/lock` once no router process is running; `just up` does this when no container is up. |
 | Streaming | Backpressure is bounded by synchronous flow control but there is no configurable stream high/low watermark. | Monitor `hypellm_stream_backpressure_milliseconds`; slow clients occupy their connection worker until a deadline or write timeout. |
 | Token estimation | Admission uses a conservative byte-based estimate rather than the selected model's tokenizer. | Expect some requests near token limits to be rejected conservatively. Provider `/v1/tokenize` support does not feed admission estimates. |
@@ -120,11 +121,31 @@ Prompt and completion bodies are not captured. The `capture_bodies` setting must
 
 The router produces authenticated audit checkpoints and exposes a durable audit export endpoint, but does not push exports to remote storage. Likewise, the store supports bounded backup as a library operation but the binary has no backup scheduler or backup CLI. Deployments must provide these workflows and their retention policy.
 
+## Local password sign-in is a deviation
+
+**Specification:** §9.1, §9.2, §22.4. **Implementation:** `crates/hypellm-crypto/src/pbkdf2.rs`, `hypellm_config::LocalUser`, `AdminApi::password_sign_in`, `web/app.js`.
+
+Specification §9.2 lists four ways a principal is established — router API key, Google OIDC session, local peer credentials, and break-glass — and a username and password is none of them. `POST /admin/v1/auth/password` and the `local_user` configuration record exist anyway, so that a deployment can be operated before an OAuth client, a redirect URI and a verifier process have been set up. It is the weakest authentication path the router has, and it is off unless a `local_user` record is declared.
+
+What it does keep:
+
+- The record stores a PBKDF2-HMAC-SHA-256 verifier, never a password. `hypellm-router --hash-password` derives one from stdin; a password is never taken from a command-line argument.
+- An unparseable verifier is a configuration error at load, not an authentication failure discovered by the person who needed to sign in.
+- A failed sign-in is refused identically whether the username is unknown, the password is wrong, or the body is malformed. Five failures lock one account for a minute, and the lockout is checked before the hash is computed.
+- The session records `password` as its authentication method, is not a break-glass session, and both outcomes reach the audit chain.
+
+What it does not:
+
+- **PBKDF2 is not memory-hard.** Argon2id or scrypt would resist GPU and ASIC attack materially better. Neither is a "fully specified, deterministic, test-vector-verifiable" primitive in the sense `crates/hypellm-crypto/MODULE.md` requires of in-repository code, and the no-dependency policy admits no library. Treat an offline copy of the configuration as an offline copy of the password hashes.
+- **An unknown username is refused without hashing anything**, so it is refused measurably faster than a known username with a wrong password. That is a username oracle. The alternative — hashing a dummy verifier so the two take the same time — hands an unauthenticated caller a CPU amplifier on an endpoint that runs before any session, and a management plane that stops answering is worse than one that confirms `admin` exists.
+- **`docker/hypellm.conf` ships `admin`/`admin`.** That is a default credential, deliberately, so a fresh checkout is usable. The router logs `critical` `startup.default_password_in_use` on every start for any account whose password is its own username; that log line is the warning, not a formality.
+
 ## Security boundaries worth understanding
 
 These are design boundaries rather than defects, but they affect deployment:
 
 - Inbound TLS is supplied by a trusted edge; outbound TLS and OIDC signature verification are supplied by local platform helpers.
+- The management session cookie is `__Host-` prefixed and `Secure`, so browsers store it only over HTTPS or on `localhost`/`127.0.0.1`. Management sign-in — including password sign-in — does not work over plain HTTP on any other address.
 - Possession of the secrets directory defeats keyed store-integrity and authentication controls. Protect it separately from state.
 - The TLS helper and OIDC verifier are part of the trusted computing base. The reference verifier in `verifier/` holds the OAuth client secret and decides which identity tokens are authentic; review it as such.
 - Availability against an attacker capable of filling the configured connection cap is bounded, not guaranteed.

@@ -55,6 +55,15 @@ pub enum AuthMethod {
     /// Specification 22.4: "Authorized operators use a preprovisioned local
     /// break-glass method stored offline."
     BreakGlass,
+    /// A local username and password.
+    ///
+    /// Not one of specification 9.2's four methods — see `LocalUser` in
+    /// `hypellm-config` and `docs/deferred-issues.md` for why it exists anyway.
+    /// It is recorded distinctly because an investigation's first question is
+    /// how a principal authenticated, and a password session answered as
+    /// `oidc` would say the identity provider vouched for someone it has never
+    /// seen.
+    Password,
     /// A router API key on the inference listener.
     ///
     /// Specification 17 requires an audit record to identify how a principal
@@ -76,6 +85,7 @@ impl AuthMethod {
         match self {
             Self::Oidc => "oidc",
             Self::BreakGlass => "break_glass",
+            Self::Password => "password",
             Self::ApiKey => "api_key",
             Self::LocalPeer => "local_peer",
         }

@@ -157,6 +157,31 @@ can cost the fleet hours of bandwidth and hundreds of gigabytes of disk.
   then takes `config.tenants.keys().next()` as the tenant. In a multi-tenant
   deployment every OIDC principal lands in the first tenant by map order.
 
+### Password sign-in is the weakest way in, and is bounded accordingly
+
+`POST /admin/v1/auth/password` authenticates a `local_user` against a PBKDF2
+verifier. It is a deviation from specification 9.2, recorded in
+`docs/deferred-issues.md`, and it runs *before* any session — so an
+unauthenticated caller who can reach the management listener decides how often
+it runs. Three bounds follow, and each has a test:
+
+- **A locked account is refused before the hash is computed.** Five failures in
+  a minute lock one account for the rest of that window. Checking after the
+  verification would still refuse the right password, so the ordering is what
+  makes the lockout a bound on *work* rather than on outcomes — a verification
+  is ~100 ms of CPU.
+- **At most two verifications run at once.** The lockout alone does not bound
+  total CPU: with enough configured accounts a caller could start one expensive
+  verification per account simultaneously.
+- **The failure map is keyed by a configured username.** An unknown name never
+  enters it, so a caller cannot grow it; `hypellm_config::MAX_LOCAL_USERS` caps
+  what a configuration can.
+
+Not hidden, deliberately: an unknown username is refused without hashing, so it
+is refused faster than a known one with a wrong password. Hashing a dummy
+verifier to level the timing would hand an unauthenticated caller a CPU
+amplifier. The trade is stated in `docs/deferred-issues.md`.
+
 ## Limits
 
 Enforced in this crate:
@@ -177,6 +202,9 @@ Enforced in this crate:
 | Preflight cache lifetime | 600 s | `CorsPolicy::max_age_secs` |
 | Break-glass reason | 8–256 characters, required | `MIN_BREAK_GLASS_REASON` / `MAX_BREAK_GLASS_REASON` in `break_glass` |
 | Break-glass session lifetime | `settings break_glass_ttl_secs` (default 900 s), clamped to the ordinary absolute lifetime | `SessionStore::issue_for` |
+| Password failures before lockout | 5 per account per 60 s window | `MAX_PASSWORD_FAILURES`, `PASSWORD_LOCKOUT_WINDOW_MILLIS` |
+| Concurrent password verifications | 2 | `MAX_CONCURRENT_PASSWORD_CHECKS` |
+| Tracked password-failure accounts | `hypellm_config::MAX_LOCAL_USERS` (64), and only configured names | `PasswordThrottle` |
 
 Enforced by the management listener before this crate is entered
 (`hypellm_router::server::ServerConfig::management`, `wire_http1::Limits::ADMIN`),

@@ -541,6 +541,61 @@ impl Router {
             );
         }
 
+        // A shipped default credential is the one configuration mistake that
+        // is invisible from inside the process and fatal from outside it, so
+        // the router says it out loud on every start. `docker/hypellm.conf`
+        // ships `admin/admin` on purpose — it is what makes a fresh checkout
+        // usable before an identity provider exists — and the whole point of
+        // that convenience is that it must not survive contact with a network
+        // anybody else can reach.
+        //
+        // "The password is the username" is the cheapest test that catches it.
+        // It costs one PBKDF2 verification per local account, so it runs
+        // against a deadline: a configuration is allowed to declare 64 accounts
+        // at ten million iterations each, and a router that took five minutes
+        // to start because of a *warning* would be a worse defect than the one
+        // being warned about.
+        {
+            const CHECK_BUDGET: Duration = Duration::from_secs(2);
+            let started = std::time::Instant::now();
+            let mut unchecked = 0usize;
+            for user in &config.local_users {
+                if started.elapsed() >= CHECK_BUDGET {
+                    unchecked = unchecked.saturating_add(1);
+                    continue;
+                }
+                if user.verifier.verify(&user.id) {
+                    telemetry.log(
+                        &hypellm_telemetry::Event::critical("startup.default_password_in_use")
+                            .str_field(hypellm_telemetry::Field::Code, &user.id)
+                            .str_field(
+                                hypellm_telemetry::Field::Detail,
+                                "this local account's password is its own username. \
+                                 Anyone who can reach the management listener is an \
+                                 administrator. Replace it with \
+                                 `hypellm-router --hash-password`",
+                            ),
+                    );
+                }
+            }
+            if unchecked > 0 {
+                // Said rather than skipped silently: a check that quietly
+                // covered half the accounts reads as "no default passwords".
+                telemetry.log(
+                    &hypellm_telemetry::Event::warn("startup.default_password_check_incomplete")
+                        .int_field(
+                            hypellm_telemetry::Field::Count,
+                            u64::try_from(unchecked).unwrap_or(u64::MAX),
+                        )
+                        .str_field(
+                            hypellm_telemetry::Field::Detail,
+                            "local accounts were not checked for a default password \
+                             within the startup budget",
+                        ),
+                );
+            }
+        }
+
         // 2. Store.
         let state_dir = PathBuf::from(&config.settings.state_dir);
         let (store, recovery) = Store::open(

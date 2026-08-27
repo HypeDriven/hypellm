@@ -79,7 +79,7 @@ cargo run -p hypellm-router -- \
   --config ./hypellm.conf --secrets ./secrets --static ./web
 ```
 
-`--generate-secrets` prints the break-glass token once and stores only its verifier. Save it offline: it cannot be recovered, and with no OIDC configured it is the only way into the management plane — and therefore the only way to mint the API key inference requires.
+`--generate-secrets` prints the break-glass token once and stores only its verifier. Save it offline: it cannot be recovered, and it is the only credential that carries `manage_keys` on a deployment with no identity provider — and therefore the only way to mint the API key inference requires. The container profile also ships a `local_user` account (`admin`/`admin`) for the admin application; it is a default credential and the first thing to change.
 
 Inference requests require a router API key created through the management API. [Using the router](docs/using-the-router.md) is the client-side guide — how to mint that key and point a project at the endpoint. See the [deployment guide](docs/deployment.md) for HTTPS/OIDC setup, credentials, configuration and service hardening.
 
@@ -95,7 +95,7 @@ just key        # mint another API key
 just down       # drain over the control socket, then remove the container
 ```
 
-`just bootstrap` is `just up` plus the two steps that otherwise happen by hand. It captures the break-glass token from `--generate-secrets` — printed once, stored nowhere — spends it minting the first API key, and prints the token at the end to be stored offline. Without a key the router answers `/health` and refuses everything else, and with no OIDC provider configured break-glass is the only credential the management plane accepts.
+`just bootstrap` is `just up` plus the two steps that otherwise happen by hand. It captures the break-glass token from `--generate-secrets` — printed once, stored nowhere — spends it minting the first API key, and prints the token at the end to be stored offline. Without a key the router answers `/health` and refuses everything else, and break-glass is the only credential that carries `manage_keys` where no identity provider is configured — the shipped `admin` password account can reach every other screen but not this one.
 
 `just up` prints the inference, management and metrics endpoints when the router answers `/health/live`. The image build runs `depscan` and the release build offline; the router container gets no capabilities, a read-only root filesystem, and the invoking user's uid. Configuration is [`docker/hypellm.conf`](docker/hypellm.conf); state and secrets are bind-mounted under `run/`.
 

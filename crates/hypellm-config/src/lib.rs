@@ -55,8 +55,9 @@ pub mod parse;
 pub mod schema;
 
 pub use build::{
-    CredentialMeta, PriceSchedule, Quota, QuotaScope, RoleBinding, RoleSubject, Settings,
-    TenantConfig, ValidatedConfig, build, price_in_effect,
+    CredentialMeta, LocalUser, MAX_LOCAL_USERS, MAX_USERNAME_LEN, PriceSchedule, Quota,
+    QuotaScope, RoleBinding, RoleSubject, Settings, TenantConfig, ValidatedConfig, build,
+    price_in_effect,
 };
 pub use parse::{
     Document, ParseError, ParseErrorKind, ParseLimits, Position, Record, parse, quote_if_needed,
@@ -858,6 +859,126 @@ identity issuer=https://accounts.google.com subject=1234567890 \\
         // The tenant is the one named, not whichever sorts first — "acme"
         // would win a map-order lookup and is deliberately not the answer.
         assert_eq!(identity.tenant.as_str(), "other");
+    }
+
+    // -- Local users ---------------------------------------------------------
+
+    /// A real verifier at the cheapest legal iteration count.
+    fn verifier_for(password: &str) -> String {
+        hypellm_crypto::PasswordVerifier::derive(
+            password,
+            hypellm_crypto::pbkdf2::MIN_ITERATIONS,
+        )
+        .expect("the test host has an entropy source")
+        .encode()
+    }
+
+    #[test]
+    fn a_local_user_binds_a_username_to_a_principal_and_a_verifier() {
+        let text = format!(
+            "\
+tenant id=acme
+tenant id=other
+local_user id=admin principal=user:admin tenant=other verifier={} \\
+           description=\"the initial administrator\"
+",
+            verifier_for("a-password")
+        );
+        let c = load_ok(&text);
+        assert_eq!(c.local_users.len(), 1);
+        let user = c.local_users.first().expect("the account");
+        assert_eq!(user.id, "admin");
+        assert_eq!(user.principal.as_str(), "user:admin");
+        // The tenant named, not whichever sorts first: "acme" would win a
+        // map-order lookup and is deliberately not the answer.
+        assert_eq!(user.tenant.as_str(), "other");
+        assert!(user.verifier.verify("a-password"));
+        assert!(!user.verifier.verify("a-passwordx"));
+    }
+
+    #[test]
+    fn a_verifier_that_cannot_be_parsed_fails_the_configuration() {
+        // The property: this is a *load* error. A verifier checked for the
+        // first time at sign-in would put the failure in front of the one
+        // person who then cannot fix it — during the outage that made them try
+        // to sign in.
+        //
+        // Each case is a way a verifier could plausibly be wrong in a file: a
+        // truncated paste, a hand-edited iteration count, an algorithm label
+        // swapped for a fast hash, and a password written where the verifier
+        // goes.
+        for bad in [
+            "pbkdf2-sha256$210000$c2FsdHNhbHQ",
+            "pbkdf2-sha256$1$c2FsdHNhbHQ$AAAA",
+            "sha256$210000$c2FsdHNhbHQ$AAAA",
+            "hunter2",
+            "",
+        ] {
+            let text = format!(
+                "tenant id=acme\nlocal_user id=admin principal=user:admin tenant=acme verifier={}\n",
+                crate::quote_if_needed(bad)
+            );
+            assert!(
+                codes(&load_err(&text)).contains(&"invalid_verifier"),
+                "{bad:?} must not load"
+            );
+        }
+    }
+
+    #[test]
+    fn one_username_cannot_be_declared_twice() {
+        // Two records for one name would make the principal that signs in
+        // depend on record order.
+        let text = format!(
+            "tenant id=acme\n\
+             local_user id=admin principal=user:a tenant=acme verifier={}\n\
+             local_user id=admin principal=user:b tenant=acme verifier={}\n",
+            verifier_for("one"),
+            verifier_for("two")
+        );
+        assert!(codes(&load_err(&text)).contains(&"duplicate_record"));
+    }
+
+    #[test]
+    fn a_local_user_naming_an_undefined_tenant_is_rejected() {
+        let text = format!(
+            "tenant id=acme\nlocal_user id=admin principal=user:a tenant=nosuch verifier={}\n",
+            verifier_for("x")
+        );
+        assert!(codes(&load_err(&text)).contains(&"unresolved_reference"));
+    }
+
+    #[test]
+    fn a_username_outside_the_permitted_character_set_is_rejected() {
+        // A username reaches an audit record, a log line and an error message.
+        // Restricting it to printable ASCII means no configured byte can
+        // change how any of those three is read.
+        let verifier = verifier_for("x");
+        for id in ["ad min", "admin\u{7f}", "admin/../root", "admin:1", ""] {
+            let text = format!(
+                "tenant id=acme\nlocal_user id={} principal=user:a tenant=acme verifier={verifier}\n",
+                crate::quote_if_needed(id)
+            );
+            assert!(
+                codes(&load_err(&text)).contains(&"invalid_identifier"),
+                "{id:?} must not be a username"
+            );
+        }
+    }
+
+    #[test]
+    fn more_local_users_than_the_maximum_are_rejected() {
+        // The bound that makes the sign-in path's per-account failure map
+        // finite (specification 3.2). Without it the map is as large as the
+        // configuration says.
+        let verifier = verifier_for("x");
+        let mut text = String::from("tenant id=acme\n");
+        for n in 0..=crate::MAX_LOCAL_USERS {
+            text.push_str(&format!(
+                "local_user id=user{n} principal=user:u{n} tenant=acme verifier={verifier}\n"
+            ));
+        }
+        assert!(codes(&load_err(&text)).contains(&"too_many_records"));
     }
 
     #[test]

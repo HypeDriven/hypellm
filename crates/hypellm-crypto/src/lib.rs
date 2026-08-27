@@ -7,6 +7,7 @@
 //!
 //! - [`sha256`] — FIPS 180-4
 //! - [`hmac`] — RFC 2104 / FIPS 198-1
+//! - [`pbkdf2`] — RFC 8018 section 5.2, over that HMAC
 //! - [`crc32`] — IEEE 802.3, corruption detection only
 //! - [`base64`] — RFC 4648, strict decoding
 //! - [`hex`] — RFC 4648 section 8
@@ -47,12 +48,14 @@ pub mod crc32;
 pub mod ct;
 pub mod hex;
 pub mod hmac;
+pub mod pbkdf2;
 pub mod random;
 pub mod secret;
 pub mod sha256;
 
 pub use crc32::crc32;
 pub use hmac::{HmacSha256, hmac_sha256, hmac_sha256_parts};
+pub use pbkdf2::{PasswordVerifier, VerifierError};
 pub use secret::{Digest, Secret};
 pub use sha256::{Sha256, sha256, sha256_parts};
 

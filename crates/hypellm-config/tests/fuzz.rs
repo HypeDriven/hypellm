@@ -114,6 +114,67 @@ fn a_loaded_configuration_never_grants_more_than_its_text_says() {
 }
 
 #[test]
+fn no_mutated_verifier_ever_accepts_a_password_it_was_not_built_from() {
+    // The fail-open specific to `local_user`. A verifier is the only field in
+    // the grammar whose value decides an *authentication* outcome, so the
+    // question is not "does it parse" but "can a corrupted one be made to say
+    // yes". Concretely, this fails if `PasswordVerifier::parse` ever defaults a
+    // field instead of refusing: a zeroed derived key, an iteration count that
+    // silently becomes one, an algorithm label that falls back — each would
+    // turn a mangled string into a credential somebody can guess.
+    //
+    // The probes are passwords no seed contains, including the two a defaulting
+    // parser would most plausibly accept: the empty string, and the username.
+    const PROBES: &[&str] = &["", "admin", "password", "\u{0}", "the-real-password "];
+
+    let verifier = hypellm_crypto::PasswordVerifier::derive(
+        "the-real-password",
+        hypellm_crypto::pbkdf2::MIN_ITERATIONS,
+    )
+    .expect("the test host has an entropy source")
+    .encode();
+    let seed = format!(
+        "tenant id=acme\nlocal_user id=admin principal=user:admin tenant=acme verifier={verifier}\n"
+    );
+
+    // Fewer iterations than the other targets, and the reason is stated rather
+    // than hidden: every loaded case costs five real PBKDF2 verifications, so
+    // the full sweep runs for half a minute in a debug build and would be the
+    // slowest thing in `cargo test --workspace`. The mutation space that
+    // matters here is one field of one record, not the whole grammar.
+    const VERIFIER_ITERATIONS: u32 = 2_000;
+
+    let mut rng = Rng::new(0xc0f1_0009);
+    let mut loaded = 0u32;
+
+    for _ in 0..VERIFIER_ITERATIONS {
+        let case = fuzz::mutate(seed.as_bytes(), &mut rng);
+        let Ok(text) = core::str::from_utf8(&case) else {
+            continue;
+        };
+        let Ok(config) = load(text, 1) else {
+            continue;
+        };
+        loaded = loaded.saturating_add(1);
+
+        for user in &config.local_users {
+            for probe in PROBES {
+                // A mutation can legitimately rewrite the record into a
+                // *different* valid verifier only by producing one someone
+                // derived; it cannot produce one for a probe by chance. So any
+                // acceptance here is the parser inventing a credential.
+                assert!(
+                    !user.verifier.verify(probe),
+                    "a mutated verifier accepted {probe:?}:\n{text}"
+                );
+            }
+        }
+    }
+
+    assert!(loaded > 0, "no mutated configuration ever loaded");
+}
+
+#[test]
 fn an_unknown_field_is_always_an_error() {
     // Specification 11.1: "Unknown fields are errors." This is what makes a
     // typo fail at load rather than leaving a capability un-declared. A

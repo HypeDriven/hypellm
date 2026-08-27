@@ -200,6 +200,21 @@ pub const SCHEMAS: &[Schema] = &[
         optional: &["description"],
         singleton: false,
     },
+    // Local password sign-in. A deviation from specification 9.2's four
+    // authentication methods, recorded in `docs/deferred-issues.md`: it exists
+    // so a deployment can be operated before an identity provider and a
+    // verifier process have been set up.
+    //
+    // `verifier` carries the encoded PBKDF2 hash, never a password. A record
+    // that named a password in cleartext would put it in the configuration
+    // digest, the canonical text, every draft, and the management API's view of
+    // the active configuration.
+    Schema {
+        kind: "local_user",
+        required: &["id", "principal", "tenant", "verifier"],
+        optional: &["description"],
+        singleton: false,
+    },
     Schema {
         kind: "group",
         required: &["id", "tenant"],

@@ -258,6 +258,33 @@ export class Api {
    * @param {string} reason
    * @returns {Promise<{csrf_token: string, expires_in_seconds: number}>}
    */
+  /**
+   * Sign in with a local username and password.
+   *
+   * The same shape as `breakGlassSignIn`: no CSRF token is sent because there
+   * is no session to bind one to yet, and the router answers this endpoint
+   * before it looks at a cookie. `credentials: 'same-origin'` is what lets the
+   * browser keep the session cookie the response sets.
+   *
+   * @param {string} username
+   * @param {string} password
+   */
+  async passwordSignIn(username, password) {
+    const response = await fetch(`${BASE}/auth/password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      redirect: 'error',
+      body: JSON.stringify({ username, password }),
+    });
+    if (!response.ok) {
+      throw new ApiError(response.status, await response.json().catch(() => ({})));
+    }
+    const data = await response.json();
+    this.csrfToken = data.csrf_token || null;
+    return data;
+  }
+
   async breakGlassSignIn(token, reason) {
     const response = await fetch(`${BASE}/auth/break-glass`, {
       method: 'POST',
