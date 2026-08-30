@@ -15,5 +15,10 @@
 /state
 /secrets
 
+# Host-side deployment secrets: the OAuth client secret that `just oidc` writes
+# into run/verifier/client_secret. `.env.example` is the committed template and
+# holds no value; `.env` holds the real one and must never be committed.
+/.env
+
 # Machine-local editor and tool settings, not project configuration.
 .claude/settings.local.json

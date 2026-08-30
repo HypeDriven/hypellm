@@ -852,6 +852,7 @@ pub fn record_completion(
         state.clock.wall_millis(),
     );
 
+    record_traffic(state, request, outcome, routing_millis);
     record_usage(state, request, outcome, principal_key);
 
     let event = match &outcome.summary {
@@ -868,6 +869,51 @@ pub fn record_completion(
     };
 
     state.telemetry.log(&event);
+}
+
+/// Fold a completed request into the rolling rate and latency window.
+///
+/// Specification 15.3 puts "request rate, latency, errors" on the overview
+/// screen, and none of the three can be read back from the metric registry: its
+/// counters are cumulative since the router started, so a rate taken from them
+/// is the average over the whole uptime rather than what is happening now. This
+/// is the one place where the outcome class, the routing time and the upstream
+/// time are all still in hand, so the window is written here.
+///
+/// On the monotonic clock rather than the wall clock. The window measures
+/// intervals, and a wall clock that steps — an NTP correction, a virtual
+/// machine resuming — would move a sample into a slot that has already been
+/// summed, or into one that will never be.
+fn record_traffic(
+    state: &RouterState,
+    request: &CanonicalRequest,
+    outcome: &Outcome,
+    routing_millis: u64,
+) {
+    let status = match &outcome.error {
+        None => hypellm_admin_api::UsageStatus::Success,
+        Some(error) => hypellm_admin_api::UsageStatus::from_status(error.code.status()),
+    };
+    state.traffic.record(
+        &request.tenant,
+        &hypellm_admin_api::TrafficSample {
+            status,
+            router_millis: routing_millis,
+            // Absent when the request never reached a target. A refusal is not
+            // a fast upstream exchange, and recording it as zero would pull the
+            // latency of a router that is refusing everything towards nothing.
+            upstream_millis: outcome.summary.as_ref().map(|summary| summary.total_millis),
+            input_tokens: outcome
+                .summary
+                .as_ref()
+                .map_or(0, |summary| summary.usage.input_tokens),
+            output_tokens: outcome
+                .summary
+                .as_ref()
+                .map_or(0, |summary| summary.usage.output_tokens),
+        },
+        state.clock.now_millis(),
+    );
 }
 
 /// Fold a completed request into the usage aggregate.

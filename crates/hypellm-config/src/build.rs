@@ -130,6 +130,35 @@ pub struct Settings {
     /// purpose and independent of the ordinary session lifetime, because this
     /// one is for the duration of an incident.
     pub break_glass_ttl_secs: u64,
+    /// The principal an uncredentialed inference request would be served as.
+    ///
+    /// This declares *who*, never *whether*. The switch is not configuration:
+    /// it is `RecordKind::AnonymousAccess` in the store, changed only through
+    /// the management API. A configuration file therefore cannot open the
+    /// router by declaring these, and `anonymous_enabled` is not a settings
+    /// key — a document that names it fails to load as an unknown field.
+    ///
+    /// Declaring the subject is inert on its own and is what makes the switch
+    /// *available*: the management API refuses to switch anonymous access on
+    /// when this and [`anonymous_tenant`](Self::anonymous_tenant) are not both
+    /// set, because an anonymous caller has to be a subject that `grant`,
+    /// `binding`, quota and the audit chain can name rather than an identity
+    /// the router invents.
+    pub anonymous_principal: Option<String>,
+    /// The tenant an anonymous request belongs to.
+    pub anonymous_tenant: Option<String>,
+    /// The scopes an anonymous request would hold.
+    ///
+    /// Defaults to `inference` and `models` — enough to complete and to
+    /// discover what can be completed, and nothing else. `embeddings` and
+    /// `tokenize` are opt-in for the same reason a minted key names its scopes:
+    /// a scope not granted is a 403 rather than a routing decision.
+    ///
+    /// Neither management scope may appear. An unauthenticated caller holding
+    /// `management:write` would be an unauthenticated administrator, and no
+    /// deployment means to ask for that — so it is refused at load rather than
+    /// at the moment somebody switches anonymous access on.
+    pub anonymous_scopes: Vec<String>,
     /// Maximum simultaneous client connections on the inference listener.
     ///
     /// Zero keeps the compiled-in profile default. Clamped to a hard ceiling
@@ -258,6 +287,9 @@ impl Default for Settings {
             keepalive_timeout_ms: 0,
             break_glass_principal: None,
             break_glass_tenant: None,
+            anonymous_principal: None,
+            anonymous_tenant: None,
+            anonymous_scopes: Vec::new(),
             break_glass_ttl_secs: 900,
             fleet_enabled: false,
             fleet_state_dir: None,
@@ -897,6 +929,84 @@ pub fn build(document: &Document, version: u64) -> Result<ValidatedConfig, Vec<C
         }
     }
 
+    // The anonymous *subject*, when a deployment declares one. Whether anonymous
+    // access is switched on is not decided here and cannot be: the switch is
+    // `RecordKind::AnonymousAccess` in the store, and `anonymous_enabled` is not
+    // a settings key, so a document naming it fails to load as an unknown field.
+    //
+    // These checks therefore run whenever the subject is named at all, not only
+    // when it is in use. Validating it lazily — at the moment an operator
+    // switches anonymous access on — would report a configuration error from a
+    // management endpoint, hours or weeks after the document that caused it was
+    // published, and to a person who did not write it.
+    if settings.anonymous_principal.is_some() || settings.anonymous_tenant.is_some() {
+        match (
+            settings.anonymous_principal.as_deref(),
+            settings.anonymous_tenant.as_deref(),
+        ) {
+            (Some(principal), Some(tenant)) => {
+                // A tenant that does not exist would leave the anonymous caller
+                // outside every `grant` and `binding`, so each request would be
+                // excluded as `not_selected_by_any_binding` — an open router
+                // that answers nothing, which reads as a routing bug rather
+                // than as the configuration error it is.
+                match TenantId::new(tenant) {
+                    Ok(id) if tenant_map.contains_key(&id) => {}
+                    Ok(id) => errors.push(ConfigError::new(
+                        "unresolved_reference",
+                        format!("anonymous_tenant '{id}' is not defined"),
+                        Position { line: 0, column: 0 },
+                    )),
+                    Err(e) => errors.push(ConfigError::new(
+                        "invalid_value",
+                        format!("anonymous_tenant '{tenant}' is not a valid tenant id: {e}"),
+                        Position { line: 0, column: 0 },
+                    )),
+                }
+                if let Err(e) = PrincipalId::new(principal) {
+                    errors.push(ConfigError::new(
+                        "invalid_value",
+                        format!(
+                            "anonymous_principal '{principal}' is not a valid principal id: {e}"
+                        ),
+                        Position { line: 0, column: 0 },
+                    ));
+                }
+            }
+            _ => errors.push(ConfigError::new(
+                "incomplete_record",
+                "anonymous_principal and anonymous_tenant must be set together: an \
+                 anonymous caller must be a named subject, not an identity the router \
+                 invents. Declaring neither is the default and switches nothing on"
+                    .to_owned(),
+                Position { line: 0, column: 0 },
+            )),
+        }
+
+        // The one scope rule that is not a preference. `management:read` and
+        // `management:write` on a caller who presented nothing is an
+        // unauthenticated administrator; no deployment means to ask for that,
+        // and a typo in a scope list should not be able to grant it.
+        for scope in &settings.anonymous_scopes {
+            if scope == "management:read" || scope == "management:write" {
+                errors.push(ConfigError::new(
+                    "invalid_value",
+                    format!(
+                        "anonymous_scopes names '{scope}': an unauthenticated caller may \
+                         not hold a management scope"
+                    ),
+                    Position { line: 0, column: 0 },
+                ));
+            } else if !is_known_scope(scope) {
+                errors.push(ConfigError::new(
+                    "invalid_value",
+                    format!("anonymous_scopes names '{scope}', which is not a scope"),
+                    Position { line: 0, column: 0 },
+                ));
+            }
+        }
+    }
+
     let credentials = collect(document, "credential", &mut errors, build_credential);
 
     // A price naming a target that does not exist is almost always a typo in
@@ -1100,6 +1210,25 @@ fn collect<T>(
     out
 }
 
+/// The inference scope names `anonymous_scopes` may contain.
+///
+/// The authority is `hypellm_auth::Scope`, which this crate cannot see —
+/// `hypellm-config` and `hypellm-auth` are siblings and neither depends on the
+/// other. The list is therefore duplicated here on purpose, and
+/// `crates/hypellm-router/tests/anonymous.rs` asserts the two agree, so a scope
+/// added to the enum and not to this list fails a test rather than silently
+/// becoming an unknown-scope configuration error.
+///
+/// The two management scopes are deliberately absent: they are rejected with a
+/// specific message before this is reached, because "not a scope" would be a
+/// misleading answer to someone who wrote a real scope name that an
+/// unauthenticated caller may simply never hold.
+const ANONYMOUS_SCOPE_NAMES: &[&str] = &["inference", "embeddings", "models", "tokenize"];
+
+fn is_known_scope(name: &str) -> bool {
+    ANONYMOUS_SCOPE_NAMES.contains(&name)
+}
+
 fn build_settings(document: &Document) -> Result<Settings, ConfigError> {
     let Some(record) = document.of_kind("settings").next() else {
         return Ok(Settings::default());
@@ -1157,6 +1286,16 @@ fn build_settings(document: &Document) -> Result<Settings, ConfigError> {
         keepalive_timeout_ms: f.u64_field("keepalive_timeout_ms", d.keepalive_timeout_ms)?,
         break_glass_principal: f.opt_str("break_glass_principal").map(ToOwned::to_owned),
         break_glass_tenant: f.opt_str("break_glass_tenant").map(ToOwned::to_owned),
+        anonymous_principal: f.opt_str("anonymous_principal").map(ToOwned::to_owned),
+        anonymous_tenant: f.opt_str("anonymous_tenant").map(ToOwned::to_owned),
+        anonymous_scopes: {
+            let named = f.list_field("anonymous_scopes");
+            if named.is_empty() {
+                vec!["inference".to_owned(), "models".to_owned()]
+            } else {
+                named.into_iter().map(str::to_owned).collect()
+            }
+        },
         break_glass_ttl_secs: f.u64_field("break_glass_ttl_secs", d.break_glass_ttl_secs)?,
         fleet_enabled: f.bool_field("fleet_enabled", d.fleet_enabled)?,
         fleet_state_dir: f.opt_str("fleet_state_dir").map(str::to_owned),

@@ -496,12 +496,13 @@ pub fn router_with_config(_upstream: &FakeUpstream, config_text: &str) -> TestRo
     }
 
     let state = RouterState {
+        anonymous_access: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         config: Arc::new(Activatable::new(config)),
         keys: Arc::new(keys),
         sessions: Arc::new(SessionStore::new(b"test-session-key", SessionPolicy::DEFAULT)),
         credentials: Arc::new(credentials),
         health,
-        admission,
+        admission: Arc::new(admission),
         egress,
         telemetry: Arc::new(telemetry),
         store: Arc::new(store),
@@ -509,6 +510,7 @@ pub fn router_with_config(_upstream: &FakeUpstream, config_text: &str) -> TestRo
         trusted_edge: TrustedEdge::none(),
         decisions: Arc::new(hypellm_admin_api::DecisionCache::default()),
         usage: Arc::new(hypellm_admin_api::UsageAggregate::default()),
+        traffic: Arc::new(hypellm_admin_api::TrafficWindow::default()),
         fleet: std::sync::OnceLock::new(),
     };
 

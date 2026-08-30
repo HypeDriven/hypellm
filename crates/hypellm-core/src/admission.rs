@@ -595,6 +595,20 @@ impl Scope {
         }
     }
 
+    /// The limits this scope enforces.
+    ///
+    /// Exposed for reporting, not for decisions: nothing on the admission path
+    /// reads this, because a caller that compared `in_flight()` against
+    /// `limits().max_concurrency` itself would be re-implementing
+    /// [`Scope::try_acquire`] without its atomicity. A management read is the
+    /// one place where the pair is genuinely wanted — an operator looking at a
+    /// utilisation figure needs the denominator, and the denominator is not
+    /// otherwise reachable from outside this module.
+    #[must_use]
+    pub const fn limits(&self) -> ScopeLimits {
+        self.limits
+    }
+
     /// Requests currently in flight.
     #[must_use]
     pub fn in_flight(&self) -> u32 {
@@ -700,6 +714,25 @@ impl Scope {
     #[must_use]
     pub fn spent_this_period(&self, now_ms: u64) -> u64 {
         self.spend_in_period(now_ms)
+    }
+
+    /// Minor units spent in the current period, without rolling it.
+    ///
+    /// [`Self::spent_this_period`] resets the ledger when the period has
+    /// elapsed, which is right on the admission path and wrong for a
+    /// management read: a dashboard refresh would move the period boundary to
+    /// whenever somebody happened to look, and two operators watching the same
+    /// screen would each shorten the tenant's next budget period a little. This
+    /// reports what the rolled value *would* be — zero once the period is up —
+    /// and leaves the roll to the next request.
+    #[must_use]
+    pub fn observed_spend(&self, now_ms: u64) -> u64 {
+        let period = self.limits.budget_period.millis();
+        let start = self.period_start.load(Ordering::SeqCst);
+        if now_ms.saturating_sub(start) >= period {
+            return 0;
+        }
+        self.spent.load(Ordering::SeqCst)
     }
 
     fn try_acquire_as(
@@ -1232,6 +1265,27 @@ impl AdmissionController {
     pub fn target_has_capacity(&self, target: &TargetId) -> bool {
         self.target_scope(target)
             .is_none_or(|s| s.has_capacity())
+    }
+
+    /// A tenant's scope, if one exists yet.
+    ///
+    /// Deliberately not the internal [`Self::tenant_scope`], which creates one
+    /// on demand: a management read must not bring a scope into existence. A
+    /// scope created by a reader would start its budget period at the moment
+    /// somebody opened a dashboard rather than at the tenant's first request,
+    /// which moves the reset of a spend limit to whoever looks at it.
+    ///
+    /// `None` therefore means "this tenant has not been admitted yet", and the
+    /// limits that *would* apply are [`Self::default_tenant_limits`].
+    #[must_use]
+    pub fn configured_tenant_scope(&self, tenant: &TenantId) -> Option<Arc<Scope>> {
+        self.tenants.read().ok()?.get(tenant).cloned()
+    }
+
+    /// The limits a tenant with no explicit configuration is admitted under.
+    #[must_use]
+    pub const fn default_tenant_limits(&self) -> ScopeLimits {
+        self.default_tenant_limits
     }
 
     fn tenant_scope(&self, tenant: &TenantId) -> Arc<Scope> {

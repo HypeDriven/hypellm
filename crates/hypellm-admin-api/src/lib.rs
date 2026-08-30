@@ -41,6 +41,7 @@ pub mod drafts;
 pub mod fleet;
 pub mod handlers;
 pub mod response;
+pub mod traffic;
 pub mod usage;
 
 pub use audit_index::AuditIndex;
@@ -52,4 +53,5 @@ pub use handlers::{
     AdminApi, AdminRequest, AdminState, BreakGlassPolicy, CredentialSink, ProbeOutcome,
 };
 pub use response::{ApiError, ApiErrorCode, ApiResponse, Pagination};
+pub use traffic::{LatencySummary, TrafficSample, TrafficSummary, TrafficWindow};
 pub use usage::{UsageAggregate, UsageSample, UsageStatus, UsageTotals};

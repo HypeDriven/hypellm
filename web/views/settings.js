@@ -360,6 +360,57 @@ function signInPanel(oidc, sessions) {
  * @param {unknown} tenant
  * @returns {HTMLElement}
  */
+/**
+ * Anonymous inference access.
+ *
+ * A panel rather than a row in `deploymentPanel`, and a banner above it,
+ * because an enabled value here is not a tuning parameter: it means requests
+ * that present no credential are served, so there is no key to revoke and no
+ * caller to attribute a request to. `prompt_capture_enabled` gets the same
+ * treatment for the same reason — a documented security default turned off is
+ * worth more weight than a table row.
+ *
+ * When it is disabled the panel still renders, stating that a credential is
+ * required. An absent panel would read as "this router has no such setting",
+ * which would be the wrong thing to believe on the one screen that answers what
+ * this router is configured with.
+ *
+ * @param {object} anonymous The `anonymous` object from `GET /settings`.
+ * @returns {HTMLElement}
+ */
+function anonymousPanel(anonymous) {
+  const enabled = anonymous.enabled === true;
+  const scopes = array(anonymous.scopes).map((s) => String(s));
+
+  return panel({
+    title: 'Anonymous access',
+    note: 'Specification 9.2 requires every inference request to authenticate. This is a deviation from it, switched on only through the management API — it is not a configuration setting and editing the router configuration cannot change it. The control is on the Credentials screen.',
+    content: definitionList(
+      [
+        [
+          'Uncredentialed requests',
+          flag(enabled, {
+            on: 'Served without a credential',
+            off: 'Refused (default)',
+            onTone: 'danger',
+            offTone: 'ok',
+          }),
+        ],
+        enabled ? ['Served as principal', anonymous.principal ? String(anonymous.principal) : '—'] : null,
+        enabled ? ['Tenant', anonymous.tenant ? String(anonymous.tenant) : '—'] : null,
+        enabled
+          ? [
+              'Scopes',
+              scopes.length > 0
+                ? scopes.join(', ')
+                : 'None — every request is refused with forbidden',
+            ]
+          : null,
+      ].filter(Boolean),
+    ),
+  });
+}
+
 function retentionPanel(retention, tenant) {
   const named = tenant ? String(tenant) : 'this tenant';
   const hasProfile =
@@ -673,10 +724,20 @@ function paint(body, settings, error, ctx) {
   const oidc = object(settings.oidc);
   const retention = object(settings.retention);
   const breakGlass = object(settings.break_glass);
+  const anonymous = object(settings.anonymous);
   const deployment = object(settings.deployment);
   const origins = array(settings.cors_origins).map((origin) => String(origin));
 
   render(body, [
+    // First, and the only one at error weight. The other two describe a router
+    // that logs more than it should or cannot be recovered; this one describes
+    // a router that serves anyone who can reach it.
+    anonymous.enabled === true
+      ? banner(
+          'error',
+          `Anonymous access is enabled. Requests to the inference listener that present no credential are served as ${anonymous.principal ? String(anonymous.principal) : 'a configured principal'}, so anyone who can reach that listener can spend this fleet's capacity — there is no key to revoke and no caller to attribute a request to. Set anonymous_enabled=false in the router configuration to require a credential.`,
+        )
+      : null,
     // Two facts that must not be a row in a table, for opposite reasons: one is
     // a default that has been turned off, the other a capability that reads as
     // present and is not.
@@ -716,6 +777,7 @@ function paint(body, settings, error, ctx) {
 
     identityPanel(settings, ctx.session),
     signInPanel(oidc, object(settings.sessions)),
+    anonymousPanel(anonymous),
     retentionPanel(retention, settings.tenant),
     corsPanel(origins),
     breakGlassPanel(breakGlass, ctx.session),

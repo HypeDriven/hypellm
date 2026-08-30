@@ -457,7 +457,12 @@ pub struct RouterState {
     /// Target health and circuit breakers.
     pub health: Arc<HealthRegistry>,
     /// Admission control.
-    pub admission: AdmissionController,
+    ///
+    /// Behind an `Arc` because the management plane reports occupancy against
+    /// these limits on `GET /admin/v1/traffic`, and a capacity panel built from
+    /// a copy of the limits would show the configured ceiling beside an
+    /// occupancy that some other controller was counting.
+    pub admission: Arc<AdmissionController>,
     /// Outbound networking.
     pub egress: Egress,
     /// Metrics and logs.
@@ -468,10 +473,30 @@ pub struct RouterState {
     pub clock: Arc<dyn Clock>,
     /// The forwarded-identity policy.
     pub trusted_edge: TrustedEdge,
+    /// Whether the inference listener serves a request that presents no
+    /// credential, as the configured anonymous subject.
+    ///
+    /// Runtime state, shared with the management plane, and deliberately *not*
+    /// part of `config`. A deployment declares who an anonymous caller would be
+    /// in the configuration document; only `POST /admin/v1/settings/anonymous`
+    /// decides whether one is served. Editing a file cannot open the router,
+    /// and the state survives a restart because every change is a
+    /// `RecordKind::AnonymousAccess` frame replayed at startup.
+    ///
+    /// `false` on a router that has never been told otherwise, including one
+    /// whose log is empty or truncated past the last such frame.
+    pub anonymous_access: Arc<std::sync::atomic::AtomicBool>,
     /// Recent decision traces, shared with the management plane.
     pub decisions: Arc<hypellm_admin_api::DecisionCache>,
     /// Usage aggregates, shared with the management plane.
     pub usage: Arc<hypellm_admin_api::UsageAggregate>,
+    /// The rolling rate and latency window, shared with the management plane.
+    ///
+    /// Written once per completed request in `pipeline::record_completion` and
+    /// read by `GET /admin/v1/traffic`. The metric registry cannot answer for
+    /// it: its counters are cumulative since start, and specification 15.3 asks
+    /// the overview for a *rate*.
+    pub traffic: Arc<hypellm_admin_api::TrafficWindow>,
     /// Fleet orchestration, when a fleet is declared and enabled.
     ///
     /// Unset is not a degraded mode. A router with no fleet classifies every

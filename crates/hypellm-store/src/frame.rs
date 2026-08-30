@@ -86,6 +86,18 @@ pub enum RecordKind {
     FleetLease,
     /// The outcome of an activation, for the cost model and the audit view.
     FleetActivation,
+    /// Whether anonymous inference access is switched on.
+    ///
+    /// Runtime state rather than configuration, deliberately. The
+    /// configuration document declares *who* an anonymous caller would be —
+    /// principal, tenant, scopes — and this record is the switch. Keeping the
+    /// switch out of the document means it cannot be flipped by editing a file
+    /// and restarting; the management API is the only way to change it, and
+    /// every change is one of these frames.
+    ///
+    /// Last frame wins on replay. Absent means off, which is what a router
+    /// that has never been told otherwise must be.
+    AnonymousAccess,
     /// A deployment's accrued flap backoff.
     ///
     /// Persisted deliberately: a router bounce that reset accrued backoff
@@ -116,6 +128,7 @@ impl RecordKind {
             Self::FleetLease => 12,
             Self::FleetActivation => 13,
             Self::FleetFlap => 14,
+            Self::AnonymousAccess => 15,
             Self::Unknown(v) => v,
         }
     }
@@ -138,6 +151,7 @@ impl RecordKind {
             12 => Self::FleetLease,
             13 => Self::FleetActivation,
             14 => Self::FleetFlap,
+            15 => Self::AnonymousAccess,
             other => Self::Unknown(other),
         }
     }
@@ -171,6 +185,12 @@ impl RecordKind {
                 // re-issuing a verb nobody asked for.
                 | Self::FleetLease
                 | Self::FleetFlap
+                // The switch that decides whether the inference listener
+                // requires a credential at all. An unprotected one could be
+                // appended on disk by anything that can write the state
+                // directory, and the router would open itself on the next
+                // start believing an operator had asked for it.
+                | Self::AnonymousAccess
         )
     }
 
@@ -192,6 +212,7 @@ impl RecordKind {
             Self::FleetLease => "fleet_lease",
             Self::FleetActivation => "fleet_activation",
             Self::FleetFlap => "fleet_flap",
+            Self::AnonymousAccess => "anonymous_access",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -214,6 +235,7 @@ impl RecordKind {
             Self::FleetLease,
             Self::FleetActivation,
             Self::FleetFlap,
+            Self::AnonymousAccess,
         ]
     }
 }

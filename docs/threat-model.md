@@ -414,14 +414,19 @@ tenant B's targets, requests, and spend.*
   absent, so it is not an existence oracle.
 - `UsageAggregate` never crosses a tenant boundary and refuses to attribute an
   overflow row to any principal.
+- `TrafficWindow` keeps one ring per tenant and `GET /admin/v1/traffic` reads
+  only the caller's. A request rate measures how much work a tenant is doing, so
+  a router-wide one would be the same disclosure the overview's tenant count was
+  already narrowed to prevent. A tenant past the ring cap is reported as
+  `attributed: false` rather than as zero traffic.
 - `list_keys` filters on `session.tenant`; `revoke_key` re-filters before acting.
 - Alias visibility is default-deny through `PolicySnapshot::authorizes`.
 
 OIDC identity is explicitly configured: an `identity` record binds each
 `(issuer, subject)` pair to a principal and tenant, and an account with no
-matching record cannot sign in. `list_targets`, `list_providers`, `list_aliases`
-and `overview` derive visibility from the same tenant authorization used by
-`GET /v1/models`. There is no platform-wide role that bypasses tenant scoping.
+matching record cannot sign in. `list_targets`, `list_providers`, `list_aliases`,
+`overview` and `traffic` derive visibility from the same tenant authorization
+used by `GET /v1/models`. There is no platform-wide role that bypasses tenant scoping.
 
 ### A5 — Credential disclosure through logs
 

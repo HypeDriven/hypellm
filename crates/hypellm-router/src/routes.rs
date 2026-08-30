@@ -654,6 +654,46 @@ fn is_known_path(path: &str) -> bool {
     )
 }
 
+/// The anonymous principal to serve an uncredentialed request as, if any.
+///
+/// Two independent conditions, and they come from two different places on
+/// purpose:
+///
+/// - **Whether** anonymous access is on is runtime state, not configuration —
+///   the `AtomicBool` that `POST /admin/v1/settings/anonymous` sets and a
+///   `RecordKind::AnonymousAccess` frame restores at startup. A configuration
+///   file cannot switch it on; `anonymous_enabled` is not a settings key.
+/// - **Who** it is comes from the document, which validated at load that a
+///   declared subject names a resolvable principal and tenant and holds no
+///   management scope. Nothing here re-decides any of that.
+///
+/// `None` — the default, and the state of any router that has never been told
+/// otherwise — means an uncredentialed request is refused, which is
+/// specification 9.2's behaviour.
+///
+/// Groups come from `group` records exactly as they do for a key-authenticated
+/// caller. An anonymous principal named by a `group` gets that group's routing
+/// policy, which is the point of naming it.
+fn anonymous_principal(state: &RouterState) -> Option<Principal> {
+    if !state
+        .anonymous_access
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return None;
+    }
+    let config = state.config();
+    let settings = &config.settings;
+    let id = hypellm_core::ids::PrincipalId::new(settings.anonymous_principal.as_deref()?).ok()?;
+    let tenant = hypellm_core::ids::TenantId::new(settings.anonymous_tenant.as_deref()?).ok()?;
+    let scopes = settings
+        .anonymous_scopes
+        .iter()
+        .filter_map(|s| Scope::parse(s))
+        .collect();
+    let groups = groups_for(state, &tenant, &id);
+    Some(Principal::anonymous(id, tenant, scopes, groups))
+}
+
 /// Authenticate a request.
 ///
 /// Accepts `Authorization: Bearer` and, for the Anthropic profile, `x-api-key`.
@@ -664,13 +704,32 @@ fn authenticate(
     head: &RequestHead,
     peer: Option<std::net::IpAddr>,
 ) -> Result<Principal, RouterError> {
-    let presented = head
-        .headers
-        .get("authorization")
+    // Header *presence* and credential *usability* are two different questions,
+    // and anonymous access turns on the difference. `bearer_token` returns
+    // `None` for `Bearer ` and for any scheme it does not recognise, so folding
+    // the two together would make a caller who presented a malformed
+    // credential indistinguishable from one who presented none — and serve it
+    // anonymously instead of telling it the credential is broken.
+    let authorization = head.headers.get("authorization");
+    let api_key_header = head.headers.get("x-api-key");
+    let presented = authorization
         .and_then(apikey::bearer_token)
-        .or_else(|| head.headers.get("x-api-key"));
+        .or(api_key_header);
 
     let Some(presented) = presented else {
+        // Nothing usable was presented. Anonymous access is reachable only
+        // when nothing was presented *at all*: a revoked or expired key is
+        // well-formed and fails verification below, and a malformed one is
+        // caught by the header check here. Either way the caller is refused
+        // rather than quietly downgraded, which is the whole safety property
+        // of the setting — `a_rejected_key_is_not_downgraded_to_anonymous` in
+        // `tests/anonymous.rs` covers both shapes and fails if this is
+        // loosened to "no usable credential".
+        if authorization.is_none() && api_key_header.is_none() {
+            if let Some(principal) = anonymous_principal(state) {
+                return Ok(principal);
+            }
+        }
         state.telemetry.count(
             hypellm_telemetry::names::AUTH_FAILURES,
             "Authentication failures.",

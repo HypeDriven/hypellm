@@ -104,6 +104,10 @@ export async function mount(container, ctx) {
     providersNote: null,
     /** @type {unknown} The failure that stopped the list from loading. */
     error: null,
+    /** @type {object|null} The `anonymous` object from GET /settings. */
+    anonymous: null,
+    /** @type {string|null} Why anonymous access is not shown, when it is not. */
+    anonymousNote: null,
   };
 
   // ------------------------------------------------------------- controls --
@@ -133,6 +137,18 @@ export async function mount(container, ctx) {
   const createRepeat = secretInput();
   const createStatus = liveStatus();
   const createActions = el('div', { class: 'button-row' });
+
+  // Built once and re-inserted, for the reason the credential controls are:
+  // a repaint must not discard a half-typed reason, and the live region has to
+  // be the same node across paints to announce anything.
+  const anonReason = el('input', {
+    type: 'text',
+    autocomplete: 'off',
+    maxlength: '256',
+    placeholder: 'why this is changing',
+  });
+  const anonStatus = liveStatus();
+  const anonActions = el('div', { class: 'button-row' });
 
   // ------------------------------------------------------------- loading ---
 
@@ -176,12 +192,47 @@ export async function mount(container, ctx) {
     }
   }
 
+  /**
+   * Read whether anonymous inference access is on.
+   *
+   * Gated on `manage_settings` rather than attempted and caught: this screen's
+   * own permission is `manage_credentials`, and the two are deliberately not
+   * the same. A `credential_manager` session would get a guaranteed 403 here,
+   * so it is not asked for — the panel says where the control lives instead.
+   *
+   * There is no ETag to carry: the switch is not part of the configuration
+   * snapshot, and the request states the value it wants rather than flipping
+   * whatever it finds. Two operators asking for the same thing both get it;
+   * two asking for different things resolve last-write-wins, which is what a
+   * toggle means.
+   */
+  async function loadAnonymous() {
+    if (!ctx.can('manage_settings')) {
+      state.anonymous = null;
+      state.anonymousNote =
+        'Anonymous access is not shown or changeable here: that setting is behind manage_settings, and this session holds manage_credentials. It is on the Settings screen for a principal that holds both.';
+      return;
+    }
+    try {
+      const { data } = await ctx.api.get('/settings');
+      state.anonymous = data && typeof data.anonymous === 'object' ? data.anonymous : null;
+      state.anonymousNote = null;
+    } catch (error) {
+      if (error && error.name === 'AbortError') {
+        throw error;
+      }
+      state.anonymous = null;
+      state.anonymousNote = `Anonymous access could not be read: ${describe(error)}`;
+    }
+  }
+
   /** Re-read everything and repaint. Used after every mutation. */
   async function refresh() {
     state.error = null;
     try {
       await loadCredentials();
       await loadProviders();
+      await loadAnonymous();
     } catch (error) {
       if (error && error.name === 'AbortError') {
         throw error;
@@ -315,6 +366,68 @@ export async function mount(container, ctx) {
     );
   }
 
+  /**
+   * Ask for confirmation, then flip anonymous access.
+   *
+   * The confirmation text differs by direction on purpose. Turning it *off* is
+   * a safe action and says so; turning it *on* is the one that needs the
+   * operator to have read a sentence before pressing the button, so the detail
+   * names what stops being true.
+   */
+  function beginAnonymousChange() {
+    const current = state.anonymous && state.anonymous.enabled === true;
+    const next = !current;
+    const reason = anonReason.value.trim();
+    if (reason.length < 8 || reason.length > 256) {
+      anonStatus.textContent = 'A reason of 8 to 256 characters is required; it is recorded in the audit chain.';
+      anonReason.focus();
+      return;
+    }
+    anonStatus.textContent = '';
+    replace(
+      anonActions,
+      confirmPrompt({
+        message: next
+          ? 'Serve inference requests that present no credential?'
+          : 'Require a credential on every inference request?',
+        detail: next
+          ? 'Anyone who can reach the inference listener will be able to spend this fleet\'s capacity. Every such request is the same principal, so there is no key to revoke and nothing to attribute a request to. This is recorded in the audit chain and logged at critical on every start.'
+          : 'Requests that present no credential will be refused again. Requests already in flight keep the configuration they were admitted under.',
+        confirmLabel: next ? 'Enable anonymous access' : 'Require a credential',
+        // Typed confirmation in the enabling direction only, the way revoking
+        // a key is confirmed by typing its id. Turning authentication *on* is
+        // the safe direction and does not need a hurdle; turning it off is the
+        // one where a misplaced click is the whole incident.
+        phrase: next ? 'anonymous' : undefined,
+        onConfirm: () =>
+          guarded(anonStatus, async () => {
+            await ctx.api.post('/settings/anonymous', { enabled: next, reason });
+            anonReason.value = '';
+            anonStatus.textContent = next
+              ? 'Anonymous access is enabled. It is in force for the next request and survives a restart.'
+              : 'A credential is required again. Requests already admitted are unaffected.';
+            ctx.notify(
+              next ? 'warn' : 'ok',
+              next ? 'Anonymous access is now enabled.' : 'Anonymous access is now disabled.',
+            );
+            await refresh();
+          }),
+        onCancel: () => paintAnonymousActions(),
+      }),
+    );
+  }
+
+  function paintAnonymousActions() {
+    const current = state.anonymous && state.anonymous.enabled === true;
+    replace(
+      anonActions,
+      actionButton(current ? 'Require a credential…' : 'Enable anonymous access…', beginAnonymousChange, {
+        tone: current ? undefined : 'danger',
+        busyLabel: 'Activating…',
+      }),
+    );
+  }
+
   function paintRotateActions() {
     replace(
       rotateActions,
@@ -350,6 +463,88 @@ export async function mount(container, ctx) {
       rotateSelect.value = previous;
     }
     return ids;
+  }
+
+  /**
+   * The anonymous-access panel.
+   *
+   * Rendered on this screen because that is where it was asked for, and gated
+   * at `manage_settings` because that is what the endpoint requires. Those two
+   * facts do not always agree for a given session, and when they disagree the
+   * panel says so rather than offering a control that would 403.
+   */
+  function anonymousPanel() {
+    if (state.anonymousNote) {
+      return panel({
+        title: 'Anonymous access',
+        note: 'Specification 9.2 requires every inference request to authenticate.',
+        content: [el('p', { class: 'field__hint', text: state.anonymousNote })],
+      });
+    }
+    if (!state.anonymous) {
+      return panel({
+        title: 'Anonymous access',
+        note: 'Specification 9.2 requires every inference request to authenticate.',
+        content: [
+          emptyState(
+            'The router did not report an anonymous-access setting',
+            'This router predates the setting, or the settings response changed shape. Nothing is shown rather than a guess at which state it is in.',
+          ),
+        ],
+      });
+    }
+
+    const enabled = state.anonymous.enabled === true;
+    const available = state.anonymous.available === true;
+    const scopes = Array.isArray(state.anonymous.scopes)
+      ? state.anonymous.scopes.map((s) => String(s))
+      : [];
+
+    return panel({
+      title: 'Anonymous access',
+      note: 'Whether a request that presents no API key is served. A deviation from specification 9.2, recorded in docs/deferred-issues.md.',
+      content: [
+        enabled
+          ? banner(
+              'error',
+              text(
+                `Requests with no credential are served as ${
+                  state.anonymous.principal ? String(state.anonymous.principal) : 'a configured principal'
+                }${state.anonymous.tenant ? ` in tenant ${String(state.anonymous.tenant)}` : ''}${
+                  scopes.length > 0 ? `, holding ${scopes.join(', ')}` : ''
+                }. There is no key to revoke and no caller to attribute a request to.`,
+              ),
+            )
+          : null,
+        el('p', {
+          class: 'field__hint',
+          text: enabled
+            ? 'Turning this off takes effect immediately for new requests; requests already admitted keep the configuration they started under.'
+            : 'Every inference request must present a valid API key. This is the default.',
+        }),
+        el('p', {
+          class: 'field__hint',
+          text: 'This switch is not a configuration setting and cannot be changed by editing the router configuration: anonymous_enabled is not a settings key, and a file naming it will not load. The change is written to the durable log and survives a restart.',
+        }),
+        available
+          ? el('p', {
+              class: 'field__hint',
+              text: 'The configuration declares who an uncredentialed caller would be served as. That declaration is inert on its own — it is what makes this switch available, not what turns it on.',
+            })
+          : emptyState(
+              'No anonymous subject is declared',
+              'The configuration names no anonymous_principal and anonymous_tenant, so there is nobody to serve an uncredentialed request as and this switch cannot be turned on. Declare both in the router configuration first; they decide who, never whether.',
+            ),
+        available ? field({
+          label: 'Reason',
+          id: 'anonymous-reason',
+          control: anonReason,
+          hint: 'Recorded in the audit chain, 8 to 256 characters.',
+        }) : null,
+        available ? anonActions : null,
+        available ? anonStatus : null,
+      ],
+    });
   }
 
   /** Providers that name a given reference. @returns {object[]} */
@@ -442,6 +637,7 @@ export async function mount(container, ctx) {
     const ids = refreshRotationOptions();
     paintRotateActions();
     paintCreateActions();
+    paintAnonymousActions();
 
     if (state.error) {
       // No forms while the list is unreadable. Storing a secret under a
@@ -465,6 +661,11 @@ export async function mount(container, ctx) {
 
     render(container, [
       pageHeader(meta.title, meta.lede),
+
+      // First on the screen: it is the control this screen was asked to carry,
+      // and an operator looking for it should not have to scroll past the
+      // credential table to find it.
+      anonymousPanel(),
 
       dangling.length > 0
         ? banner(

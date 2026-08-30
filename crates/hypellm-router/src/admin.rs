@@ -60,7 +60,29 @@ impl AdminHandler {
         self
     }
 
-    fn serve_static(&self, path: &str, writer: &mut ClientWriter) -> io::Result<Disposition> {
+    /// Serve one file of the admin application.
+    ///
+    /// Every response carries a strong `ETag` over the bytes and
+    /// `Cache-Control: no-cache`, and an `If-None-Match` that matches answers
+    /// `304`. "no-cache" is revalidate-before-use, not do-not-store: the file
+    /// stays in the browser cache and costs a conditional request, which is
+    /// the trade this application wants.
+    ///
+    /// It was previously served with no `Cache-Control`, no `ETag` and no
+    /// `Last-Modified` at all, which leaves a browser to invent its own
+    /// freshness. That is how an operator ends up reading a screen the router
+    /// stopped serving: after an upgrade the old bundle keeps rendering, and
+    /// it renders *honestly* — an application built to say "the router did not
+    /// report this setting" will say exactly that about a setting the router
+    /// now reports. The screen and the router disagreeing is the failure this
+    /// header prevents, and it is the same class of defect as a handler that
+    /// reports success without doing anything.
+    fn serve_static(
+        &self,
+        path: &str,
+        head: &RequestHead,
+        writer: &mut ClientWriter,
+    ) -> io::Result<Disposition> {
         let Some(root) = &self.static_root else {
             return write_error(
                 writer,
@@ -116,18 +138,48 @@ impl AdminHandler {
             );
         };
 
+        // Strong, and over the bytes actually being served rather than over a
+        // modification time: a rebuilt container resets mtimes on files whose
+        // content did not change, and two files that differ can share one.
+        let etag = format!("\"{}\"", hypellm_crypto::digest(&bytes).to_hex());
+
+        // A conditional request that already holds this exact body. The 304
+        // carries the validator and the cache directive and no payload.
+        if not_modified(head.headers.get("if-none-match"), &etag) {
+            let mut builder = ResponseBuilder::new(304)
+                .header("ETag", &etag)
+                .map_err(|_| io::Error::other("response head"))?
+                .header("Cache-Control", "no-cache")
+                .map_err(|_| io::Error::other("response head"))?;
+            for (name, value) in static_security_headers() {
+                builder = builder
+                    .header(name, value)
+                    .map_err(|_| io::Error::other("response head"))?;
+            }
+            let response = builder
+                .finish_with_length(0)
+                .map_err(|_| io::Error::other("response head"))?;
+            writer.write(&response)?;
+            writer.flush()?;
+            return Ok(Disposition::KeepAlive);
+        }
+
         let mut builder = ResponseBuilder::new(200)
             .header("Content-Type", content_type)
+            .map_err(|_| io::Error::other("response head"))?
+            .header("ETag", &etag)
+            .map_err(|_| io::Error::other("response head"))?
+            .header("Cache-Control", "no-cache")
             .map_err(|_| io::Error::other("response head"))?;
         for (name, value) in static_security_headers() {
             builder = builder
                 .header(name, value)
                 .map_err(|_| io::Error::other("response head"))?;
         }
-        let head = builder
+        let response = builder
             .finish_with_length(bytes.len())
             .map_err(|_| io::Error::other("response head"))?;
-        writer.write(&head)?;
+        writer.write(&response)?;
         writer.write(&bytes)?;
         writer.flush()?;
         Ok(Disposition::KeepAlive)
@@ -185,7 +237,7 @@ impl Handler for AdminHandler {
         }
 
         if !head.path.starts_with("/admin/v1") {
-            return self.serve_static(&head.path, writer);
+            return self.serve_static(&head.path, head, writer);
         }
 
         let request = AdminRequest {
@@ -203,6 +255,25 @@ impl Handler for AdminHandler {
             Err(error) => write_error(writer, &error, &request_id),
         }
     }
+}
+
+/// Whether a conditional request already holds the body being served.
+///
+/// RFC 9110 §13.1.2: `If-None-Match` is a comma-separated list, `*` matches any
+/// current representation, and comparison for this header is by *weak* match —
+/// but the router only ever mints strong tags, so the weak prefix can only
+/// arrive from a cache that added one, and `W/"x"` must still match `"x"`.
+///
+/// Getting this wrong in the permissive direction serves a `304` for a body the
+/// client does not have, which is the stale-screen failure the ETag was added
+/// to prevent, arrived at by a different route.
+fn not_modified(if_none_match: Option<&str>, etag: &str) -> bool {
+    let Some(presented) = if_none_match else {
+        return false;
+    };
+    presented.split(',').map(str::trim).any(|candidate| {
+        candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == etag
+    })
 }
 
 fn write_response(
@@ -329,6 +400,7 @@ pub fn admin_state_from(
         Arc::new(crate::state::CredentialSinkAdapter::new(Arc::clone(router)));
     hypellm_admin_api::AdminState {
         config: Arc::clone(&router.config),
+        anonymous_access: Arc::clone(&router.anonymous_access),
         keys: Arc::clone(&router.keys),
         sessions: Arc::clone(&router.sessions),
         oidc: Arc::new(hypellm_auth::oidc::TransactionStore::new(oidc_key)),
@@ -341,6 +413,11 @@ pub fn admin_state_from(
         cors,
         decisions: Arc::clone(&router.decisions),
         usage: Arc::clone(&router.usage),
+        traffic: Arc::clone(&router.traffic),
+        // Shared, not copied: the capacity panel reports occupancy against the
+        // limits the data path is actually enforcing, and a second controller
+        // would report a ceiling nobody is admitting against.
+        admission: Some(Arc::clone(&router.admission)),
         audit: Arc::new(hypellm_admin_api::AuditIndex::default()),
         // Restored from the durable log, so a draft awaiting a second approver
         // survives a restart (`DI-013`).
@@ -610,6 +687,50 @@ mod tests {
         assert!(!csp.contains("http://"));
         assert!(!csp.contains("https://"));
         assert!(!csp.contains('*'));
+    }
+
+    #[test]
+    fn a_static_etag_follows_the_bytes_and_not_the_file() {
+        // Derived from content, so a rebuilt container that resets mtimes on
+        // unchanged files does not invalidate every asset, and a changed file
+        // cannot keep its old validator. The second half is the one that
+        // matters: an upgraded bundle that reused its ETag would go on being
+        // served from cache, and the screen would keep describing the router
+        // that was replaced.
+        let before = hypellm_crypto::digest(b"export const meta = {};").to_hex();
+        let same = hypellm_crypto::digest(b"export const meta = {};").to_hex();
+        let after = hypellm_crypto::digest(b"export const meta = { added: true };").to_hex();
+        assert_eq!(before, same, "identical bytes must revalidate as unchanged");
+        assert_ne!(before, after, "changed bytes must not keep the old validator");
+    }
+
+    #[test]
+    fn a_conditional_request_matches_only_the_tag_it_holds() {
+        let etag = "\"abc123\"";
+
+        assert!(not_modified(Some(etag), etag));
+        assert!(not_modified(Some("*"), etag), "* matches any representation");
+        assert!(
+            not_modified(Some("\"other\", \"abc123\""), etag),
+            "the header is a list"
+        );
+        assert!(
+            not_modified(Some("W/\"abc123\""), etag),
+            "a cache may weaken a strong tag; it still matches"
+        );
+
+        assert!(!not_modified(None, etag), "no header is not a match");
+        assert!(!not_modified(Some(""), etag));
+        assert!(!not_modified(Some("\"abc124\""), etag));
+        assert!(
+            !not_modified(Some("abc123"), etag),
+            "an unquoted tag is not the quoted one; matching it would serve a \
+             304 for a body the client does not hold"
+        );
+        assert!(
+            !not_modified(Some("\"abc123\"extra"), etag),
+            "a prefix is not a match"
+        );
     }
 
     #[test]

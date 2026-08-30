@@ -590,6 +590,11 @@ pub struct Harness {
     pub credentials: Arc<MemoryCredentialSink>,
     /// Captured log lines, for redaction tests.
     pub logs: Arc<MemorySink>,
+    /// The rolling rate and latency window, for seeding traffic.
+    pub traffic: Arc<hypellm_admin_api::TrafficWindow>,
+    /// Admission control, for occupying capacity. `None` when the deployment
+    /// was built without one.
+    pub admission: Option<Arc<hypellm_core::admission::AdmissionController>>,
     /// The state directory, kept alive for the store's lifetime.
     pub dir: TempDir,
     request_counter: AtomicU64,
@@ -1105,6 +1110,8 @@ pub struct HarnessBuilder {
     cors: CorsPolicy,
     session_policy: SessionPolicy,
     with_credential_sink: bool,
+    /// Whether the built state shares an admission controller.
+    with_admission: bool,
     /// The fleet control this harness serves, when a test supplies one.
     fleet: Option<Arc<dyn hypellm_admin_api::FleetControl>>,
     oidc_config: Option<oidc::OidcConfig>,
@@ -1139,6 +1146,7 @@ impl HarnessBuilder {
             break_glass: None,
             session_policy: SessionPolicy::DEFAULT,
             with_credential_sink: true,
+            with_admission: true,
             fleet: None,
             oidc_config: None,
             verifier: None,
@@ -1188,6 +1196,14 @@ impl HarnessBuilder {
     #[must_use]
     pub fn without_credential_sink(mut self) -> Self {
         self.with_credential_sink = false;
+        self
+    }
+
+    /// Build a deployment whose management API sees no admission controller,
+    /// so that the capacity panel must say so rather than render zeros.
+    #[must_use]
+    pub fn without_admission(mut self) -> Self {
+        self.with_admission = false;
         self
     }
 
@@ -1251,8 +1267,36 @@ impl HarnessBuilder {
             None
         };
 
+        // A real controller over the harness's own targets, so a capacity test
+        // reads the same type the router shares rather than a stub that can
+        // drift from it. The global ceiling is small enough that a test can
+        // fill it without simulating a thousand requests.
+        let admission = if self.with_admission {
+            let controller = hypellm_core::admission::AdmissionController::new(
+                Arc::clone(&shared_clock),
+                hypellm_core::admission::ScopeLimits {
+                    max_concurrency: 16,
+                    ..hypellm_core::admission::ScopeLimits::UNLIMITED
+                },
+            );
+            for (id, target) in &config.snapshot.targets {
+                controller.configure_target(
+                    id,
+                    hypellm_core::admission::ScopeLimits {
+                        max_concurrency: target.max_concurrency,
+                        ..hypellm_core::admission::ScopeLimits::UNLIMITED
+                    },
+                );
+            }
+            Some(Arc::new(controller))
+        } else {
+            None
+        };
+        let traffic = Arc::new(hypellm_admin_api::TrafficWindow::new(clock.now_millis()));
+
         let version = config.snapshot.version;
         let state = Arc::new(AdminState {
+            anonymous_access: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config: Arc::new(Activatable::new(config)),
             keys: Arc::new(KeyStore::new(b"harness-verifier-key")),
             sessions: Arc::new(SessionStore::new(
@@ -1269,6 +1313,11 @@ impl HarnessBuilder {
             cors: self.cors,
             decisions: Arc::new(DecisionCache::default()),
             usage: Arc::new(UsageAggregate::default()),
+            traffic: Arc::clone(&traffic),
+            // The harness carries a real controller so the capacity panel is
+            // exercised against the type the router shares, not against a stub.
+            // `without_admission()` is the deployment that has none.
+            admission: admission.clone(),
             audit: Arc::new(AuditIndex::default()),
             drafts: DraftStore::new(),
             next_version: AtomicU64::new(version + 1),
@@ -1283,6 +1332,8 @@ impl HarnessBuilder {
             clock,
             credentials,
             logs,
+            traffic,
+            admission,
             dir,
             request_counter: AtomicU64::new(1),
         }

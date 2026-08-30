@@ -109,6 +109,36 @@ impl Principal {
         }
     }
 
+    /// Build the principal an uncredentialed inference request is served as.
+    ///
+    /// Only reachable when `anonymous_enabled` is configured, which
+    /// `hypellm-config` refuses unless a principal, a tenant, and a
+    /// management-free scope list are all present. Nothing here invents an
+    /// identity: every field comes from configuration, and `key_id` is `None`
+    /// because no key was presented — an audit reader asking "which key" gets
+    /// no answer rather than a wrong one.
+    #[must_use]
+    pub fn anonymous(
+        id: hypellm_core::ids::PrincipalId,
+        tenant: hypellm_core::ids::TenantId,
+        scopes: Vec<Scope>,
+        groups: Vec<hypellm_core::ids::GroupId>,
+    ) -> Self {
+        Self {
+            id,
+            tenant,
+            method: AuthMethod::Anonymous,
+            scopes,
+            // No management roles, ever. The scope list is validated at
+            // startup and the role list is simply not offered: an anonymous
+            // caller reaches the inference listener, and the management
+            // listener authenticates sessions by a path this never touches.
+            roles: Vec::new(),
+            key_id: None,
+            groups,
+        }
+    }
+
     /// Build from a validated session.
     #[must_use]
     pub fn from_session(session: &Session, groups: Vec<hypellm_core::ids::GroupId>) -> Self {

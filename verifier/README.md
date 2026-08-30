@@ -118,6 +118,25 @@ An unknown field is an error rather than a warning, for the reason the router's
 own grammar takes that position (specification 11.1): a misspelled
 `client_secret_file` would otherwise deploy a verifier with no secret.
 
+Under the compose stack the paths are `run/verifier/` on the host, and `just
+oidc` does the last three lines for you — it writes `client_secret` from
+`HYPELLM_OIDC_CLIENT_SECRET` in a git-ignored `.env` (see `.env.example`), runs
+`--check`, and starts the service under the `oidc` profile:
+
+```bash
+cp .env.example .env                 # then put the client secret in it
+cp verifier/verifier.example.json run/verifier/verifier.json
+$EDITOR run/verifier/verifier.json   # client_id and redirect_uri
+just oidc
+```
+
+`.env` is read by `just` on the host and is never loaded into a container
+environment — `docker inspect` prints a container's environment to anyone in the
+`docker` group, whereas the 0600 file is readable by the verifier's user alone.
+`verifier.json` is still edited by hand: `client_id` and `redirect_uri` have to
+agree with the router's configuration and the Google console byte for byte, and
+generating them here would add a third place for them to disagree.
+
 ### 3. Run it
 
 ```bash

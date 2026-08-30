@@ -405,6 +405,14 @@ pub struct BreakGlassPolicy {
 pub struct AdminState {
     /// The active configuration.
     pub config: Arc<hypellm_store::Activatable<ValidatedConfig>>,
+    /// Whether anonymous inference access is switched on.
+    ///
+    /// The same `AtomicBool` the inference listener reads, so a change here is
+    /// in force for the next request without a configuration activation. It is
+    /// runtime state on purpose: the configuration document declares who an
+    /// anonymous caller would be and never whether one is served, so this
+    /// endpoint is the only way to change it.
+    pub anonymous_access: Arc<std::sync::atomic::AtomicBool>,
     /// API keys.
     pub keys: Arc<hypellm_auth::KeyStore>,
     /// Management sessions.
@@ -429,6 +437,26 @@ pub struct AdminState {
     pub decisions: Arc<DecisionCache>,
     /// Usage aggregates, for the usage screen.
     pub usage: Arc<UsageAggregate>,
+    /// The rolling rate and latency window, for the overview.
+    ///
+    /// Written on the router's completion path and read here. It is the only
+    /// source in the process for a *rate*: the metric registry holds cumulative
+    /// counters, and a cumulative counter divided by uptime is the average
+    /// since boot rather than what the router is doing now.
+    pub traffic: Arc<crate::traffic::TrafficWindow>,
+    /// Admission control, for the capacity half of the overview.
+    ///
+    /// Read-only here, and read-only by construction: this crate calls
+    /// `in_flight`, `queued`, `limits` and the conservation counters, and there
+    /// is no management endpoint that reserves, releases, or reconfigures a
+    /// scope. Shared directly rather than through a trait because
+    /// `AdmissionController` is a `hypellm-core` type with no I/O and no
+    /// secrets — the same reason `health` is shared directly.
+    ///
+    /// `None` in a deployment with no data path, in which case the capacity
+    /// panel reports that rather than rendering zeros that read as an idle
+    /// router.
+    pub admission: Option<Arc<hypellm_core::admission::AdmissionController>>,
     /// Recent audit events, for the audit view.
     pub audit: Arc<AuditIndex>,
     /// Policy drafts.
@@ -971,6 +999,7 @@ impl AdminApi {
             (Method::Get, "/admin/v1/providers") => self.list_providers(session),
             (Method::Get, "/admin/v1/aliases") => self.list_aliases(session),
             (Method::Get, "/admin/v1/overview") => self.overview(session),
+            (Method::Get, "/admin/v1/traffic") => self.traffic(session),
 
             (Method::Get, "/admin/v1/policies") => self.list_drafts(session),
             (Method::Post, "/admin/v1/policies") => self.create_draft(request, session),
@@ -986,6 +1015,9 @@ impl AdminApi {
 
             (Method::Get, "/admin/v1/access") => self.list_access(session),
             (Method::Get, "/admin/v1/settings") => self.settings_view(session),
+            (Method::Post, "/admin/v1/settings/anonymous") => {
+                self.set_anonymous_access(request, session)
+            }
 
             (Method::Get, "/admin/v1/usage") => self.list_usage(session),
 
@@ -2119,6 +2151,184 @@ impl AdminApi {
         );
         root.push("audit_records", Value::from(self.state.store.audit_count()));
         Ok(ApiResponse::ok(&Value::Object(root)))
+    }
+
+    /// `GET /admin/v1/traffic` — rate, latency, and capacity.
+    ///
+    /// Specification 15.3 names all three on the overview screen, and none of
+    /// them is a figure the rest of the management API holds. `/overview` and
+    /// `/targets` report counters that are cumulative since the router started;
+    /// a rate needs a window, a latency needs a distribution, and a utilisation
+    /// needs the limit as well as the occupancy. Those three sources are
+    /// `TrafficWindow`, the same window's bucketed histograms, and the
+    /// admission controller.
+    ///
+    /// Read-only in the strict sense: nothing here reserves, releases, rolls a
+    /// budget period, or creates a scope. A management refresh that moved a
+    /// tenant's budget boundary would be a mutation performed by looking.
+    ///
+    /// Scoped like every other read on this surface. The rate and latency
+    /// figures are the caller's own tenant's; the capacity figures are the
+    /// router's limits and the caller's visible targets, which is the same
+    /// breadth `/targets` already reports per row.
+    fn traffic(&self, session: &Session) -> Result<ApiResponse, ApiError> {
+        self.require(session, Permission::ReadSummary)?;
+        let now = self.state.clock.now_millis();
+
+        let mut root = Object::new();
+        root.push("slot_millis", Value::from(crate::traffic::SLOT_MILLIS));
+        // Named, not implied. A p99 read off these buckets is an upper bound,
+        // and a console that printed it as a measurement would be claiming a
+        // precision specification 19.1 puts in `hypellm-bench` instead.
+        root.push("latency_estimate", Value::from("bucket_upper_bound"));
+        root.push(
+            "largest_bucket_millis",
+            Value::from(crate::traffic::largest_bucket_millis()),
+        );
+
+        // Both windows in one response rather than a client-chosen one: the
+        // console wants "the last minute" and "the last five minutes" side by
+        // side, and a free window parameter would be a request-shaped input to
+        // a bounded structure for no gain.
+        let mut windows = Vec::new();
+        let mut attributed = true;
+        for window_millis in [60_000_u64, crate::traffic::WINDOW_MILLIS] {
+            match self
+                .state
+                .traffic
+                .summary(&session.tenant, window_millis, now)
+            {
+                Some(summary) => windows.push(traffic_window_value(&summary)),
+                // The tenant appeared after every ring was in use, so its
+                // samples were dropped. Reporting the empty sum would be a
+                // confident zero for a tenant that may be the busiest one here.
+                None => attributed = false,
+            }
+        }
+        if !attributed {
+            windows.clear();
+        }
+        root.push("attributed", Value::from(attributed));
+        root.push("windows", Value::Array(windows));
+        root.push(
+            "unattributed_samples",
+            Value::from(self.state.traffic.unattributed_samples()),
+        );
+
+        root.push("capacity", self.capacity_value(session, now));
+        Ok(ApiResponse::ok(&Value::Object(root)))
+    }
+
+    /// The capacity half of `GET /admin/v1/traffic`.
+    fn capacity_value(&self, session: &Session, now: u64) -> Value {
+        let mut capacity = Object::new();
+        let Some(admission) = self.state.admission.as_ref() else {
+            // A deployment with no data path attached to this API. Saying so is
+            // the point: a capacity panel full of zeros reads as a router with
+            // nothing to do, which is the one thing it must never be mistaken
+            // for.
+            capacity.push("available", Value::from(false));
+            capacity.push(
+                "reason",
+                Value::from(
+                    "This router exposes no admission controller to the management API, \
+                     so no limit or occupancy figure can be reported.",
+                ),
+            );
+            return Value::Object(capacity);
+        };
+        capacity.push("available", Value::from(true));
+
+        // Router-wide, and no narrower disclosure is possible: the global scope
+        // is one counter shared by every tenant. It is the same breadth the
+        // target rows on `/targets` already carry.
+        capacity.push("global", scope_value(admission.global(), now));
+
+        // The caller's own tenant. A scope only exists once the tenant has been
+        // admitted, and this read deliberately does not create one, so a tenant
+        // that has sent nothing yet is reported through the limits that would
+        // apply to it.
+        let tenant = match admission.configured_tenant_scope(&session.tenant) {
+            Some(scope) => scope_value(&scope, now),
+            None => prospective_scope_value(
+                &format!("tenant:{}", session.tenant),
+                admission.default_tenant_limits(),
+            ),
+        };
+        capacity.push("tenant", tenant);
+
+        let config = self.state.config();
+        let visible = visible_targets(&config, session);
+        let mut streams_total = 0i64;
+        let mut targets = Vec::new();
+        for target in config
+            .snapshot
+            .targets
+            .values()
+            .filter(|target| visible.contains(&target.id))
+        {
+            let mut row = Object::new();
+            row.push("id", Value::from(target.id.as_str()));
+
+            // Specification 17 lists active streams among the required signals,
+            // and the gauge the pipeline maintains is the only place the router
+            // holds it. Read back rather than recomputed, so the panel and the
+            // exposition cannot disagree.
+            let streams = self.state.telemetry.metrics.gauge_value(
+                hypellm_telemetry::names::ACTIVE_STREAMS,
+                &hypellm_telemetry::Labels::one(
+                    hypellm_telemetry::LabelName::Target,
+                    target.id.as_str(),
+                ),
+            );
+            row.push_opt("active_streams", streams.map(Value::from));
+            streams_total = streams_total.saturating_add(streams.unwrap_or(0));
+
+            match admission.target_scope(&target.id) {
+                // The scope's own occupancy, not the health registry's, because
+                // this row pairs it with a limit and only one of the two
+                // counters is the one that limit is enforced against. The health
+                // counter is per `(target, operation)` and `/targets` reports
+                // the chat one; a utilisation built from it would read as
+                // under-occupied on a target serving embeddings.
+                Some(scope) => {
+                    let limits = scope.limits();
+                    row.push("in_flight", Value::from(u64::from(scope.in_flight())));
+                    row.push("queued", Value::from(u64::from(scope.queued())));
+                    row.push(
+                        "max_concurrency",
+                        Value::from(u64::from(limits.max_concurrency)),
+                    );
+                    row.push("max_queued", Value::from(u64::from(limits.max_queued)));
+                    row.push(
+                        "requests_per_second",
+                        Value::from(u64::from(limits.requests_per_second)),
+                    );
+                    row.push("admission_scope", Value::from(true));
+                }
+                // No scope admits against this target, so nothing is enforcing
+                // its declared concurrency. The declaration is still what an
+                // operator wrote and worth showing, and `admission_scope: false`
+                // is what stops the pair being read as a limit in force.
+                None => {
+                    let health = self.state.health.entry(&target.id, Operation::Chat);
+                    row.push("in_flight", Value::from(u64::from(health.in_flight())));
+                    row.push(
+                        "max_concurrency",
+                        Value::from(u64::from(target.max_concurrency)),
+                    );
+                    row.push(
+                        "requests_per_second",
+                        Value::from(u64::from(target.max_requests_per_second)),
+                    );
+                    row.push("admission_scope", Value::from(false));
+                }
+            }
+            targets.push(Value::Object(row));
+        }
+        capacity.push("targets", Value::Array(targets));
+        capacity.push("active_streams", Value::from(streams_total));
+        Value::Object(capacity)
     }
 
     fn decision(&self, session: &Session, raw_id: &str) -> Result<ApiResponse, ApiError> {
@@ -3353,6 +3563,164 @@ impl AdminApi {
         Ok(response)
     }
 
+    /// Turn anonymous inference access on or off.
+    ///
+    /// **The configuration document does not decide this and cannot.**
+    /// `anonymous_enabled` is not a settings key — a document naming it fails
+    /// to load as an unknown field — so editing a file and restarting cannot
+    /// open the router. What the document declares is the *subject*:
+    /// `anonymous_principal`, `anonymous_tenant` and `anonymous_scopes`, which
+    /// are inert on their own and say who an anonymous caller would be if one
+    /// were ever served. This endpoint is the only thing that decides whether
+    /// one is.
+    ///
+    /// The state is therefore not part of the configuration snapshot. It is an
+    /// `AtomicBool` shared with the inference listener plus a
+    /// `RecordKind::AnonymousAccess` frame, and the ordering between them is
+    /// the one that matters: **the frame is written first**. A router that
+    /// answered "enabled", served open traffic, and forgot on restart would be
+    /// a screen lying about a security control. The reverse — a frame written
+    /// and the flag not flipped — is refused-by-default and self-corrects on
+    /// the next start.
+    ///
+    /// The frame is MAC-protected, because it decides authorization. An
+    /// unprotected one could be appended by anything able to write the state
+    /// directory, and the router would open itself on the next start believing
+    /// an operator had asked for it.
+    ///
+    /// `ManageSettings` gates it, not `ManageCredentials`, even though the
+    /// control is rendered on the credentials screen. The two are not
+    /// interchangeable: `credential_manager` exists to rotate provider
+    /// secrets, and letting it disable authentication fleet-wide would make it
+    /// the most powerful role in the model by accident.
+    ///
+    /// A reason is required and recorded, for the reason a rollback requires
+    /// one: the audit entry that matters is not "it changed" but "why".
+    fn set_anonymous_access(
+        &self,
+        request: &AdminRequest<'_>,
+        session: &Session,
+    ) -> Result<ApiResponse, ApiError> {
+        self.require(session, Permission::ManageSettings)?;
+
+        let body = request.json(&Limits::SMALL)?;
+        let enabled = body
+            .opt_field_bool("enabled")
+            .ok()
+            .flatten()
+            .ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::InvalidRequest,
+                    "`enabled` is required and must be a boolean",
+                )
+            })?;
+        let reason = body
+            .opt_field_str("reason")
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        if reason.len() < MIN_ROLLBACK_REASON || reason.len() > MAX_BREAK_GLASS_REASON {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidRequest,
+                "changing anonymous access requires a reason of 8 to 256 characters",
+            ));
+        }
+
+        // Switching *on* needs a subject to switch on to. The document's own
+        // validation has already established that a declared subject is
+        // complete and resolvable; what it cannot establish is that one was
+        // declared at all, because declaring none is the ordinary case.
+        let config = self.state.config();
+        if enabled
+            && (config.settings.anonymous_principal.is_none()
+                || config.settings.anonymous_tenant.is_none())
+        {
+            return Err(ApiError::new(
+                ApiErrorCode::ValidationFailed,
+                "this router declares no anonymous subject, so there is nobody to serve \
+                 an uncredentialed request as. Set anonymous_principal and \
+                 anonymous_tenant in the configuration first — they decide who, not \
+                 whether",
+            ));
+        }
+
+        // A no-op is refused rather than recorded. Writing a frame and an audit
+        // entry for a change that changes nothing puts something in the chain
+        // an investigator has to rule out.
+        let current = self
+            .state
+            .anonymous_access
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if current == enabled {
+            return Err(ApiError::new(
+                ApiErrorCode::ValidationFailed,
+                if enabled {
+                    "anonymous access is already enabled"
+                } else {
+                    "anonymous access is already disabled"
+                },
+            ));
+        }
+
+        // Durable first, then in force. The payload is the state and who set
+        // it; the reason lives in the audit chain, which is where a reason
+        // belongs and is hash-chained.
+        let mut record = Object::new();
+        record.push("enabled", Value::from(enabled));
+        record.push("at", Value::from(self.state.clock.wall_millis()));
+        record.push("by", Value::from(session.principal.as_str()));
+        self.state
+            .store
+            .append(
+                hypellm_store::RecordKind::AnonymousAccess,
+                wire_json::to_string(&Value::Object(record)).as_bytes(),
+            )
+            .map_err(|_| {
+                ApiError::new(
+                    ApiErrorCode::InternalFault,
+                    "the change could not be recorded durably",
+                )
+            })?;
+
+        self.state
+            .anonymous_access
+            .store(enabled, std::sync::atomic::Ordering::SeqCst);
+
+        self.record_audit(
+            AuditEvent::new(
+                self.state.clock.wall_millis(),
+                session.principal.as_str(),
+                AuditAction::SettingsChanged,
+            )
+            .with_object(if enabled {
+                "anonymous_access_enabled"
+            } else {
+                "anonymous_access_disabled"
+            })
+            .with_tenant(session.tenant.as_str())
+            .with_reason(&reason),
+        )?;
+
+        // Critical in both directions. Enabling it is self-evidently critical;
+        // disabling it closes a window in which unattributed requests were
+        // served, and an investigator reconstructing that window needs both
+        // edges at the same severity to find them.
+        self.state.telemetry.log(
+            &hypellm_telemetry::Event::critical(if enabled {
+                "settings.anonymous_access_enabled"
+            } else {
+                "settings.anonymous_access_disabled"
+            })
+            .str_field(hypellm_telemetry::Field::Detail, &reason),
+        );
+
+        let mut root = Object::new();
+        root.push("enabled", Value::from(enabled));
+        Ok(ApiResponse::ok(&Value::Object(root)))
+    }
+
     fn publish_draft(
         &self,
         request: &AdminRequest<'_>,
@@ -3963,6 +4331,69 @@ impl AdminApi {
             }),
         );
 
+        // Anonymous inference access. Reported as its own object rather than a
+        // deployment row for the reason `prompt_capture_enabled` gets a banner:
+        // an enabled value here means a documented security default has been
+        // turned off, and a table row is not enough weight for that.
+        //
+        // The principal and tenant are named because an operator's first
+        // question is "served as whom", and both are already this caller's own
+        // configuration — `manage_settings` gates this endpoint, and the values
+        // are in the config text the policy view already serves.
+        let mut anonymous = Object::new();
+        let anonymous_on = self
+            .state
+            .anonymous_access
+            .load(std::sync::atomic::Ordering::SeqCst);
+        anonymous.push("enabled", Value::from(anonymous_on));
+        // The subject is reported whether or not it is in use, because "can
+        // this be switched on, and as whom" is the question this screen is
+        // asked, and a blank panel would answer neither.
+        anonymous.push_opt(
+            "principal",
+            settings.anonymous_principal.as_deref().map(Value::from),
+        );
+        anonymous.push_opt(
+            "tenant",
+            settings.anonymous_tenant.as_deref().map(Value::from),
+        );
+        anonymous.push(
+            "available",
+            Value::from(
+                settings.anonymous_principal.is_some() && settings.anonymous_tenant.is_some(),
+            ),
+        );
+        if anonymous_on {
+            anonymous.push_opt(
+                "principal",
+                settings.anonymous_principal.as_deref().map(Value::from),
+            );
+            anonymous.push_opt(
+                "tenant",
+                settings.anonymous_tenant.as_deref().map(Value::from),
+            );
+            anonymous.push(
+                "scopes",
+                Value::Array(
+                    settings
+                        .anonymous_scopes
+                        .iter()
+                        .map(|s| Value::from(s.as_str()))
+                        .collect(),
+                ),
+            );
+        }
+        anonymous.push(
+            "note",
+            Value::from(if anonymous_on {
+                "requests to the inference listener that present no credential are served \
+                 as the principal above. Anyone who can reach that listener can spend \
+                 this fleet's capacity, and no key can be revoked to stop them"
+            } else {
+                "every request to the inference listener must present a valid API key"
+            }),
+        );
+
         let mut root = Object::new();
         root.push("object", Value::from("settings"));
         root.push("tenant", Value::from(session.tenant.as_str()));
@@ -3988,10 +4419,17 @@ impl AdminApi {
         root.push("sessions", Value::Object(sessions));
         root.push("retention", Value::Object(retention));
         root.push("break_glass", Value::Object(break_glass));
+        root.push("anonymous", Value::Object(anonymous));
         root.push("deployment", Value::Object(deployment));
         root.push("config_version", Value::from(config.snapshot.version));
         root.push("config_digest", Value::from(config.digest_short()));
-        Ok(ApiResponse::ok(&Value::Object(root)))
+        // The active configuration's ETag, so a caller that goes on to change
+        // a setting can present it as `If-Match`. `set_anonymous_access`
+        // requires one, and without this the only way to obtain it would be to
+        // read a different endpoint and hope it had not moved in between.
+        let mut response = ApiResponse::ok(&Value::Object(root));
+        response.etag = Some(active_etag(&config));
+        Ok(response)
     }
 
     fn list_credentials(&self, session: &Session) -> Result<ApiResponse, ApiError> {
@@ -4772,6 +5210,116 @@ fn visible_targets(
     visible
 }
 
+/// One window of the rolling traffic summary, as JSON.
+///
+/// Counts and a covered span, not a rate. The division is left to the reader
+/// deliberately: `covered_millis` is the only correct denominator and it varies
+/// with how long the router has been up, so publishing a precomputed rate
+/// alongside the counts would create a second figure that can disagree with the
+/// first. One measurement, stated once.
+fn traffic_window_value(summary: &crate::traffic::TrafficSummary) -> Value {
+    let mut object = Object::new();
+    object.push("window_millis", Value::from(summary.window_millis));
+    object.push("covered_millis", Value::from(summary.covered_millis));
+    object.push("complete", Value::from(summary.complete));
+    object.push("requests", Value::from(summary.requests));
+    object.push("successes", Value::from(summary.successes()));
+    object.push("client_errors", Value::from(summary.client_errors));
+    object.push("throttled", Value::from(summary.throttled));
+    object.push("server_errors", Value::from(summary.server_errors));
+    object.push("input_tokens", Value::from(summary.input_tokens));
+    object.push("output_tokens", Value::from(summary.output_tokens));
+    object.push("router_latency", latency_value(&summary.router));
+    object.push("upstream_latency", latency_value(&summary.upstream));
+    Value::Object(object)
+}
+
+/// A bucketed latency distribution, as JSON.
+///
+/// A quantile that falls in the overflow bucket is rendered `null` rather than
+/// as the largest bound: the bucket has no upper bound, and printing 120000
+/// there would turn "longer than two minutes" into "two minutes".
+/// `above_largest_bucket` is how the reader tells that case from "no samples".
+fn latency_value(latency: &crate::traffic::LatencySummary) -> Value {
+    let mut object = Object::new();
+    object.push("samples", Value::from(latency.samples));
+    object.push_opt("mean_millis", latency.mean_millis.map(Value::from));
+    object.push_opt("p50_millis", latency.p50_millis.map(Value::from));
+    object.push_opt("p90_millis", latency.p90_millis.map(Value::from));
+    object.push_opt("p99_millis", latency.p99_millis.map(Value::from));
+    object.push(
+        "above_largest_bucket",
+        Value::from(latency.above_largest_bucket),
+    );
+    Value::Object(object)
+}
+
+/// One admission scope's occupancy and limits.
+///
+/// `acquired` and `released` are the conservation pair from Appendix B — "every
+/// reservation is released exactly once on all success, error, timeout, and
+/// cancellation paths". Exposed because a leak is otherwise invisible until the
+/// scope stops admitting: an idle router whose two counters differ has lost a
+/// reservation, and that is a thing an operator should be able to see without a
+/// debugger.
+fn scope_value(scope: &hypellm_core::admission::Scope, now: u64) -> Value {
+    let limits = scope.limits();
+    let mut object = Object::new();
+    object.push("name", Value::from(scope.name.as_str()));
+    object.push("exists", Value::from(true));
+    object.push("in_flight", Value::from(u64::from(scope.in_flight())));
+    object.push("queued", Value::from(u64::from(scope.queued())));
+    let (acquired, released) = scope.conservation();
+    object.push("acquired", Value::from(acquired));
+    object.push("released", Value::from(released));
+    object.push("spent_minor_units", Value::from(scope.observed_spend(now)));
+    push_limits(&mut object, limits);
+    Value::Object(object)
+}
+
+/// The limits a scope that does not exist yet would be created with.
+///
+/// A tenant that has sent no request has no scope, and this read does not make
+/// one — creating a scope on a dashboard refresh would start its budget period
+/// at whenever somebody looked. `exists: false` says the occupancy figures are
+/// absent because there is nothing to occupy, not because they were withheld.
+fn prospective_scope_value(
+    name: &str,
+    limits: hypellm_core::admission::ScopeLimits,
+) -> Value {
+    let mut object = Object::new();
+    object.push("name", Value::from(name));
+    object.push("exists", Value::from(false));
+    push_limits(&mut object, limits);
+    Value::Object(object)
+}
+
+/// The limit fields shared by both scope renderings.
+///
+/// Zero means unlimited throughout [`hypellm_core::admission::ScopeLimits`], and
+/// it is rendered as zero rather than as `null` so that the wire type of a limit
+/// never changes with its value. The console is what turns zero into "no limit";
+/// a client that treated it as a ceiling of zero would be reading a field this
+/// crate has never used that way.
+fn push_limits(object: &mut Object, limits: hypellm_core::admission::ScopeLimits) {
+    object.push(
+        "max_concurrency",
+        Value::from(u64::from(limits.max_concurrency)),
+    );
+    object.push("max_queued", Value::from(u64::from(limits.max_queued)));
+    object.push(
+        "requests_per_second",
+        Value::from(u64::from(limits.requests_per_second)),
+    );
+    object.push("request_burst", Value::from(u64::from(limits.request_burst)));
+    object.push("tokens_per_minute", Value::from(limits.tokens_per_minute));
+    object.push("budget_minor_units", Value::from(limits.budget_minor_units));
+    object.push(
+        "budget_period",
+        Value::from(limits.budget_period.as_str()),
+    );
+}
+
 /// A target's declared capabilities, as the API spells them.
 fn capabilities_value(capabilities: &hypellm_core::target::Capabilities) -> Value {
     let mut caps = Object::new();
@@ -4912,6 +5460,7 @@ fn resolve_identity(
         roles,
     ))
 }
+
 
 fn active_etag(config: &ValidatedConfig) -> String {
     let mut object = Object::new();

@@ -330,6 +330,79 @@ fn the_exposition_carries_every_signal_the_specification_names() {
 }
 
 #[test]
+fn a_served_request_lands_in_the_rolling_window_the_overview_reads() {
+    // Specification 15.3 puts a request *rate* on the overview, and the metric
+    // registry cannot answer for one: its counters are cumulative since start.
+    // The window is fed from `pipeline::record_completion`, and it is fed from
+    // nowhere else — so if that call is ever dropped, every rate and latency
+    // figure on the overview silently becomes zero while the screen keeps
+    // rendering as though the router were idle. This is what catches that.
+    let harness = Harness::default(chat_completion_response());
+    let tenant = hypellm_core::ids::TenantId::new("acme").expect("tenant");
+    let now = harness.router.state.clock.now_millis();
+
+    let before = harness
+        .router
+        .state
+        .traffic
+        .summary(&tenant, 60_000, now)
+        .expect("acme is tracked");
+    assert_eq!(before.requests, 0);
+
+    let response = harness.request("POST", "/v1/chat/completions", CHAT_BODY, true);
+    assert_eq!(response.status, 200, "{}", response.body);
+
+    let now = harness.router.state.clock.now_millis();
+    let after = harness
+        .router
+        .state
+        .traffic
+        .summary(&tenant, 60_000, now)
+        .expect("acme is tracked");
+    assert_eq!(after.requests, 1);
+    assert_eq!(after.successes(), 1);
+    // The upstream leg was reached, so it contributed a latency sample; a
+    // refusal would have contributed none.
+    assert_eq!(after.router.samples, 1);
+    assert_eq!(after.upstream.samples, 1);
+    // Provider-reported usage from the canned response, carried through.
+    assert_eq!(after.input_tokens, 12);
+    assert_eq!(after.output_tokens, 5);
+}
+
+#[test]
+fn a_refused_request_is_counted_without_an_upstream_latency_sample() {
+    // A router refusing everything must not read as the fastest one in the
+    // fleet. The refusal counts towards the rate — an operator needs to see the
+    // refusals — but contributes no upstream sample, because no upstream
+    // exchange happened.
+    let harness = Harness::default(chat_completion_response());
+    let tenant = hypellm_core::ids::TenantId::new("acme").expect("tenant");
+
+    let response = harness.request(
+        "POST",
+        "/v1/chat/completions",
+        r#"{"model":"no-such-alias","messages":[{"role":"user","content":"hi"}]}"#,
+        true,
+    );
+    assert!(response.status >= 400, "{}", response.body);
+
+    let now = harness.router.state.clock.now_millis();
+    let after = harness
+        .router
+        .state
+        .traffic
+        .summary(&tenant, 60_000, now)
+        .expect("acme is tracked");
+    assert_eq!(after.requests, 1);
+    assert_eq!(after.successes(), 0);
+    assert_eq!(
+        after.upstream.samples, 0,
+        "a refusal is not a zero-millisecond upstream exchange"
+    );
+}
+
+#[test]
 fn a_stream_reports_how_long_it_spent_blocked_on_the_client() {
     // `DI-037`: specification 14 asks for explicit high/low watermarks that
     // pause upstream reads. The blocking model produces that behaviour without

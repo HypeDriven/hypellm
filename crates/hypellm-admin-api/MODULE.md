@@ -16,9 +16,10 @@ input/resource limits.
 This module is the `/admin/v1` surface of specification 16, and the enforcement
 point for specification 15.4's API behaviour: explicit JSON schemas, ETags,
 `If-Match` on mutation, pagination cursors, stable error codes, and request IDs.
-It owns the authorization gate for management actions and four bounded
-in-memory views (`DecisionCache`, `AuditIndex`, `UsageAggregate`, `DraftStore`)
-that the admin screens of specification 15.3 read.
+It owns the authorization gate for management actions and five bounded
+in-memory views (`DecisionCache`, `AuditIndex`, `UsageAggregate`,
+`TrafficWindow`, `DraftStore`) that the admin screens of specification 15.3
+read.
 
 What it deliberately does **not** do is at least as important, because the crate
 sits at the point where an operator's browser meets the router's most privileged
@@ -197,6 +198,7 @@ Enforced in this crate:
 | Audit index depth | 2 048 records, oldest evicted | `AuditIndex::default()` |
 | Decision traces retained | 4 096, oldest evicted | `DecisionCache::default()` |
 | Distinct usage rows | `MAX_SERIES` = 4 096; further tuples fold into a per-tenant overflow row and `truncated` is reported | `UsageAggregate::record` |
+| Traffic windows tracked | `traffic::MAX_TENANTS` = 64 tenants, each a fixed ring of `SLOTS` = 30 slots of `SLOT_MILLIS` = 10 s. Nothing is allocated per request; a slot is recycled by overwriting. A tenant past the cap is counted in `unattributed_samples` and reported as `attributed: false` rather than as zero traffic | `TrafficWindow::record` |
 | Usage counters | saturating `u64` addition throughout | `UsageTotals::add`, `UsageAggregate::summary` |
 | Drafts retained | 256; the oldest by `created_at_millis` is evicted on overflow | `DraftStore::capacity` |
 | Preflight cache lifetime | 600 s | `CorsPolicy::max_age_secs` |

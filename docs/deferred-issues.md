@@ -140,6 +140,29 @@ What it does not:
 - **An unknown username is refused without hashing anything**, so it is refused measurably faster than a known username with a wrong password. That is a username oracle. The alternative — hashing a dummy verifier so the two take the same time — hands an unauthenticated caller a CPU amplifier on an endpoint that runs before any session, and a management plane that stops answering is worse than one that confirms `admin` exists.
 - **`docker/hypellm.conf` ships `admin`/`admin`.** That is a default credential, deliberately, so a fresh checkout is usable. The router logs `critical` `startup.default_password_in_use` on every start for any account whose password is its own username; that log line is the warning, not a formality.
 
+## Anonymous inference access is a deviation
+
+**Specification:** §9.2. **Implementation:** `RecordKind::AnonymousAccess` in `hypellm-store`, `RouterState::anonymous_access`, `Principal::anonymous`, `routes::authenticate`, `AdminApi::set_anonymous_access`, `web/views/credentials.js`.
+
+Specification §9.2 requires every request to the inference listener to establish a principal from one of four credentials. This router can be switched into serving a request that presents **none** of them, as a configured principal. It is off in every fresh deployment and has to be switched on deliberately.
+
+**The configuration document cannot switch it on.** `anonymous_enabled` is not a settings key — a document naming it fails to load as an unknown field, in either direction, so a key that silently did nothing when `false` cannot read as one that works. What the document declares is the *subject*: `anonymous_principal`, `anonymous_tenant`, `anonymous_scopes`. Those are inert on their own; they say who an uncredentialed caller would be served as, and declaring them is what makes the switch *available*. The switch itself is `POST /admin/v1/settings/anonymous`, which writes a MAC-protected `AnonymousAccess` frame and sets the `AtomicBool` the inference listener reads. Anyone able to write `hypellm.conf` can change routing; they cannot change whether authentication is required.
+
+What it keeps:
+
+- **It is not a bypass of credential checking.** The fallback is reachable only when neither `Authorization` nor `x-api-key` is present. A credential that is presented and fails — revoked, expired, unparseable, an unrecognised scheme, or an empty `Bearer ` — is refused with `unauthenticated`. A revoked key does not become an anonymous caller, so revocation keeps meaning what the Keys screen says it means.
+- **The anonymous caller is a named subject**, not an identity the router invents. The document refuses a half-declared subject or one naming an undeclared tenant at load, and the endpoint refuses to switch on when no subject is declared at all.
+- **It may not hold a management scope.** `management:read` and `management:write` in `anonymous_scopes` are a configuration error. Scopes default to `inference,models`; an unknown name is refused rather than dropped.
+- **It is durable, and fails closed.** The last frame wins on replay; absent means off. A frame that does not parse, or carries no `enabled`, is treated as off rather than skipped — so a corrupt tail cannot resurrect a switch an operator turned off.
+- **It is recorded as `anonymous`.** `AuthMethod::Anonymous` is distinct from `ApiKey`, and `key_id` is `None`. §22.3's investigation asks how a principal authenticated, and the answer here is "it did not" rather than a credential that was never issued.
+- **It is said out loud.** `critical` `startup.anonymous_access_enabled` on every start while it is on, `critical` on both edges of every change, an audit entry with a mandatory reason, and an error-weight banner on the Credentials and Settings screens.
+- **The permission is `manage_settings`**, not the `manage_credentials` that gates the screen the control is rendered on. `credential_manager` exists to rotate provider secrets; letting it disable authentication fleet-wide would make it the most powerful role in the model by accident.
+
+What it does not:
+
+- **There is nothing to revoke and nothing to attribute.** Every anonymous request is the same principal, so per-caller rate limiting, quota, and audit attribution are all at the granularity of "everyone who did not present a key". Usage for that principal is a single aggregate.
+- **Reaching the listener is the entire authorization check.** On a listener bound to a network anyone else can reach, this is an open inference endpoint and the fleet's capacity is spendable by anyone who finds it. That is the intended behaviour of the switch, which is why it is off by default and why turning it on is a `critical` log line rather than an informational one.
+
 ## Security boundaries worth understanding
 
 These are design boundaries rather than defects, but they affect deployment:

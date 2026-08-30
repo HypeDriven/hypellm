@@ -54,8 +54,9 @@ const PROVIDER_HOST: &str = "api.provider.test";
 const SECRET_VALUE: &str = "sk-live-DO-NOT-DISCLOSE-9f3c1a";
 
 /// Every read endpoint this suite covers.
-const READ_ENDPOINTS: [&str; 6] = [
+const READ_ENDPOINTS: [&str; 7] = [
     "/admin/v1/overview",
+    "/admin/v1/traffic",
     "/admin/v1/providers",
     "/admin/v1/aliases",
     "/admin/v1/usage",

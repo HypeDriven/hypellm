@@ -4,19 +4,37 @@
  * Specification 15.3: "Request rate, latency, errors, active streams, capacity,
  * target status, configuration version."
  *
- * The management API answers four of those seven honestly and does not answer
- * the other three at all, and that gap is the main design problem this file
- * solves. `GET /admin/v1/overview` returns fleet counts and the active
- * configuration identity; `GET /admin/v1/targets` returns, per target, the
- * breaker state, the admin state, the operator quarantine flag, and three
- * cumulative counters (`in_flight`, `total_requests`, `total_failures`). None
- * of that is a rate, none of it is a latency distribution, and no endpoint
- * reports an admission limit, so nothing here can be labelled "requests per
- * second" or "p99" without inventing it. Rates and latencies live in the
- * router's Prometheus exposition, which is a different surface with a different
- * audience; this screen names that instead of approximating it. An operator has
- * to be able to trust that what the console shows is what the router said —
- * a plausible-looking number nobody measured is worse than a blank.
+ * All seven are answered, from three endpoints. `GET /admin/v1/overview`
+ * returns fleet counts and the active configuration identity; `GET
+ * /admin/v1/targets` returns, per target, the breaker state, the admin state,
+ * the operator quarantine flag, and three counters that are cumulative since
+ * the router started; `GET /admin/v1/traffic` returns the rolling rate and
+ * latency window, the active-stream gauge, and the admission limits beside
+ * their occupancy.
+ *
+ * The distinction between the second and the third is the one to keep hold of
+ * while editing this file. A cumulative counter divided by uptime is the
+ * average since boot: on a router that was busy yesterday and is idle now it
+ * reads as busy. `/admin/v1/traffic` measures a window instead, and it reports
+ * the span it actually covered rather than the one it was asked for, because a
+ * router that has been up for thirty seconds has not lived through a minute.
+ * Every rate on this screen is that count divided by that span, and neither
+ * half is ever presented without the other.
+ *
+ * Two limits on what the numbers mean, both of which the screen states rather
+ * than hides:
+ *
+ * - **The latency figures are bucket upper bounds.** The router keeps a
+ *   bucketed histogram, so a p99 of 25 ms means "at or below 25 ms". The cells
+ *   are written `≤ 25 ms` for that reason, and a quantile past the largest
+ *   bucket reads `> 2 min` rather than being clamped to the bound.
+ *   Specification 19.1's measured distributions come from `hypellm-bench`, not
+ *   from here.
+ * - **Rate and latency are the caller's own tenant's.** Appendix B keeps
+ *   management visibility inside the caller's tenant, and a request rate is a
+ *   direct measure of how much work a tenant is doing. On a single-tenant
+ *   deployment that is the whole router; on a shared one it is not, and the
+ *   panel says so.
  *
  * Two further decisions worth stating:
  *
@@ -32,13 +50,21 @@
  *   "traffic" would make an idle router that has been up for a week look busy.
  */
 
-import { append, el, formatCount, formatTime, pill, replace, text } from '../components/dom.js';
+import {
+  append,
+  el,
+  formatCount,
+  formatDuration,
+  formatTime,
+  pill,
+  replace,
+  text,
+} from '../components/dom.js';
 import {
   actionButton,
   definitionList,
   emptyState,
   inlineField,
-  notAvailable,
   panel,
   toolbar,
 } from '../components/layout.js';
@@ -50,11 +76,11 @@ export const meta = {
   title: 'Overview',
   // The lede says what the numbers are, because "since the router started" is
   // the difference between reading this screen correctly and misreading it.
-  lede: 'Fleet health, target status, and the active configuration, as the router reports them now.',
-  // `GET /admin/v1/overview` and `GET /admin/v1/targets` both require
+  lede: 'Rate, latency, capacity, target status, and the active configuration, as the router reports them now.',
+  // `GET /admin/v1/overview`, `/targets` and `/traffic` all require
   // `Permission::ReadSummary` (crates/hypellm-admin-api/src/handlers.rs), which
   // every role holds. A principal who cannot read the summary cannot use this
-  // screen at all, so the nav hides it rather than showing two failing panels.
+  // screen at all, so the nav hides it rather than showing three failing panels.
   permission: 'read_summary',
 };
 
@@ -216,23 +242,25 @@ export async function mount(container, ctx) {
 }
 
 /**
- * Read both endpoints.
+ * Read all three endpoints.
  *
  * Sequentially, not concurrently: `Api.request` aborts whatever is in flight
  * before starting a non-shared request, so two overlapping `get` calls would
- * cancel each other. Doing them in order keeps both cancellable by navigation,
- * which matters more here than the one round trip it costs.
+ * cancel each other. Doing them in order keeps all three cancellable by
+ * navigation, which matters more here than the two round trips it costs.
  *
  * @param {import('../api.js').Api} api
- * @returns {Promise<{overview: object, targets: object[], truncated: boolean, readAt: number}>}
+ * @returns {Promise<{overview: object, targets: object[], traffic: object, truncated: boolean, readAt: number}>}
  */
 async function load(api) {
   const overview = await api.get('/overview');
   const targets = await api.get(`/targets?limit=${TARGET_PAGE_LIMIT}`);
+  const traffic = await api.get('/traffic');
   const envelope = targets.data || {};
   return {
     overview: overview.data || {},
     targets: Array.isArray(envelope.data) ? envelope.data : [],
+    traffic: traffic.data || {},
     truncated: Boolean(envelope.has_more),
     readAt: Date.now(),
   };
@@ -246,18 +274,12 @@ async function load(api) {
  * @param {object} ctx
  */
 function paint(body, snapshot, ctx) {
-  const { overview, targets, truncated } = snapshot;
+  const { overview, targets, traffic, truncated } = snapshot;
   const live = summarize(targets);
 
   replace(body, [
-    grid(tiles(overview, live, targets.length, truncated)),
-    panel({
-      title: 'Rate, latency, and capacity',
-      content: notAvailable(
-        'Live rate, latency, and capacity reporting',
-        'The management API reports cumulative counters per target, not rates, latency distributions, or admission limits. The router publishes hypellm_requests_total, hypellm_router_overhead_milliseconds, and hypellm_upstream_latency_milliseconds at GET /metrics on the management listener; this console reads only /admin/v1 JSON and does not scrape it.',
-      ),
-    }),
+    grid(tiles(overview, live, traffic, targets.length, truncated)),
+    ratePanel(traffic),
     panel({
       title: 'Target status',
       note: targetsNote(overview, targets.length, truncated),
@@ -289,11 +311,12 @@ function paint(body, snapshot, ctx) {
  *
  * @param {object} overview
  * @param {{inFlight: number, requests: number, failures: number, complete: boolean}} live
+ * @param {object} traffic The `/admin/v1/traffic` body.
  * @param {number} listed
  * @param {boolean} truncated
  * @returns {HTMLElement[]}
  */
-function tiles(overview, live, listed, truncated) {
+function tiles(overview, live, traffic, listed, truncated) {
   // "Across the targets this screen read" rather than "across the fleet": when
   // the list is truncated the sums are a subset, and saying which subset is the
   // difference between an incomplete figure and a wrong one.
@@ -302,12 +325,20 @@ function tiles(overview, live, listed, truncated) {
     : `summed across ${formatCount(listed)} targets`;
   const partial = live.complete ? '' : ' The router omitted a counter on at least one target.';
 
+  const shortest = shortestWindow(traffic);
+  const streams = traffic && traffic.capacity ? traffic.capacity.active_streams : undefined;
+
   return [
     stat(
       'Targets healthy',
       healthText(overview),
       degradedNote(overview),
     ),
+    // The one figure on this row that is a *rate* rather than a total, which is
+    // why its note names the span it was measured over. Every other tile here
+    // counts since the router started.
+    stat('Requests per second', rateTileValue(shortest), rateTileNote(traffic, shortest)),
+    stat('Active streams', formatCount(streams), streamsNote(traffic)),
     stat('Requests in flight', formatCount(live.inFlight), `${scope}.${partial}`),
     stat('Requests seen', formatCount(live.requests), 'Cumulative since the router started.'),
     stat('Failed requests', formatCount(live.failures), failureNote(live)),
@@ -317,6 +348,506 @@ function tiles(overview, live, listed, truncated) {
       typeof overview.config_digest === 'string' ? overview.config_digest : 'digest not reported',
     ),
   ];
+}
+
+/**
+ * The shortest measurement window the router reported, or `null`.
+ *
+ * "Shortest" rather than "first": the tile is meant to say what the router is
+ * doing *now*, and a five-minute average hides a spike that started ninety
+ * seconds ago. The panel below shows every window the router returned.
+ *
+ * @param {object} traffic
+ * @returns {object|null}
+ */
+function shortestWindow(traffic) {
+  if (!traffic || traffic.attributed === false || !Array.isArray(traffic.windows)) {
+    return null;
+  }
+  let shortest = null;
+  for (const window of traffic.windows) {
+    if (!window || typeof window.window_millis !== 'number') {
+      continue;
+    }
+    if (shortest === null || window.window_millis < shortest.window_millis) {
+      shortest = window;
+    }
+  }
+  return shortest;
+}
+
+/**
+ * The span below which a rate is arithmetic rather than measurement.
+ *
+ * One request in the first fifty milliseconds of uptime divides out to twenty a
+ * second. The count is real; the rate is not, so it is withheld until the
+ * router has been observing for at least a second.
+ */
+const MINIMUM_RATE_SPAN_MILLIS = 1000;
+
+/**
+ * A per-second rate, or `null` when the covered span is too short to divide by.
+ *
+ * The router deliberately reports counts and a covered span rather than a rate,
+ * so that there is exactly one figure per measurement and no second one to
+ * disagree with it. This is the division, done once, here.
+ *
+ * @param {unknown} count
+ * @param {unknown} coveredMillis
+ * @returns {number|null}
+ */
+function perSecond(count, coveredMillis) {
+  if (typeof count !== 'number' || !Number.isFinite(count)) {
+    return null;
+  }
+  if (
+    typeof coveredMillis !== 'number' ||
+    !Number.isFinite(coveredMillis) ||
+    coveredMillis < MINIMUM_RATE_SPAN_MILLIS
+  ) {
+    return null;
+  }
+  return (count * 1000) / coveredMillis;
+}
+
+/**
+ * Format a rate with a precision that does not outrun the measurement.
+ *
+ * @param {number|null} value
+ * @returns {string}
+ */
+function formatRate(value) {
+  if (value === null) {
+    return '—';
+  }
+  if (value === 0) {
+    return '0';
+  }
+  if (value < 1) {
+    return value.toFixed(2);
+  }
+  if (value < 100) {
+    return value.toFixed(1);
+  }
+  return formatCount(Math.round(value));
+}
+
+/**
+ * @param {object|null} window
+ * @returns {string}
+ */
+function rateTileValue(window) {
+  if (!window) {
+    return '—';
+  }
+  return formatRate(perSecond(window.requests, window.covered_millis));
+}
+
+/**
+ * The tile's note, which is where the honesty lives.
+ *
+ * @param {object} traffic
+ * @param {object|null} window
+ * @returns {string}
+ */
+function rateTileNote(traffic, window) {
+  if (traffic && traffic.attributed === false) {
+    return 'This tenant is not being attributed; see the panel below.';
+  }
+  if (!window) {
+    return 'The router reported no measurement window.';
+  }
+  const covered = formatDuration(window.covered_millis);
+  const requests = formatCount(window.requests);
+  if (window.complete === false) {
+    return `${requests} requests over ${covered}; the router has not been observing for a full ${formatDuration(window.window_millis)}.`;
+  }
+  return `${requests} requests over ${covered}, for this tenant.`;
+}
+
+/**
+ * @param {object} traffic
+ * @returns {string}
+ */
+function streamsNote(traffic) {
+  const capacity = traffic ? traffic.capacity : undefined;
+  if (!capacity || capacity.available === false) {
+    return 'The router reported no capacity figures.';
+  }
+  return 'Upstream streams open right now, across the targets you can see.';
+}
+
+/**
+ * The rate, latency, and capacity panel.
+ *
+ * Three readings, one panel, because an operator reads them together: a rate
+ * that has risen, a latency that has risen with it, and a limit it is
+ * approaching are one story, and on three separate screens they are three
+ * unrelated facts.
+ *
+ * @param {object} traffic The `/admin/v1/traffic` body.
+ * @returns {HTMLElement}
+ */
+function ratePanel(traffic) {
+  const attributed = !traffic || traffic.attributed !== false;
+  const windows = traffic && Array.isArray(traffic.windows) ? traffic.windows : [];
+
+  let rateContent;
+  if (!attributed) {
+    // Not "no traffic": the router tracks a bounded number of tenants and this
+    // one arrived after the last ring was taken, so its samples were dropped. A
+    // zero here would report the busiest tenant on the router as idle.
+    rateContent = emptyState(
+      'This tenant’s traffic is not being attributed',
+      `The router keeps a bounded set of per-tenant measurement windows, and every one of them was already in use when this tenant first appeared, so its completed requests were not recorded. The figures are missing, not zero — ${formatCount(traffic.unattributed_samples)} samples have been dropped this way across the router. The metrics exposition on the management listener still carries router-wide totals.`,
+    );
+  } else if (windows.length === 0) {
+    rateContent = emptyState(
+      'The router returned no measurement window',
+      'The traffic endpoint answered without a window, which is a router-side inconsistency rather than an idle deployment. Quote the configuration digest when reporting it.',
+    );
+  } else {
+    rateContent = rateTable(traffic, windows);
+  }
+
+  return panel({
+    title: 'Rate, latency, and capacity',
+    note: 'Rate and latency are measured over a rolling window for your own tenant. Latency is bucketed, so a percentile is an upper bound and is written as one.',
+    content: [
+      rateContent,
+      el('h3', { class: 'card__title', text: 'Admission capacity' }),
+      capacityContent(traffic ? traffic.capacity : undefined),
+    ],
+  });
+}
+
+/**
+ * One row per measurement window.
+ *
+ * The count and the span it was measured over both appear, not just the rate
+ * derived from them: a rate with no denominator cannot be checked, and this
+ * screen's whole claim is that what it shows is what the router said.
+ *
+ * @param {object} traffic
+ * @param {object[]} windows
+ * @returns {HTMLElement}
+ */
+function rateTable(traffic, windows) {
+  const largest = typeof traffic.largest_bucket_millis === 'number'
+    ? traffic.largest_bucket_millis
+    : null;
+
+  return table({
+    caption:
+      'Completed requests and their latency, over each rolling window. Percentiles are bucket upper bounds; the router publishes the same distributions as histograms at GET /metrics on the management listener.',
+    rows: windows,
+    columns: [
+      { label: 'Window', cell: (row) => windowCell(row) },
+      {
+        label: 'Requests',
+        numeric: true,
+        cell: (row) => formatCount(row.requests),
+      },
+      {
+        label: 'Per second',
+        numeric: true,
+        cell: (row) => formatRate(perSecond(row.requests, row.covered_millis)),
+      },
+      { label: 'Succeeded', numeric: true, cell: (row) => formatCount(row.successes) },
+      { label: 'Client errors', numeric: true, cell: (row) => errorCell(row, 'client_errors') },
+      { label: 'Throttled', numeric: true, cell: (row) => errorCell(row, 'throttled') },
+      { label: 'Server errors', numeric: true, cell: (row) => errorCell(row, 'server_errors') },
+      {
+        label: 'Router p50 / p99',
+        cell: (row) => quantilePairCell(row.router_latency, largest),
+      },
+      {
+        label: 'Upstream p50 / p99',
+        cell: (row) => quantilePairCell(row.upstream_latency, largest),
+      },
+      {
+        label: 'Output tokens/s',
+        numeric: true,
+        cell: (row) => formatRate(perSecond(row.output_tokens, row.covered_millis)),
+      },
+    ],
+  });
+}
+
+/**
+ * The window name, and the span actually covered when it is not the whole one.
+ *
+ * @param {object} row
+ * @returns {Node}
+ */
+function windowCell(row) {
+  const label = `Last ${formatDuration(row.window_millis)}`;
+  if (row.complete === false) {
+    return el('span', {}, [
+      text(label),
+      el('span', { class: 'stat__note', text: ` covering ${formatDuration(row.covered_millis)}` }),
+    ]);
+  }
+  return text(label);
+}
+
+/**
+ * An error count, tinted only when it is non-zero.
+ *
+ * @param {object} row
+ * @param {string} field
+ * @returns {Node}
+ */
+function errorCell(row, field) {
+  const value = row[field];
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return text('—');
+  }
+  if (value === 0) {
+    return text('0');
+  }
+  // Throttling is a limit working as configured; a server error is an outage.
+  // The tones differ because the operator's next action does.
+  return pill(formatCount(value), field === 'throttled' ? 'warn' : 'danger');
+}
+
+/**
+ * The median and the 99th percentile, side by side.
+ *
+ * @param {object} latency
+ * @param {number|null} largest
+ * @returns {Node}
+ */
+function quantilePairCell(latency, largest) {
+  if (!latency || typeof latency.samples !== 'number' || latency.samples === 0) {
+    return el('span', { class: 'stat__note', text: 'no samples' });
+  }
+  return text(
+    `${quantileText(latency.p50_millis, latency, largest)} / ${quantileText(latency.p99_millis, latency, largest)}`,
+  );
+}
+
+/**
+ * One percentile, written as the bound it actually is.
+ *
+ * `≤ 25 ms` rather than `25 ms`, because the router keeps a bucketed histogram
+ * and 25 is the bucket's upper edge. A percentile that fell in the overflow
+ * bucket has no upper edge at all and reads `> 2 min` — the difference between
+ * a slow provider and a hung one.
+ *
+ * @param {unknown} value
+ * @param {object} latency
+ * @param {number|null} largest
+ * @returns {string}
+ */
+function quantileText(value, latency, largest) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return `≤ ${formatDuration(value)}`;
+  }
+  if (latency.above_largest_bucket > 0 && largest !== null) {
+    return `> ${formatDuration(largest)}`;
+  }
+  return '—';
+}
+
+/**
+ * The capacity half of the panel.
+ *
+ * @param {object|undefined} capacity
+ * @returns {Array<Node>|Node}
+ */
+function capacityContent(capacity) {
+  if (!capacity || capacity.available === false) {
+    return emptyState(
+      'The router is not reporting admission capacity',
+      typeof capacity?.reason === 'string'
+        ? capacity.reason
+        : 'The traffic endpoint returned no capacity object.',
+    );
+  }
+
+  const scopes = [capacity.global, capacity.tenant].filter((scope) => scope && typeof scope === 'object');
+  const targets = Array.isArray(capacity.targets) ? capacity.targets : [];
+
+  return [
+    scopeTable(scopes),
+    targets.length === 0
+      ? emptyState(
+          'No target is visible to you',
+          'Per-target capacity is scoped the same way the target list is; an alias you hold no grant for does not appear here.',
+        )
+      : targetCapacityTable(targets),
+  ];
+}
+
+/**
+ * The admission scopes that govern the caller.
+ *
+ * @param {object[]} scopes
+ * @returns {HTMLElement}
+ */
+function scopeTable(scopes) {
+  return table({
+    caption:
+      'Admission scopes, with what is occupying them. A limit of zero means the scope imposes none. Reservations acquired and released must be equal whenever nothing is in flight.',
+    rows: scopes,
+    columns: [
+      { label: 'Scope', cell: (row) => el('span', { class: 'mono', text: String(row.name ?? '—') }) },
+      { label: 'Concurrency', cell: (row) => occupancyCell(row.in_flight, row.max_concurrency, row.exists) },
+      { label: 'Queued', cell: (row) => occupancyCell(row.queued, row.max_queued, row.exists) },
+      { label: 'Rate limit', cell: (row) => limitText(row.requests_per_second, '/s') },
+      { label: 'Token limit', cell: (row) => limitText(row.tokens_per_minute, '/min') },
+      { label: 'Reservations', cell: (row) => reservationCell(row) },
+      { label: 'Budget', cell: (row) => budgetCell(row) },
+    ],
+  });
+}
+
+/**
+ * Per-target capacity.
+ *
+ * @param {object[]} targets
+ * @returns {HTMLElement}
+ */
+function targetCapacityTable(targets) {
+  return table({
+    caption:
+      'Per-target admission. A target with no admission scope shows the concurrency its configuration declares, which nothing is currently enforcing.',
+    rows: targets,
+    columns: [
+      { label: 'Target', cell: (row) => el('span', { class: 'mono', text: String(row.id ?? '—') }) },
+      { label: 'Concurrency', cell: (row) => occupancyCell(row.in_flight, row.max_concurrency, true) },
+      { label: 'Queued', cell: (row) => occupancyCell(row.queued, row.max_queued, true) },
+      { label: 'Rate limit', cell: (row) => limitText(row.requests_per_second, '/s') },
+      { label: 'Active streams', numeric: true, cell: (row) => formatCount(row.active_streams) },
+      { label: 'Enforced', cell: (row) => enforcedCell(row.admission_scope) },
+    ],
+  });
+}
+
+/**
+ * An occupancy against its limit, with a bar when there is a limit to draw.
+ *
+ * A `<meter>` rather than a styled div, for the reason the fleet screen already
+ * gives: the value, the maximum, and the accessible label come from the element
+ * itself, so a screen reader announces the numbers rather than "graphic".
+ *
+ * @param {unknown} used
+ * @param {unknown} limit
+ * @param {unknown} exists Whether the scope exists at all.
+ * @returns {Node}
+ */
+function occupancyCell(used, limit, exists) {
+  if (exists === false) {
+    // The scope has not been created yet, so there is nothing occupying it —
+    // which is not the same as an occupancy of zero that was measured.
+    return el('span', { class: 'stat__note', text: 'not yet in use' });
+  }
+  if (typeof used !== 'number' || !Number.isFinite(used)) {
+    return text('—');
+  }
+  if (typeof limit !== 'number' || !Number.isFinite(limit) || limit === 0) {
+    return el('span', {}, [
+      text(formatCount(used)),
+      el('span', { class: 'stat__note', text: ' of no limit' }),
+    ]);
+  }
+  const meter = el('meter', {
+    class: 'meter',
+    min: '0',
+    max: String(limit),
+    value: String(Math.min(used, limit)),
+    'aria-label': `${formatCount(used)} of ${formatCount(limit)} in use`,
+  });
+  return el('div', { class: 'meter-row' }, [
+    meter,
+    el('span', {
+      class: 'meter-row__label',
+      text: `${formatCount(used)} / ${formatCount(limit)}`,
+    }),
+  ]);
+}
+
+/**
+ * A configured limit, where zero means "none".
+ *
+ * @param {unknown} value
+ * @param {string} suffix
+ * @returns {Node}
+ */
+function limitText(value, suffix) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return text('—');
+  }
+  if (value === 0) {
+    return el('span', { class: 'stat__note', text: 'no limit' });
+  }
+  return text(`${formatCount(value)}${suffix}`);
+}
+
+/**
+ * The conservation pair from Appendix B.
+ *
+ * Shown because a leak is otherwise invisible until the scope stops admitting
+ * anything: an idle scope whose two counters differ has lost a reservation.
+ *
+ * @param {object} row
+ * @returns {Node}
+ */
+function reservationCell(row) {
+  if (typeof row.acquired !== 'number' || typeof row.released !== 'number') {
+    return text('—');
+  }
+  const outstanding = row.acquired - row.released;
+  const label = `${formatCount(row.acquired)} / ${formatCount(row.released)}`;
+  if (outstanding === 0) {
+    return text(label);
+  }
+  // A non-zero difference is expected while requests are in flight, and is only
+  // a defect if it persists with an idle scope — which the note says, rather
+  // than the cell claiming a leak it cannot know about.
+  return el('span', {}, [
+    text(label),
+    el('span', { class: 'stat__note', text: ` (${formatCount(outstanding)} outstanding)` }),
+  ]);
+}
+
+/**
+ * Spend against the budget, when one is configured.
+ *
+ * @param {object} row
+ * @returns {Node}
+ */
+function budgetCell(row) {
+  const limit = row.budget_minor_units;
+  if (typeof limit !== 'number' || !Number.isFinite(limit) || limit === 0) {
+    return el('span', { class: 'stat__note', text: 'no budget' });
+  }
+  const spent = typeof row.spent_minor_units === 'number' ? row.spent_minor_units : 0;
+  const period = typeof row.budget_period === 'string' ? row.budget_period : 'period';
+  return el('span', {}, [
+    text(`${formatCount(spent)} / ${formatCount(limit)}`),
+    el('span', { class: 'stat__note', text: ` per ${period}, in minor units` }),
+  ]);
+}
+
+/**
+ * Whether an admission scope is actually policing this target.
+ *
+ * @param {unknown} value
+ * @returns {Node}
+ */
+function enforcedCell(value) {
+  if (value === true) {
+    return pill('enforced', 'ok');
+  }
+  if (value === false) {
+    // The configuration declares a concurrency and nothing is admitting against
+    // it. Saying "declared" rather than showing the pair unqualified is what
+    // stops the number being read as a limit in force.
+    return pill('declared only', 'warn');
+  }
+  return pill('unknown', 'neutral');
 }
 
 /**

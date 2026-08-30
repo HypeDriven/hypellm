@@ -7,6 +7,7 @@
 #   just logs       follow the router's structured log
 #   just status     is it up, and what is it serving
 #   just tailnet    the tailnet node: address, routes, who can reach it
+#   just oidc       write the OAuth secret from .env, start the verifier
 #
 # `just --list` prints the rest.
 
@@ -344,6 +345,41 @@ verifier-acceptance:
     @echo
     @verifier/acceptance
 
+# Bring up Google sign-in: the OAuth client secret, then the verifier process.
+#
+# The secret comes from `.env` (see `.env.example`) and lands in
+# `run/verifier/client_secret`. Everything else the verifier needs is in
+# `run/verifier/verifier.json`, which is copied and edited by hand because two
+# of its fields — `client_id` and `redirect_uri` — have to match the router's
+# configuration and the Google console byte for byte, and a recipe that
+# generated them would be a third place for them to disagree.
+#
+# `--check` before `up`: it loads the configuration, asserts the secret file is
+# present and non-empty, and prints what it resolved without starting a socket.
+# It prints "loaded" for the secret, never the secret.
+[doc('Write the OAuth client secret from .env and start the identity verifier')]
+oidc: _dirs _verifier_secret
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -f "{{verifier_dir}}/verifier.json" ]; then
+        echo "hypellm: run/verifier/verifier.json does not exist" >&2
+        echo >&2
+        echo "  cp verifier/verifier.example.json run/verifier/verifier.json" >&2
+        echo >&2
+        echo "  then set client_id and redirect_uri to match oidc_client_id and" >&2
+        echo "  oidc_redirect_uri in {{config}}, and the authorized redirect URI" >&2
+        echo "  on the OAuth client. See verifier/README.md." >&2
+        exit 1
+    fi
+    {{compose}} --profile oidc run --rm --no-deps verifier \
+        python3 /opt/hypellm-verifier/hypellm-verifier \
+        --config /etc/hypellm/verifier/verifier.json --check
+    {{compose}} --profile oidc up -d verifier
+    echo
+    echo "  The verifier is up. The router reads its socket only when"
+    echo "  oidc_verifier_socket is set in {{config}}; add the oidc_* settings"
+    echo "  there and \`just restart\` if you have not already."
+
 # Stop the router the way it is meant to be stopped: `shutdown` over the
 # authenticated control socket, which stops admission and drains in-flight
 # requests. Falls back to compose's SIGTERM/SIGKILL if the socket is gone.
@@ -564,6 +600,58 @@ _secrets:
     echo "  Save it now: with no OIDC configured it is the only way into the"
     echo "  management plane, and therefore the only way to mint the API key"
     echo "  that inference requires. See docs/using-the-router.md."
+
+# Materialise the OAuth client secret from `.env` into the one file the verifier
+# reads, and nowhere else.
+#
+# Why a file when `.env` is right there and compose would happily pass it as an
+# environment variable: `docker inspect hypellm-verifier` prints a container's
+# whole environment to anyone in the `docker` group, and `/proc/<pid>/environ`
+# does the same for the process uid. A 0600 file is readable by the verifier's
+# user alone. So `dotenv-load` stays false at the top of this file and nothing
+# here exports anything — `.env` is a host-side convenience for typing the
+# secret once, not a channel into a container.
+#
+# Parsed, not sourced, for the same reason no secret here is ever an argv entry:
+# `source .env` executes it, which turns a text file holding one secret into
+# arbitrary code running as the invoking user.
+#
+# Absent `.env` is not an error when the secret file already exists — that is
+# the operator who wrote it by hand, as verifier/README.md describes, and
+# overwriting or complaining would both be wrong.
+_verifier_secret:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    env_file="{{justfile_directory()}}/.env"
+    target="{{verifier_dir}}/client_secret"
+    if [ ! -f "$env_file" ]; then
+        if [ -f "$target" ]; then exit 0; fi
+        echo "hypellm: no .env, and run/verifier/client_secret does not exist" >&2
+        echo "  cp .env.example .env    then put the OAuth client secret in it" >&2
+        exit 1
+    fi
+    secret=$(sed -n 's/^[[:space:]]*HYPELLM_OIDC_CLIENT_SECRET=//p' "$env_file" | head -1)
+    # A CRLF `.env` is likely on this host — the repository already carries two
+    # spellings of the Windows Zone.Identifier rule — and a trailing carriage
+    # return would be sent to Google as part of the secret. Stripped before the
+    # quotes, so a quoted value ending in CR loses both.
+    secret=${secret%$'\r'}
+    case "$secret" in
+        \"*\") secret=${secret#\"}; secret=${secret%\"} ;;
+        \'*\') secret=${secret#\'}; secret=${secret%\'} ;;
+    esac
+    if [ -z "$secret" ]; then
+        echo "hypellm: HYPELLM_OIDC_CLIENT_SECRET is unset or empty in .env" >&2
+        exit 1
+    fi
+    # umask first, so the file is never briefly world-readable between the
+    # write and the chmod.
+    umask 077
+    printf '%s' "$secret" > "$target"
+    chmod 600 "$target"
+    # The length, not the value. Enough to catch an empty or truncated paste
+    # without putting the secret in a terminal scrollback or a CI log.
+    echo "→ wrote run/verifier/client_secret from .env (${#secret} bytes)"
 
 # Every provider endpoint the configuration declares, for the endpoint map.
 _upstreams:

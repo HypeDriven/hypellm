@@ -1651,6 +1651,9 @@ fn the_publish_response_carries_nothing_beyond_the_activation_it_performed() {
 fn self_approving_api(admin: &Harness) -> AdminApi {
     let state = Arc::new(AdminState {
         config: Arc::clone(&admin.state.config),
+        // Shared, so the two APIs cannot disagree about whether the inference
+        // listener requires a credential.
+        anonymous_access: Arc::clone(&admin.state.anonymous_access),
         keys: Arc::clone(&admin.state.keys),
         sessions: Arc::clone(&admin.state.sessions),
         oidc: Arc::clone(&admin.state.oidc),
@@ -1663,6 +1666,8 @@ fn self_approving_api(admin: &Harness) -> AdminApi {
         cors: CorsPolicy::with_origins(vec![ALLOWED_ORIGIN.to_owned()]),
         decisions: Arc::clone(&admin.state.decisions),
         usage: Arc::clone(&admin.state.usage),
+        traffic: Arc::clone(&admin.state.traffic),
+        admission: admin.state.admission.clone(),
         audit: Arc::clone(&admin.state.audit),
         drafts: DraftStore::with_self_approval(),
         break_glass: None,

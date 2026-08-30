@@ -783,6 +783,33 @@ impl Router {
         }
 
         let keys = Arc::new(KeyStore::new(&secrets.key_verifier));
+        // Anonymous access is runtime state, not configuration: the document
+        // says who an anonymous caller would be, and only the management API
+        // says whether one is served. So it is restored from the log rather
+        // than read from `config`, and a router whose log has never carried
+        // one of these frames requires a credential — which is what a router
+        // that has never been told otherwise must do.
+        let anonymous_access = Arc::new(std::sync::atomic::AtomicBool::new(
+            restore_anonymous_access(&recovery),
+        ));
+        if anonymous_access.load(std::sync::atomic::Ordering::SeqCst) {
+            let scopes = config.settings.anonymous_scopes.join(",");
+            telemetry.log(
+                &hypellm_telemetry::Event::critical("startup.anonymous_access_enabled")
+                    .str_field(
+                        hypellm_telemetry::Field::Code,
+                        config.settings.anonymous_principal.as_deref().unwrap_or(""),
+                    )
+                    .str_field(hypellm_telemetry::Field::Detail, &format!(
+                        "requests to the inference listener that present no credential are \
+                         served as this principal with scopes [{scopes}]. Anyone who can \
+                         reach the inference listener can spend this fleet's capacity. \
+                         Turn it off from the management API; it is not a configuration \
+                         setting and editing the configuration file will not change it"
+                    )),
+            );
+        }
+
         let restored_keys = restore_keys(&recovery, &keys);
         if restored_keys.unreadable > 0 {
             // Dropping a record silently would quietly reduce a key's authority
@@ -844,12 +871,13 @@ impl Router {
         let policy_for_fleet = config.snapshot.clone();
 
         let state = Arc::new(RouterState {
+            anonymous_access,
             config: Arc::new(Activatable::new(config)),
             keys,
             sessions,
             credentials,
             health,
-            admission,
+            admission: Arc::new(admission),
             egress,
             telemetry: Arc::clone(&telemetry),
             store: Arc::new(store),
@@ -857,6 +885,10 @@ impl Router {
             trusted_edge: TrustedEdge::none(),
             decisions: Arc::new(DecisionCache::default()),
             usage: Arc::new(hypellm_admin_api::UsageAggregate::default()),
+            // Starts observing now, on the monotonic clock, so the overview can
+            // say how much of a window the router has actually been up for
+            // rather than dividing by a window it has not lived through.
+            traffic: Arc::new(hypellm_admin_api::TrafficWindow::new(clock.now_millis())),
             fleet: std::sync::OnceLock::new(),
         });
 
@@ -1384,6 +1416,28 @@ struct RestoredKeys {
 /// bypasses configuration publication delay" survive a restart. Without this
 /// the whole key store is empty on boot and every issued credential stops
 /// authenticating.
+/// Whether the last `AnonymousAccess` frame switched it on.
+///
+/// Last frame wins; absent means off. A frame whose payload does not parse, or
+/// carries no `enabled`, is treated as *off* rather than skipped: the two
+/// differ when a malformed frame is the most recent one, and refusing
+/// uncredentialed requests is the direction to fail in.
+fn restore_anonymous_access(recovery: &hypellm_store::Recovery) -> bool {
+    let Some(frame) = recovery
+        .of_kind(hypellm_store::RecordKind::AnonymousAccess)
+        .last()
+    else {
+        return false;
+    };
+    let Ok(text) = core::str::from_utf8(&frame.payload) else {
+        return false;
+    };
+    wire_json::parse_str(text, &wire_json::Limits::SMALL)
+        .ok()
+        .and_then(|value| value.opt_field_bool("enabled").ok().flatten())
+        .unwrap_or(false)
+}
+
 fn restore_keys(recovery: &hypellm_store::Recovery, keys: &KeyStore) -> RestoredKeys {
     let mut counts = RestoredKeys::default();
 
@@ -1651,6 +1705,81 @@ binding id=b scope=tenant:acme model=* prefer=local:m
     }
 
     /// A recovery containing one `ConfigActivation` frame carrying `text`.
+    /// A recovery containing the given `AnonymousAccess` payloads, in order.
+    fn recovery_with_switches(dir: &TempDir, payloads: &[&str]) -> hypellm_store::Recovery {
+        let (store, _) = Store::open(dir.path(), b"a-store-mac-key-for-these-tests", 0)
+            .expect("open store");
+        for payload in payloads {
+            store
+                .append(RecordKind::AnonymousAccess, payload.as_bytes())
+                .expect("append switch");
+        }
+        drop(store);
+        let (_store, recovery) = Store::open(dir.path(), b"a-store-mac-key-for-these-tests", 0)
+            .expect("reopen store");
+        recovery
+    }
+
+    #[test]
+    fn a_router_that_was_never_told_otherwise_requires_a_credential() {
+        // Absent means off. This is the state of every fresh deployment, and
+        // the one a torn log tail leaves behind.
+        let dir = TempDir::new("anon-empty");
+        let recovery = recovery_with_switches(&dir, &[]);
+        assert!(!restore_anonymous_access(&recovery));
+    }
+
+    #[test]
+    fn the_last_switch_frame_wins() {
+        // Durability in both directions, and the ordering that makes it right.
+        // A router that restored the *first* frame would come back open days
+        // after an operator closed it.
+        let dir = TempDir::new("anon-order");
+        let recovery = recovery_with_switches(
+            &dir,
+            &[
+                r#"{"enabled":true,"at":1,"by":"user:a"}"#,
+                r#"{"enabled":false,"at":2,"by":"user:a"}"#,
+                r#"{"enabled":true,"at":3,"by":"user:b"}"#,
+            ],
+        );
+        assert!(restore_anonymous_access(&recovery));
+
+        let dir = TempDir::new("anon-order-off");
+        let recovery = recovery_with_switches(
+            &dir,
+            &[
+                r#"{"enabled":true,"at":1,"by":"user:a"}"#,
+                r#"{"enabled":false,"at":2,"by":"user:a"}"#,
+            ],
+        );
+        assert!(!restore_anonymous_access(&recovery));
+    }
+
+    #[test]
+    fn an_unreadable_switch_frame_leaves_the_router_closed() {
+        // Fails in the refusing direction. The alternative — skipping a
+        // malformed frame and honouring the one before it — would let a
+        // corrupt tail resurrect a switch an operator had turned off, which is
+        // the one direction a damaged log must not be able to move this.
+        for payload in [
+            "not json at all",
+            "{}",
+            r#"{"enabled":"yes"}"#,
+            r#"{"disabled":true}"#,
+        ] {
+            let dir = TempDir::new("anon-malformed");
+            let recovery = recovery_with_switches(
+                &dir,
+                &[r#"{"enabled":true,"at":1,"by":"user:a"}"#, payload],
+            );
+            assert!(
+                !restore_anonymous_access(&recovery),
+                "`{payload}` as the newest frame must leave the router closed"
+            );
+        }
+    }
+
     fn recovery_with_activation(dir: &TempDir, text: &str) -> hypellm_store::Recovery {
         let (store, _) = Store::open(dir.path(), b"a-store-mac-key-for-these-tests", 0)
             .expect("open store");

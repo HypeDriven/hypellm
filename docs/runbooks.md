@@ -85,6 +85,7 @@ on the spot.
 ```
 GET /admin/v1/overview        # ReadSummary
 GET /admin/v1/targets         # ReadSummary, paginated
+GET /admin/v1/traffic         # ReadSummary
 ```
 
 `overview` returns `targets_total`, `targets_healthy`, `targets_degraded`,
@@ -94,6 +95,31 @@ GET /admin/v1/targets         # ReadSummary, paginated
 (`closed` / `open` / `half_open`), `in_flight`, `total_requests`,
 `total_failures`, `quarantined`, plus declared capabilities and cost class
 (`handlers.rs`, `render_target`).
+
+`traffic` returns the figures the other two cannot: a rolling rate and latency
+window, and the admission limits beside their occupancy. The counters on
+`targets` are cumulative since the router started, so the ratio between them is
+the average over the whole uptime — on a router that was busy yesterday and is
+idle now, it reads as busy. Use `traffic` for "what is happening", `targets` for
+"what has happened".
+
+Two things about it are worth knowing before quoting a number from it:
+
+- **Every window reports `covered_millis` as well as `window_millis`.** The rate
+  is `requests / covered_millis`, never `requests / window_millis`: a router up
+  for thirty seconds has not lived through a minute, and dividing by the nominal
+  window would understate it by half.
+- **Percentiles are bucket upper bounds.** `p99_millis: 25` means "at or below
+  25 ms". A percentile that fell past the largest bucket is `null` with a
+  non-zero `above_largest_bucket`, which is "longer than two minutes" rather
+  than "two minutes". Specification 19.1's measured distributions come from
+  `hypellm-bench`.
+
+Rate and latency are scoped to the caller's own tenant (Appendix B). `attributed:
+false` means this tenant's samples were not recorded — the router keeps a bounded
+set of per-tenant windows and every one was in use — and is *not* the same as no
+traffic. `capacity.available: false` means the deployment attached no admission
+controller to the management API.
 
 Neither response contains a provider credential, a provider error message, or
 any prompt content. Provider error text is dropped at the adapter boundary;

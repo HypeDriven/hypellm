@@ -76,6 +76,19 @@ pub enum AuthMethod {
     ApiKey,
     /// Unix socket peer credentials.
     LocalPeer,
+    /// No credential was presented, and the deployment configured an anonymous
+    /// principal for the inference listener to fall back to.
+    ///
+    /// Recorded as its own method for the reason [`Self::ApiKey`] was added:
+    /// specification 22.3's investigation starts from *how* a principal
+    /// authenticated, and the honest answer here is "it did not". Reusing
+    /// `ApiKey` would export every open request as having presented a
+    /// credential that was never issued, which is precisely the false answer
+    /// that field exists to prevent.
+    ///
+    /// This is a deviation from specification 9.2, recorded in
+    /// `docs/deferred-issues.md`. It is off unless configured.
+    Anonymous,
 }
 
 impl AuthMethod {
@@ -88,6 +101,7 @@ impl AuthMethod {
             Self::Password => "password",
             Self::ApiKey => "api_key",
             Self::LocalPeer => "local_peer",
+            Self::Anonymous => "anonymous",
         }
     }
 }
