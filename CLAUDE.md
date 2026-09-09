@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The specification is `secure_llm_router_specification.md` (v1.0, "HypeLLM Router"). It is the authority: when this file and the specification disagree, the specification wins.
 
-The implementation is a Rust workspace of 17 crates, a static admin SPA under `web/`, and two reference out-of-process services that are deliberately **not** workspace members: the fleet agent under `agent/` and the identity verifier under `verifier/`. It is **not** feature-complete against the specification; `docs/deferred-issues.md` lists only the current limitations and accepted deviations.
+The implementation is a Rust workspace of 17 crates, a static admin SPA under `web/`, and three reference out-of-process components that are deliberately **not** workspace members: the fleet agent under `agent/`, the identity verifier under `verifier/`, and the container init under `supervisor/`. It is **not** feature-complete against the specification; `docs/deferred-issues.md` lists only the current limitations and accepted deviations.
 
 The repository uses Git. Do not assume an edited working tree is disposable.
 
@@ -29,6 +29,7 @@ cargo run -p hypellm-router -- --generate-secrets <dir>      # creates the key b
 cargo run -p hypellm-router -- --check --config <path>       # validate configuration; prints the fleet digest too
 cargo run -p hypellm-router -- --config <path> --secrets <dir> [--static web] [--log info]
 cargo run -p hypellm-router -- --shutdown --config <path> --secrets <dir>   # graceful stop
+cargo run -p hypellm-router -- --backup --config <path> --secrets <dir>     # copy state into `settings backup_dir`
 ```
 
 `--generate-secrets` prints the break-glass token **once** and stores only its verifier; the token is the operator's to keep offline (§22.4). Control-socket commands are authenticated by `<secrets>/control.key`, so use `--shutdown` rather than writing to the socket by hand — it keeps the token out of the process list.
@@ -59,6 +60,7 @@ These are the spec's defining decisions. Most "obvious" implementation choices v
 - **Configuration is a custom line-oriented grammar, not YAML/TOML** — records of the form `type key=value …`, JSON-style quoted strings, `#` comments, unknown fields are errors. No includes, env-var expansion, anchors, or templates (§11.1).
 - **The SPA has no `vendor/` directory.** First-party HTML/CSS/ES-modules/SVG only; no eval, no inline handlers, no HTML string injection (build DOM nodes), no service-worker code execution, strict CSP (§15).
 - **Everything is bounded.** No unbounded thread, task, buffer, channel, queue, retry loop, or log entry may originate from a request. Header/body/JSON-depth/stream-buffer limits are in §3.2; every I/O has a deadline and cancellation path. A request may not create an unbounded amount of *fleet work* either: activation queues, plan sizes, eviction sets and leases all carry finite maxima.
+- **The router handles no signals**, and cannot: `sigaction` and `signalfd` are `unsafe` FFI, which §18.2 forbids, and std has no signal API. Shutdown is the authenticated control socket. `supervisor/hypellm-init` is PID 1 in the container and converts `SIGTERM` into `hypellm-router --shutdown`, which is why `docker stop` drains — a container's PID 1 gets no default signal actions, so a bare router there ignores `SIGTERM` outright.
 - **The router never executes a process.** Starting a container means `ssh` and `docker`, which happens in `agent/` across a narrow authenticated Unix socket carrying opaque identifiers and bounded integers only. `depscan`'s `forbidden-api` rule fails the build on `process::Command`; do not work around it (§26.2).
 - **The router verifies no JWT and terminates no TLS.** §4 and §9.1 put both outside it, so `hypellm-net::helper` is a *client* for two platform services. `verifier/` is the reference identity verifier: it performs no cryptography of its own — `openssl dgst -verify` for the signature, the platform's TLS for the transport — and it validates the signature only, because `iss`/`aud`/`exp`/`nonce` are checked in exactly one place (`hypellm_auth::oidc::validate_claims`). Adding a claim check there would create the second path that design exists to prevent.
 
@@ -78,7 +80,7 @@ Workspace crates as built. §18.1 names most of these; the six marked *(addition
 | `hypellm-auth` | API keys, OIDC transactions and sessions, peer/edge identity |
 | `hypellm-adapters` | Compile-time provider families. The only code that touches provider credentials |
 | `hypellm-net` | Egress guard, bounded upstream client, connection pool, DNS pool, TLS/verifier helpers *(addition)* |
-| `hypellm-crypto` | SHA-256, HMAC, CRC-32, base64, hex, constant-time compare, OS randomness *(addition)* — see its `MODULE.md`; it deliberately implements **no** TLS, asymmetric signatures, or JWT verification |
+| `hypellm-crypto` | SHA-256, HMAC, CRC-32, PBKDF2, scrypt, base64, hex, constant-time compare, OS randomness *(addition)* — see its `MODULE.md`; it deliberately implements **no** TLS, asymmetric signatures, or JWT verification |
 | `hypellm-admin-api` | `/admin/v1` surface, CORS/CSRF, drafts, usage and audit views |
 | `hypellm-telemetry` | Bounded metrics and structured logs with closed label vocabularies |
 | `wire-http1`, `wire-json`, `wire-sse` | Strict bounded parsers written in-repo |
@@ -129,6 +131,8 @@ A fuzz target that only asserts "does not panic" is close to worthless here. Eac
 
 Keep fuzz documentation aligned with the suites that exist. The required seven areas are present; module-specific optional targets may still be absent and must not be claimed as implemented.
 
+- **The out-of-workspace components have their own suites**, outside `cargo test` because they are deliberately outside the workspace. `python3 supervisor/test_hypellm_init.py` covers the container init — a signal becoming `--shutdown`, a second signal not cutting the drain, a wedged drain being killed *and reported*. Run it when touching `supervisor/hypellm-init`.
+- `python3 agent/test_fleet_agent.py` covers the `FETCH` path — retry and resumption, the attempt cap, the router's deadline, one-fetch-per-host, cancellation during backoff, and the digest refusal — with `run_on` replaced by a scripted stub. No SSH, no Docker, no network. Run it when touching `agent/fleet-agent`.
 - **Fleet integration** — `crates/hypellm-router/tests/fleet.rs` drives the real client over a real Unix socket against `hypellm_net::fleet_sim::SimulatedAgent`, which verifies the handshake HMAC and enforces its own allowlist. `Clock::sleep` advances a `TestClock` rather than blocking, so a three-minute model load takes microseconds and the deadline arithmetic is exact. No SSH, no Docker, no network.
 
 ### What a test here is for

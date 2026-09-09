@@ -2230,6 +2230,11 @@ target id=local:model provider=local model=test-model local=true \\
 alias id=test-alias capability=chat targets=local:model description=\"the test model\"
 grant scope=tenant:acme model=* allow=true
 binding id=default scope=tenant:acme model=* prefer=local:model
+# The harness key's principal, bound here rather than carried on the key: a key
+# says who is calling, and the configuration says what they may do. `operator`
+# holds `fleet.activate`, which is permission to make the *fleet* do work; a
+# plain inference key deliberately has none, which `svc:plain` below proves.
+role_binding subject=principal:svc:test role=operator
 fleet_agent id=local socket=\"{socket}\" observation_interval_ms=1000 \\
     observation_max_age_ms=600000 request_timeout_ms=5000
 host id=h1 agent=local arch=x86_64 reserved_memory_bytes=0 max_concurrent_activations=1
@@ -2353,7 +2358,6 @@ fn a_key_without_the_fleet_permission_cannot_cause_an_activation() {
             hypellm_core::ids::TenantId::new("acme").expect("tenant"),
             hypellm_core::ids::PrincipalId::new("svc:plain").expect("principal"),
             vec![hypellm_auth::Scope::Inference],
-            Vec::new(),
             None,
             hypellm_auth::SourceRestriction::Any,
             Some("a key with no fleet permission".to_owned()),
@@ -2390,4 +2394,137 @@ fn a_key_without_the_fleet_permission_cannot_cause_an_activation() {
         agent.verbs()
     );
     agent.stop();
+}
+
+// -- Jobs (specification-extension 11) ---------------------------------------
+
+/// Drive one job worker until it has nothing left to do.
+///
+/// The harness starts no worker pool — `Harness::start` binds a listener, not a
+/// router — so the test runs the loop itself. It exercises the real
+/// `jobs::worker_loop` against the real pipeline and the real fake upstream;
+/// only the *scheduling* is the test's.
+fn drain_jobs(router: &TestRouter) {
+    let state = Arc::clone(&router.state);
+    let jobs = state.jobs().expect("the harness enables jobs").clone();
+    let worker = std::thread::spawn(move || hypellm_router::jobs::worker_loop(&state));
+    // The loop exits when the store stops, which is the only way out of its
+    // blocking take.
+    std::thread::sleep(Duration::from_millis(200));
+    jobs.shutdown();
+    let _ = worker.join();
+}
+
+#[test]
+fn a_job_is_accepted_runs_and_yields_its_result() {
+    // The whole point of the endpoint: the connection is released at `202`, and
+    // the answer is collected later. Asserted end to end over real HTTP,
+    // because the interesting failures — a 202 with no job, a result that never
+    // materialises, a body in the wrong dialect — are all invisible from the
+    // store's own tests.
+    let harness = Harness::default(chat_completion_response());
+
+    let accepted = harness.request("POST", "/v1/jobs", CHAT_BODY, true);
+    assert_eq!(accepted.status, 202, "body: {}", accepted.body);
+    assert!(accepted.body.contains("\"state\":\"queued\""), "{}", accepted.body);
+    let job_id = accepted
+        .body
+        .split("\"job_id\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("a job id")
+        .to_owned();
+
+    // Not finished, so the result is a 409 rather than an empty 200. A client
+    // that received `{}` here would parse it as an answer.
+    let early = harness.request("GET", &format!("/v1/jobs/{job_id}/result"), "", true);
+    assert_eq!(early.status, 409, "body: {}", early.body);
+    assert!(early.body.contains("job_not_ready"), "{}", early.body);
+
+    drain_jobs(&harness.router);
+
+    let done = harness.request("GET", &format!("/v1/jobs/{job_id}"), "", true);
+    assert_eq!(done.status, 200, "body: {}", done.body);
+    assert!(
+        done.body.contains("\"state\":\"succeeded\""),
+        "the job did not succeed: {}",
+        done.body
+    );
+
+    let result = harness.request("GET", &format!("/v1/jobs/{job_id}/result"), "", true);
+    assert_eq!(result.status, 200, "body: {}", result.body);
+    assert!(
+        result.body.contains("chat.completion"),
+        "the result is not a chat response: {}",
+        result.body
+    );
+}
+
+#[test]
+fn a_job_is_not_readable_without_a_credential() {
+    // The endpoint sits on the inference listener and authenticates exactly as
+    // the rest of it does. A job id is a handle within a tenant, never a
+    // bearer token on its own.
+    let harness = Harness::default(chat_completion_response());
+    let accepted = harness.request("POST", "/v1/jobs", CHAT_BODY, true);
+    assert_eq!(accepted.status, 202, "body: {}", accepted.body);
+    let job_id = accepted
+        .body
+        .split("\"job_id\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("a job id")
+        .to_owned();
+
+    let anonymous = harness.request("GET", &format!("/v1/jobs/{job_id}"), "", false);
+    assert_eq!(anonymous.status, 401, "body: {}", anonymous.body);
+
+    let unsubmitted = harness.request("POST", "/v1/jobs", CHAT_BODY, false);
+    assert_eq!(unsubmitted.status, 401, "body: {}", unsubmitted.body);
+}
+
+#[test]
+fn an_unknown_job_is_not_found_rather_than_forbidden() {
+    let harness = Harness::default(chat_completion_response());
+    for path in [
+        "/v1/jobs/job_00000000000000000000000000000000",
+        "/v1/jobs/job_00000000000000000000000000000000/result",
+        "/v1/jobs/not-a-job-id",
+    ] {
+        let response = harness.request("GET", path, "", true);
+        assert_eq!(response.status, 404, "{path}: {}", response.body);
+        assert!(response.body.contains("job_not_found"), "{}", response.body);
+    }
+}
+
+#[test]
+fn a_cancelled_job_never_reaches_the_upstream() {
+    // Cancellation has to be observable before the work starts, or it is only a
+    // way to stop reading the answer. The job is cancelled while queued, the
+    // worker then runs, and the upstream must see nothing.
+    let harness = Harness::default(chat_completion_response());
+    let accepted = harness.request("POST", "/v1/jobs", CHAT_BODY, true);
+    let job_id = accepted
+        .body
+        .split("\"job_id\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("a job id")
+        .to_owned();
+
+    let cancelled = harness.request("DELETE", &format!("/v1/jobs/{job_id}"), "", true);
+    assert_eq!(cancelled.status, 200, "body: {}", cancelled.body);
+    assert!(
+        cancelled.body.contains("\"state\":\"cancelled\""),
+        "{}",
+        cancelled.body
+    );
+
+    let before = harness.upstream.served();
+    drain_jobs(&harness.router);
+    assert_eq!(
+        harness.upstream.served(),
+        before,
+        "a cancelled job still reached the provider"
+    );
 }

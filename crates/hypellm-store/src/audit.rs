@@ -82,6 +82,13 @@ pub enum AuditAction {
     RouterStopped,
     /// Settings were changed.
     SettingsChanged,
+    /// A point-in-time backup of the state directory was taken.
+    ///
+    /// A backup is a complete copy of everything the log and snapshot hold, so
+    /// it is a security-relevant event in its own right: specification 17 asks
+    /// who caused state to leave the state directory, and without a record the
+    /// answer is that nobody can tell.
+    StateBackedUp,
 
     // -- Fleet orchestration (specification-extension 18) -------------------
     //
@@ -148,6 +155,7 @@ impl AuditAction {
             Self::RouterStarted => "router_started",
             Self::RouterStopped => "router_stopped",
             Self::SettingsChanged => "settings_changed",
+            Self::StateBackedUp => "state_backed_up",
         }
     }
 
@@ -203,6 +211,7 @@ impl AuditAction {
             Self::RouterStarted,
             Self::RouterStopped,
             Self::SettingsChanged,
+            Self::StateBackedUp,
             Self::FleetActivate,
             Self::FleetDeactivate,
             Self::FleetEvict,

@@ -31,20 +31,32 @@ test-vector-verifiable primitives the router cannot function without:
 | Base64 / Base64url | RFC 4648 | Key material encoding, OIDC PKCE/state, cookie values |
 | Hex | RFC 4648 §8 | Digest display in audit records and config digests |
 | Constant-time compare | — | Digest comparison without timing oracle |
-| PBKDF2-HMAC-SHA-256 | RFC 8018 §5.2 | `local_user` password verifiers on the management plane |
+| PBKDF2-HMAC-SHA-256 | RFC 8018 §5.2 | scrypt's inner and outer passes; reading `local_user` verifiers written before scrypt |
+| scrypt | RFC 7914 | `local_user` password verifiers on the management plane |
 
 Every primitive is validated against published vectors in the unit tests. A
 divergence from the reference is a build failure, not a runtime surprise.
 
-PBKDF2 is the newest entry and the one that needs justifying. It adds no
-primitive: it is the HMAC above, iterated, and RFC 8018 specifies it exactly, so
-it meets this module's admission test — the unit tests hold it against published
-vectors, cross-checked against `hashlib.pbkdf2_hmac`. It is **not** memory-hard.
-Argon2id or scrypt would resist GPU and ASIC attack materially better, and
-neither is deterministic-and-test-vector-verifiable in the narrow sense this
-module requires of in-repository code. The consequence is recorded in
-`docs/deferred-issues.md`: treat an offline copy of the configuration as an
-offline copy of the password hashes, and prefer an identity provider.
+scrypt is the newest entry and the one that needs justifying. It adds one
+non-obvious piece — the Salsa20/8 core — and nothing else: the inner and outer
+passes are the PBKDF2 above, and `scryptBlockMix` and `scryptROMix` are index
+arithmetic over it. Salsa20/8 here is a fixed permutation with no key schedule,
+no field arithmetic, and no parsing; it is not used as a cipher and nothing
+depends on its cryptographic properties beyond diffusion. RFC 7914 specifies all
+four in full and publishes vectors for the whole construction, which
+`scrypt::tests` holds this against — a wrong rotation, a missed shuffle, a
+big-endian `Integerify`, or a zero-based PBKDF2 block counter each fail there.
+So it meets this module's admission test on the same terms PBKDF2 did.
+
+It replaced PBKDF2 for password verifiers because PBKDF2 is not memory-hard: an
+iterated SHA-256 is the shape a GPU or an ASIC is good at, so an attacker with
+an offline copy of the configuration got orders of magnitude more guesses per
+second than the router spent deriving. PBKDF2 verifiers still *parse*, so a
+configuration written before this keeps loading; `--hash-password` emits scrypt,
+and the router logs `startup.password_verifier_legacy` for any account still on
+the old form. Memory is bounded at `MAX_MEMORY_BYTES` and refused at parse time,
+because a verifier is read from a file and `ln=30` in one must be a
+configuration error rather than an allocation on an unauthenticated endpoint.
 
 ## Threat notes
 
@@ -74,9 +86,11 @@ offline copy of the password hashes, and prefer an identity provider.
 | HMAC key length | Unbounded input, hashed down to 32 bytes when > 64 |
 | Base64 decode input | Caller-supplied `max_output` (bytes), default callers use 8 KiB |
 | Hex decode input | Caller-supplied buffer size |
-| PBKDF2 password length | 1 024 bytes; longer is refused without hashing |
-| PBKDF2 iterations | 1 000 to 10 000 000; the default derivation uses 210 000 |
-| PBKDF2 salt | 8 to 64 bytes; 16 when derived here |
+| Password length | 1 024 bytes; longer is refused without hashing |
+| scrypt working set | `128 · N · r`, refused above `MAX_MEMORY_BYTES` (128 MiB); 32 MiB at the defaults (`ln=15, r=8, p=1`) |
+| scrypt cost floor | `ln` below `MIN_LOG_N` (8) is a parse error, so `ln=1` cannot reach production by way of a typo |
+| PBKDF2 iterations | 1 000 to 10 000 000, for reading verifiers written before scrypt |
+| Verifier salt | 8 to 64 bytes; 16 when derived here |
 
 ## Public API
 

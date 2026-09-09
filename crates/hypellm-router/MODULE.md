@@ -197,7 +197,11 @@ management listeners differ, so both are given.
 | End-to-end deadline | `settings.default_deadline_ms`, default 120 s | — | `Deadline::after` in `InferenceHandler::inference`, checked each attempt |
 | Admission queue wait | `min(settings.queue_timeout_ms` (default 5 s)`, deadline remaining)` | — | `pipeline::execute` → `AdmissionController::reserve_queued`; zero never waits |
 | Admission queue depth | `quota queued=`, default 0 (no queue) | — | `ScopeLimits::max_queued` in `Scope::join_queue` |
-| Background threads | 4 fixed: accept loop, management listener, housekeeping, and the metrics listener when `settings metrics_listen` names one | — | `Router::run`; none is created per request (3.2) |
+| Background threads | 4 fixed — accept loop, management listener, housekeeping, and the metrics listener when `settings metrics_listen` names one — plus `settings job_workers` (default 0) | — | `Router::run`; none is created per request (3.2) |
+| Live jobs per tenant | `settings max_jobs_per_tenant`, default 32; counts retained jobs until they expire | — | `JobStore::submit`, checked under the insert lock |
+| Queued jobs | `settings max_queued_jobs`, default 64, fleet-wide | — | `JobStore::submit`; a full queue is a `429`, never growth |
+| Job result spool | `settings max_job_result_bytes`, default 8 MiB, in memory | — | `JobStore::finish`; a larger result fails the job rather than truncating it |
+| Job retention | `settings job_retention_ms`, default 15 min | — | `JobStore::sweep_locked`, run from every path that reads the table |
 | Control socket path | 100 bytes | — | `startup::MAX_UNIX_PATH`, checked before bind |
 | Platform secret file | ≥ 32 bytes each, five files | — | `Secrets::from_dir` |
 

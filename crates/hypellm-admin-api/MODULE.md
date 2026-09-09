@@ -75,6 +75,16 @@ can cost the fleet hours of bandwidth and hundreds of gigabytes of disk.
 
 ## Threat notes
 
+- **A management API key as a route around the session controls.** `/admin/v1`
+  accepts a key carrying `management:read` (and `management:write` for anything
+  mutating) as well as a session cookie. `AdminApi::key_caller` is reached
+  *only* when no session cookie was sent, so a request that is
+  cookie-authenticated cannot divert itself to a path with no CSRF check by
+  adding an `Authorization` header. The key carries no roles of its own — they
+  are resolved from the active configuration's bindings for its principal on
+  every request — and `require` refuses `BreakGlass` and `ManageKeys` to any
+  key whatever those bindings say, so a key that publishes a policy granting
+  itself `break_glass_admin` still cannot use either.
 - **Cross-site request forgery against a privileged session.** The gate in
   `AdminApi::handle` runs origin → session → CSRF → permission → freshness →
   `If-Match`, and the order is load-bearing: a caller from a hostile origin is

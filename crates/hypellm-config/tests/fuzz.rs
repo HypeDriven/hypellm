@@ -127,9 +127,11 @@ fn no_mutated_verifier_ever_accepts_a_password_it_was_not_built_from() {
     // parser would most plausibly accept: the empty string, and the username.
     const PROBES: &[&str] = &["", "admin", "password", "\u{0}", "the-real-password "];
 
-    let verifier = hypellm_crypto::PasswordVerifier::derive(
+    let verifier = hypellm_crypto::PasswordVerifier::derive_with(
         "the-real-password",
-        hypellm_crypto::pbkdf2::MIN_ITERATIONS,
+        hypellm_crypto::scrypt::MIN_LOG_N,
+        hypellm_crypto::scrypt::DEFAULT_R,
+        hypellm_crypto::scrypt::DEFAULT_P,
     )
     .expect("the test host has an entropy source")
     .encode();

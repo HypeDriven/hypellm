@@ -550,7 +550,7 @@ impl Router {
         // anybody else can reach.
         //
         // "The password is the username" is the cheapest test that catches it.
-        // It costs one PBKDF2 verification per local account, so it runs
+        // It costs one verification per local account, so it runs
         // against a deadline: a configuration is allowed to declare 64 accounts
         // at ten million iterations each, and a router that took five minutes
         // to start because of a *warning* would be a worse defect than the one
@@ -563,6 +563,24 @@ impl Router {
                 if started.elapsed() >= CHECK_BUDGET {
                     unchecked = unchecked.saturating_add(1);
                     continue;
+                }
+                // A verifier written before scrypt still authenticates, and an
+                // operator has no way to see that from the screens — the
+                // configuration text is not on any of them. Said once per
+                // account at startup, because the remedy is one command and
+                // the cost of not knowing is that an offline copy of the
+                // configuration is worth orders of magnitude more guesses.
+                if !user.verifier.is_memory_hard() {
+                    telemetry.log(
+                        &hypellm_telemetry::Event::warn("startup.password_verifier_legacy")
+                            .str_field(hypellm_telemetry::Field::Code, &user.id)
+                            .str_field(
+                                hypellm_telemetry::Field::Detail,
+                                "this local account's verifier is PBKDF2, which is not \
+                                 memory-hard. Re-derive it with \
+                                 `hypellm-router --hash-password` to get scrypt",
+                            ),
+                    );
                 }
                 if user.verifier.verify(&user.id) {
                     telemetry.log(
@@ -870,7 +888,20 @@ impl Router {
         }
         let policy_for_fleet = config.snapshot.clone();
 
+        // Off unless asked for. A `/v1/jobs` that accepted work with no worker
+        // to run it would report `queued` forever, which is worse than a 404.
+        let jobs = (config.settings.job_workers > 0).then(|| {
+            Arc::new(crate::jobs::JobStore::new(crate::jobs::JobLimits {
+                max_per_tenant: config.settings.max_jobs_per_tenant.max(1),
+                max_queued: config.settings.max_queued_jobs.max(1),
+                max_result_bytes: usize::try_from(config.settings.max_job_result_bytes)
+                    .unwrap_or(usize::MAX),
+                retention_ms: config.settings.job_retention_ms,
+            }))
+        });
+
         let state = Arc::new(RouterState {
+            jobs,
             anonymous_access,
             config: Arc::new(Activatable::new(config)),
             keys,
@@ -1097,6 +1128,29 @@ impl Router {
                 .spawn(move || housekeeping_loop(&state, &stopping))?
         };
 
+        // The job pool. A fixed number of threads, started here and never from
+        // a request (specification 3.2), and none at all unless
+        // `settings job_workers` asked for them.
+        let job_workers = {
+            let count = state.config().settings.job_workers;
+            let mut handles = Vec::new();
+            if state.jobs().is_some() {
+                for index in 0..count {
+                    let state = Arc::clone(&state);
+                    handles.push(
+                        std::thread::Builder::new()
+                            .name(format!("hypellm-job-{index}"))
+                            .spawn(move || crate::jobs::worker_loop(&state))?,
+                    );
+                }
+                state.telemetry.log(
+                    &hypellm_telemetry::Event::info("router.jobs_enabled")
+                        .int_field(hypellm_telemetry::Field::Count, u64::from(count)),
+                );
+            }
+            handles
+        };
+
         // `serve` returns once the accept loop stops *and* its connections have
         // drained within their deadline.
         let result = self.inference.serve(inference_handler);
@@ -1107,6 +1161,17 @@ impl Router {
             let _ = thread.join();
         }
         let _ = housekeeping.join();
+
+        // After the listeners have drained: a job accepted on the last request
+        // before the drain still gets its worker. `shutdown` stops new
+        // submissions and cancels what is still queued, so the join is bounded
+        // by the work already running rather than by the queue.
+        if let Some(jobs) = state.jobs() {
+            jobs.shutdown();
+        }
+        for worker in job_workers {
+            let _ = worker.join();
+        }
 
         if abandoned > 0 {
             state.telemetry.log(
@@ -1213,6 +1278,27 @@ fn housekeeping_loop(state: &Arc<RouterState>, stopping: &crate::server::Shutdow
                 // have reported back did not. Releasing it here is what keeps a
                 // leaked lease from pinning a host out of service.
                 fleet.expire_leases();
+
+                // Predictive pre-warm (specification-extension 9.8), which does
+                // nothing unless a host declares `prewarm_min_rate_per_minute`.
+                // It runs *after* observation, on belief that was just
+                // refreshed, and on this thread rather than a request's: a
+                // speculative activation must never be something a caller waits
+                // behind.
+                if let Some(deployment) = fleet.prewarm() {
+                    state.telemetry.log(
+                        &hypellm_telemetry::Event::info("fleet.prewarm_started")
+                            .str_field(
+                                hypellm_telemetry::Field::Deployment,
+                                deployment.as_str(),
+                            )
+                            .str_field(
+                                hypellm_telemetry::Field::Detail,
+                                "started before a request asked for it, on the \
+                                 smoothed demand rate for its capability",
+                            ),
+                    );
+                }
             }
         }
 
@@ -1296,6 +1382,97 @@ pub fn authenticated_control_command<'a>(line: &'a str, expected_hex: &[u8]) -> 
     } else {
         None
     }
+}
+
+/// Take a point-in-time backup into the configured directory.
+///
+/// Specification 11.2 requires the store to "support point-in-time backup by
+/// copying a validated snapshot plus log boundary". `Store::backup_to` does
+/// that under the log lock, so this runs on the *live* router rather than
+/// asking an operator to stop it first: a copy taken while the writer is
+/// running is exact, and a copy taken with `cp` is not.
+///
+/// The destination comes from `settings backup_dir` and never from the caller.
+/// A backup is the whole of the router's durable state — key verifiers, session
+/// digests, the audit chain — and letting the control socket name where that
+/// lands would make `control.key` a general-purpose file-writing capability.
+///
+/// # Why the audit record is written first
+///
+/// So that the copy contains the record of its own creation. Appended
+/// afterwards, the record lands only in the live chain: the restored store then
+/// says nothing about when it was taken or by whom, which is precisely what
+/// someone holding a recovered state directory needs to know. Because
+/// `append_audit` and `backup_to` both take the log lock, the head the manifest
+/// names is exactly the head the copy ends on.
+///
+/// The cost is that a failed copy leaves a claim standing in the live chain, so
+/// a failure appends its own `Failure` record rather than leaving the first one
+/// to be read as a backup that exists.
+///
+/// # Errors
+///
+/// Returns a message suitable for the control reply when no destination is
+/// configured, when the copy fails, or when the attempt could not be recorded.
+pub fn backup_state(state: &RouterState) -> Result<String, String> {
+    let config = state.config();
+    let Some(dir) = config.settings.backup_dir.as_deref() else {
+        return Err(
+            "backup is not configured; set `settings backup_dir=<path>` and restart".to_owned(),
+        );
+    };
+    let target = Path::new(dir);
+    let taken_at = state.clock.wall_millis();
+
+    // Fails closed, like every other security-relevant action: a backup whose
+    // record did not reach disk is not reported as having been taken.
+    state
+        .store
+        .append_audit(AuditEvent::new(taken_at, "control", AuditAction::StateBackedUp).with_object(dir))
+        .map_err(|e| format!("the backup was not started: it could not be recorded durably: {e}"))?;
+
+    let manifest = match state.store.backup_to(target) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let message = format!("backup to {dir} failed: {error}");
+            // The record above says a backup was taken. Left alone it would be
+            // read as one that exists, so the failure is recorded too.
+            let _ = state.store.append_audit(
+                AuditEvent::new(
+                    state.clock.wall_millis(),
+                    "control",
+                    AuditAction::StateBackedUp,
+                )
+                .with_object(dir)
+                .with_outcome(hypellm_store::AuditOutcome::Failed)
+                .with_reason(&message),
+            );
+            state.telemetry.log(
+                &hypellm_telemetry::Event::warn("router.backup_failed")
+                    .str_field(hypellm_telemetry::Field::Detail, &message),
+            );
+            return Err(message);
+        }
+    };
+
+    let head = hypellm_crypto::hex::encode(&manifest.audit_head);
+    // Line-oriented and first-party, like every other file this router writes.
+    let document = format!(
+        "taken_at_millis {taken_at}\nsequence {}\nlog_bytes {}\nsnapshot_bytes {}\naudit_head {head}\n",
+        manifest.sequence, manifest.log_bytes, manifest.snapshot_bytes,
+    );
+    hypellm_store::write_atomic(target, "backup.manifest", document.as_bytes())
+        .map_err(|e| format!("backup to {dir} left no manifest: {e}"))?;
+
+    state.telemetry.log(
+        &hypellm_telemetry::Event::info("router.backup_taken")
+            .int_field(hypellm_telemetry::Field::Count, manifest.sequence),
+    );
+
+    Ok(format!(
+        "backed up to {dir}: sequence {} log {} bytes snapshot {} bytes audit_head {head}",
+        manifest.sequence, manifest.log_bytes, manifest.snapshot_bytes,
+    ))
 }
 
 /// Apply configured limits to a listener profile.
@@ -1933,7 +2110,6 @@ binding id=b scope=tenant:acme model=* prefer=local:m
                     hypellm_core::ids::TenantId::new("acme").expect("tenant"),
                     hypellm_core::ids::PrincipalId::new("svc:test").expect("principal"),
                     vec![hypellm_auth::Scope::Inference],
-                    Vec::new(),
                     None,
                     hypellm_auth::SourceRestriction::Any,
                     None,
@@ -1976,7 +2152,6 @@ binding id=b scope=tenant:acme model=* prefer=local:m
                     hypellm_core::ids::TenantId::new("acme").expect("tenant"),
                     hypellm_core::ids::PrincipalId::new("svc:test").expect("principal"),
                     vec![hypellm_auth::Scope::Inference],
-                    Vec::new(),
                     None,
                     hypellm_auth::SourceRestriction::Any,
                     None,

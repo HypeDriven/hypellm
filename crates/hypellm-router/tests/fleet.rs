@@ -956,3 +956,207 @@ fn an_operator_override_survives_a_reload_and_is_dropped_when_its_deployment_is(
     h.runtime.adopt_fleet(Arc::new(next));
     assert!(!h.runtime.config().deployments.contains_key(&music.id));
 }
+
+// -- Predictive pre-warm (specification-extension 9.8) ------------------------
+//
+// Off unless a host declares `prewarm_min_rate_per_minute`, budget-gated like
+// any other activation, and — the property the whole feature rests on — never
+// permitted to evict. A predictor that displaces a running model pays a stop
+// and a start on a guess, which is exactly the doubled swap rate the design
+// warns about.
+
+/// Register the capability map the demand signal is keyed on.
+///
+/// Production does this from the activated policy snapshot; the fleet suite has
+/// no `PolicySnapshot`, so the map is planted directly through the same field.
+fn declare_capability(h: &Harness, deployment: &DeploymentId, capability: Capability) {
+    h.runtime.set_capability_for_test(deployment, capability);
+}
+
+#[test]
+fn prewarm_does_nothing_unless_a_host_asks_for_it() {
+    // The default. A fleet that never mentions pre-warm must behave exactly as
+    // it did before the feature existed, and "nothing happened" has to be
+    // asserted against the agent rather than against a return value — a
+    // predictor that started something and reported `None` would pass a weaker
+    // test.
+    let socket = socket_in("prewarm-off");
+    let mut fleet = spark(&socket);
+    let music = deployment("spark-music3", "spark:music3", 64 * GIB);
+    fleet.deployments.insert(music.id.clone(), music.clone());
+
+    let h = harness(fleet, |script| {
+        script
+            .with_deployment("spark-music3", Behaviour::ReadyAfter(2))
+            .with_state("spark-music3", "stopped")
+    });
+    h.runtime.observe();
+    declare_capability(&h, &music.id, Capability::TextToMusic);
+    for _ in 0..1_000 {
+        h.runtime.record_request(Capability::TextToMusic);
+    }
+
+    assert_eq!(h.runtime.prewarm(), None);
+    assert!(
+        !h.agent.verbs().iter().any(|v| v.starts_with("ACTIVATE")),
+        "pre-warm ran with no policy asking for it: {:?}",
+        h.agent.verbs()
+    );
+}
+
+#[test]
+fn prewarm_starts_a_cold_deployment_its_capability_is_busy() {
+    let socket = socket_in("prewarm-on");
+    let mut fleet = spark(&socket);
+    fleet.default_policy.prewarm_min_rate_per_minute = 1;
+    let music = deployment("spark-music3", "spark:music3", 64 * GIB);
+    fleet.deployments.insert(music.id.clone(), music.clone());
+
+    let h = harness(fleet, |script| {
+        script
+            .with_deployment("spark-music3", Behaviour::ReadyAfter(2))
+            .with_state("spark-music3", "stopped")
+    });
+    h.runtime.observe();
+    declare_capability(&h, &music.id, Capability::TextToMusic);
+
+    // No demand yet: the predictor has nothing to predict from.
+    assert_eq!(h.runtime.prewarm(), None, "prewarm fired on zero demand");
+
+    for _ in 0..64 {
+        h.runtime.record_request(Capability::TextToMusic);
+    }
+    // Close the demand window so the smoothed rate carries the arrivals.
+    h.clock.advance(hypellm_fleet::demand::DEMAND_WINDOW_MS + 1);
+    h.runtime.observe();
+
+    assert_eq!(
+        h.runtime.prewarm(),
+        Some(music.id.clone()),
+        "a busy capability with a cold deployment must pre-warm"
+    );
+    assert!(
+        h.agent
+            .verbs()
+            .iter()
+            .any(|v| v.starts_with("ACTIVATE spark-music3 ")),
+        "pre-warm reported a start it did not make: {:?}",
+        h.agent.verbs()
+    );
+}
+
+#[test]
+fn prewarm_never_evicts_a_running_deployment() {
+    // The property the feature rests on. The fixture is adversarial: the host
+    // has room for one model, something is already resident, and the cold
+    // deployment's capability is the busy one — so the *only* plan that would
+    // start it is one that stops the other. Pre-warm must decline.
+    let socket = socket_in("prewarm-evict");
+    let mut fleet = spark(&socket);
+    fleet.default_policy.prewarm_min_rate_per_minute = 1;
+    let music = deployment("spark-music3", "spark:music3", 64 * GIB);
+    let mut qwen = deployment("spark-qwen38", "spark:qwen38", 64 * GIB);
+    // Past its dwell floor and worth little to keep, so the planner *can*
+    // choose to evict it. Without this the fixture proves nothing: the plan
+    // would be infeasible for a reason that has nothing to do with pre-warm,
+    // and the test would pass with the guard deleted.
+    qwen.min_resident_ms = 0;
+    qwen.retention_weight = 0;
+    fleet.deployments.insert(music.id.clone(), music.clone());
+    fleet.deployments.insert(qwen.id.clone(), qwen.clone());
+
+    let h = harness(fleet, |script| {
+        script
+            .with_deployment("spark-music3", Behaviour::ReadyAfter(2))
+            .with_deployment("spark-qwen38", Behaviour::ReadyAfter(2))
+            .with_state("spark-music3", "stopped")
+            .with_state("spark-qwen38", "stopped")
+    });
+
+    // Qwen resident, started by the router so it is genuinely evictable.
+    start_through_router(&h, &qwen.target);
+    h.runtime.observe();
+
+    declare_capability(&h, &music.id, Capability::TextToMusic);
+    for _ in 0..256 {
+        h.runtime.record_request(Capability::TextToMusic);
+    }
+    h.clock.advance(hypellm_fleet::demand::DEMAND_WINDOW_MS + 1);
+    h.runtime.observe();
+
+    // First establish that the fixture *can* produce the bad outcome. A
+    // demand-driven request for music here plans an eviction; if it did not,
+    // the assertion below would hold for a reason unrelated to pre-warm and
+    // would keep holding with the guard deleted.
+    let snapshot = h.runtime.snapshot();
+    let demand = h.runtime.demand_snapshot();
+    let outcome = hypellm_fleet::plan::plan(
+        &snapshot,
+        &demand,
+        &music.target,
+        &context(h.clock.now_millis(), 900_000),
+    );
+    let PlanOutcome::Plan(plan) = outcome else {
+        panic!("the fixture cannot produce an eviction plan, so it proves nothing: {outcome:?}");
+    };
+    assert!(
+        plan.evicts(),
+        "the fixture must be one where starting music means stopping qwen"
+    );
+
+    let before = h.agent.verbs().len();
+    assert_eq!(
+        h.runtime.prewarm(),
+        None,
+        "pre-warm displaced a running deployment on a prediction"
+    );
+    let after = h.agent.verbs();
+    assert!(
+        !after
+            .iter()
+            .skip(before)
+            .any(|v| v.starts_with("DEACTIVATE") || v.starts_with("ACTIVATE")),
+        "pre-warm acted on a plan that evicts: {:?}",
+        &after[before..]
+    );
+}
+
+#[test]
+fn prewarm_spends_the_same_activation_budget() {
+    // "Gated by the same activation budget so a bad predictor cannot exceed the
+    // ceiling." With the budget already spent, prediction must be refused —
+    // not queued, not retried at a lower priority, refused.
+    let socket = socket_in("prewarm-budget");
+    let mut fleet = spark(&socket);
+    fleet.default_policy.prewarm_min_rate_per_minute = 1;
+    fleet.default_policy.max_activations_per_hour = 1;
+    let music = deployment("spark-music3", "spark:music3", 32 * GIB);
+    let qwen = deployment("spark-qwen38", "spark:qwen38", 32 * GIB);
+    fleet.deployments.insert(music.id.clone(), music.clone());
+    fleet.deployments.insert(qwen.id.clone(), qwen.clone());
+
+    let h = harness(fleet, |script| {
+        script
+            .with_deployment("spark-music3", Behaviour::ReadyAfter(2))
+            .with_deployment("spark-qwen38", Behaviour::ReadyAfter(2))
+            .with_state("spark-music3", "stopped")
+            .with_state("spark-qwen38", "stopped")
+    });
+
+    // Spend the hour's one activation on a real request.
+    start_through_router(&h, &qwen.target);
+    h.runtime.observe();
+
+    declare_capability(&h, &music.id, Capability::TextToMusic);
+    for _ in 0..256 {
+        h.runtime.record_request(Capability::TextToMusic);
+    }
+    h.clock.advance(hypellm_fleet::demand::DEMAND_WINDOW_MS + 1);
+    h.runtime.observe();
+
+    assert_eq!(
+        h.runtime.prewarm(),
+        None,
+        "pre-warm activated past the host's hourly ceiling"
+    );
+}

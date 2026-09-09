@@ -476,12 +476,6 @@ pub fn router_with_config(_upstream: &FakeUpstream, config_text: &str) -> TestRo
                 hypellm_auth::Scope::Models,
                 hypellm_auth::Scope::Tokenize,
             ],
-            // The operator role, so the harness key may cause fleet work. A
-            // plain inference key deliberately may not: `fleet.activate` is
-            // permission to make the *fleet* do something, not permission to
-            // reach a model, and the fleet tests below rely on that distinction
-            // being real.
-            vec![hypellm_core::rbac::Role::Operator],
             None,
             hypellm_auth::SourceRestriction::Any,
             Some("integration test key".to_owned()),
@@ -496,6 +490,13 @@ pub fn router_with_config(_upstream: &FakeUpstream, config_text: &str) -> TestRo
     }
 
     let state = RouterState {
+        // The harness enables jobs unconditionally, so a test that exercises
+        // `/v1/jobs` does not have to remember to turn it on in its fixture.
+        // The workers are started by `serve`; a test driving the store
+        // directly needs none.
+        jobs: Some(Arc::new(crate::jobs::JobStore::new(
+            crate::jobs::JobLimits::DEFAULT,
+        ))),
         anonymous_access: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         config: Arc::new(Activatable::new(config)),
         keys: Arc::new(keys),

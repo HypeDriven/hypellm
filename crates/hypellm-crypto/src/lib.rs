@@ -50,6 +50,7 @@ pub mod hex;
 pub mod hmac;
 pub mod pbkdf2;
 pub mod random;
+pub mod scrypt;
 pub mod secret;
 pub mod sha256;
 

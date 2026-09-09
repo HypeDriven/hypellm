@@ -96,14 +96,25 @@ impl Principal {
     }
 
     /// Build from a verified API key record.
+    ///
+    /// `roles` comes from the caller, which resolves it from the active
+    /// configuration's role bindings for `record.principal`. The key record
+    /// carries none of its own: a key is a credential that says *who* is
+    /// calling, and what that principal may do is settled in one place — the
+    /// configuration — so that removing a role binding de-powers every key held
+    /// by that principal at once, without finding and reissuing them.
     #[must_use]
-    pub fn from_key(record: &KeyRecord, groups: Vec<hypellm_core::ids::GroupId>) -> Self {
+    pub fn from_key(
+        record: &KeyRecord,
+        groups: Vec<hypellm_core::ids::GroupId>,
+        roles: Vec<hypellm_core::rbac::Role>,
+    ) -> Self {
         Self {
             id: record.principal.clone(),
             tenant: record.tenant.clone(),
             method: AuthMethod::ApiKey,
             scopes: record.scopes.clone(),
-            roles: record.roles.clone(),
+            roles,
             key_id: Some(record.id.clone()),
             groups,
         }
@@ -226,14 +237,13 @@ mod tests {
             tenant: hypellm_core::ids::TenantId::new("acme").expect("tenant"),
             principal: hypellm_core::ids::PrincipalId::new("svc:a").expect("principal"),
             scopes: vec![Scope::Inference],
-            roles: Vec::new(),
             expires_at_millis: None,
             source: SourceRestriction::Any,
             created_at_millis: 0,
             description: None,
             revoked: false,
         };
-        let principal = Principal::from_key(&key, Vec::new());
+        let principal = Principal::from_key(&key, Vec::new(), Vec::new());
         assert_eq!(principal.method, AuthMethod::ApiKey);
         assert_eq!(principal.method.as_str(), "api_key");
         assert_ne!(
@@ -296,7 +306,6 @@ mod tests {
                 TenantId::new("acme").unwrap(),
                 PrincipalId::new("svc:ci").unwrap(),
                 vec![Scope::Inference],
-                vec![Role::Viewer],
                 None,
                 SourceRestriction::Any,
                 None,
@@ -304,7 +313,7 @@ mod tests {
             )
             .unwrap();
 
-        let principal = Principal::from_key(&new_key.record, Vec::new());
+        let principal = Principal::from_key(&new_key.record, Vec::new(), vec![Role::Viewer]);
         assert_eq!(principal.id.as_str(), "svc:ci");
         assert_eq!(principal.tenant.as_str(), "acme");
         assert!(principal.has_scope(Scope::Inference));

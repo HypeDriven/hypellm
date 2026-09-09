@@ -97,6 +97,11 @@ pub struct Settings {
     ///
     /// Specification 10: "Prompt and completion bodies are not logged by
     /// default."
+    /// Always `false`.
+    ///
+    /// The field parses so that a document written against specification 17 is
+    /// not rejected outright, and `true` is a configuration error until capture
+    /// is actually built — see `check_document_limits`.
     pub capture_bodies: bool,
     /// Interval between SSE keepalive comments.
     pub keepalive_interval_ms: u64,
@@ -243,6 +248,37 @@ pub struct Settings {
     /// path is limited to about 108 bytes by the kernel, so a deep state
     /// directory needs this set explicitly to somewhere short.
     pub control_socket: Option<String>,
+    /// Where `hypellm-router --backup` writes a point-in-time copy of the state
+    /// directory.
+    ///
+    /// Absent means the router refuses the command. The destination is
+    /// deliberately declared here rather than sent over the control socket:
+    /// specification 10 keeps every path the router writes under administrator
+    /// control, and a backup command that carried its own destination would
+    /// turn possession of `control.key` into the ability to write the whole
+    /// state — API key verifiers, sessions, the audit chain — anywhere the
+    /// router's user can write.
+    pub backup_dir: Option<String>,
+    /// Fixed worker threads serving `POST /v1/jobs`.
+    ///
+    /// **Zero disables the endpoint**, which is the default: `/v1/jobs`
+    /// answers `404` rather than accepting work nothing will run. The pool is
+    /// started at boot and is what bounds how much long-running generation the
+    /// router will carry at once — a request never creates a worker
+    /// (specification 3.2).
+    pub job_workers: u32,
+    /// Live plus retained jobs one tenant may hold.
+    pub max_jobs_per_tenant: u32,
+    /// Jobs waiting for a worker, fleet-wide. A full queue is a `429`.
+    pub max_queued_jobs: u32,
+    /// Bytes of job result held in memory, per job.
+    ///
+    /// The spool is memory, bounded and expiring. Specification 2.2's non-goals
+    /// say the router is not a blob store, and this is the number that keeps
+    /// `/v1/jobs` from quietly making it one.
+    pub max_job_result_bytes: u64,
+    /// How long a finished job stays readable, in milliseconds.
+    pub job_retention_ms: u64,
 }
 
 impl Default for Settings {
@@ -302,6 +338,12 @@ impl Default for Settings {
                 hypellm_core::canonical::DEFAULT_DOCUMENT_TOKEN_ESTIMATE,
             activation_effort_headroom_ms: 5_000,
             control_socket: None,
+            backup_dir: None,
+            job_workers: 0,
+            max_jobs_per_tenant: 32,
+            max_queued_jobs: 64,
+            max_job_result_bytes: 8 * 1024 * 1024,
+            job_retention_ms: 900_000,
         }
     }
 }
@@ -318,6 +360,13 @@ pub struct TenantConfig {
     /// Default data region.
     pub residency: Option<Residency>,
     /// Retention window for captured data.
+    /// The tenant's declared retention window, in days.
+    ///
+    /// **Declared, not enforced.** Nothing in the router deletes state, audit
+    /// records, usage, or exported logs when this elapses; specification 5's
+    /// "retention profile" is recorded here so that the deployment's own
+    /// lifecycle tooling has one authoritative place to read it, and every
+    /// surface that shows it says so. See `docs/deferred-issues.md`.
     pub retention_days: u32,
     /// The most expensive class this tenant's requests may select.
     ///
@@ -1313,6 +1362,12 @@ fn build_settings(document: &Document) -> Result<Settings, ConfigError> {
             d.activation_effort_headroom_ms,
         )?,
         control_socket: f.opt_str("control_socket").map(str::to_owned),
+        backup_dir: f.opt_str("backup_dir").map(str::to_owned),
+        job_workers: f.u32_field("job_workers", d.job_workers)?,
+        max_jobs_per_tenant: f.u32_field("max_jobs_per_tenant", d.max_jobs_per_tenant)?,
+        max_queued_jobs: f.u32_field("max_queued_jobs", d.max_queued_jobs)?,
+        max_job_result_bytes: f.u64_field("max_job_result_bytes", d.max_job_result_bytes)?,
+        job_retention_ms: f.u64_field("job_retention_ms", d.job_retention_ms)?,
     })
 }
 
@@ -1325,6 +1380,22 @@ fn build_settings(document: &Document) -> Result<Settings, ConfigError> {
 /// kind for an operator to debug.
 fn check_document_limits(settings: &Settings, errors: &mut Vec<ConfigError>) {
     let position = Position { line: 1, column: 1 };
+    // Specification 17 admits body capture only as "per-tenant, sampled,
+    // encrypted, access-controlled, time-limited, and visibly indicated". None
+    // of that exists, so `capture_bodies=true` is a document claiming a control
+    // the router does not have — and the claim is the danger: an operator who
+    // set it would believe capture was on, with the access control and the
+    // expiry that sentence promises, and it is not.
+    //
+    // The same reasoning that keeps `anonymous_enabled` out of the grammar
+    // entirely. `false` still loads, because `false` is true.
+    if settings.capture_bodies {
+        errors.push(ConfigError::new(
+            "unimplemented_setting",
+            "capture_bodies=true claims a capability this router does not have:              specification 17 requires capture to be per-tenant, sampled, encrypted,              access-controlled and time-limited, and none of that is implemented.              Remove the field or set it to false",
+            position,
+        ));
+    }
     if settings.max_documents_per_request > 0 && settings.max_document_bytes == 0 {
         errors.push(ConfigError::new(
             "invalid_document_limits",
@@ -1732,6 +1803,32 @@ fn build_target(f: &Fields<'_>) -> Result<(Target, Position), ConfigError> {
         }
     };
 
+    let bytes_per_token = match f.opt_str("bytes_per_token") {
+        None => None,
+        Some(_) => {
+            let raw = f.u32_field("bytes_per_token", 0)?;
+            // Both ends matter, and for opposite reasons. Zero would divide by
+            // zero; anything above the ceiling makes the input half of the
+            // estimate small enough that the field stops being a calibration
+            // and becomes a way to disable quota accounting by editing one
+            // number. Refused rather than clamped: an operator who wrote 64
+            // meant something, and silently running at 8 would tell them their
+            // quota was doing something it is not.
+            if raw == 0 || raw > hypellm_core::canonical::MAX_BYTES_PER_TOKEN {
+                return Err(f.error(
+                    "invalid_bytes_per_token",
+                    format!(
+                        "bytes_per_token must be between 1 and {}; it is a measured \
+                         property of the target's tokenizer, and a larger value \
+                         under-reserves input tokens rather than calibrating them",
+                        hypellm_core::canonical::MAX_BYTES_PER_TOKEN
+                    ),
+                ));
+            }
+            Some(raw)
+        }
+    };
+
     Ok((
         Target {
             id,
@@ -1742,6 +1839,7 @@ fn build_target(f: &Fields<'_>) -> Result<(Target, Position), ConfigError> {
             cost_class: CostClass::new(cost),
             quality_class: QualityClass::new(quality),
             document_token_estimate,
+            bytes_per_token,
             residency: f.opt_str("residency").map(Residency::new),
             is_local: f.bool_field("local", false)?,
             admin_state,

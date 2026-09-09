@@ -646,6 +646,134 @@ impl FleetRuntime {
         view
     }
 
+    /// Start cold deployments whose capability is already busy, before a
+    /// request asks for one.
+    ///
+    /// Specification-extension 9.8, and off unless a host's `fleet_policy`
+    /// declares `prewarm_min_rate_per_minute`. Returns the deployments it
+    /// started, which is what the caller logs.
+    ///
+    /// # What keeps a bad predictor from being worse than no predictor
+    ///
+    /// The prediction here is deliberately the dullest one available — "this
+    /// capability is being asked for at least this often, and something that
+    /// serves it is cold" — because the sophistication of the predictor is not
+    /// what bounds the damage. Three other things are:
+    ///
+    /// - **The same budget.** `ensure_ready` spends `max_activations_per_hour`
+    ///   whoever asked, so prediction cannot exceed the ceiling; at worst it
+    ///   spends the hour's allowance earlier than demand would have.
+    /// - **The same governance.** Dwell, cooldown and flap backoff are enforced
+    ///   inside `plan`, so a deployment just evicted is not predicted back.
+    /// - **Never evicting.** A plan that would stop something is abandoned, not
+    ///   executed. Displacing a running model on a guess is precisely how the
+    ///   swap rate doubles — the fleet pays a stop *and* a start, and the
+    ///   evicted model's own traffic then pays for it again.
+    ///
+    /// One deployment per pass, so a fleet that has just become busy warms up
+    /// over several observation intervals rather than in one burst that the
+    /// per-host concurrent-activation limit would reject anyway.
+    pub fn prewarm(&self) -> Option<DeploymentId> {
+        let config = self.config();
+        let snapshot = self.snapshot();
+        let demand = self.demand_snapshot();
+        let now = self.clock.now_millis();
+
+        // Stale belief is not a basis for a *speculative* swap. The request
+        // path already refuses to plan against an expired observation; doing
+        // this on one would spend the hour's budget on a guess about a fleet
+        // the router has not seen recently.
+        let max_age = config
+            .agents
+            .values()
+            .map(|a| a.observation_max_age_ms)
+            .min()
+            .unwrap_or(0);
+        if max_age > 0 && snapshot.observation_age_ms(now).is_none_or(|age| age > max_age) {
+            return None;
+        }
+
+        for deployment in config.deployments.values() {
+            let target = deployment.target.clone();
+            // The host comes from the accelerator, which is where the
+            // deployment's placement actually lives.
+            let Some(host) = config
+                .accelerator_of(deployment)
+                .map(|accelerator| accelerator.host.clone())
+            else {
+                continue;
+            };
+            let policy = config.policy_for(&host);
+            if policy.prewarm_min_rate_per_minute == 0 {
+                continue;
+            }
+            let Some(capability) = self.capability_of(&deployment.id) else {
+                // No capability axis, so there is no demand signal to predict
+                // from. Not an error: an alias that predates capabilities keeps
+                // working, it just never pre-warms.
+                continue;
+            };
+            if demand.rate(capability) < u64::from(policy.prewarm_min_rate_per_minute) {
+                continue;
+            }
+
+            // Built as an ordinary plan, so every rule the request path obeys
+            // applies unchanged. `may_activate` is the *router's* own authority
+            // here, not a caller's: nobody asked for this.
+            let context = PlanContext {
+                now_ms: now,
+                // No request, so no deadline. The activation is bounded by the
+                // deployment's own `start_ms` and the lease expiry, which is
+                // what bounds a demand-driven one after admission too.
+                deadline_remaining_ms: u64::MAX,
+                effort_multiplier: 1,
+                effort_headroom_ms: 0,
+                may_activate: true,
+                // Never. A fetch on a prediction is hours of bandwidth and
+                // hundreds of gigabytes of disk spent on a guess, and
+                // specification-extension 12 makes it a separate permission for
+                // exactly that reason.
+                may_fetch: false,
+                capability: Some(capability),
+                priority_bonus: 0,
+            };
+
+            let PlanOutcome::Plan(plan) = hypellm_fleet::plan::plan(
+                &snapshot, &demand, &target, &context,
+            ) else {
+                continue;
+            };
+            if plan.evicts() || plan.fetches() {
+                continue;
+            }
+
+            let decision = format!("prewarm-{}", self.activations_total.load(Ordering::SeqCst));
+            if matches!(
+                self.ensure_ready(&target, &plan, &decision, u64::MAX),
+                ActivationResult::Ready
+            ) {
+                return Some(plan.deployment.clone());
+            }
+            // A refusal is not a reason to try the next one in the same pass:
+            // whatever refused it — the budget, the host's concurrent
+            // activation limit — applies to the others too.
+            return None;
+        }
+        None
+    }
+
+    /// Register a deployment's capability directly.
+    ///
+    /// Production derives this from the activated policy snapshot in
+    /// [`Self::adopt_policy`]; the fleet integration suite has no
+    /// `PolicySnapshot` to derive it from, so it plants the same map.
+    #[cfg(any(test, feature = "test-harness"))]
+    pub fn set_capability_for_test(&self, deployment: &DeploymentId, capability: Capability) {
+        if let Ok(mut guard) = self.capabilities.write() {
+            guard.insert(deployment.clone(), capability);
+        }
+    }
+
     /// Refine the class of a resident target using live in-flight counts.
     ///
     /// `Resident` and `ResidentBusy` are one rung apart on the warmth ladder,

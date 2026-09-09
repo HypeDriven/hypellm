@@ -22,3 +22,7 @@
 
 # Machine-local editor and tool settings, not project configuration.
 .claude/settings.local.json
+
+# Byte-cache from running the reference agent's tests. `agent/` is deliberately
+# outside the Rust workspace, so nothing in `target/` covers it.
+__pycache__/

@@ -454,9 +454,11 @@ The design forbids free text rather than scrubbing it:
 - An upstream `Authentication` failure maps to `InternalFault` for the client, so
   a router credential problem cannot be mistaken for the caller's key being wrong
   (`crates/hypellm-router/src/dispatch.rs`).
-- Prompt and completion bodies are not logged. `capture_bodies` exists in the
-  configuration grammar but **nothing reads it** — there is no capture
-  implementation at all, which is fail-safe for this threat.
+- Prompt and completion bodies are not logged. `capture_bodies` parses, and
+  **`true` is a configuration error that refuses the document** — there is no
+  capture implementation at all, and a setting that read as "capture is on"
+  while nothing captured would be worse than the missing feature. The only
+  value that loads is the one the router actually implements.
 
 Residual risks worth naming: a stalled log reader no longer stalls the data path
 (`QueueingSink` bounds the queue and drops oldest-first, reporting what it

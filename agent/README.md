@@ -131,10 +131,12 @@ and set `fleet_enabled=true` in the `settings` record.
 
 Stated so the gaps are not mistaken for controls:
 
-- **No resumable fetches.** `FETCH` runs `docker pull` and verifies the digest
-  afterwards. A 40 GB download that fails partway restarts. Specification-
-  extension 12 requires resumability; this does not have it, and
-  `docs/deferred-issues.md` records that.
+- **Fetch resumption is at layer granularity, not byte granularity.** `FETCH`
+  retries within the router's deadline, and `docker pull` skips layers already
+  in the host's content store — so each attempt resumes from what the last one
+  finished. A layer interrupted mid-transfer is re-fetched. An artifact
+  published as one enormous layer therefore gains nothing from this, which is a
+  property of how it was built rather than of this agent.
 - **No Windows-host support.** Four of the six machines are Windows hosts whose
   SSH lands in WSL, where `powershell.exe` interop reaches the Windows side.
   Driving that is entirely the agent's concern — the router must never learn
@@ -171,14 +173,40 @@ Stated so the gaps are not mistaken for controls:
 ← OK\n | ERR <code>\n
 ```
 
-`ACTIVATE`, `DEACTIVATE`, and `FETCH` are asynchronous and **idempotent per
-`lease-id`**: re-sending returns the same `activation-id` rather than starting a
-second one. That is what makes the router's crash recovery tractable.
+`ACTIVATE`, `DEACTIVATE`, and `FETCH` are asynchronous, and re-sending one
+returns the same `activation-id` rather than starting a second one — which is
+what makes the router's crash recovery tractable. `ACTIVATE` and `DEACTIVATE`
+are idempotent per **`lease-id`**; `FETCH` carries no lease, so it is idempotent
+per **(artifact, host)** while the fetch is in flight. A `FETCH` for a
+*different* artifact on a host already pulling is refused `host_busy`:
+specification-extension 12 allows one fetch per host, and two pulls against one
+disk and one link make each other slower.
+
+`FETCH` runs under the router's `deadline-ms`, clamped here to
+`MAX_FETCH_SECONDS`, and **not** under `--command-timeout` — 120 seconds would
+kill every pull worth making and report it as a transport failure. Within that
+budget it retries a failed pull up to `MAX_FETCH_ATTEMPTS` times with capped
+backoff, checking for cancellation before each attempt and during each wait. A
+pull that exits zero but produces an image whose digest does not match is
+**not** retried: it would produce the same image again, and the refusal is the
+control.
+
+A fetch's `progress-permille` is `0` until the digest verifies and `1000`
+afterwards. It is not a percentage: the pull reports nothing this agent can read
+incrementally, and a figure derived from elapsed time would read as bytes
+transferred and be wrong exactly when someone was relying on it.
 
 States are a closed vocabulary: `pending`, `draining`, `stopping`, `fetching`,
 `starting`, `probing`, `ready`, `failed`, `stopped`, `cancelled`. An
 unrecognised state fails the router's whole observation rather than being mapped
 to something plausible.
+
+`agent/test_fleet_agent.py` covers the fetch path — retry and resumption, the
+attempt cap, the deadline, per-host exclusion, cancellation during backoff, and
+the digest refusal — with `run_on` replaced by a scripted stub, so no `ssh`, no
+`docker`, and no network. Run it with `python3 agent/test_fleet_agent.py`. It is
+not part of `cargo test --workspace`, because this agent is deliberately outside
+the Rust workspace.
 
 The normative definition lives in `crates/hypellm-fleet/src/protocol.rs`, and
 `crates/hypellm-net/src/fleet_sim.rs` is a conformant simulator used by the

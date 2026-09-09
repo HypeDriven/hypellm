@@ -36,6 +36,24 @@ pub enum ErrorCode {
     NoEligibleTarget,
     /// 504 — the end-to-end deadline expired.
     DeadlineExceeded,
+    /// 404 — no such job, or one belonging to another tenant.
+    ///
+    /// Distinct from [`Self::ModelNotFound`] because the two answer different
+    /// questions and a client acts on them differently: one means "ask for a
+    /// different model", the other means "this job identifier is not yours or
+    /// no longer exists".
+    ///
+    /// Deliberately the same answer for a job that never existed, one that
+    /// expired, and one belonging to another tenant. Appendix B bounds
+    /// visibility to the caller's tenant, and telling those apart would confirm
+    /// that a guessed identifier names a real job.
+    JobNotFound,
+    /// 409 — the job exists and has not finished.
+    ///
+    /// Not an error in the sense the others are: the request was correct and
+    /// the answer is "not yet". It is a distinct code so a client can retry on
+    /// it without having to parse a message.
+    JobNotReady,
     /// 500 — an internal fault. Never carries detail.
     InternalFault,
 }
@@ -55,6 +73,8 @@ impl ErrorCode {
             Self::UpstreamInvalidResponse => "upstream_invalid_response",
             Self::NoEligibleTarget => "no_eligible_target",
             Self::DeadlineExceeded => "deadline_exceeded",
+            Self::JobNotFound => "job_not_found",
+            Self::JobNotReady => "job_not_ready",
             Self::InternalFault => "internal_fault",
         }
     }
@@ -66,8 +86,8 @@ impl ErrorCode {
             Self::InvalidRequest => 400,
             Self::Unauthenticated => 401,
             Self::Forbidden => 403,
-            Self::ModelNotFound => 404,
-            Self::IdempotencyConflict => 409,
+            Self::ModelNotFound | Self::JobNotFound => 404,
+            Self::IdempotencyConflict | Self::JobNotReady => 409,
             Self::RateLimited | Self::CapacityExhausted => 429,
             Self::UpstreamInvalidResponse => 502,
             Self::NoEligibleTarget => 503,
@@ -92,9 +112,11 @@ impl ErrorCode {
     #[must_use]
     pub const fn openai_type(self) -> &'static str {
         match self {
-            Self::InvalidRequest | Self::ModelNotFound | Self::IdempotencyConflict => {
-                "invalid_request_error"
-            }
+            Self::InvalidRequest
+            | Self::ModelNotFound
+            | Self::IdempotencyConflict
+            | Self::JobNotFound
+            | Self::JobNotReady => "invalid_request_error",
             Self::Unauthenticated => "authentication_error",
             Self::Forbidden => "permission_error",
             Self::RateLimited | Self::CapacityExhausted => "rate_limit_error",
@@ -109,10 +131,12 @@ impl ErrorCode {
     #[must_use]
     pub const fn anthropic_type(self) -> &'static str {
         match self {
-            Self::InvalidRequest | Self::IdempotencyConflict => "invalid_request_error",
+            Self::InvalidRequest | Self::IdempotencyConflict | Self::JobNotReady => {
+                "invalid_request_error"
+            }
             Self::Unauthenticated => "authentication_error",
             Self::Forbidden => "permission_error",
-            Self::ModelNotFound => "not_found_error",
+            Self::ModelNotFound | Self::JobNotFound => "not_found_error",
             Self::RateLimited | Self::CapacityExhausted => "rate_limit_error",
             Self::UpstreamInvalidResponse | Self::NoEligibleTarget => "api_error",
             Self::DeadlineExceeded => "timeout_error",
@@ -134,6 +158,8 @@ impl ErrorCode {
             Self::UpstreamInvalidResponse,
             Self::NoEligibleTarget,
             Self::DeadlineExceeded,
+            Self::JobNotFound,
+            Self::JobNotReady,
             Self::InternalFault,
         ]
     }

@@ -78,8 +78,14 @@ const SCOPES = [
   { name: 'embeddings', hint: 'Embedding requests.' },
   { name: 'models', hint: 'Model and alias discovery.' },
   { name: 'tokenize', hint: 'Tokenisation.' },
-  { name: 'management:read', hint: 'Read-only management access.' },
-  { name: 'management:write', hint: 'Write management access.' },
+  {
+    name: 'management:read',
+    hint: 'Read /admin/v1 with this key. Permissions still come from the role bindings for the key\u2019s principal.',
+  },
+  {
+    name: 'management:write',
+    hint: 'Also change things through /admin/v1. No key may mint keys or open break-glass.',
+  },
 ];
 
 /**

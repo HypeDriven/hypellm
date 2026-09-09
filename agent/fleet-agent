@@ -64,6 +64,23 @@ MAX_FIELD = 64
 MAX_COMMAND_OUTPUT = 64 * 1024
 DEFAULT_COMMAND_TIMEOUT = 120
 
+# A fetch is the one command that legitimately runs for hours, so it does not
+# take `--command-timeout`: 120 seconds would kill every pull worth making and
+# report it as a transport failure. The budget is the router's `deadline-ms`,
+# clamped here so a router bug cannot pin a host's disk and network forever.
+MAX_FETCH_SECONDS = 6 * 60 * 60
+# What one attempt may take before it is abandoned and retried. Long enough for
+# a large layer on a slow link, short enough that a wedged connection is noticed
+# well inside the overall budget.
+FETCH_ATTEMPT_SECONDS = 30 * 60
+# Attempts per fetch, including the first. Bounded, because "retry until the
+# deadline" against a source returning an immediate error is a busy loop.
+MAX_FETCH_ATTEMPTS = 5
+# Backoff between attempts, doubling, capped. Also the interval at which
+# cancellation is noticed while waiting.
+FETCH_BACKOFF_SECONDS = 5.0
+MAX_FETCH_BACKOFF_SECONDS = 60.0
+
 # The identifier alphabet the router validates on its side. Anything else is
 # refused before it is looked up, so a malformed identifier cannot reach a
 # dictionary key, a log line, or a command.
@@ -281,6 +298,11 @@ class Agent:
         self.key = key
         self.command_timeout = command_timeout
         self.digest = fleet.digest()
+        # host id -> the activation currently pulling on it. Specification
+        # extension 12's "one fetch per host", enforced here as well as in the
+        # router: two pulls against one disk and one link make each other
+        # slower, and the router cannot see a fetch an operator started.
+        self._fetches: dict[str, str] = {}
         self.limiter = RateLimiter()
         self._activations: dict[str, Activation] = {}
         self._leases: dict[str, str] = {}  # lease -> activation id
@@ -291,12 +313,19 @@ class Agent:
 
     # -- Command execution -------------------------------------------------
 
-    def run_on(self, host: Host, argv: list[str]) -> tuple[int, str]:
+    def run_on(
+        self, host: Host, argv: list[str], timeout: float | None = None
+    ) -> tuple[int, str]:
         """Run an argument vector on a host, bounded and deadlined.
 
         `argv` comes from this agent's own table. It is passed as a list with
         `shell=False`, so there is nothing to quote and no way for a value to
         become a second command.
+
+        `timeout` overrides `--command-timeout` for the one command that
+        legitimately takes longer than any other: an artifact pull. It is a
+        parameter rather than a raised global so that a wedged `docker ps`
+        still fails in two minutes.
         """
         command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
         command.extend(host.ssh_options)
@@ -306,7 +335,7 @@ class Agent:
             completed = subprocess.run(  # noqa: S603 - argv is from the agent's own table
                 command,
                 capture_output=True,
-                timeout=self.command_timeout,
+                timeout=self.command_timeout if timeout is None else timeout,
                 check=False,
                 shell=False,
             )
@@ -565,8 +594,33 @@ class Agent:
         with self._lock:
             self._states[deployment.id] = activation.state
 
-    def fetch(self, artifact_id: str, host_id: str) -> str:
+    def fetch(self, artifact_id: str, host_id: str, deadline_ms: str) -> str:
+        """Acquire an artifact on a host, resuming rather than restarting.
+
+        Specification-extension 12 requires four things this implements, and
+        each of them is a property a naive `docker pull` does not have:
+
+        - **A budget from the router.** `deadline-ms` is the router's, clamped
+          here. `--command-timeout` is deliberately not used: 120 seconds would
+          kill every pull worth making and report it as a transport failure.
+        - **Resume, not restart.** A failed attempt is retried within the
+          budget. `docker pull` skips layers already in the host's content
+          store, so each attempt starts from what the last one finished rather
+          than from zero. A layer interrupted mid-transfer is re-fetched; a
+          completed one is not. That is resumption at layer granularity — worth
+          stating exactly, because it is not byte-level resumption and a 40 GB
+          artifact in one layer would gain nothing from it.
+        - **One fetch per host.** A second FETCH for the artifact already being
+          pulled returns the *same* activation rather than a second pull
+          competing for the same disk and link. A second FETCH for a different
+          artifact on a busy host is refused.
+        - **Cancellation.** Checked before each attempt and while backing off,
+          so `CANCEL` ends a fetch inside a backoff rather than at the end of
+          the budget.
+        """
         if not IDENTIFIER.match(artifact_id or "") or not IDENTIFIER.match(host_id or ""):
+            return "ERR malformed"
+        if not deadline_ms.isdigit() or len(deadline_ms) > 12:
             return "ERR malformed"
         artifact = self.fleet.artifacts.get(artifact_id)
         host = self.fleet.hosts.get(host_id)
@@ -582,31 +636,116 @@ class Agent:
         if not argv:
             return "ERR unknown_artifact"
 
+        budget = min(max(int(deadline_ms) / 1000.0, 1.0), MAX_FETCH_SECONDS)
+
         with self._lock:
+            # Idempotent per (artifact, host) while the fetch is in flight, and
+            # exclusive per host. Without this, a router that retries a FETCH
+            # it never saw accepted starts a second pull against the same disk
+            # and the same link, and the two make each other slower.
+            in_flight = self._fetches.get(host_id)
+            if in_flight is not None:
+                running = self._activations.get(in_flight)
+                if running is not None and running.state == "fetching":
+                    if running.deployment == artifact_id:
+                        return f"ACCEPTED {in_flight}"
+                    return "ERR host_busy"
+
             activation_id = f"act-{self._next}"
             self._next += 1
             activation = Activation(activation_id, artifact_id, True)
             activation.state = "fetching"
+            activation.detail = "attempt_1"
             self._activations[activation_id] = activation
+            self._fetches[host_id] = activation_id
 
         def run() -> None:
-            code, _ = self.run_on(host, argv)
-            if code != 0:
-                activation.state = "failed"
-                activation.detail = f"exit_{code}"
-                return
-            # Verified before the artifact becomes usable. An unverified
-            # artifact must never be activated.
-            if self.verify(host, artifact):
-                activation.state = "ready"
-                activation.detail = "verified"
-                activation.progress = 1000
-            else:
-                activation.state = "failed"
-                activation.detail = "digest_mismatch"
+            try:
+                self._run_fetch(activation, artifact, host, argv, budget)
+            finally:
+                with self._lock:
+                    if self._fetches.get(host_id) == activation.id:
+                        del self._fetches[host_id]
 
         threading.Thread(target=run, daemon=True).start()
         return f"ACCEPTED {activation_id}"
+
+    def _run_fetch(
+        self,
+        activation: Activation,
+        artifact: Artifact,
+        host: Host,
+        argv: list[str],
+        budget: float,
+    ) -> None:
+        """Pull until the artifact verifies, the budget runs out, or it is cancelled.
+
+        `progress` stays at 0 for the whole fetch and becomes 1000 only once the
+        digest has been verified. It is not a percentage and is not guessed at:
+        the pull reports nothing this agent can read incrementally, and a
+        progress figure derived from elapsed time would read as bytes
+        transferred and be wrong exactly when an operator was relying on it.
+        """
+        expires_at = time.monotonic() + budget
+        backoff = FETCH_BACKOFF_SECONDS
+
+        for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
+            if activation.cancelled.is_set():
+                activation.state = "cancelled"
+                activation.detail = "cancelled"
+                return
+            remaining = expires_at - time.monotonic()
+            if remaining <= 0:
+                activation.state = "failed"
+                activation.detail = f"deadline_after_{attempt - 1}"
+                return
+
+            activation.detail = f"attempt_{attempt}"
+            code, _ = self.run_on(
+                host, argv, timeout=min(remaining, FETCH_ATTEMPT_SECONDS)
+            )
+
+            if activation.cancelled.is_set():
+                activation.state = "cancelled"
+                activation.detail = "cancelled"
+                return
+
+            if code == 0:
+                # Verified before the artifact becomes usable. An unverified
+                # artifact must never be activated — and a pull that exited
+                # zero having fetched the wrong thing is exactly what this
+                # check is for, so it is not retried.
+                if self.verify(host, artifact):
+                    activation.state = "ready"
+                    activation.detail = "verified"
+                    activation.progress = 1000
+                else:
+                    activation.state = "failed"
+                    activation.detail = "digest_mismatch"
+                return
+
+            # Retry. What was already transferred stays on the host, so the
+            # next attempt resumes from it rather than starting again.
+            if attempt == MAX_FETCH_ATTEMPTS:
+                activation.state = "failed"
+                activation.detail = f"exit_{code}"
+                return
+
+            # Waited in slices, so a CANCEL arriving during a backoff is acted
+            # on then rather than when the backoff ends.
+            waited = 0.0
+            while waited < backoff:
+                if activation.cancelled.is_set():
+                    activation.state = "cancelled"
+                    activation.detail = "cancelled"
+                    return
+                if time.monotonic() >= expires_at:
+                    activation.state = "failed"
+                    activation.detail = f"deadline_after_{attempt}"
+                    return
+                time.sleep(min(1.0, backoff - waited))
+                waited += 1.0
+            backoff = min(backoff * 2, MAX_FETCH_BACKOFF_SECONDS)
 
     def verify(self, host: Host, artifact: Artifact) -> bool:
         code, output = self.run_on(
@@ -696,7 +835,7 @@ class Handler(socketserver.BaseRequestHandler):
         if verb == "DEACTIVATE" and len(parts) == 4:
             return (agent.start_verb(parts[1], parts[2], False), None)
         if verb == "FETCH" and len(parts) == 4:
-            return (agent.fetch(parts[1], parts[2]), None)
+            return (agent.fetch(parts[1], parts[2], parts[3]), None)
         if verb == "STATUS" and len(parts) == 2:
             return (agent.status(parts[1]), None)
         if verb == "CANCEL" and len(parts) == 2:

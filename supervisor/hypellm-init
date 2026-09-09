@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+#
+# The HypeLLM reference init: SIGTERM, turned into a graceful drain.
+#
+# This is the fourth out-of-process component in this system, and it exists for
+# the same reason as the other three. Specification 18.2 forbids `unsafe` code
+# workspace-wide; `sigaction` and `signalfd` are both `unsafe` FFI and the Rust
+# standard library has no signal API, so *the router cannot handle a signal at
+# all*. Its answer is an authenticated control socket, and
+# `hypellm-router --shutdown` is how every documented stop path reaches it.
+#
+# That left one gap, and it is the one an operator hits first. A container's
+# PID 1 receives no default signal actions from the kernel, so a router running
+# as PID 1 ignores SIGTERM completely: `docker stop`, `docker compose down`,
+# `kubectl delete pod` and a systemd unit without `ExecStop` all wait out the
+# grace period and then SIGKILL, cutting every in-flight stream. The drain the
+# control socket exists to provide was reachable only by an operator who knew to
+# ask for it.
+#
+# So this process is PID 1 instead. It runs the router as its child, catches
+# SIGTERM and SIGINT, and turns them into exactly the command the documentation
+# already tells operators to run. Nothing about the router changes: it still
+# handles no signals, still contains no `unsafe`, and still shuts down only when
+# its authenticated control socket says so.
+#
+# Why bash
+# --------
+#
+# Because it is already in the image. `docker/Dockerfile` installs no packages
+# in either stage — the runtime layer is a bare Debian plus one binary and the
+# static assets — and adding a Python runtime to the *router's* image to gain a
+# forty-line init would expand its attack surface for no security return. The
+# agent and the verifier are Python because they do real work; this does not.
+#
+# What this is not
+# ----------------
+#
+# It is not a supervisor. It starts one child, forwards one shutdown, and exits
+# with the child's status. It does not restart the router — `compose.yaml` sets
+# `restart: "no"` deliberately, because a router that exited cleanly after a
+# drain must not be started again — and it makes no decision of its own.
+#
+# The rules it keeps
+# ------------------
+#
+# 1. It runs one fixed command. The router's argv comes from this script's own
+#    arguments, which come from the image's CMD. Nothing is read from the
+#    network, from a file, or from the router.
+# 2. Everything is bounded. One child, one shutdown attempt, one deadline. A
+#    router that has not exited by the deadline is killed, and the exit status
+#    says so rather than hanging PID 1 forever.
+# 3. A failed drain is loud. If `--shutdown` cannot be delivered, or the router
+#    outlives the deadline, this says so on stderr and exits non-zero. A silent
+#    fallback to SIGKILL would recreate exactly the behaviour it exists to
+#    remove.
+
+set -u
+
+ROUTER="${HYPELLM_ROUTER_BIN:-/usr/local/bin/hypellm-router}"
+
+# How long the router is given to finish its own drain after `--shutdown` is
+# accepted. Must exceed the inference listener's `drain_timeout` (30 s in
+# `ServerConfig::inference`), or this cuts off the drain it just asked for --
+# the same ordering `compose.yaml`'s `stop_grace_period` has to respect, and for
+# the same reason. The supervisor's grace period must in turn exceed this.
+DRAIN_DEADLINE="${HYPELLM_DRAIN_DEADLINE:-40}"
+
+# Exit codes, distinct from the router's own (2 configuration, 3 state, 4
+# listener, 5 secrets) so a supervisor can tell whose failure it was.
+EXIT_DRAIN_FAILED=70
+EXIT_ARGUMENTS=71
+
+# The router's one-shot commands. Each does its work and exits; there is no
+# long-running process to supervise and no drain to arrange, so this hands them
+# straight to the router and gets out of the way.
+#
+# This is not a convenience. `docker run hypellm-router:local --generate-secrets
+# /etc/hypellm/secrets` is how the secret bundle is created — `just _secrets`
+# and `just bootstrap` both do exactly that — and an init that swallowed those
+# arguments would break the first command anyone runs against a fresh checkout.
+# The image's contract is "append arguments and they reach the router", and
+# putting an init in front of it must not change that.
+ONE_SHOT=(
+    --generate-secrets
+    --check
+    --hash-password
+    --adopt-config
+    --shutdown
+    --ping
+    --backup
+    --version
+    -V
+    --help
+    -h
+)
+
+if [ "$#" -gt 0 ]; then
+    for flag in "${ONE_SHOT[@]}"; do
+        if [ "$1" = "$flag" ]; then
+            exec "$ROUTER" "$@"
+        fi
+    done
+fi
+
+config=""
+secrets=""
+drain_failed=0
+shutting_down=0
+child=0
+watchdog=0
+
+usage() {
+    cat >&2 <<'USAGE'
+hypellm-init — run hypellm-router and turn SIGTERM into a graceful drain
+
+USAGE:
+    hypellm-init --config <path> --secrets <dir> [router arguments...]
+
+Both --config and --secrets are read twice: the router needs them to run, and
+this needs them to address the control socket when a signal arrives. Every
+other argument is passed to the router verbatim.
+USAGE
+}
+
+# The router's own arguments are passed through untouched; only the two this
+# script also needs are read out of them.
+for ((i = 1; i <= $#; i++)); do
+    case "${!i}" in
+        --config)
+            next=$((i + 1))
+            [ "$next" -le "$#" ] && config="${!next}"
+            ;;
+        --secrets)
+            next=$((i + 1))
+            [ "$next" -le "$#" ] && secrets="${!next}"
+            ;;
+    esac
+done
+
+if [ -z "$config" ] || [ -z "$secrets" ]; then
+    echo "hypellm-init: --config and --secrets are required" >&2
+    usage
+    exit "$EXIT_ARGUMENTS"
+fi
+
+# Turn a signal into the router's own shutdown command.
+#
+# Re-entrant on purpose: a second SIGTERM while a drain is running is an
+# operator asking again, not an instruction to escalate. Escalating would kill
+# the drain the first signal started, which is the behaviour this whole
+# component exists to remove.
+on_signal() {
+    local name="$1"
+    if [ "$shutting_down" -eq 1 ]; then
+        echo "hypellm-init: ${name} again; a drain is already running (up to ${DRAIN_DEADLINE}s)" >&2
+        return
+    fi
+    shutting_down=1
+    echo "hypellm-init: ${name} → hypellm-router --shutdown" >&2
+
+    if ! "$ROUTER" --shutdown --config "$config" --secrets "$secrets" >/dev/null; then
+        drain_failed=1
+        echo "hypellm-init: the router refused or could not receive the shutdown command" >&2
+    fi
+
+    # The deadline, as a background timer rather than a blocking sleep, so the
+    # wait loop below keeps running and the child is still reaped promptly if it
+    # finishes first.
+    (
+        sleep "$DRAIN_DEADLINE"
+        if kill -0 "$child" 2>/dev/null; then
+            echo "hypellm-init: the router did not exit within ${DRAIN_DEADLINE}s of the drain starting; killing it" >&2
+            kill -KILL "$child" 2>/dev/null
+        fi
+    ) &
+    watchdog=$!
+}
+
+trap 'on_signal SIGTERM' TERM
+trap 'on_signal SIGINT' INT
+
+"$ROUTER" "$@" &
+child=$!
+
+# `wait` returns a status above 128 when a trap interrupts it, and the child is
+# still running at that point. Testing the *status* to tell those apart does not
+# work: a router killed by the watchdog exits 137, which is also above 128, and
+# treating that as an interruption loops onto an already-reaped child and
+# reports 127 instead. So the loop asks whether the child is still there, which
+# is the actual question.
+status=0
+while kill -0 "$child" 2>/dev/null; do
+    wait "$child"
+    status=$?
+done
+
+# The watchdog has nothing left to guard.
+if [ "$watchdog" -ne 0 ]; then
+    kill "$watchdog" 2>/dev/null
+    wait "$watchdog" 2>/dev/null
+fi
+
+# 137 is SIGKILL, which here can only be the watchdog: the router does not kill
+# itself, and an operator killing it directly is the case this reports too.
+if [ "$status" -eq 137 ] && [ "$shutting_down" -eq 1 ]; then
+    drain_failed=1
+fi
+
+if [ "$drain_failed" -eq 1 ]; then
+    echo "hypellm-init: the shutdown was not graceful; in-flight streams may have been cut" >&2
+    exit "$EXIT_DRAIN_FAILED"
+fi
+exit "$status"

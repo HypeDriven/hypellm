@@ -590,6 +590,10 @@ fn build_policy(f: &Fields<'_>, base: FleetPolicy) -> Result<FleetPolicy, Config
             "memory_drift_tolerance_permille",
             base.memory_drift_tolerance_permille,
         )?,
+        prewarm_min_rate_per_minute: f.u32_field(
+            "prewarm_min_rate_per_minute",
+            base.prewarm_min_rate_per_minute,
+        )?,
         adopt_unmanaged: f.bool_field("adopt_unmanaged", base.adopt_unmanaged)?,
     };
     if policy.max_activations_per_hour == 0 {

@@ -7,6 +7,7 @@
 //! hypellm-router --config <path> --secrets <dir> [--static <dir>] [--log <level>]
 //! hypellm-router --check --config <path>
 //! hypellm-router --generate-secrets <dir>
+//! hypellm-router --backup --config <path> --secrets <dir>
 //! hypellm-router --version
 //! ```
 //!
@@ -100,6 +101,7 @@ fn parse_arguments() -> Result<Arguments, String> {
             // an argument.
             "--shutdown" => arguments.control = Some("shutdown"),
             "--ping" => arguments.control = Some("ping"),
+            "--backup" => arguments.control = Some("backup"),
             "--hash-password" => arguments.hash_password = true,
             "--generate-secrets" => {
                 arguments.generate_secrets = Some(PathBuf::from(
@@ -125,6 +127,7 @@ USAGE:
     hypellm-router --adopt-config REASON --config <path> --secrets <dir>
     hypellm-router --shutdown --config <path> --secrets <dir>
     hypellm-router --ping --config <path> --secrets <dir>
+    hypellm-router --backup --config <path> --secrets <dir>
 
 OPTIONS:
     -c, --config <path>        the configuration file
@@ -140,6 +143,9 @@ OPTIONS:
                                published policy; the reason is audited
         --shutdown             ask a running router to drain and stop
         --ping                 check that a running router answers
+        --backup               ask a running router to copy a consistent
+                               point-in-time backup into `settings backup_dir`;
+                               the destination is configured, never an argument
     -V, --version              print the version
     -h, --help                 print this message
 
@@ -199,6 +205,14 @@ fn send_control_command(config_path: &std::path::Path, control_key: &[u8], comma
         );
         return ExitCode::from(exit::SECRETS);
     }
+    // A command that did not do what it was asked must not exit zero. A backup
+    // that failed and reported success is worse than no backup command at all:
+    // a scheduler wrapping this would keep reporting green over an empty
+    // destination.
+    if let Some(detail) = reply.strip_prefix("error: ") {
+        eprintln!("hypellm-router: {detail}");
+        return ExitCode::from(exit::STATE);
+    }
     ExitCode::SUCCESS
 }
 
@@ -247,10 +261,7 @@ fn hash_password() -> ExitCode {
         return ExitCode::from(exit::CONFIGURATION);
     }
 
-    let verifier = match hypellm_crypto::PasswordVerifier::derive(
-        password,
-        hypellm_crypto::pbkdf2::DEFAULT_ITERATIONS,
-    ) {
+    let verifier = match hypellm_crypto::PasswordVerifier::derive(password) {
         Ok(verifier) => verifier,
         Err(error) => {
             // Fails closed: a salt that is not random is not a salt.
@@ -489,6 +500,7 @@ fn main() -> ExitCode {
             }
 
             let shutdown_handles = shutdown_handles.clone();
+            let control_state = Arc::clone(&router.state);
             let thread_path = control_path.clone();
             // Hex, so the token is a single whitespace-free word an operator
             // can paste, and so the comparison is over a fixed-width string
@@ -526,6 +538,20 @@ fn main() -> ExitCode {
                             }
                             "ping" => {
                                 let _ = reply.write_all(b"pong\n");
+                            }
+                            // Runs on the control thread, not on a listener
+                            // worker: the copy holds the log lock for as long
+                            // as the state takes to write, and a data-plane
+                            // thread blocked behind it would turn a backup into
+                            // a latency event.
+                            "backup" => {
+                                let line = match hypellm_router::startup::backup_state(
+                                    &control_state,
+                                ) {
+                                    Ok(summary) => format!("{summary}\n"),
+                                    Err(message) => format!("error: {message}\n"),
+                                };
+                                let _ = reply.write_all(line.as_bytes());
                             }
                             other => {
                                 let _ = reply

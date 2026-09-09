@@ -46,7 +46,7 @@ use crate::state::RouterState;
     clippy::integer_division,
     reason = "milliseconds to whole seconds is the intended truncation"
 )]
-fn wall_seconds(clock: &dyn Clock) -> u64 {
+pub(crate) fn wall_seconds(clock: &dyn Clock) -> u64 {
     clock.wall_millis() / 1000
 }
 
@@ -185,6 +185,13 @@ impl Handler for InferenceHandler {
                 Operation::Tokenize,
                 started,
             ),
+            (Method::Post, "/v1/jobs") => {
+                self.submit_job(head, body, writer, &principal, request_id, started)
+            }
+            (Method::Get, "/v1/jobs") => self.list_jobs(writer, &principal, request_id),
+            (_, path) if path.starts_with("/v1/jobs/") => {
+                self.job_endpoint(&head.method, path, writer, &principal, request_id)
+            }
             (Method::Options, _) => no_content(writer),
             (_, path) if is_known_path(path) => {
                 let error = RouterError::new(
@@ -297,6 +304,343 @@ impl InferenceHandler {
             self.stream(&request, principal, writer, started)
         } else {
             self.buffered(&request, principal, writer, started)
+        }
+    }
+
+    // -- Jobs (specification-extension 11) ---------------------------------
+
+    /// `POST /v1/jobs` — accept long-running work and release the connection.
+    ///
+    /// The body is an ordinary chat request. What makes it a job is the
+    /// endpoint, not a different dialect: a caller that wants the same
+    /// generation synchronously posts the same body to
+    /// `/v1/chat/completions`, and gets the same answer by holding the socket.
+    fn submit_job(
+        &self,
+        head: &RequestHead,
+        body: &[u8],
+        writer: &mut ClientWriter,
+        principal: &Principal,
+        request_id: RequestId,
+        _started: u64,
+    ) -> io::Result<Disposition> {
+        let state = &self.state;
+        let protocol = ClientProtocol::OpenAiChat;
+
+        let Some(jobs) = state.jobs() else {
+            let error = RouterError::new(
+                ErrorCode::InvalidRequest,
+                "this router does not run jobs; set `settings job_workers`",
+            );
+            return respond_error(writer, &error, Some(request_id), protocol);
+        };
+
+        // The same scope an interactive generation needs. A job is not a
+        // separate privilege — it is the same work, waited for differently.
+        if !principal.has_scope(Scope::Inference) {
+            let error = RouterError::new(
+                ErrorCode::Forbidden,
+                "the credential is not permitted to perform this operation",
+            );
+            return respond_error(writer, &error, Some(request_id), protocol);
+        }
+
+        let config = state.config();
+        let tenant_config = config.tenants.get(&principal.tenant);
+        // A job's patience is what makes an eviction- or fetch-requiring target
+        // legitimately eligible (specification-extension 7.3): the caller is
+        // not holding a socket, so minutes are affordable. It is still a
+        // configured ceiling rather than a caller's number.
+        let patience = Duration::from_millis(
+            config
+                .settings
+                .job_retention_ms
+                .max(config.settings.default_deadline_ms),
+        );
+        let context = ParseContext {
+            request_id,
+            tenant: principal.tenant.clone(),
+            principal: principal.id.clone(),
+            deadline: Deadline::after(state.clock.as_ref(), patience),
+            hints_permitted: principal
+                .permissions()
+                .has(hypellm_core::rbac::Permission::OperateTargets),
+            residency: tenant_config.and_then(|t| t.residency.clone()),
+            max_cost_class: tenant_config.and_then(|t| t.max_cost_class),
+            min_quality_class: tenant_config.and_then(|t| t.min_quality_class),
+            document_limits: crate::protocol::DocumentLimits {
+                max_documents: config.settings.max_documents_per_request,
+                max_document_bytes: config.settings.max_document_bytes,
+                max_inline_bytes: config.settings.max_inline_document_bytes,
+            },
+        };
+        let limits = JsonLimits::DEFAULT.with_max_input_bytes(
+            usize::try_from(config.settings.max_body_bytes).unwrap_or(usize::MAX),
+        );
+
+        let mut request = match openai::parse_chat_request(body, &context, &limits) {
+            Ok(request) => request,
+            Err(error) => return respond_error(writer, &error, Some(request_id), protocol),
+        };
+        request.operation = Operation::Chat;
+        // A job's result is collected whole from `/result`. Streaming it to a
+        // connection that has already been released is not a thing that can
+        // happen, so the flag is cleared rather than honoured — leaving it set
+        // would make the worker render SSE nobody can read.
+        request.stream.enabled = false;
+
+        if let Err(error) =
+            crate::protocol::enforce_document_limits(&request, &context.document_limits)
+        {
+            return respond_error(writer, &error, Some(request_id), protocol);
+        }
+        let _ = head;
+
+        match jobs.submit(
+            request,
+            principal.groups.clone(),
+            principal.permissions(),
+            principal.key_id.clone(),
+            state.clock.wall_millis(),
+            state.clock.now_millis(),
+        ) {
+            Ok(view) => {
+                let payload = wire_json::to_string(&crate::jobs::job_body(&view));
+                write_json(writer, 202, &payload, request_id)?;
+                Ok(Disposition::KeepAlive)
+            }
+            Err(refusal) => {
+                let error = match refusal {
+                    crate::jobs::SubmitRefusal::NoEntropy => RouterError::new(
+                        ErrorCode::InternalFault,
+                        "the router cannot generate a job identifier",
+                    ),
+                    crate::jobs::SubmitRefusal::ShuttingDown => RouterError::new(
+                        ErrorCode::CapacityExhausted,
+                        "the router is shutting down and is not accepting new jobs",
+                    ),
+                    // Both bounds report as rate limits rather than as faults:
+                    // the caller's request is well formed and will succeed
+                    // later, which is exactly what 429 means.
+                    crate::jobs::SubmitRefusal::TenantAtCapacity => RouterError::new(
+                        ErrorCode::RateLimited,
+                        "this tenant already holds as many jobs as this router will keep",
+                    ),
+                    crate::jobs::SubmitRefusal::QueueFull => RouterError::new(
+                        ErrorCode::RateLimited,
+                        "the job queue is full",
+                    ),
+                };
+                respond_error(writer, &error, Some(request_id), protocol)
+            }
+        }
+    }
+
+    /// `GET /v1/jobs` — this tenant's jobs, newest first.
+    fn list_jobs(
+        &self,
+        writer: &mut ClientWriter,
+        principal: &Principal,
+        request_id: RequestId,
+    ) -> io::Result<Disposition> {
+        let state = &self.state;
+        let Some(jobs) = state.jobs() else {
+            let error = RouterError::new(ErrorCode::InvalidRequest, "this router does not run jobs");
+            return respond_error(writer, &error, Some(request_id), ClientProtocol::OpenAiChat);
+        };
+        if !principal.has_scope(Scope::Inference) {
+            let error = RouterError::new(
+                ErrorCode::Forbidden,
+                "the credential is not permitted to perform this operation",
+            );
+            return respond_error(writer, &error, Some(request_id), ClientProtocol::OpenAiChat);
+        }
+
+        let limit = usize::try_from(jobs.limits().max_per_tenant).unwrap_or(usize::MAX);
+        let views = jobs.list(&principal.tenant, limit, state.clock.now_millis());
+        let mut root = wire_json::Object::new();
+        root.push(
+            "data",
+            wire_json::Value::Array(views.iter().map(crate::jobs::job_body).collect()),
+        );
+        let payload = wire_json::to_string(&wire_json::Value::Object(root));
+        write_json(writer, 200, &payload, request_id)?;
+        Ok(Disposition::KeepAlive)
+    }
+
+    /// The `/v1/jobs/{id}` family.
+    ///
+    /// Every path here reports a job belonging to another tenant as **absent**,
+    /// not forbidden. Appendix B bounds visibility to the caller's tenant, and
+    /// a `403` would confirm that a guessed identifier names a real job.
+    fn job_endpoint(
+        &self,
+        method: &Method,
+        path: &str,
+        writer: &mut ClientWriter,
+        principal: &Principal,
+        request_id: RequestId,
+    ) -> io::Result<Disposition> {
+        let state = &self.state;
+        let protocol = ClientProtocol::OpenAiChat;
+        let not_found = || RouterError::new(ErrorCode::JobNotFound, "no such job");
+
+        let Some(jobs) = state.jobs() else {
+            return respond_error(writer, &not_found(), Some(request_id), protocol);
+        };
+        if !principal.has_scope(Scope::Inference) {
+            let error = RouterError::new(
+                ErrorCode::Forbidden,
+                "the credential is not permitted to perform this operation",
+            );
+            return respond_error(writer, &error, Some(request_id), protocol);
+        }
+
+        let rest = path.strip_prefix("/v1/jobs/").unwrap_or_default();
+        let (raw_id, suffix) = match rest.split_once('/') {
+            Some((id, tail)) => (id, tail),
+            None => (rest, ""),
+        };
+        let Some(id) = crate::jobs::JobId::parse(raw_id) else {
+            return respond_error(writer, &not_found(), Some(request_id), protocol);
+        };
+        let now = state.clock.now_millis();
+
+        match (method, suffix) {
+            (Method::Get, "") => match jobs.get(&id, &principal.tenant, now) {
+                Some(view) => {
+                    let payload = wire_json::to_string(&crate::jobs::job_body(&view));
+                    write_json(writer, 200, &payload, request_id)?;
+                    Ok(Disposition::KeepAlive)
+                }
+                None => respond_error(writer, &not_found(), Some(request_id), protocol),
+            },
+            (Method::Get, "result") => {
+                let Some(view) = jobs.get(&id, &principal.tenant, now) else {
+                    return respond_error(writer, &not_found(), Some(request_id), protocol);
+                };
+                match jobs.result(&id, &principal.tenant, now) {
+                    Some(bytes) => {
+                        let payload = String::from_utf8(bytes).unwrap_or_default();
+                        write_json(writer, 200, &payload, request_id)?;
+                        Ok(Disposition::KeepAlive)
+                    }
+                    // A job that has not finished is not an error and must not
+                    // read as one: `409` says "ask again", and the state in the
+                    // body says what to wait for.
+                    None => {
+                        let error = if view.state.is_terminal() {
+                            RouterError::new(
+                                ErrorCode::JobNotFound,
+                                "this job produced no result",
+                            )
+                        } else {
+                            RouterError::new(
+                                ErrorCode::JobNotReady,
+                                "this job has not finished",
+                            )
+                        };
+                        respond_error(writer, &error, Some(request_id), protocol)
+                    }
+                }
+            }
+            (Method::Delete, "") => match jobs.cancel(
+                &id,
+                &principal.tenant,
+                state.clock.wall_millis(),
+                now,
+            ) {
+                Some(view) => {
+                    let payload = wire_json::to_string(&crate::jobs::job_body(&view));
+                    write_json(writer, 200, &payload, request_id)?;
+                    Ok(Disposition::KeepAlive)
+                }
+                None => respond_error(writer, &not_found(), Some(request_id), protocol),
+            },
+            (Method::Get, "events") => self.job_events(&id, writer, principal, request_id),
+            (Method::Options, _) => no_content(writer),
+            _ => {
+                let error =
+                    RouterError::new(ErrorCode::InvalidRequest, "no such job endpoint");
+                respond_error(writer, &error, Some(request_id), protocol)
+            }
+        }
+    }
+
+    /// `GET /v1/jobs/{id}/events` — a bounded progress stream.
+    ///
+    /// One SSE event per observed state change, then `done`. It is bounded in
+    /// both directions that matter: it ends when the job reaches a terminal
+    /// state, and it ends anyway at the router's slow-client write timeout, so
+    /// a client that opens one and stops reading occupies its connection worker
+    /// no longer than any other stream would.
+    ///
+    /// Resumption is by *state*, not by replay: a client that reconnects
+    /// receives the job's current state immediately and then further changes.
+    /// There is no event log to resume from and deliberately none — a job's
+    /// history is bounded by its revision counter, and storing the intermediate
+    /// states so a reconnecting client could replay them would be retention the
+    /// caller never asked for.
+    fn job_events(
+        &self,
+        id: &crate::jobs::JobId,
+        writer: &mut ClientWriter,
+        principal: &Principal,
+        request_id: RequestId,
+    ) -> io::Result<Disposition> {
+        let state = &self.state;
+        let protocol = ClientProtocol::OpenAiChat;
+        let Some(jobs) = state.jobs() else {
+            let error = RouterError::new(ErrorCode::JobNotFound, "no such job");
+            return respond_error(writer, &error, Some(request_id), protocol);
+        };
+        let Some(mut view) = jobs.get(id, &principal.tenant, state.clock.now_millis()) else {
+            let error = RouterError::new(ErrorCode::JobNotFound, "no such job");
+            return respond_error(writer, &error, Some(request_id), protocol);
+        };
+
+        let head = ResponseBuilder::new(200)
+            .header("Content-Type", "text/event-stream")
+            .and_then(|b| b.header("Cache-Control", "no-store"))
+            .and_then(|b| b.header("X-Request-Id", &request_id.to_string()))
+            .and_then(ResponseBuilder::finish_streaming)
+            .map_err(|_| io::Error::other("response head"))?;
+        writer.write(&head)?;
+        writer.flush()?;
+
+        let mut revision = jobs.revision(id, &principal.tenant).unwrap_or(0);
+        loop {
+            let payload = wire_json::to_string(&crate::jobs::job_body(&view));
+            writer.write(format!("event: state\ndata: {payload}\n\n").as_bytes())?;
+            writer.flush()?;
+            if view.state.is_terminal() {
+                writer.write(b"event: done\ndata: {}\n\n")?;
+                writer.flush()?;
+                return Ok(Disposition::KeepAlive);
+            }
+
+            // Poll rather than a condvar per stream: a waiter per connection is
+            // a per-request synchronisation object, and the interval is what
+            // bounds how often this thread wakes.
+            state.clock.sleep(Duration::from_millis(JOB_EVENT_POLL_MS));
+
+            match jobs.get(id, &principal.tenant, state.clock.now_millis()) {
+                Some(next) => {
+                    let next_revision = jobs.revision(id, &principal.tenant).unwrap_or(revision);
+                    if next_revision == revision {
+                        continue;
+                    }
+                    revision = next_revision;
+                    view = next;
+                }
+                // Swept while the stream was open. Ending the stream is the
+                // only honest answer: there is nothing left to report on.
+                None => {
+                    writer.write(b"event: done\ndata: {}\n\n")?;
+                    writer.flush()?;
+                    return Ok(Disposition::KeepAlive);
+                }
+            }
         }
     }
 
@@ -640,6 +984,14 @@ fn protocol_for(path: &str) -> ClientProtocol {
 }
 
 /// Whether the path is one the router serves, for 405 versus 404.
+/// How often a job events stream re-reads its job.
+///
+/// A poll interval rather than a condvar per stream: one waiter per open
+/// connection is a per-request synchronisation object, which specification 3.2
+/// does not admit. Half a second is fast enough that a state change is not
+/// noticeably late and slow enough that a hundred open streams cost nothing.
+const JOB_EVENT_POLL_MS: u64 = 500;
+
 fn is_known_path(path: &str) -> bool {
     matches!(
         path,
@@ -649,6 +1001,7 @@ fn is_known_path(path: &str) -> bool {
             | "/v1/messages"
             | "/v1/models"
             | "/v1/tokenize"
+            | "/v1/jobs"
             | "/health/live"
             | "/health/ready"
     )
@@ -753,9 +1106,32 @@ fn authenticate(
         })?;
 
     // Groups come from configuration, never from a token claim
-    // (specification 25).
+    // (specification 25). Roles come from the same place and for a stronger
+    // reason: a role copied onto the key record at creation would keep
+    // authorising after the binding that granted it was withdrawn, and nothing
+    // would go back and reissue the key.
     let groups = groups_for(state, &record.tenant, &record.principal);
-    Ok(Principal::from_key(&record, groups))
+    let roles = roles_for(state, &record.principal);
+    Ok(Principal::from_key(&record, groups, roles))
+}
+
+/// The management roles bound to `principal` in the active configuration.
+///
+/// The one authority on what a principal may do, shared with the management
+/// plane so a key and a session for the same principal cannot disagree.
+pub fn roles_for(
+    state: &RouterState,
+    principal: &hypellm_core::ids::PrincipalId,
+) -> Vec<hypellm_core::rbac::Role> {
+    let config = state.config();
+    config
+        .roles
+        .iter()
+        .filter_map(|binding| match &binding.subject {
+            hypellm_config::RoleSubject::Principal(p) if p == principal => Some(binding.role),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The groups `principal` actually belongs to, within its own tenant.

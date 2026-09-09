@@ -27,7 +27,6 @@
 //! disclosure yields verifier values that cannot be replayed as keys.
 
 use hypellm_core::ids::{KeyId, PrincipalId, TenantId};
-use hypellm_core::rbac::{PermissionSet, Role};
 use hypellm_crypto::{Digest, base64, ct, hex, hmac_sha256_parts, random};
 use core::fmt;
 use std::collections::BTreeMap;
@@ -178,8 +177,6 @@ pub struct KeyRecord {
     pub principal: PrincipalId,
     /// What the key may do.
     pub scopes: Vec<Scope>,
-    /// Management roles, for a key used against `/admin/v1`.
-    pub roles: Vec<Role>,
     /// Wall-clock expiry in milliseconds, if any.
     pub expires_at_millis: Option<u64>,
     /// Where the key may be used from.
@@ -197,12 +194,6 @@ impl KeyRecord {
     #[must_use]
     pub fn has_scope(&self, scope: Scope) -> bool {
         self.scopes.contains(&scope)
-    }
-
-    /// The permissions this key's roles grant.
-    #[must_use]
-    pub fn permissions(&self) -> PermissionSet {
-        PermissionSet::from_roles(&self.roles)
     }
 
     /// Whether the key is expired at `now`.
@@ -248,12 +239,6 @@ impl KeyRecord {
                 self.scopes.iter().map(|s| wire_json::Value::from(s.as_str())).collect(),
             ),
         );
-        object.push(
-            "roles",
-            wire_json::Value::Array(
-                self.roles.iter().map(|r| wire_json::Value::from(r.as_str())).collect(),
-            ),
-        );
         object.push_opt("expires_at_millis", self.expires_at_millis.map(wire_json::Value::from));
         object.push("source", source_to_json(&self.source));
         object.push("created_at_millis", wire_json::Value::from(self.created_at_millis));
@@ -283,12 +268,6 @@ impl KeyRecord {
                 .as_array()?
                 .iter()
                 .map(|v| v.as_str().and_then(Scope::parse))
-                .collect::<Option<Vec<_>>>()?,
-            roles: value
-                .get("roles")?
-                .as_array()?
-                .iter()
-                .map(|v| v.as_str().and_then(Role::parse))
                 .collect::<Option<Vec<_>>>()?,
             expires_at_millis: value.get("expires_at_millis").and_then(|v| v.as_u64()),
             source: source_from_json(value.get("source")?)?,
@@ -581,7 +560,6 @@ impl KeyStore {
         tenant: TenantId,
         principal: PrincipalId,
         scopes: Vec<Scope>,
-        roles: Vec<Role>,
         expires_at_millis: Option<u64>,
         source: SourceRestriction,
         description: Option<String>,
@@ -600,7 +578,6 @@ impl KeyStore {
             tenant,
             principal,
             scopes,
-            roles,
             expires_at_millis,
             source,
             created_at_millis: now_wall_millis,
@@ -723,7 +700,6 @@ mod tests {
                 TenantId::new("acme").unwrap(),
                 PrincipalId::new("svc:harness").unwrap(),
                 vec![Scope::Inference, Scope::Models],
-                Vec::new(),
                 None,
                 SourceRestriction::Any,
                 Some("test key".to_owned()),
@@ -1047,7 +1023,6 @@ mod tests {
                 TenantId::new("acme").unwrap(),
                 PrincipalId::new("svc:x").unwrap(),
                 vec![Scope::Inference],
-                Vec::new(),
                 Some(NOW + 1000),
                 SourceRestriction::Any,
                 None,
@@ -1105,7 +1080,6 @@ mod tests {
                 TenantId::new("acme").unwrap(),
                 PrincipalId::new("svc:x").unwrap(),
                 vec![Scope::Inference],
-                Vec::new(),
                 None,
                 SourceRestriction::Addresses(vec![allowed]),
                 None,
@@ -1186,23 +1160,33 @@ mod tests {
     }
 
     #[test]
-    fn roles_resolve_to_permissions() {
+    fn a_key_record_carries_no_roles_of_its_own() {
+        // The management permissions a key acts with come from the active
+        // configuration's role bindings for its principal, resolved per
+        // request, and never from the durable key record. This is what makes
+        // removing a role binding take effect immediately for every key that
+        // principal holds; a copy stored on the record would keep authorising
+        // after the binding was withdrawn, and nothing would reissue it.
+        //
+        // The assertion is on the encoding, because that is where a
+        // reintroduced copy would have to live to survive a restart.
         let store = store();
         let new_key = store
             .create(
                 TenantId::new("acme").unwrap(),
                 PrincipalId::new("svc:ops").unwrap(),
                 vec![Scope::ManagementRead],
-                vec![Role::Operator],
                 None,
                 SourceRestriction::Any,
                 None,
                 NOW,
             )
             .unwrap();
-        let permissions = new_key.record.permissions();
-        assert!(permissions.has(hypellm_core::rbac::Permission::OperateTargets));
-        assert!(!permissions.has(hypellm_core::rbac::Permission::PublishPolicy));
+        let encoded = String::from_utf8(new_key.record.to_payload()).expect("utf-8");
+        assert!(
+            !encoded.contains("role"),
+            "a key record must not carry roles: {encoded}"
+        );
     }
 
     #[test]

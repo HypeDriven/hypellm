@@ -475,13 +475,19 @@ pub fn execute(
                 } else {
                     "base"
                 };
+                // Labelled by target as well as by source, because that is
+                // what makes the histogram actionable: `target bytes_per_token`
+                // is declared per target, and an operator calibrating it needs
+                // to know which target is over-reserving. The target id is
+                // administrator-configured and therefore bounded — the same
+                // reason `Host` and `Deployment` are admissible labels — so
+                // this adds no unbounded cardinality (specification 17.1).
                 state.telemetry.metrics.histogram_observe(
                     hypellm_telemetry::names::TOKEN_ESTIMATE_ERROR,
                     "Reserved minus reconciled tokens, when the estimate was high.",
-                    &hypellm_telemetry::Labels::one(
-                        hypellm_telemetry::LabelName::UsageSource,
-                        source,
-                    ),
+                    &hypellm_telemetry::Labels::new()
+                        .with(hypellm_telemetry::LabelName::UsageSource, source)
+                        .with(hypellm_telemetry::LabelName::Target, target.id.as_str()),
                     estimate.saturating_sub(actual),
                 );
                 reservation.commit(actual);

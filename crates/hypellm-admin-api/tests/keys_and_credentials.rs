@@ -38,7 +38,10 @@ use hypellm_core::ids::KeyId;
 use hypellm_core::rbac::Role;
 use hypellm_core::time::Clock;
 use hypellm_store::{Frame, Log, RecordKind};
-use harness::{ANY_ETAG, CREDENTIAL, Harness, STALE_ETAG, TENANT_A, TENANT_B, TestSession};
+use harness::{
+    ANY_ETAG, CREDENTIAL, Harness, KEY_EDITOR_PRINCIPAL, KEY_ONCALL_PRINCIPAL,
+    KEY_VIEWER_PRINCIPAL, STALE_ETAG, TENANT_A, TENANT_B, TestSession,
+};
 use wire_http1::Method;
 
 /// The MAC key [`Harness`] opens its store with.
@@ -426,9 +429,10 @@ fn a_key_is_minted_in_the_callers_tenant_whatever_the_body_asks_for() {
 
 #[test]
 fn a_created_key_carries_no_roles_however_the_request_asks() {
-    // Roles on a key are management authority. `create_key` passes an empty
-    // role list; a body-supplied one would let a break-glass administrator mint
-    // a non-expiring credential that is itself a break-glass administrator.
+    // A key is a credential that says *who* is calling. What that principal may
+    // do is settled by the configuration's role bindings, resolved on every
+    // request — so a `roles` array in the creation body must not become
+    // authority, and must not be stored where a restart would restore it.
     let admin = Harness::new();
     let oncall = admin.break_glass();
 
@@ -447,36 +451,197 @@ fn a_created_key_carries_no_roles_however_the_request_asks() {
         .keys
         .get(&KeyId::new(response.str_field("id")).unwrap())
         .expect("the key exists");
+    let encoded = String::from_utf8(record.to_payload()).expect("utf-8");
     assert!(
-        record.roles.is_empty(),
-        "the request body granted roles: {:?}",
-        record.roles
+        !encoded.contains("role") && !encoded.contains("break_glass"),
+        "the request body's roles reached the durable key record: {encoded}"
     );
-    assert!(record.permissions().is_empty());
 }
 
 #[test]
-fn a_management_scoped_key_still_cannot_call_the_management_api() {
-    // Specification 3: the management path is separated from the data plane.
-    // `/admin/v1` authenticates sessions only, so a key — whatever scope it
-    // carries — is not an admission ticket to it.
+fn a_management_key_reaches_the_management_api_as_its_principal() {
+    // Specification 9.2 lists the router API key among the credentials that
+    // establish a principal, and `/admin/v1` is not exempt. The permissions it
+    // acts with come from the configuration's bindings for that principal, not
+    // from the key.
     let admin = Harness::new();
-    let oncall = admin.break_glass();
+    let (_id, secret) = admin.issue_management_key(TENANT_A, KEY_VIEWER_PRINCIPAL, &["management:read"]);
 
-    let response = admin.post(
-        &oncall,
-        "/admin/v1/keys",
-        r#"{"principal":"svc:build","scopes":["management:write"]}"#,
+    let listed = admin
+        .request(Method::Get, "/admin/v1/targets")
+        .header("authorization", &format!("Bearer {secret}"))
+        .send();
+    assert_eq!(listed.status, 200, "{}", listed.body);
+
+    let who = admin
+        .request(Method::Get, "/admin/v1/session")
+        .header("authorization", &format!("Bearer {secret}"))
+        .send();
+    assert_eq!(who.status, 200, "{}", who.body);
+    assert_eq!(who.str_field("principal"), KEY_VIEWER_PRINCIPAL);
+    assert_eq!(who.str_field("auth_method"), "api_key");
+    assert!(
+        !who.body_contains("csrf_token"),
+        "a key caller was handed a CSRF token it does not use: {}",
+        who.body
     );
-    assert_eq!(response.status, 201, "{}", response.body);
-    let secret = response.str_field("secret");
+}
+
+#[test]
+fn a_key_without_a_management_scope_reaches_nothing() {
+    // The scope is the gate. An inference key is not an admission ticket to the
+    // management plane just because the management listener answered it.
+    let admin = Harness::new();
+    let (_id, secret) = admin.issue_api_key(TENANT_A, KEY_VIEWER_PRINCIPAL);
 
     let attempt = admin
+        .request(Method::Get, "/admin/v1/targets")
+        .header("authorization", &format!("Bearer {secret}"))
+        .send();
+    assert_eq!(attempt.status, 403, "{}", attempt.body);
+    assert!(!attempt.body_contains("local:"), "{}", attempt.body);
+}
+
+#[test]
+fn a_read_scoped_key_cannot_change_anything() {
+    // `management:read` and `management:write` are two scopes because they are
+    // two privileges. A read key that could POST would make the distinction the
+    // Keys screen offers a decoration.
+    let admin = Harness::new();
+    let (_id, secret) = admin.issue_management_key(TENANT_A, KEY_EDITOR_PRINCIPAL, &["management:read"]);
+    let before = admin.state.drafts.len();
+
+    let attempt = admin
+        .request(Method::Post, "/admin/v1/policies")
+        .header("authorization", &format!("Bearer {secret}"))
+        .json(r#"{"text":"tenant id=acme\n"}"#)
+        .send();
+    assert_eq!(attempt.status, 403, "{}", attempt.body);
+    assert_eq!(
+        admin.state.drafts.len(),
+        before,
+        "a refused write created a draft"
+    );
+}
+
+#[test]
+fn a_revoked_key_stops_reaching_the_management_api() {
+    // Revocation has to be the end of a credential on both planes. A key that
+    // kept working against `/admin/v1` after the Keys screen reported it
+    // revoked would make that screen lie about the control it offers.
+    let admin = Harness::new();
+    let (id, secret) = admin.issue_management_key(TENANT_A, KEY_EDITOR_PRINCIPAL, &["management:write"]);
+
+    let before = admin
+        .request(Method::Get, "/admin/v1/targets")
+        .header("authorization", &format!("Bearer {secret}"))
+        .send();
+    assert_eq!(before.status, 200, "{}", before.body);
+
+    admin.state.keys.revoke(&id);
+
+    let after = admin
+        .request(Method::Get, "/admin/v1/targets")
+        .header("authorization", &format!("Bearer {secret}"))
+        .send();
+    assert_eq!(after.status, 401, "{}", after.body);
+    assert_eq!(after.error_code.as_deref(), Some("unauthenticated"));
+}
+
+#[test]
+fn no_key_may_mint_a_key_or_open_break_glass() {
+    // The two permissions no key holds, whatever its principal's bindings say.
+    // A key that can mint keys can replace itself the moment it is revoked, and
+    // a key that can open break-glass is specification 22.4's offline token
+    // replaced by a string in a CI secret store.
+    //
+    // The fixture is adversarial on purpose: the principal is bound to
+    // `break_glass_admin`, which holds every permission there is, so the
+    // refusal can only be coming from the key ceiling.
+    let admin = Harness::new();
+    let (_id, secret) =
+        admin.issue_management_key(TENANT_A, KEY_ONCALL_PRINCIPAL, &["management:write"]);
+    let before = admin.state.keys.len();
+
+    let minted = admin
+        .request(Method::Post, "/admin/v1/keys")
+        .header("authorization", &format!("Bearer {secret}"))
+        .json(r#"{"principal":"svc:escalated","scopes":["inference"]}"#)
+        .send();
+    assert_eq!(minted.status, 403, "{}", minted.body);
+    assert!(!minted.body_contains("hypellmk_"), "{}", minted.body);
+    assert_eq!(
+        admin.state.keys.len(),
+        before,
+        "a refused call minted a key"
+    );
+
+    // And the read side too: a key that cannot mint but can list every key in
+    // the tenant still holds the identifiers an attacker wants.
+    let listed = admin
         .request(Method::Get, "/admin/v1/keys")
         .header("authorization", &format!("Bearer {secret}"))
         .send();
-    assert_eq!(attempt.status, 401, "{}", attempt.body);
-    assert_eq!(attempt.error_code.as_deref(), Some("unauthenticated"));
+    assert_eq!(listed.status, 403, "{}", listed.body);
+
+    // And the caller is told the truth about itself. `GET /admin/v1/session` is
+    // what an automation reads to decide what to attempt; advertising
+    // `manage_keys` and `break_glass` here — which the principal's
+    // `break_glass_admin` binding does grant a *session* — would send whoever
+    // debugged the 403 above looking at role bindings that are not the cause.
+    let who = admin
+        .request(Method::Get, "/admin/v1/session")
+        .header("authorization", &format!("Bearer {secret}"))
+        .send();
+    assert_eq!(who.status, 200, "{}", who.body);
+    assert!(!who.body_contains("manage_keys"), "{}", who.body);
+    assert!(!who.body_contains("\"break_glass\":true"), "{}", who.body);
+    // The rest of the role is intact, so this is a ceiling rather than a
+    // blanket refusal to report anything.
+    assert!(who.body_contains("publish_policy"), "{}", who.body);
+}
+
+#[test]
+fn a_key_whose_principal_loses_its_binding_stops_working() {
+    // The reason roles are not stored on the key record. Withdrawing a binding
+    // has to de-power every key that principal holds, immediately, without
+    // anyone finding and reissuing them.
+    let admin = Harness::new();
+    let (_id, secret) = admin.issue_management_key(TENANT_A, KEY_VIEWER_PRINCIPAL, &["management:read"]);
+
+    let before = admin
+        .request(Method::Get, "/admin/v1/targets")
+        .header("authorization", &format!("Bearer {secret}"))
+        .send();
+    assert_eq!(before.status, 200, "{}", before.body);
+
+    admin.activate_config_without(KEY_VIEWER_PRINCIPAL);
+
+    let after = admin
+        .request(Method::Get, "/admin/v1/targets")
+        .header("authorization", &format!("Bearer {secret}"))
+        .send();
+    assert_eq!(after.status, 403, "{}", after.body);
+}
+
+#[test]
+fn a_key_holds_no_session_to_log_out_of() {
+    // A `204` here would report that the credential had been withdrawn while
+    // the key still worked.
+    let admin = Harness::new();
+    let (_id, secret) = admin.issue_management_key(TENANT_A, KEY_EDITOR_PRINCIPAL, &["management:write"]);
+
+    let out = admin
+        .request(Method::Post, "/admin/v1/logout")
+        .header("authorization", &format!("Bearer {secret}"))
+        .send();
+    assert_eq!(out.status, 403, "{}", out.body);
+
+    let still = admin
+        .request(Method::Get, "/admin/v1/targets")
+        .header("authorization", &format!("Bearer {secret}"))
+        .send();
+    assert_eq!(still.status, 200, "the key stopped working: {}", still.body);
 }
 
 // -- Keys: authorization -----------------------------------------------------

@@ -119,6 +119,14 @@ Scopes are `inference` (chat and responses), `embeddings`, `models`,
 uses and no more — a key without `embeddings` gets `403` from
 `/v1/embeddings` rather than a routing decision.
 
+The two management scopes let a key call `/admin/v1` as well, for automation
+that has no browser session: `management:read` to read, `management:write` for
+anything that changes something. What the key may *do* there comes from the
+`role_binding` records for its principal, not from the key, so a key whose
+principal is unbound is refused. No key may mint keys or open break-glass,
+whatever its principal's roles say. See
+[management access with an API key](deferred-issues.md#management-access-with-an-api-key).
+
 Optional fields: `expires_at` (epoch milliseconds) and a source restriction.
 A source-restricted key fails closed where the peer address is unknown, which
 includes every caller arriving over a Unix-socket listener.
@@ -453,6 +461,48 @@ send hints — otherwise silently ignored, by design.
 
 Prompt content is never configuration. Nothing written in a message can change
 a destination, a credential, or a routing decision.
+
+---
+
+## Long-running work: `/v1/jobs`
+
+First-party, not OpenAI-compatible, and announced as such because no
+OpenAI-compatible shape fits. Off unless the deployment set `job_workers`; a
+router that does not run jobs answers `404`.
+
+Post the same body you would post to `/v1/chat/completions`:
+
+```bash
+curl -sS $BASE/v1/jobs -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"long-generation","messages":[{"role":"user","content":"..."}]}'
+```
+
+```json
+{"job_id":"job_5f3a…","state":"queued","progress_permille":0,"eta_ms":0}
+```
+
+Then:
+
+| Request | Answer |
+|---|---|
+| `GET /v1/jobs/{id}` | state, progress, and the error once failed |
+| `GET /v1/jobs/{id}/events` | SSE, one `state` event per change, then `done` |
+| `GET /v1/jobs/{id}/result` | the completed response, in the dialect you submitted; `409 job_not_ready` until then |
+| `DELETE /v1/jobs/{id}` | cancel; a queued job stops at once, a running one at its next cancellation point |
+| `GET /v1/jobs` | your tenant's jobs, newest first |
+
+Three things to know before building on it:
+
+- **A job identifier is valid for one router lifetime.** Jobs are held in
+  memory, so a restart loses them and their results, and the identifier then
+  answers `job_not_found`. Resubmit rather than poll indefinitely.
+- **Results expire.** `job_retention_ms` (15 minutes by default) is how long a
+  finished job stays readable. Collect the result, do not treat the router as
+  storage.
+- **`stream: true` is ignored.** The connection is released at `202`; there is
+  nothing to stream it to. Use `/events` for progress and `/result` for the
+  answer.
 
 ---
 

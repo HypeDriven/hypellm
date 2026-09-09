@@ -118,6 +118,7 @@ fn target(id: &str) -> Target {
         cost_class: CostClass::CHEAPEST,
         quality_class: QualityClass::LOWEST,
         document_token_estimate: None,
+            bytes_per_token: None,
         residency: None,
         is_local: true,
         admin_state: AdminState::Enabled,
@@ -300,6 +301,64 @@ fn a_document_url_is_never_dereferenced_and_never_influences_routing() {
 }
 
 #[test]
+fn a_declared_bytes_per_token_changes_what_is_reserved() {
+    use hypellm_core::canonical::{DEFAULT_BYTES_PER_TOKEN, MAX_BYTES_PER_TOKEN, TokenEstimate};
+
+    // The point of the field: an operator who has measured their target's
+    // tokenizer reserves closer to what the request will actually use. A test
+    // that only checked the default would pass on an implementation that
+    // ignored the declaration entirely.
+    let req = request(vec![ContentPart::Text("x".repeat(4_000))]);
+
+    let base = TokenEstimate {
+        bytes_per_token: DEFAULT_BYTES_PER_TOKEN,
+        ..TokenEstimate::default()
+    };
+    let calibrated = TokenEstimate {
+        bytes_per_token: 4,
+        ..TokenEstimate::default()
+    };
+
+    let reserved_by_default = req.estimated_input_tokens_for(&base);
+    let reserved_calibrated = req.estimated_input_tokens_for(&calibrated);
+    assert!(
+        reserved_calibrated < reserved_by_default,
+        "a declared 4 bytes per token must reserve less than the default 2: \
+         {reserved_calibrated} vs {reserved_by_default}"
+    );
+
+    // And it is bounded on both ends, because this is the one knob that makes
+    // the input half of a quota smaller. Zero must not divide by zero, and a
+    // number past the ceiling must not shrink the estimate further than the
+    // ceiling allows — the configuration refuses both, and a `TokenEstimate`
+    // built any other way must still be safe.
+    let zero = TokenEstimate {
+        bytes_per_token: 0,
+        ..TokenEstimate::default()
+    };
+    assert_eq!(
+        req.estimated_input_tokens_for(&zero),
+        req.estimated_input_tokens_for(&TokenEstimate {
+            bytes_per_token: 1,
+            ..TokenEstimate::default()
+        }),
+        "zero must clamp to the most conservative setting, not divide by zero"
+    );
+    let absurd = TokenEstimate {
+        bytes_per_token: u32::MAX,
+        ..TokenEstimate::default()
+    };
+    assert_eq!(
+        req.estimated_input_tokens_for(&absurd),
+        req.estimated_input_tokens_for(&TokenEstimate {
+            bytes_per_token: MAX_BYTES_PER_TOKEN,
+            ..TokenEstimate::default()
+        }),
+        "a value past the ceiling must clamp to it rather than erase the estimate"
+    );
+}
+
+#[test]
 fn a_document_costs_a_configured_constant_rather_than_its_byte_length() {
     // A scanned PDF is megabytes and few tokens; a dense text PDF is the
     // reverse. Byte-derived estimation is meaningless for both, and the
@@ -318,12 +377,12 @@ fn a_document_costs_a_configured_constant_rather_than_its_byte_length() {
         },
     }]);
     assert_eq!(
-        small.estimated_input_tokens_with(4_096),
-        large.estimated_input_tokens_with(4_096),
+        small.estimated_input_tokens(),
+        large.estimated_input_tokens(),
         "the estimate must not depend on the document's size"
     );
     // And the constant is what it charges.
-    assert!(small.estimated_input_tokens_with(4_096) >= 4_096);
+    assert!(small.estimated_input_tokens() >= 4_096);
     assert_eq!(small.document_parts(), 1);
 }
 

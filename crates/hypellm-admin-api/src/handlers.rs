@@ -593,6 +593,20 @@ impl AdminRequest<'_> {
         self.headers.get(session::CSRF_HEADER)
     }
 
+    /// The API key presented on this request, if any.
+    ///
+    /// The same two headers the inference listener accepts, for the same
+    /// reason: which one a client reaches for is a transport detail, not a
+    /// separate credential type. `bearer_token` returns `None` for a scheme it
+    /// does not recognise and for an empty `Bearer `, so a malformed
+    /// credential reads as one presented and broken rather than as none.
+    fn presented_key(&self) -> Option<&str> {
+        self.headers
+            .get("authorization")
+            .and_then(hypellm_auth::apikey::bearer_token)
+            .or_else(|| self.headers.get("x-api-key"))
+    }
+
     fn if_match(&self) -> Option<&str> {
         self.headers.get("if-match")
     }
@@ -608,6 +622,62 @@ impl AdminRequest<'_> {
                 format!("the request body is not valid JSON ({})", e.kind.code()),
             )
         })
+    }
+}
+
+/// How many distinct keys the first-use register will remember.
+///
+/// A bound rather than a set that grows with the key store: the register exists
+/// to stop the same key writing a record on every request, and a router serving
+/// more management keys than this in one lifetime has stopped being the case
+/// the record was for. Past the cap, later keys simply get no first-use record;
+/// their actions are still attributed to their principal.
+const MAX_REMEMBERED_KEYS: usize = 512;
+
+/// Which management keys have already been recorded as having signed in.
+///
+/// # Why a record at all
+///
+/// Every management action a key causes is audited against its *principal*,
+/// exactly as a session's actions are. That leaves specification 22.3's first
+/// question — which credential — answerable only if something, somewhere, ties
+/// the key identifier to the principal at a point in time. One `login` record
+/// per key does that, and it is the same shape a session sign-in already
+/// writes.
+///
+/// # Why it is bounded and per-process
+///
+/// Specification 3.2 admits no unbounded log entry from a request. A record per
+/// *request* would be exactly that; a record per key per router lifetime is
+/// bounded by the key store, and bounded again by [`MAX_REMEMBERED_KEYS`]. A
+/// restart writes them again, which is correct: an investigation reading one
+/// router lifetime should not have to read the previous one to learn which
+/// credentials were in use.
+#[derive(Debug)]
+struct KeyFirstUse {
+    seen: Mutex<std::collections::BTreeSet<String>>,
+}
+
+impl KeyFirstUse {
+    const fn new() -> Self {
+        Self {
+            seen: Mutex::new(std::collections::BTreeSet::new()),
+        }
+    }
+
+    /// Whether this key should have a first-use record written now.
+    ///
+    /// Returns `true` at most once per key per process, and `false` — never a
+    /// duplicate — if the lock is poisoned, because a second record is worse
+    /// than a missing one in a trail an investigation counts.
+    fn admit(&self, key_id: &str) -> bool {
+        let Ok(mut seen) = self.seen.lock() else {
+            return false;
+        };
+        if seen.len() >= MAX_REMEMBERED_KEYS {
+            return false;
+        }
+        seen.insert(key_id.to_owned())
     }
 }
 
@@ -862,6 +932,8 @@ pub struct AdminApi {
     password_audits: AnonymousAuditBudget,
     /// Failure counters and the verification concurrency bound.
     passwords: PasswordThrottle,
+    /// Which management keys have already been recorded as having signed in.
+    key_first_use: KeyFirstUse,
 }
 
 impl AdminApi {
@@ -874,6 +946,7 @@ impl AdminApi {
             break_glass_audits: AnonymousAuditBudget::new(),
             password_audits: AnonymousAuditBudget::new(),
             passwords: PasswordThrottle::new(),
+            key_first_use: KeyFirstUse::new(),
         }
     }
 
@@ -962,10 +1035,18 @@ impl AdminApi {
             _ => {}
         }
 
-        // 2. Session.
-        let token = request
-            .session_token()
-            .ok_or_else(|| session_error(SessionRejection::Missing))?;
+        // 2. Session, or a management-scoped API key.
+        //
+        // The cookie wins whenever one is present, and the key path is reached
+        // only when there is none. Two reasons, and the second is the one that
+        // matters: a browser attaches the cookie by itself, so a request that
+        // carries one is subject to CSRF and must go through the CSRF gate —
+        // letting an `Authorization` header divert it to a path with no CSRF
+        // check would be a bypass written into the router.
+        let Some(token) = request.session_token() else {
+            let session = self.key_caller(request)?;
+            return self.dispatch(request, &session, "");
+        };
         let session = self
             .state
             .sessions
@@ -983,6 +1064,144 @@ impl AdminApi {
         self.dispatch(request, &session, token)
     }
 
+    /// Resolve a management caller from a presented API key.
+    ///
+    /// Specification 9.2 lists the router API key among the credentials that
+    /// establish a principal, and specification 16's management surface is not
+    /// exempt from it — but a key reaching `/admin/v1` is a different privilege
+    /// from a key reaching the inference listener, so it is gated three ways:
+    ///
+    /// 1. **Scope.** The key must carry `management:read`; a mutating request
+    ///    additionally needs `management:write`. These are the scopes the Keys
+    ///    screen has always offered, and they now mean what the screen says.
+    /// 2. **Roles from configuration.** Permissions come from the role bindings
+    ///    for the key's principal in the *active* configuration, resolved on
+    ///    every request. The key carries no roles of its own, so withdrawing a
+    ///    binding de-powers every key that principal holds at once.
+    /// 3. **A ceiling no key may exceed** — see [`Self::key_may_hold`].
+    ///
+    /// # Why there is no CSRF check here
+    ///
+    /// CSRF exists because a browser attaches a cookie to a cross-site request
+    /// by itself. Nothing attaches an `Authorization` header by itself, so
+    /// there is no forgery to prevent — and `serve` reaches this only when no
+    /// session cookie was sent, so a request that *is* cookie-authenticated
+    /// cannot route around the CSRF gate by adding a header.
+    fn key_caller(&self, request: &AdminRequest<'_>) -> Result<Session, ApiError> {
+        let Some(presented) = request.presented_key() else {
+            return Err(session_error(SessionRejection::Missing));
+        };
+
+        let now = self.state.clock.now_millis();
+        let record = self
+            .state
+            .keys
+            .verify(presented, request.peer, self.state.clock.wall_millis())
+            .map_err(|_| {
+                // One answer for every key failure, as on the inference
+                // listener: an unknown key, a wrong secret, a revoked key and a
+                // key used from a forbidden address are all `unauthenticated`.
+                ApiError::new(
+                    ApiErrorCode::Unauthenticated,
+                    "this credential is not valid for the management API",
+                )
+            })?;
+
+        // Scope before roles, so a key with no management scope learns nothing
+        // about whether its principal has bindings.
+        if !record.has_scope(hypellm_auth::Scope::ManagementRead)
+            && !record.has_scope(hypellm_auth::Scope::ManagementWrite)
+        {
+            return Err(ApiError::new(
+                ApiErrorCode::Forbidden,
+                "this key carries no management scope",
+            ));
+        }
+        if request.is_mutating() && !record.has_scope(hypellm_auth::Scope::ManagementWrite) {
+            return Err(ApiError::new(
+                ApiErrorCode::Forbidden,
+                "this key carries management:read, which does not permit a change",
+            ));
+        }
+
+        let config = self.state.config();
+        let roles = management_roles_for(&config, &record.principal);
+        if roles.is_empty() {
+            // The same refusal as an unbound password or break-glass principal,
+            // and the same reason: a credential proves who is calling, not what
+            // they may do. A caller with no role can reach no endpoint, and
+            // saying so is more useful than 403 on every path.
+            return Err(ApiError::new(
+                ApiErrorCode::Forbidden,
+                "this key's principal has no role binding in this configuration",
+            ));
+        }
+
+        // One record per key per router lifetime, so the audit chain ties this
+        // key identifier to the principal every later action is attributed to.
+        if self.key_first_use.admit(record.id.as_str()) {
+            let _ = self.record_audit(
+                AuditEvent::new(
+                    self.state.clock.wall_millis(),
+                    record.principal.as_str(),
+                    AuditAction::Login,
+                )
+                .with_object(record.id.as_str())
+                .with_tenant(record.tenant.as_str())
+                .with_source(
+                    request
+                        .peer
+                        .map_or_else(|| "unknown".to_owned(), |p| p.to_string()),
+                )
+                .with_reason("management api key"),
+            );
+        }
+
+        Ok(Session {
+            // Not a session token digest — no session was issued and none is
+            // stored. It is derived from the key identifier, which is the key's
+            // public prefix, so it is stable for logging and carries no secret.
+            digest: hypellm_crypto::Digest::from_bytes(hypellm_crypto::sha256::sha256_parts(&[
+                b"hypellm/management-key/v1\0",
+                record.id.as_str().as_bytes(),
+            ])),
+            principal: record.principal.clone(),
+            tenant: record.tenant.clone(),
+            subject: None,
+            email: None,
+            roles,
+            method: hypellm_auth::AuthMethod::ApiKey,
+            created_at_millis: record.created_at_millis,
+            last_seen_millis: now,
+            absolute_expiry_millis: record.expires_at_millis.unwrap_or(u64::MAX),
+            // The full credential was presented on *this* request, which is
+            // what a reauthentication check asks for. The freshness rule exists
+            // because a browser session is ambient authority that outlives the
+            // moment its holder proved who they were; a key is not ambient and
+            // has no second factor to re-prove. The permissions that rule
+            // guards hardest are excluded from keys outright instead.
+            authenticated_at_millis: now,
+        })
+    }
+
+    /// Whether an API key may exercise `permission` at all.
+    ///
+    /// Two permissions are refused to every key, whatever its principal's
+    /// bindings say, and the check runs per request against live configuration
+    /// — so a key that publishes a policy granting itself `break_glass_admin`
+    /// still cannot use either one.
+    ///
+    /// - **`BreakGlass`.** Specification 22.4's recovery path is a human with a
+    ///   token held offline, a stated reason, and an alert. A key that could
+    ///   open a break-glass session is that whole control replaced by a string
+    ///   in a CI secret store.
+    /// - **`ManageKeys`.** A key that can mint keys can mint one with wider
+    ///   scope, or a fresh one to replace itself the moment it is revoked.
+    ///   Revocation has to be the end of a credential, not an inconvenience.
+    const fn key_may_hold(permission: Permission) -> bool {
+        !matches!(permission, Permission::BreakGlass | Permission::ManageKeys)
+    }
+
     fn dispatch(
         &self,
         request: &AdminRequest<'_>,
@@ -993,7 +1212,18 @@ impl AdminApi {
 
         match (request.method, path) {
             (Method::Get, "/admin/v1/session") => self.session_info(session),
-            (Method::Post, "/admin/v1/logout") => self.logout(session, token),
+            (Method::Post, "/admin/v1/logout") => {
+                // There is no server-side session to invalidate, so a `204`
+                // here would tell a caller its credential had been withdrawn
+                // when the key still works. Revoke the key instead.
+                if session.method == hypellm_auth::AuthMethod::ApiKey {
+                    return Err(ApiError::new(
+                        ApiErrorCode::Forbidden,
+                        "an API key holds no session to end; revoke the key instead",
+                    ));
+                }
+                self.logout(session, token)
+            }
 
             (Method::Get, "/admin/v1/targets") => self.list_targets(request, session),
             (Method::Get, "/admin/v1/providers") => self.list_providers(session),
@@ -1002,6 +1232,7 @@ impl AdminApi {
             (Method::Get, "/admin/v1/traffic") => self.traffic(session),
 
             (Method::Get, "/admin/v1/policies") => self.list_drafts(session),
+            (Method::Get, "/admin/v1/policies/active") => self.active_policy(session),
             (Method::Post, "/admin/v1/policies") => self.create_draft(request, session),
             (Method::Post, "/admin/v1/policies:rollback") => self.rollback_policy(request, session),
             (Method::Post, "/admin/v1/policies/active:simulate") => {
@@ -1105,10 +1336,18 @@ impl AdminApi {
 
     fn session_info(&self, session: &Session) -> Result<ApiResponse, ApiError> {
         let config = self.state.config();
+        // Filtered through the same ceiling `require` applies, so this reports
+        // what the caller can actually do rather than what its roles would
+        // grant a session. An automation reads this to decide what to attempt;
+        // listing `manage_keys` for a key that will be refused it is the kind
+        // of plausible-looking answer that sends someone debugging their role
+        // bindings for a refusal that has nothing to do with them.
+        let by_key = session.method == hypellm_auth::AuthMethod::ApiKey;
         let permissions: Vec<Value> = session
             .permissions()
             .as_slice()
             .iter()
+            .filter(|p| !by_key || Self::key_may_hold(**p))
             .map(|p| Value::from(p.as_str()))
             .collect();
 
@@ -1130,13 +1369,25 @@ impl AdminApi {
         );
         // The CSRF token is delivered here rather than in a cookie, so a page
         // that cannot read it cannot forge a request with it.
-        root.push(
-            "csrf_token",
-            Value::from(self.state.sessions.csrf_for(&session.digest)),
-        );
+        //
+        // A key-authenticated caller gets none: there is no session for it to
+        // be bound to, and handing one out would suggest a request needs it
+        // when the key path does not read it.
+        if session.method != hypellm_auth::AuthMethod::ApiKey {
+            root.push(
+                "csrf_token",
+                Value::from(self.state.sessions.csrf_for(&session.digest)),
+            );
+        }
         root.push("config_version", Value::from(config.snapshot.version));
         root.push("config_digest", Value::from(config.digest_short()));
-        root.push("break_glass", Value::from(session.is_break_glass()));
+        // Never for a key, whatever its principal's roles say: `require`
+        // refuses `BreakGlass` to every key, so a `true` here would announce a
+        // capability the next request would deny.
+        root.push(
+            "break_glass",
+            Value::from(!by_key && session.is_break_glass()),
+        );
         root.push(
             "authenticated_at",
             Value::from(session.authenticated_at_millis),
@@ -2998,6 +3249,36 @@ impl AdminApi {
 
     // -- Policies -----------------------------------------------------------
 
+    /// `GET /admin/v1/policies/active` — the active configuration bundle.
+    ///
+    /// The canonical text, its version, and its digest. Specification 25 settles
+    /// state distribution as "single-writer versioned bundles; do not build
+    /// consensus in v1", and this is the read side of that: a second router is
+    /// brought to the same policy by taking this bundle, writing it to that
+    /// node's configuration file, and confirming that
+    /// `hypellm-router --check` prints the same digest. Nothing is replicated,
+    /// no node elects another, and the operator remains the single writer.
+    ///
+    /// Gated on `EditPolicy` rather than `ReadSummary`. The canonical text is
+    /// the whole configuration — every target, every binding, every
+    /// `local_user` verifier — and it is already what a policy editor sees when
+    /// they open a draft. A summary reader is not entitled to it.
+    fn active_policy(&self, session: &Session) -> Result<ApiResponse, ApiError> {
+        self.require(session, Permission::EditPolicy)?;
+        let config = self.state.config();
+
+        let mut root = Object::new();
+        root.push("version", Value::from(config.snapshot.version));
+        root.push("digest", Value::from(config.digest.to_hex()));
+        // The bytes a second node writes to its own configuration file. The
+        // digest above is over exactly these, so a node that reproduces the
+        // digest is running the same policy — which is the whole guarantee this
+        // endpoint offers, and it is checkable rather than asserted.
+        root.push("canonical", Value::from(config.canonical.as_str()));
+
+        Ok(ApiResponse::ok(&Value::Object(root)).with_header("ETag", active_etag(&config)))
+    }
+
     fn list_drafts(&self, session: &Session) -> Result<ApiResponse, ApiError> {
         self.require(session, Permission::SimulatePolicy)
             .or_else(|_| self.require(session, Permission::EditPolicy))?;
@@ -3920,7 +4201,6 @@ impl AdminApi {
                 session.tenant.clone(),
                 principal.clone(),
                 scopes,
-                Vec::new(),
                 expires_at,
                 source,
                 body.opt_field_str("description")
@@ -4270,11 +4550,21 @@ impl AdminApi {
             "outbound_tls_configured",
             Value::from(settings.tls_helper_socket.is_some()),
         );
+        // Whether, not where: this endpoint discloses no local path, and an
+        // operator asking "will `--backup` work" needs only the first.
+        deployment.push(
+            "backup_configured",
+            Value::from(settings.backup_dir.is_some()),
+        );
 
         // Retention is per-tenant, so the caller sees its own.
         let mut retention = Object::new();
         if let Some(tenant) = config.tenants.get(&session.tenant) {
             retention.push("days", Value::from(u64::from(tenant.retention_days)));
+            // Sent beside the window rather than left to the screen to know:
+            // an operator reading "30 days" has to be told that nothing here
+            // deletes anything at 30 days, or the number reads as a control.
+            retention.push("days_enforced", Value::from(false));
             retention.push_opt(
                 "residency",
                 tenant.residency.as_ref().map(|r| Value::from(r.as_str())),
@@ -4284,6 +4574,10 @@ impl AdminApi {
                 tenant.max_cost_class.map(|c| Value::from(u64::from(c.0))),
             );
         }
+        // Always `false`: `capture_bodies=true` does not load. Reported anyway,
+        // because "no prompt capture" is a fact an operator comes to this
+        // screen to confirm, and an absent field reads as an unanswered
+        // question rather than as an answer.
         retention.push(
             "prompt_capture_enabled",
             Value::from(settings.capture_bodies),
@@ -5001,6 +5295,14 @@ impl AdminApi {
     // -- Helpers ------------------------------------------------------------
 
     fn require(&self, session: &Session, permission: Permission) -> Result<(), ApiError> {
+        // Before the role check, because the answer does not depend on the
+        // caller's bindings and must not change when they do.
+        if session.method == hypellm_auth::AuthMethod::ApiKey && !Self::key_may_hold(permission) {
+            return Err(ApiError::new(
+                ApiErrorCode::Forbidden,
+                "an API key may not perform this action; sign in as an operator",
+            ));
+        }
         self.state
             .sessions
             .authorize(session, permission, self.state.clock.now_millis())

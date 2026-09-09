@@ -429,6 +429,27 @@ pub struct FleetPolicy {
     pub fetch_disk_headroom_bytes: u64,
     /// Observed-over-declared memory ratio, in permille, that counts as drift.
     pub memory_drift_tolerance_permille: u32,
+    /// Smoothed requests per minute at which a *cold* deployment is started
+    /// before anything asks for it.
+    ///
+    /// **Zero disables it, and zero is the default.** Specification-extension
+    /// 9.8: starting a model before it is asked for is genuinely valuable and
+    /// genuinely capable of doubling the swap rate when the prediction is poor,
+    /// so it ships off and an operator turns it on per host with a number they
+    /// can defend.
+    ///
+    /// Three properties keep a bad predictor from being worse than no
+    /// predictor, and the third is the one that matters:
+    ///
+    /// - It spends the same `max_activations_per_hour` budget as a demand-driven
+    ///   activation, so prediction cannot exceed the ceiling — it can only use
+    ///   the ceiling up sooner.
+    /// - It respects dwell, cooldown and flap backoff, so a deployment that was
+    ///   just evicted is not immediately predicted back.
+    /// - **It never evicts.** A prediction that displaces a running model is
+    ///   exactly how the swap rate doubles: the router pays a stop *and* a
+    ///   start on a guess. Pre-warm acts only where the plan needs neither.
+    pub prewarm_min_rate_per_minute: u32,
     /// Whether a deployment observed running but not started by this router
     /// may be evicted by it.
     ///
@@ -452,6 +473,7 @@ impl FleetPolicy {
         allow_fetch: false,
         fetch_disk_headroom_bytes: 16 * 1024 * 1024 * 1024,
         memory_drift_tolerance_permille: 100,
+        prewarm_min_rate_per_minute: 0,
         adopt_unmanaged: false,
     };
 }

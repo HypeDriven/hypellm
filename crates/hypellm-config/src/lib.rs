@@ -863,11 +863,13 @@ identity issuer=https://accounts.google.com subject=1234567890 \\
 
     // -- Local users ---------------------------------------------------------
 
-    /// A real verifier at the cheapest legal iteration count.
+    /// A real verifier at the cheapest legal cost parameter.
     fn verifier_for(password: &str) -> String {
-        hypellm_crypto::PasswordVerifier::derive(
+        hypellm_crypto::PasswordVerifier::derive_with(
             password,
-            hypellm_crypto::pbkdf2::MIN_ITERATIONS,
+            hypellm_crypto::scrypt::MIN_LOG_N,
+            hypellm_crypto::scrypt::DEFAULT_R,
+            hypellm_crypto::scrypt::DEFAULT_P,
         )
         .expect("the test host has an entropy source")
         .encode()
@@ -1204,6 +1206,33 @@ alias id=a targets=t
         let document = parse(FULL, &ParseLimits::DEFAULT).unwrap();
         let c = build(&document, 42).unwrap();
         assert_eq!(c.snapshot.version, 42);
+    }
+
+    #[test]
+    fn capture_bodies_true_is_refused_and_false_is_not() {
+        // A document that turns on body capture is claiming per-tenant,
+        // sampled, encrypted, access-controlled, time-limited capture
+        // (specification 17) — a control this router does not have. Loading it
+        // would leave an operator believing prompts were being captured under
+        // controls that do not exist, which is worse than refusing to start.
+        //
+        // `false` must keep loading: it is a true statement, and refusing it
+        // would break every document that spells the default out.
+        let refused = load(
+            "settings state_dir=/tmp/x capture_bodies=true\ntenant id=acme\n",
+            1,
+        )
+        .expect_err("capture_bodies=true must not load");
+        assert!(
+            refused.iter().any(|e| e.to_string().contains("capture_bodies")),
+            "the error must name the field: {refused:?}"
+        );
+
+        load(
+            "settings state_dir=/tmp/x capture_bodies=false\ntenant id=acme\n",
+            1,
+        )
+        .expect("capture_bodies=false is the truth and must load");
     }
 
     // -- Routing over a built snapshot ---------------------------------------

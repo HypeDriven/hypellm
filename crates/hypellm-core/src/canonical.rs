@@ -1071,35 +1071,35 @@ impl CanonicalRequest {
     /// would let a request slip past a quota it should have been held by.
     ///
     /// Uses the compiled-in default document constant. Prefer
-    /// [`CanonicalRequest::estimated_input_tokens_with`] on the routing path,
+    /// [`CanonicalRequest::estimated_input_tokens_for`] on the routing path,
     /// where the selected target's declaration is available.
     #[must_use]
     pub fn estimated_input_tokens(&self) -> u64 {
-        self.estimated_input_tokens_with(DEFAULT_DOCUMENT_TOKEN_ESTIMATE)
+        self.estimated_input_tokens_for(&TokenEstimate::for_effort(self.reasoning_effort))
     }
 
-    /// Conservative upper bound on input tokens, given a document constant.
-    ///
-    /// A document contributes `document_token_estimate` tokens regardless of
-    /// its size, because the router cannot count pages without parsing it and
-    /// parsing it is exactly what the data plane must not do. An operator
-    /// tuning this constant is choosing between rejecting large documents and
-    /// admitting them past a quota, and the number should err high.
+    /// Conservative upper bound on input tokens, given a target's declaration.
     #[must_use]
-    pub fn estimated_input_tokens_with(&self, document_token_estimate: u32) -> u64 {
+    pub fn estimated_input_tokens_for(&self, estimate: &TokenEstimate) -> u64 {
         // Saturating rather than truncating: this is an upper bound feeding a
         // quota check, so a value too large holds the request, while a
         // wrapped-around small value would let it slip past.
         let bytes = u64::try_from(self.non_document_input_byte_len()).unwrap_or(u64::MAX);
+        // Clamped, not trusted. Zero would divide by zero and a huge value
+        // would make the input half of the estimate vanish; the configuration
+        // refuses both, and clamping here means a `TokenEstimate` built any
+        // other way cannot produce an unbounded admission.
+        let per_token =
+            u64::from(estimate.bytes_per_token.clamp(1, MAX_BYTES_PER_TOKEN));
         // Per-message framing overhead that every provider adds.
         let framing = u64::try_from(self.messages.len())
             .unwrap_or(u64::MAX)
             .saturating_mul(8);
         let documents = u64::try_from(self.document_parts())
             .unwrap_or(u64::MAX)
-            .saturating_mul(u64::from(document_token_estimate));
+            .saturating_mul(u64::from(estimate.document_token_estimate));
         bytes
-            .div_ceil(2)
+            .div_ceil(per_token)
             .saturating_add(framing)
             .saturating_add(documents)
     }
@@ -1129,7 +1129,7 @@ impl CanonicalRequest {
     /// Total token budget under a specific target's declarations.
     #[must_use]
     pub fn estimated_total_tokens_with(&self, estimate: &TokenEstimate) -> u64 {
-        self.estimated_input_tokens_with(estimate.document_token_estimate)
+        self.estimated_input_tokens_for(estimate)
             .saturating_add(self.estimated_output_tokens_with(estimate.output_multiplier))
     }
 }
@@ -1143,6 +1143,30 @@ impl CanonicalRequest {
 /// lower it per target, or router-wide through `default_document_token_estimate`.
 pub const DEFAULT_DOCUMENT_TOKEN_ESTIMATE: u32 = 4_096;
 
+/// Input bytes assumed to make one token when no target declares otherwise.
+///
+/// Two, which is deliberately pessimistic: real text tokenizes at roughly three
+/// to four bytes per token for English and more for code, so this reserves
+/// something like twice what a request will use. Specification 12 asks for "the
+/// selected target tokenizer when available; otherwise a conservative
+/// byte-based upper bound", and this is the second half of that sentence.
+///
+/// Under-counting is the failure that matters — it lets a request slip past a
+/// quota that should have held it — so the default errs the other way and stays
+/// there. An operator who has *measured* their target, using the per-target
+/// `hypellm_token_estimate_error` histogram, declares what they measured with
+/// `target … bytes_per_token=N`. The router never adjusts this on its own: a
+/// gateway that quietly loosened its own quota enforcement in response to
+/// traffic would be enforcing whatever the traffic taught it.
+pub const DEFAULT_BYTES_PER_TOKEN: u32 = 2;
+
+/// The largest `bytes_per_token` a target may declare.
+///
+/// Eight bytes per token is already beyond any real tokenizer on any real
+/// input; past this the field stops being a calibration and becomes a way to
+/// disable the input half of quota accounting by editing one number.
+pub const MAX_BYTES_PER_TOKEN: u32 = 8;
+
 /// The two target-declared inputs to a token estimate.
 ///
 /// Bundled rather than passed as two integers because they are read together
@@ -1154,6 +1178,14 @@ pub struct TokenEstimate {
     pub document_token_estimate: u32,
     /// Multiplier applied to the requested output length.
     pub output_multiplier: u32,
+    /// Input bytes assumed to make one token, for this target.
+    ///
+    /// [`DEFAULT_BYTES_PER_TOKEN`] unless the target declares otherwise. A
+    /// *smaller* number reserves more, so this is the knob that trades quota
+    /// accuracy against the risk of admitting a request that should have been
+    /// held — which is why it is administrator-declared per target and never
+    /// inferred by the router from what it observed.
+    pub bytes_per_token: u32,
 }
 
 impl TokenEstimate {
@@ -1163,6 +1195,7 @@ impl TokenEstimate {
         Self {
             document_token_estimate: DEFAULT_DOCUMENT_TOKEN_ESTIMATE,
             output_multiplier: effort.default_output_multiplier(),
+            bytes_per_token: DEFAULT_BYTES_PER_TOKEN,
         }
     }
 }

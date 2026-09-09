@@ -776,7 +776,7 @@ impl PolicySnapshot {
         // one is the reverse.
         let estimate =
             target.token_estimate(req.reasoning_effort, self.default_document_token_estimate);
-        let estimated_input = req.estimated_input_tokens_with(estimate.document_token_estimate);
+        let estimated_input = req.estimated_input_tokens_for(&estimate);
         if estimated_input > u64::from(caps.max_context_tokens) {
             return Err(ExclusionReason::ContextWindowTooSmall);
         }
@@ -1159,6 +1159,7 @@ mod tests {
             cost_class: CostClass::new(cost),
             quality_class: Default::default(),
             document_token_estimate: None,
+            bytes_per_token: None,
             residency: Some(Residency::new("eu")),
             is_local: local,
             admin_state: AdminState::Enabled,

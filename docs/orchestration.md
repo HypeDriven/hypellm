@@ -2,7 +2,7 @@
 
 **Status: built, with four stated exceptions.** Phases 5 through 8 are implemented: the capability contract, the fleet domain model and agent protocol, observation, planning, activation with leases and rollback, anti-thrash governance, the management surface, and the SPA screens. `crates/hypellm-fleet` is the planner, `crates/hypellm-net/src/fleet.rs` the socket, `crates/hypellm-router/src/fleet.rs` the runtime, and `agent/` the reference agent that reaches the slaves.
 
-Four things described here are **not** implemented, and are recorded in [current limitations](deferred-issues.md) rather than approximated: `POST /v1/jobs` (§11), predictive pre-warm (§9.8, which this document already defers), resumable artifact fetches (§12), and Windows-host actuation. Two implemented details deviate from the design below and are marked **[as built]** where they occur — the `HELLO` line carries the fleet digest, and the activation budget is a sliding window rather than a token bucket. Both changes were forced by building it, and both are explained at the point they appear.
+One thing described here is **not** implemented, and is recorded in [current limitations](deferred-issues.md) rather than approximated: Windows-host actuation. `POST /v1/jobs` is built, with its job records in memory rather than durable — see [current limitations](deferred-issues.md#jobs-are-in-memory-and-a-restart-loses-them). Two implemented details deviate from the design below and are marked **[as built]** where they occur — the `HELLO` line carries the fleet digest, and the activation budget is a sliding window rather than a token bucket. Both changes were forced by building it, and both are explained at the point they appear.
 
 This document remains written in the specification's normative voice. `secure_llm_router_specification.md` §26 now carries the normative summary; this is the reasoning behind it.
 
@@ -199,11 +199,11 @@ Quantization itself remains unmodelled, and deliberately. What the router needs 
 
 ### 3.6 Client hints
 
-`RoutingHints.prefer_target` is currently parsed from `hypellm_routing.prefer_target`, validated as a target id, and correctly permission-gated behind `hints_permitted` — and then never read by `PolicySnapshot::route`. Only `require_local` is consulted. Its docstring promises "prefer this target if it is already eligible", which does not happen.
+`RoutingHints.prefer_target` is parsed from `hypellm_routing.prefer_target`, validated as a target id, permission-gated behind `hints_permitted`, and read by `PolicySnapshot::score` as a bounded slice of the affinity term.
 
-**The permission gate is less covered than it looks, and that must be repaired first.** The fuzz target `a_hint_is_ignored_unless_the_principal_may_supply_one` plants its hints under the key `"hypellm"`, while `parse_hints` looks up `"hypellm_routing"`. Since the key lookup is the *first* early return and the permission gate the *second*, control never reaches the gate: the function returns a default for a reason unrelated to permissions, and all three of that target's cases assert vacuously. The test would pass with the gate deleted. Repairing the key is a prerequisite for the wiring below — once `prefer_target` actually reorders candidates, a permission-gate test that cannot fail is worse than no test at all.
+**The permission gate was less covered than it looked, and that had to be repaired first.** The fuzz target `a_hint_is_ignored_unless_the_principal_may_supply_one` planted its hints under the key `"hypellm"`, while `parse_hints` looks up `"hypellm_routing"`. Since the key lookup is the *first* early return and the permission gate the *second*, control never reached the gate: the function returned a default for a reason unrelated to permissions, and all three of that target's cases asserted vacuously. The test would have passed with the gate deleted. It now derives the key from `openai::HINTS_KEY` and asserts the other half of the property — the same body *with* the permission must produce the hint — so a parser that dropped every hint unconditionally fails it.
 
-It fails safe, so this is a functionality gap rather than a security one. This design wires it, with semantics that keep it safe:
+The wiring keeps the semantics that make a client hint admissible at all:
 
 - A hint **reorders** targets that are already eligible. It never creates eligibility.
 - It draws from a bounded slice of `affinity_term` (§7.2), so it can break a tie between comparable targets and can never beat a warmer target, a higher-ranked target, or a policy binding.
@@ -590,9 +590,11 @@ Placement prefers, strictly: `Resident`, then `Activating`, then `ColdFits` on a
 
 `pinned=true` and `evictable=false` remove a deployment from automatic eviction. The Qwen3.8 chat service every coding harness depends on, and the unrelated production services on `rtx5090`, are configured this way. The planner is not asked to be clever about things the operator has already decided.
 
-### 9.8 Predictive pre-warm — deferred, off by default
+### 9.8 Predictive pre-warm — implemented, off by default
 
-Starting a model before it is asked for is genuinely valuable and genuinely capable of doubling the swap rate if the prediction is poor. Deferred to Phase 9, ships disabled, and gated by the same activation budget so a bad predictor cannot exceed the ceiling. Listed here so its absence earlier is a stated decision rather than an oversight.
+Starting a model before it is asked for is genuinely valuable and genuinely capable of doubling the swap rate if the prediction is poor. **[as built]** It ships disabled — `fleet_policy … prewarm_min_rate_per_minute=0` is the default — and is gated by the same activation budget so a bad predictor cannot exceed the ceiling.
+
+Two constraints beyond the budget, both because the budget alone bounds the *rate* of damage rather than its *kind*: a pre-warm plan that would evict is abandoned rather than executed, and one that would fetch is too. Prediction that displaces running work is the failure this section warns about, and refusing those two plan shapes is what makes the feature safe to enable on a fleet that is already busy.
 
 ### 9.9 Making the goal falsifiable
 
@@ -898,7 +900,7 @@ Extending spec §24. Phase 5 has **no fleet dependency at all** and ships value 
 | **8 — Fleet-wide placement** | Multi-host and multi-accelerator placement, capability routing, batching, `/v1/jobs`, simulation endpoint, decision-explorer integration. | Correct `device=1` selection on `node0`; correct ARM64/x86-64 separation; job semantics under cancellation and disconnect. |
 | **9 — Acquisition and prediction** | Artifact fetch with digest verification and budgets; predictive pre-warm, shipped disabled. | Fetch drills including disk-full and interruption; pre-warm demonstrated not to raise the thrash ratio. |
 
-Phases 5 through 8 are built. Phase 9 is partly built — `FETCH` exists, is permissioned, budgeted, disk-gated and digest-verified, and the reference agent implements it without resumability — and predictive pre-warm is not built at all. `POST /v1/jobs`, listed under phase 8, is the one part of that phase that is not: see [current limitations](deferred-issues.md#fleet-orchestration) for why, and for what an operator should do instead.
+Phases 5 through 8 are built, and so is phase 9: `FETCH` is permissioned, budgeted, disk-gated and digest-verified, and the reference agent retries it within the router's deadline, one fetch per host, resuming at layer granularity; predictive pre-warm is implemented and ships disabled. `POST /v1/jobs`, listed under phase 8, is built and ships disabled; its job records are process state rather than durable, which is recorded in [current limitations](deferred-issues.md#jobs-are-in-memory-and-a-restart-loses-them).
 
 Phases 5 and 6 are each worth doing alone. Phase 5 fixes a request model that is currently unable to express what callers ask for, with no new trust boundary. Phase 6 gives an accurate read-only picture of what is loaded where, improving routing immediately, with none of the risk of actuation.
 

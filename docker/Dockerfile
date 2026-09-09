@@ -5,9 +5,17 @@
 # Two stages and no package installation in either. Specification 4 forbids
 # third-party packages in the router; the same reasoning applies to the image
 # it ships in, so the runtime layer is a bare Debian plus one statically-linked-
-# enough binary and the static admin assets. There is no shell entrypoint, no
-# init wrapper, and no `curl` — a supervisor checks liveness over HTTP from
-# outside.
+# enough binary, the static admin assets, and one stdlib-only Python init. There
+# is no `curl` — a supervisor checks liveness over HTTP from outside.
+#
+# The init is here for one reason, and it is not convenience. A container's PID 1
+# receives no default signal actions from the kernel, and specification 18.2
+# forbids the `unsafe` FFI a signal handler would need, so a router running as
+# PID 1 ignores `SIGTERM` outright: `docker stop` waits out the grace period and
+# then `SIGKILL`s it mid-stream. `supervisor/hypellm-init` is PID 1 instead and
+# turns the signal into `hypellm-router --shutdown` — the same authenticated
+# command every other documented stop path already uses. See
+# `supervisor/README.md`.
 
 # ---------------------------------------------------------------------------
 # Build
@@ -50,6 +58,7 @@ RUN useradd --system --uid 10001 --user-group --no-create-home --shell /usr/sbin
 
 COPY --from=build /usr/local/bin/hypellm-router /usr/local/bin/hypellm-router
 COPY web /srv/hypellm/web
+COPY --chmod=0755 supervisor/hypellm-init /usr/local/bin/hypellm-init
 
 # A default configuration so the image is runnable on its own. `compose.yaml`
 # bind-mounts the same file read-only, so editing `docker/hypellm.conf` and
@@ -69,9 +78,18 @@ USER hypellm
 # each to loopback on the host.
 EXPOSE 8000 8001 8002
 
-# `--generate-secrets` and `--check` are reached by appending arguments, which
-# is why the entrypoint is the binary and not a script.
-ENTRYPOINT ["/usr/local/bin/hypellm-router"]
+# The init runs the router as its child and forwards nothing but the shutdown.
+# `--config` and `--secrets` are read by both: the router needs them to run, and
+# the init needs them to address the control socket when a signal arrives.
+# Everything after them is passed through verbatim.
+#
+# The image's contract is unchanged: appending arguments still reaches the
+# router. The init recognises the one-shot commands — `--generate-secrets`,
+# `--check`, `--hash-password`, `--shutdown` and the rest — and `exec`s the
+# router for them, because there is nothing to supervise and no drain to
+# arrange. `just _secrets` runs `docker run … --generate-secrets`, and that
+# keeps working.
+ENTRYPOINT ["/usr/local/bin/hypellm-init"]
 CMD ["--config", "/etc/hypellm/hypellm.conf", \
      "--secrets", "/etc/hypellm/secrets", \
      "--static", "/srv/hypellm/web", \

@@ -120,14 +120,22 @@ capacity still needs monitoring.
 **Diagnostic output redacts the MAC key.** `Store` has a hand-written `Debug`
 implementation that never renders key bytes.
 
-**The process lock is advisory and racy.** `ProcessLock` is a PID file, not an OS
-lock — `flock` would need `unsafe` FFI, which the workspace forbids. Liveness is
-`/proc/<pid>` existence, so PID reuse can report `Held` against an unrelated
-process (a spurious refusal to start), and the stale-reclaim path
-(`remove_file` then `create_new`) is not atomic: two starters that both observe
-a stale lock can both proceed, giving two writers on one log. `Drop` removes the
-lock file unconditionally, including one another process has since claimed. On a
-shared or network volume the lock provides no protection at all.
+**The process lock is advisory and racy.** `ProcessLock` is a lock *file*, not an
+OS lock — `flock` would need `unsafe` FFI, which the workspace forbids. It
+records a `ProcessIdentity`: the boot id, the pid, and the process start time
+from `/proc/<pid>/stat`, so a pid that has been reused, a pid 1 in a fresh
+container, and a pid from before a reboot are each recognised as *not* the
+holder and the lock is reclaimed. The reclaim runs inside its own `O_EXCL` critical section (`lock.claim`) and
+re-reads the lock under it, so two starters that both observe the same stale
+lock cannot both proceed; a claim left by a starter that died mid-reclaim
+carries an identity of its own and is swept, so it cannot wedge the directory.
+`Drop` removes the lock file only if the identity on disk is still this
+process's.
+
+What remains: where `/proc` is absent or will not answer, the liveness check
+degrades to pid existence — which never steals a live lock but can refuse a
+start after a crash. **On a shared or network volume the lock provides no
+protection at all**; `O_EXCL` and the identity are both local facts.
 
 **Backup validates its boundary.** `Store::backup_to` refuses a log shorter than
 the tracked durable boundary and copies only complete validated bytes.

@@ -24,7 +24,7 @@ mod harness;
 
 use harness::{ALLOWED_ORIGIN, Harness};
 use hypellm_crypto::PasswordVerifier;
-use hypellm_crypto::pbkdf2::MIN_ITERATIONS;
+use hypellm_crypto::scrypt::{DEFAULT_P, DEFAULT_R, MIN_LOG_N};
 use wire_http1::Method;
 
 const USERNAME: &str = "admin";
@@ -36,10 +36,10 @@ const PASSWORD: &str = "a-password-that-is-not-the-username";
 const FAILURES_BEFORE_LOCKOUT: u32 = 5;
 const LOCKOUT_WINDOW_MILLIS: u64 = 60_000;
 
-/// A configuration with one local account, at the cheapest legal iteration
-/// count so the suite stays fast in a debug build.
+/// A configuration with one local account, at the cheapest legal cost parameter
+/// so the suite stays fast in a debug build.
 fn config_with_user(username: &str, password: &str, roles: &[&str]) -> String {
-    let verifier = PasswordVerifier::derive(password, MIN_ITERATIONS)
+    let verifier = PasswordVerifier::derive_with(password, MIN_LOG_N, DEFAULT_R, DEFAULT_P)
         .expect("the test host has an entropy source")
         .encode();
     let mut text = format!(
@@ -292,7 +292,8 @@ fn one_accounts_failures_do_not_lock_another() {
     // Keyed by account, not global. A shared counter would let anyone who can
     // reach the listener lock every administrator out by guessing at one name.
     let mut text = config_with_user(USERNAME, PASSWORD, &["operator"]);
-    let other = PasswordVerifier::derive("second-account-password", MIN_ITERATIONS)
+    let other =
+        PasswordVerifier::derive_with("second-account-password", MIN_LOG_N, DEFAULT_R, DEFAULT_P)
         .unwrap()
         .encode();
     text.push_str(&format!(

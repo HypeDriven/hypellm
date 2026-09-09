@@ -226,13 +226,20 @@ printf '%s' 'the-password' | hypellm-router --hash-password
 
 ```text
 local_user id=admin principal=user:admin tenant=local \
-           verifier=pbkdf2-sha256$210000$…$…
+           verifier=scrypt$15$8$1$…$…
 role_binding subject=principal:user:admin role=operator
 ```
 
 The password is read from stdin, never from an argument: `/proc/<pid>/cmdline`
 is world-readable. With no `local_user` record the endpoint answers 404 and the
 sign-in screen's local panel says so.
+
+The verifier is scrypt (RFC 7914) at `ln=15, r=8, p=1` — 32 MiB and about
+100 ms per check, bounded by the management plane's concurrency limit.
+`pbkdf2-sha256$…` verifiers written by an earlier release still authenticate, so
+an upgrade does not lock anyone out; the router logs
+`startup.password_verifier_legacy` naming each account still on one, and
+re-running the command above moves it.
 
 Three things to know before relying on it:
 
@@ -433,7 +440,7 @@ startup (`crates/hypellm-store/src/lib.rs`).
 
 ```text
 <state_dir>/
-  lock              single-writer lock (a PID file, see below)
+  lock              single-writer lock (boot id, pid, start time; see below)
   snapshot.bin      the last compacted state
   snapshot.meta     sequence, audit head, audit count, payload digest, MAC
   log.bin           frames appended since the snapshot
@@ -459,17 +466,22 @@ Writes use temporary file → `fsync` → atomic rename → directory `fsync`
 resetting the log, so a crash leaves either the old snapshot plus the full log
 or the new snapshot plus an empty log.
 
-Backup: `Store::backup_to` copies a validated snapshot plus a log boundary. It
-is a library call with no CLI flag; copying a quiesced directory works equally
-well. There is no automated backup and no retention policy in the router.
+Backup: `hypellm-router --backup` asks the running router to copy a validated
+snapshot plus a log boundary into `settings backup_dir`, under the log lock. See
+[backup](#backup). There is no schedule and no retention policy in the router.
 
 Operational notes that matter:
 
-- **The lock is a PID file, not an OS lock.** `flock` would need `unsafe` FFI,
-  which the workspace forbids. Liveness is `/proc/<pid>` existence, so PID reuse
-  can cause a spurious refusal to start, and two starters that both observe a
-  stale lock can both proceed. **On a shared or network volume it provides no
-  protection at all.** Give each router its own local state directory.
+- **The lock is a lock file, not an OS lock.** `flock` would need `unsafe` FFI,
+  which the workspace forbids. The file records the boot id, the pid, and the
+  process start time from `/proc/<pid>/stat`, and the holder is considered live
+  only if all three still match — so a reused pid, a fresh container's pid 1,
+  and a pid from before a reboot are each reclaimed rather than mistaken for a
+  running router. Reclaiming happens inside an `O_EXCL` critical section
+  (`lock.claim` beside it), so two starters racing after a crash cannot both
+  proceed. **On a shared or network volume it provides no protection at all**,
+  because both of those are local facts. Give each router its own local state
+  directory.
 - **Startup memory is roughly twice the log size.** `Log::replay` reads the
   whole file. Nothing triggers compaction automatically; size the volume and
   schedule compaction for the log growth your audit and key-change rate implies.
@@ -814,11 +826,36 @@ which prints provider/target/alias counts and the configuration digest, and
 exits 2 with every accumulated error on failure. Validation collects all errors
 rather than stopping at the first.
 
-**Unsupported lifecycle settings.** `settings capture_bodies` and `tenant
-retention_days` are accepted by the grammar but have no runtime effect. The
-router does not capture prompt or completion bodies and does not automatically
-expire stored data. Apply retention to exported logs and audit data externally;
-see [current limitations](deferred-issues.md#data-lifecycle-and-external-operations).
+**Lifecycle settings.** `settings capture_bodies=true` is a **configuration
+error** and the router refuses to start: specification 17 admits body capture
+only as per-tenant, sampled, encrypted, access-controlled and time-limited, and
+none of that exists. Setting it to `false`, or omitting it, loads — the router
+captures no prompt or completion bodies either way.
+
+`tenant retention_days` loads and is reported on the Settings screen, but is a
+**declaration, not an enforcement**: nothing in the router deletes state, audit
+records, usage, or exported logs when the window elapses. It is recorded so the
+deployment's own lifecycle tooling has one authoritative place to read it. Apply
+retention to exported logs and audit data externally; see
+[current limitations](deferred-issues.md#data-lifecycle-and-external-operations).
+
+**Several nodes.** There is no cluster mode and will not be one in v1
+(specification 25: "single-writer versioned bundles; do not build consensus").
+Give each node its own state and secrets directory, set `quota_partitions` to
+the node count, and distribute policy by hand: `GET /admin/v1/policies/active`
+on the writer returns the canonical text, its version and its digest; write
+those bytes to the other node's configuration file and confirm
+`hypellm-router --check` prints the same digest there. Matching digests are the
+guarantee, and they are checkable.
+
+**Jobs.** `settings job_workers=N` starts a fixed pool of `N` threads serving
+`POST /v1/jobs`; zero, the default, disables the endpoint. The pool size is what
+bounds how much long-running generation the router carries at once, and it is
+separate from `max_connections`: that is the point of the endpoint. See
+[current limitations](deferred-issues.md#jobs-are-in-memory-and-a-restart-loses-them)
+before relying on a job identifier across a restart. The bounds are
+`max_jobs_per_tenant`, `max_queued_jobs`, `max_job_result_bytes` and
+`job_retention_ms`.
 
 Related active settings:
 
@@ -893,7 +930,7 @@ Existing records gain optional fields only:
 | `settings` | `fleet_enabled`, `max_documents_per_request`, `max_document_bytes`, `max_inline_document_bytes`, `default_document_token_estimate`, `activation_effort_headroom_ms` |
 | `tenant` | `min_quality` |
 | `alias` | `capability` |
-| `target` | `capabilities`, `quality_class`, `reasoning_efforts`, `effort_multipliers`, `document_token_estimate`, and `document` among `modalities` |
+| `target` | `capabilities`, `quality_class`, `reasoning_efforts`, `effort_multipliers`, `document_token_estimate`, `bytes_per_token`, and `document` among `modalities` |
 
 Slave-hosted providers use `egress=private_network`. That profile — and only that
 profile — also permits cleartext HTTP to a **private** address, because a
@@ -959,8 +996,11 @@ history. Sending the line by hand works, but an operator who has to assemble it
 will eventually put the token in an argument.
 
 Commands: `shutdown` and `drain` (identical — both set the shutdown flag on both
-listeners), and `ping` → `pong`. An unauthenticated line gets `unauthenticated`
-and a log entry; an authenticated but unknown one gets `unknown command`.
+listeners), `ping` → `pong`, and `backup` (see below). An unauthenticated line
+gets `unauthenticated` and a log entry; an authenticated but unknown one gets
+`unknown command`. A command that failed replies `error: <detail>` and the CLI
+exits 3, so a wrapper script does not report green over a backup that did not
+happen.
 
 A bundle generated before `control.key` existed will not start: `--generate-secrets`
 into a fresh directory and migrate the other five files, or add a `control.key`
@@ -968,14 +1008,55 @@ of at least 32 random bytes. The router refuses rather than inventing one,
 because a generated token would authenticate the socket with a value no operator
 holds.
 
+### Backup
+
+```
+hypellm-router --backup --config /etc/hypellm/hypellm.conf --secrets /etc/hypellm/secrets
+```
+
+The running router copies a consistent point-in-time snapshot plus log boundary
+into `settings backup_dir`, holding the log lock so the boundary is exact. It
+prints the sequence, the bytes copied, and the audit chain head:
+
+```
+backed up to /var/backups/hypellm: sequence 4711 log 918233 bytes snapshot 40960 bytes audit_head 0a95…
+```
+
+Three things about this are deliberate:
+
+- **The destination is configured, not sent.** A backup is the whole of the
+  router's durable state — API key verifiers, session digests, the audit chain.
+  A command that carried its own destination would turn possession of
+  `control.key` into the ability to write that state anywhere the router's user
+  can write. With no `backup_dir` set the command is refused.
+- **The router does the copy while running.** `cp -r` on a live state directory
+  can catch a half-written frame; this cannot, because the writer is holding its
+  own lock. There is no need to stop the router first.
+- **The copy contains the record of its own creation.** The `state_backed_up`
+  audit record is appended before the copy runs, so a restored directory can
+  say when it was taken and by what. A `backup.manifest` beside the copy
+  repeats the boundary in plain text.
+
+Restore is a file copy in the other direction into a stopped router's
+`state_dir`; drop `backup.manifest`, which is not a store file. Verify first
+with `hypellm-router --check`, and keep backups on the same protection footing
+as `<secrets>` — together they are the router's whole trust base.
+
+There is still **no scheduler**. Run the command from `systemd`, `cron`, or
+whatever already runs the deployment's backups.
+
 **Drain waits.** `Server::serve` returns only after the accept loop stops *and*
 its connections have drained within `ServerConfig::drain_timeout`; the count
 still running at the deadline is reported and logged as `router.drain_incomplete`.
 Connections are not killed — each already carries a request deadline and a write
 timeout, so they end on their own.
 
-`SIGTERM` from a supervisor is **not** graceful: nothing handles it, so the
-process dies immediately and in-flight streams are cut. Handling it needs
+`SIGTERM` sent to the router binary itself is **not** graceful: nothing in the
+router handles it, so the process dies immediately and in-flight streams are
+cut. In the shipped container that does not arise —
+[`supervisor/hypellm-init`](../supervisor/README.md) is PID 1 and turns the
+signal into `--shutdown` — but a unit that runs the binary directly needs
+`ExecStop`. Handling it needs
 `sigaction` or `signalfd`, both `unsafe` FFI, which specification 18.2 forbids
 workspace-wide — so the control socket is the router's shutdown mechanism and
 `ExecStop=` is how a supervisor reaches the [graceful shutdown path](deferred-issues.md#graceful-shutdown-uses-the-control-socket).

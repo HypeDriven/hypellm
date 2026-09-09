@@ -87,6 +87,22 @@ pub const LOCAL_TARGET: &str = "local:model";
 pub const REMOTE_TARGET: &str = "remote:model";
 /// The alias both targets serve.
 pub const ALIAS: &str = "test-alias";
+
+/// A service principal bound to `viewer` in [`default_config`].
+///
+/// The key tests need principals whose authority comes from the *configuration*
+/// rather than from a session the harness minted, because that is where a
+/// key-authenticated caller's roles come from.
+pub const KEY_VIEWER_PRINCIPAL: &str = "svc:reader";
+
+/// A service principal bound to `policy_editor` in [`default_config`].
+pub const KEY_EDITOR_PRINCIPAL: &str = "svc:automation";
+
+/// A service principal bound to `break_glass_admin` in [`default_config`].
+///
+/// Deliberately the most powerful binding there is, so a test that a key cannot
+/// do something proves the key ceiling rather than a missing role.
+pub const KEY_ONCALL_PRINCIPAL: &str = "svc:oncall";
 /// The credential reference the remote provider uses.
 pub const CREDENTIAL: &str = "provider-secret";
 
@@ -146,6 +162,9 @@ alias id=test-alias targets=local:model,remote:model description=\"the test alia
 grant scope=tenant:acme model=* allow=true
 grant scope=tenant:globex model=* allow=true
 binding id=default scope=tenant:acme model=* prefer=local:model
+role_binding subject=principal:svc:reader role=viewer
+role_binding subject=principal:svc:automation role=policy_editor
+role_binding subject=principal:svc:oncall role=break_glass_admin
 "
     .to_owned()
 }
@@ -1018,7 +1037,6 @@ impl Harness {
                 TenantId::new(tenant).expect("a valid tenant"),
                 PrincipalId::new(principal).expect("a valid principal"),
                 vec![Scope::Inference],
-                Vec::new(),
                 None,
                 SourceRestriction::Any,
                 Some("harness key".to_owned()),
@@ -1027,6 +1045,63 @@ impl Harness {
             .expect("create a key");
         let id = new_key.id().clone();
         (id, new_key.into_secret())
+    }
+
+    /// Create an API key carrying management scopes, bypassing the API.
+    ///
+    /// `create_key` cannot be used for this: it needs `ManageKeys`, which no
+    /// key may hold, so a test would have to mint the key it is testing from a
+    /// break-glass session anyway.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the identifiers or scopes are invalid, or the store refuses.
+    pub fn issue_management_key(
+        &self,
+        tenant: &str,
+        principal: &str,
+        scopes: &[&str],
+    ) -> (KeyId, String) {
+        let scopes = scopes
+            .iter()
+            .map(|s| Scope::parse(s).expect("a valid scope"))
+            .collect();
+        let new_key = self
+            .state
+            .keys
+            .create(
+                TenantId::new(tenant).expect("a valid tenant"),
+                PrincipalId::new(principal).expect("a valid principal"),
+                scopes,
+                None,
+                SourceRestriction::Any,
+                Some("harness management key".to_owned()),
+                self.clock.wall_millis(),
+            )
+            .expect("create a key");
+        let id = new_key.id().clone();
+        (id, new_key.into_secret())
+    }
+
+    /// Activate a configuration identical to the default one but with every
+    /// role binding for `principal` removed.
+    ///
+    /// What withdrawing someone's access actually looks like: a new
+    /// configuration, activated, with no reissue of any credential.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the reduced configuration does not build.
+    pub fn activate_config_without(&self, principal: &str) {
+        let needle = format!("role_binding subject=principal:{principal} ");
+        let reduced: String = default_config()
+            .lines()
+            .filter(|line| !line.starts_with(&needle))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let config = hypellm_config::load(&reduced, 2)
+            .unwrap_or_else(|errors| panic!("the reduced configuration must build: {errors:?}"));
+        self.state.config.activate(config);
     }
 
     /// Create a policy draft directly in [`TENANT_A`], and return its

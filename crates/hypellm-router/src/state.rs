@@ -510,6 +510,11 @@ pub struct RouterState {
     /// through `FleetRuntime::adopt_fleet`, so in-flight activations keep the
     /// ledger that authorised them.
     pub fleet: std::sync::OnceLock<Arc<crate::fleet::FleetRuntime>>,
+    /// Long-running generative work, if `/v1/jobs` is enabled.
+    ///
+    /// `None` when `settings job_workers` is zero, which is the default: the
+    /// endpoint answers `404` rather than accepting work nothing will run.
+    pub jobs: Option<Arc<crate::jobs::JobStore>>,
 }
 
 impl RouterState {
@@ -517,6 +522,12 @@ impl RouterState {
     #[must_use]
     pub fn fleet(&self) -> Option<&Arc<crate::fleet::FleetRuntime>> {
         self.fleet.get()
+    }
+
+    /// The job store, if `/v1/jobs` is enabled.
+    #[must_use]
+    pub fn jobs(&self) -> Option<&Arc<crate::jobs::JobStore>> {
+        self.jobs.as_ref()
     }
 
     /// A fleet view for one routing decision, or an empty one.

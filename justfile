@@ -67,8 +67,18 @@ _default:
     @just --list --unsorted
 
 # Build the image, start the router, and print where it is listening.
-up: _ports _dirs _lock build _secrets _lanroutes _tailnet_up
-    @{{compose}} up -d --no-build router
+#
+# `--force-recreate` rather than a plain `up -d`: compose restarts an existing
+# container when nothing in its definition changed, and a container that
+# outlived a Docker Desktop or WSL restart comes back with its bind mounts
+# pointing at nothing. The paths still read correctly in `docker inspect` and
+# the directories are simply empty inside — so the router starts against an
+# empty run/secrets and run/state instead of failing on a missing mount.
+# Recreating makes that state unreachable. The cost is that `just up` on an
+# already-running router bounces it; the container holds no state that the two
+# bind mounts do not, so that is a restart and not a loss.
+up: _ports _dirs build _secrets _lanroutes _tailnet_up
+    @{{compose}} up -d --no-build --force-recreate router
     @just _wait
     @just endpoints
 
@@ -374,7 +384,21 @@ oidc: _dirs _verifier_secret
     {{compose}} --profile oidc run --rm --no-deps verifier \
         python3 /opt/hypellm-verifier/hypellm-verifier \
         --config /etc/hypellm/verifier/verifier.json --check
-    {{compose}} --profile oidc up -d verifier
+    # Recreated, not restarted, for the reason `up` is — and the verifier is
+    # the service that shows it, because its own script arrives over a bind
+    # mount: a stale container fails with "can't open file
+    # /opt/hypellm-verifier/hypellm-verifier" and exits 2.
+    {{compose}} --profile oidc up -d --force-recreate verifier
+
+    # It has no health check and `up -d` returns as soon as the process is
+    # started, so without this an immediate exit is silent and the next thing
+    # the operator sees is a sign-in that says the verifier is not configured.
+    sleep 1
+    if [ -z "$(docker ps -q --filter name=hypellm-verifier --filter status=running)" ]; then
+        echo "hypellm: the verifier exited immediately; its log follows" >&2
+        {{compose}} --profile oidc logs --tail 20 verifier >&2
+        exit 1
+    fi
     echo
     echo "  The verifier is up. The router reads its socket only when"
     echo "  oidc_verifier_socket is set in {{config}}; add the oidc_* settings"
@@ -534,21 +558,6 @@ tailnet:
            end)'
 
 # --- internals -------------------------------------------------------------
-
-# The store's single-writer lock is a PID file, and inside a PID namespace the
-# router is pid 1 — which always looks alive. A container that was killed
-# rather than drained therefore leaves a lock that no later start can reclaim,
-# and the refusal is permanent. Sweeping it is safe only once no router is
-# running, which is why this checks for a container before touching the file.
-# docs/deferred-issues.md records the limitation.
-_lock:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    lock="{{state_dir}}/lock"
-    if [ ! -f "$lock" ]; then exit 0; fi
-    if [ -n "$({{compose}} ps -q router 2>/dev/null)" ]; then exit 0; fi
-    echo "→ clearing a stale state lock (pid $(cat "$lock" 2>/dev/null || echo '?'), no router container running)"
-    rm -f "$lock"
 
 # A port already published on this host makes `docker compose up` fail with a
 # message about the port and nothing about which listener wanted it. Say both,

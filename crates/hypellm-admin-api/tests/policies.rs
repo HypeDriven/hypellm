@@ -2140,3 +2140,42 @@ fn a_restored_identifier_cannot_collide_with_a_new_one() {
     assert_ne!(fresh.id, "draft_7", "the allocator reused a restored id");
     assert!(store.get("draft_7", &tenant).is_some(), "the restored draft was overwritten");
 }
+
+// -- The active bundle -------------------------------------------------------
+
+#[test]
+fn the_active_bundle_reproduces_its_own_digest() {
+    // Specification 25 settles state distribution as "single-writer versioned
+    // bundles". This endpoint is the read side, and its whole guarantee is that
+    // a second node which loads the returned text computes the same digest —
+    // so that is what the test checks, by loading it and comparing, rather than
+    // asserting the field is present.
+    let admin = Harness::new();
+    let editor = admin.policy_editor();
+
+    let response = admin.get(&editor, "/admin/v1/policies/active");
+    assert_eq!(response.status, 200, "{}", response.body);
+
+    let canonical = response.str_field("canonical");
+    let digest = response.str_field("digest");
+    assert!(!canonical.is_empty(), "the bundle carried no text");
+
+    let reloaded = hypellm_config::load(&canonical, 1)
+        .unwrap_or_else(|errors| panic!("the exported bundle must build: {errors:?}"));
+    assert_eq!(
+        reloaded.digest.to_hex(),
+        digest,
+        "a node loading this bundle would compute a different digest, so the \
+         export cannot be used to confirm two routers run the same policy"
+    );
+}
+
+#[test]
+fn the_active_bundle_needs_more_than_read_summary() {
+    // The canonical text is the whole configuration — every binding, every
+    // `local_user` verifier. A viewer sees summaries, not the file.
+    let admin = Harness::new();
+    let response = admin.get(&admin.viewer(), "/admin/v1/policies/active");
+    assert_eq!(response.status, 403, "{}", response.body);
+    assert!(!response.body_contains("tenant id="), "{}", response.body);
+}

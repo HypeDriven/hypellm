@@ -594,6 +594,13 @@ unknown scope string is rejected. A browser session carries an **empty** scope
 set by design (`Principal::from_session`), so a CSRF against the admin UI can
 never spend a tenant's token budget.
 
+A key carrying a management scope reaches `/admin/v1`, with the permissions its
+principal's `role_binding` records grant and never `BreakGlass` or `ManageKeys`.
+The key record itself carries no roles, so **withdrawing a role binding
+de-powers every key that principal holds immediately** — that, rather than
+revocation, is the fastest way to stop a compromised automation without
+breaking the ones that share its tenant.
+
 The key is created in the **creating session's tenant**, not in a tenant named
 in the request.
 

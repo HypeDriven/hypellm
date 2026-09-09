@@ -420,10 +420,19 @@ function retentionPanel(retention, tenant) {
 
   return panel({
     title: 'Retention',
-    note: `Specification 5 and 17, for tenant ${named}. Another tenant's profile is not readable here.`,
+    note:
+      `Specification 5 and 17, for tenant ${named}. Another tenant's profile is not readable here. ` +
+      'The window is a declaration this router records for the deployment\u2019s own lifecycle tooling to act on; nothing here deletes state, audit records, usage, or exported logs when it elapses.',
     content: hasProfile
       ? definitionList([
-          ['Retention window', retention.days === undefined ? null : `${formatCount(retention.days)} days`],
+          [
+            'Retention window',
+            retention.days === undefined
+              ? null
+              : retention.days_enforced
+                ? `${formatCount(retention.days)} days`
+                : `${formatCount(retention.days)} days — declared, not enforced by the router`,
+          ],
           [
             'Residency',
             retention.residency
@@ -582,10 +591,12 @@ function breakGlassPanel(breakGlass, session) {
  * are read together — a deadline without a body limit and a body limit without
  * a retry budget each leave a different way to spend the router's resources.
  *
- * The three local sockets are reported here as wired or not. The endpoint does
- * not disclose their paths and this screen does not invent them: each names a
- * local attack surface, and the control socket is unauthenticated, so anything
- * that can open it can stop the router.
+ * The local sockets are reported here as wired or not. The endpoint does not
+ * disclose their paths and this screen does not invent them: each names a local
+ * attack surface. The control socket is owner-only *and* authenticated by
+ * `<secrets>/control.key`, so opening it is not enough to stop the router — but
+ * knowing where it is remains a step towards it, and this screen is not the
+ * place to publish that.
  *
  * @param {object} deployment
  * @returns {HTMLElement}
@@ -633,6 +644,17 @@ function deploymentPanel(deployment) {
           flag(deployment.outbound_tls_configured, {
             on: 'Wired',
             off: 'Not wired',
+            onTone: 'ok',
+            offTone: 'warn',
+          }),
+        ],
+        [
+          'On-demand backup',
+          flag(deployment.backup_configured, {
+            // The destination is deliberately not shown: the endpoint reports
+            // whether `settings backup_dir` is set, never where it points.
+            on: 'Configured \u2014 hypellm-router --backup writes a consistent copy',
+            off: 'Not configured \u2014 hypellm-router --backup is refused',
             onTone: 'ok',
             offTone: 'warn',
           }),

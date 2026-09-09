@@ -186,11 +186,18 @@ services:
 
     # The router does not install a signal handler: specification 18.2 forbids
     # the `unsafe` FFI that `sigaction` needs, so `shutdown` arrives over the
-    # control socket instead. `just down` sends it and waits. A plain
-    # `docker compose down` therefore ends in SIGKILL — which the store is
-    # designed to survive (a torn log tail is truncated on the next start), but
-    # it drops in-flight streams.
-    stop_grace_period: 10s
+    # control socket instead. `supervisor/hypellm-init` is PID 1 in this image
+    # and turns SIGTERM into exactly that command, so a plain `docker compose
+    # down` now drains rather than ending in SIGKILL. `just down` sends the
+    # command directly and is still the more explicit path.
+    #
+    # Forty-five seconds, not ten: the inference listener's own drain deadline
+    # is 30 s (`ServerConfig::inference`), so a ten-second grace period cut a
+    # graceful drain off two thirds of the way through and SIGKILLed the router
+    # mid-stream — the exact outcome `just down` exists to avoid, reached by
+    # `just down` itself whenever the drain used its full budget. The two
+    # numbers have to be ordered, and this is the one that has to be larger.
+    stop_grace_period: 45s
 
     # No restart policy on purpose: after a graceful `--shutdown` the process
     # exits 0, and `unless-stopped` would immediately start it again.

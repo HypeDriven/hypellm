@@ -63,6 +63,7 @@ pub fn target_fixture() -> Target {
         cost_class: CostClass::new(4),
         quality_class: Default::default(),
         document_token_estimate: None,
+        bytes_per_token: None,
         residency: None,
         is_local: false,
         admin_state: AdminState::Enabled,
