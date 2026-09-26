@@ -1115,6 +1115,57 @@ pub fn build(document: &Document, version: u64) -> Result<ValidatedConfig, Vec<C
             }
         }
     }
+    // A binding or grant whose scope names a tenant or group, or whose model
+    // names an exact alias, that is not defined never matches. For a deny that
+    // is a policy which silently fails open, so every such reference must
+    // resolve. Wildcards and prefixes are selectors, not references, and stay
+    // legal whether or not anything currently matches them.
+    let unresolved_scope = |scope: &BindingScope| -> Option<String> {
+        match scope {
+            BindingScope::Tenant(t) if !tenant_map.contains_key(t) => {
+                Some(format!("tenant '{t}'"))
+            }
+            BindingScope::Group(g) if !seen_groups.contains(g) => Some(format!("group '{g}'")),
+            _ => None,
+        }
+    };
+    let unresolved_model = |model: &ModelSelector| -> Option<String> {
+        match model {
+            ModelSelector::Exact(a) if !aliases.contains_key(a) => Some(format!("alias '{a}'")),
+            _ => None,
+        }
+    };
+    for binding in &bindings {
+        // Group scopes were reported above; only tenants are new here.
+        if let BindingScope::Tenant(_) = &binding.scope {
+            if let Some(what) = unresolved_scope(&binding.scope) {
+                errors.push(ConfigError::new(
+                    "unresolved_reference",
+                    format!("binding '{}' names {what}, which is not defined", binding.id),
+                    Position { line: 0, column: 0 },
+                ));
+            }
+        }
+        if let Some(what) = unresolved_model(&binding.model) {
+            errors.push(ConfigError::new(
+                "unresolved_reference",
+                format!("binding '{}' names {what}, which is not defined", binding.id),
+                Position { line: 0, column: 0 },
+            ));
+        }
+    }
+    for grant in &grants {
+        for what in [unresolved_scope(&grant.scope), unresolved_model(&grant.model)]
+            .into_iter()
+            .flatten()
+        {
+            errors.push(ConfigError::new(
+                "unresolved_reference",
+                format!("grant names {what}, which is not defined"),
+                Position { line: 0, column: 0 },
+            ));
+        }
+    }
     for role in &roles {
         if let RoleSubject::Group(g) = &role.subject {
             if !seen_groups.contains(g) {
@@ -2015,6 +2066,15 @@ fn build_grant(f: &Fields<'_>) -> Result<AliasGrant, ConfigError> {
         operations.push(Operation::parse(op).ok_or_else(|| {
             f.error("invalid_operation", format!("unknown operation '{op}'"))
         })?);
+    }
+    // An empty operation list means every operation to the policy engine, so
+    // `operations=` would widen the grant exactly as `model=` would. Omitting
+    // the field means every operation; writing it empty is refused.
+    if operations.is_empty() && f.present("operations") {
+        return Err(f.error(
+            "empty_field",
+            "'operations' is present but empty; omit it to mean every operation, or name one",
+        ));
     }
     Ok(AliasGrant {
         scope,

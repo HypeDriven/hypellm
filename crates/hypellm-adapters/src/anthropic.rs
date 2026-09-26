@@ -461,15 +461,7 @@ impl Adapter for AnthropicAdapter {
             if let CanonicalEvent::Usage(usage) = event {
                 merged = Some(match merged {
                     None => *usage,
-                    Some(previous) => CanonicalUsage {
-                        input_tokens: usage.input_tokens.max(previous.input_tokens),
-                        output_tokens: usage.output_tokens.max(previous.output_tokens),
-                        cached_input_tokens: usage
-                            .cached_input_tokens
-                            .max(previous.cached_input_tokens),
-                        reasoning_tokens: usage.reasoning_tokens.max(previous.reasoning_tokens),
-                        source: UsageSource::ProviderReported,
-                    },
+                    Some(previous) => previous.merge(*usage),
                 });
             }
         }
@@ -500,7 +492,13 @@ fn decode_usage(usage: Option<&Value>) -> Option<CanonicalUsage> {
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
         reasoning_tokens: 0,
-        source: UsageSource::ProviderReported,
+        // `message_delta` carries output only. Zero would be a number the
+        // router shows and meters; an unreported input is marked instead.
+        source: if input.is_some() {
+            UsageSource::ProviderReported
+        } else {
+            UsageSource::ProviderReportedOutput
+        },
     })
 }
 
@@ -982,6 +980,39 @@ mod tests {
         let usage = a.usage_from_events(&all);
         assert_eq!(usage.input_tokens, 10, "input tokens come from message_start");
         assert_eq!(usage.output_tokens, 4, "output tokens come from message_delta");
+    }
+
+    #[test]
+    fn an_output_only_message_delta_neither_zeroes_nor_invents_the_input() {
+        let a = AnthropicAdapter;
+        let start = a
+            .decode_stream_event(
+                Some("message_start"),
+                r#"{"type":"message_start","message":{"id":"m","model":"c","usage":{"input_tokens":10,"output_tokens":1}}}"#,
+            )
+            .expect("decodes");
+        let delta = a
+            .decode_stream_event(
+                Some("message_delta"),
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}"#,
+            )
+            .expect("decodes");
+
+        // Alone, the delta reports output and marks input unknown.
+        let alone = a.usage_from_events(&delta);
+        assert_eq!(alone.known_input_tokens(), None);
+        assert!(!alone.is_reported());
+
+        // A non-streaming client of a streamed upstream reads the accumulator,
+        // which must merge the halves rather than keep the last one.
+        let mut accumulator = ResponseAccumulator::new();
+        for event in start.iter().chain(&delta) {
+            accumulator.push(event);
+        }
+        let usage = accumulator.usage.expect("usage");
+        assert_eq!(usage.known_input_tokens(), Some(10));
+        assert_eq!(usage.output_tokens, 4);
+        assert!(usage.is_reported());
     }
 
     #[test]

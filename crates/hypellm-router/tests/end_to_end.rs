@@ -2528,3 +2528,263 @@ fn a_cancelled_job_never_reaches_the_upstream() {
         "a cancelled job still reached the provider"
     );
 }
+
+/// A scorer's reply, in the shape `semif/serve.py` actually sends.
+fn scorer_response() -> CannedResponse {
+    CannedResponse::json(
+        200,
+        r#"{"id":"row-1","option_ids":["0","1","2"],"probabilities":[0.0047,0.9941,0.0011],
+            "option_logits":[22.3,27.7,20.9],"input_tokens":131,
+            "model":{"source":"Qwen/Qwen3.5-4B","gguf":{"file":"Qwen_Qwen3.5-4B-Q4_K_M.gguf"}},
+            "probability_status":"conditional option score over quantized weights; uncalibrated as decision confidence",
+            "forward_seconds":0.48}"#,
+    )
+}
+
+fn scorer_config_text(port: u16) -> String {
+    format!(
+        "\
+settings state_dir=/tmp/hypellm-test default_deadline_ms=5000 retry_budget_ms=5000 max_attempts=3
+tenant id=acme
+provider id=scorer family=semif scheme=http host=127.0.0.1 port={port} egress=local
+target id=scorer:qwen provider=scorer model=Qwen3.5-4B local=true \\
+       operations=rerank capabilities=rerank streaming=false \\
+       context=4096 max_output=1 concurrency=1
+alias id=decide capability=rerank targets=scorer:qwen description=\"the decision scorer\"
+grant scope=tenant:acme model=* allow=true
+binding id=default scope=tenant:acme model=* prefer=scorer:qwen
+"
+    )
+}
+
+const RERANK_BODY: &str = r#"{"model":"decide","context":"The customer asked for a refund after 40 days. Policy allows 30.","query":"What should the agent do?","documents":["Issue a full refund","Deny the request politely","Escalate to a supervisor"],"return_documents":true}"#;
+
+#[test]
+fn a_rerank_request_reaches_a_scorer_and_comes_back_ranked() {
+    let upstream = FakeUpstream::start(scorer_response());
+    let router = router_with_config(&upstream, &scorer_config_text(upstream.address.port()));
+    let harness = Harness::start(upstream, router);
+
+    let response = harness.request("POST", "/v1/rerank", RERANK_BODY, true);
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    let value = parse_str(&response.body, &Limits::DEFAULT).expect("a JSON body");
+
+    // What the scorer was actually sent: the caller's question as the
+    // criterion, their context as the evidence, and their documents as options
+    // keyed by position.
+    let sent = harness.upstream.last_body().expect("the scorer was called");
+    let sent = parse_str(&sent, &Limits::DEFAULT).expect("JSON");
+    assert_eq!(
+        sent.get("question").and_then(|v| v.as_str()),
+        Some("What should the agent do?")
+    );
+    assert_eq!(
+        sent.get("state").and_then(|v| v.as_str()),
+        Some("The customer asked for a refund after 40 days. Policy allows 30.")
+    );
+    let options = sent.get("options").and_then(|v| v.as_array()).expect("options");
+    assert_eq!(options.len(), 3);
+    assert_eq!(options[1].get("id").and_then(|v| v.as_str()), Some("1"));
+    assert_eq!(
+        options[1].get("description").and_then(|v| v.as_str()),
+        Some("Deny the request politely")
+    );
+
+    // What the caller got back: ranked, highest first, indices pointing into
+    // the list they sent.
+    let results = value.get("results").and_then(|v| v.as_array()).expect("results");
+    assert_eq!(results.len(), 3);
+    assert_eq!(
+        results[0].get("index").and_then(|v| v.as_u64()),
+        Some(1),
+        "the scorer's winner must be first, not the first document"
+    );
+    assert!(
+        results[0]
+            .get("relevance_score")
+            .and_then(|v| v.as_f64())
+            .is_some_and(|score| (score - 0.9941).abs() < 1e-6),
+        "the score is reported as the scorer gave it"
+    );
+    assert_eq!(
+        results[0]
+            .get("document")
+            .and_then(|d| d.get("text"))
+            .and_then(|v| v.as_str()),
+        Some("Deny the request politely"),
+        "return_documents echoes the caller's own text"
+    );
+    assert!(
+        results[1].get("index").and_then(|v| v.as_u64()) > results[2].get("index").and_then(|v| v.as_u64())
+            || results[1].get("relevance_score").and_then(|v| v.as_f64())
+                >= results[2].get("relevance_score").and_then(|v| v.as_f64()),
+        "results are ordered by score"
+    );
+
+    // Metering: the scorer counted the prompt, so it is reported rather than
+    // estimated, and nothing was generated.
+    let usage = value.get("usage").expect("usage");
+    assert_eq!(usage.get("prompt_tokens").and_then(|v| v.as_u64()), Some(131));
+    assert_eq!(usage.get("completion_tokens").and_then(|v| v.as_u64()), Some(0));
+    assert_eq!(
+        usage
+            .get("hypellm")
+            .and_then(|h| h.get("usage_source"))
+            .and_then(|v| v.as_str()),
+        Some("provider_reported")
+    );
+    let meta = value.get("hypellm").expect("router metadata");
+    assert_eq!(
+        meta.get("native_model").and_then(|v| v.as_str()),
+        Some("Qwen_Qwen3.5-4B-Q4_K_M.gguf"),
+        "the quantisation that produced the logits, not the alias"
+    );
+    assert_eq!(meta.get("scored_documents").and_then(|v| v.as_u64()), Some(3));
+}
+
+#[test]
+fn top_n_narrows_the_answer_without_narrowing_the_question() {
+    // Every candidate is scored; `top_n` only decides how much is printed. A
+    // router that sent fewer options would be asking a different question and
+    // could return a "best" the scorer never compared against the rest.
+    let upstream = FakeUpstream::start(scorer_response());
+    let router = router_with_config(&upstream, &scorer_config_text(upstream.address.port()));
+    let harness = Harness::start(upstream, router);
+
+    let body = RERANK_BODY.replace("\"return_documents\":true", "\"top_n\":1");
+    let response = harness.request("POST", "/v1/rerank", &body, true);
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    let value = parse_str(&response.body, &Limits::DEFAULT).expect("a JSON body");
+
+    let sent = harness.upstream.last_body().expect("the scorer was called");
+    let sent = parse_str(&sent, &Limits::DEFAULT).expect("JSON");
+    assert_eq!(
+        sent.get("options").and_then(|v| v.as_array()).map(<[_]>::len),
+        Some(3),
+        "all three candidates were scored"
+    );
+
+    let results = value.get("results").and_then(|v| v.as_array()).expect("results");
+    assert_eq!(results.len(), 1, "only the top one is printed");
+    assert_eq!(results[0].get("index").and_then(|v| v.as_u64()), Some(1));
+    assert_eq!(
+        value
+            .get("hypellm")
+            .and_then(|m| m.get("scored_documents"))
+            .and_then(|v| v.as_u64()),
+        Some(3),
+        "and the response says how many were scored"
+    );
+}
+
+#[test]
+fn a_scorer_never_receives_a_chat_request_it_cannot_serve() {
+    // The alias declares reranking; a chat call naming it must be refused by
+    // eligibility, not sent to a scorer that would answer 400 after the prompt
+    // crossed the network.
+    let upstream = FakeUpstream::start(scorer_response());
+    let router = router_with_config(&upstream, &scorer_config_text(upstream.address.port()));
+    let harness = Harness::start(upstream, router);
+
+    let response = harness.request(
+        "POST",
+        "/v1/chat/completions",
+        r#"{"model":"decide","messages":[{"role":"user","content":"hello"}]}"#,
+        true,
+    );
+    assert_ne!(response.status, 200, "body: {}", response.body);
+    assert!(
+        response.body.contains("no_eligible_target"),
+        "the refusal is an eligibility one, decided before any I/O: {}",
+        response.body
+    );
+    assert_eq!(
+        harness.upstream.served(),
+        0,
+        "nothing was sent to the scorer"
+    );
+}
+
+#[test]
+fn a_rerank_request_does_not_stream() {
+    let upstream = FakeUpstream::start(scorer_response());
+    let router = router_with_config(&upstream, &scorer_config_text(upstream.address.port()));
+    let harness = Harness::start(upstream, router);
+
+    let body = RERANK_BODY.replace("\"return_documents\":true", "\"stream\":true");
+    let response = harness.request("POST", "/v1/rerank", &body, true);
+    assert_eq!(
+        response.status, 400,
+        "a caller who asked for frames must be told, not handed a body: {}",
+        response.body
+    );
+    assert_eq!(harness.upstream.served(), 0);
+}
+
+#[test]
+fn a_tool_call_whose_arguments_are_not_an_object_is_an_error_not_an_empty_input() {
+    // Substituting `{}` for arguments the router cannot represent hands the
+    // caller a tool call it will execute with no arguments at all — a Write
+    // with no content, a shell command with no command. The only honest
+    // answer is an error, and it must not arrive with a 200.
+    let harness = Harness::default(CannedResponse::json(
+        200,
+        r#"{"id":"chatcmpl-up9","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"write","arguments":"{\"path\": \"a.txt\", \"content\": "}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}"#,
+    ));
+    let body = r#"{"model":"test-alias","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}"#;
+    let response = harness.request("POST", "/v1/messages", body, true);
+
+    assert_ne!(response.status, 200, "{}", response.body);
+    assert!(!response.body.contains("tool_use"), "{}", response.body);
+    assert_eq!(response.json().field_str("type").unwrap(), "error", "{}", response.body);
+}
+
+const STREAM_BODY: &str =
+    r#"{"model":"test-alias","messages":[{"role":"user","content":"x"}],"stream":true}"#;
+
+fn chunked_stream(after_done: Option<&str>) -> CannedResponse {
+    CannedResponse::chunked_event_stream(
+        &[
+            r#"{"id":"1","choices":[{"delta":{"role":"assistant","content":"Hi"}}]}"#,
+            r#"{"id":"1","choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ],
+        after_done,
+    )
+}
+
+#[test]
+fn sequential_streams_reuse_one_upstream_connection() {
+    // The router stops reading at `data: [DONE]`, which left the chunked
+    // terminator unread; the pool refuses a half-read connection, so every
+    // streaming request paid for a fresh upstream connection. The framing is
+    // now drained after the sentinel and the connection goes back to the pool.
+    let harness = Harness::default(chunked_stream(None));
+    for _ in 0..2 {
+        let response = harness.request("POST", "/v1/chat/completions", STREAM_BODY, true);
+        assert_eq!(response.status, 200);
+    }
+    assert_eq!(harness.upstream.served(), 2);
+    assert_eq!(
+        harness.upstream.connections(),
+        1,
+        "two sequential streams opened {} upstream connections",
+        harness.upstream.connections()
+    );
+}
+
+#[test]
+fn a_stream_with_bytes_after_its_sentinel_is_not_pooled() {
+    // An upstream still talking after `[DONE]` is not one whose next response
+    // can be trusted to start where it should.
+    let harness = Harness::default(chunked_stream(Some("data: stray\n\n")));
+    for _ in 0..2 {
+        let response = harness.request("POST", "/v1/chat/completions", STREAM_BODY, true);
+        assert_eq!(response.status, 200);
+    }
+    assert_eq!(harness.upstream.served(), 2);
+    assert_eq!(
+        harness.upstream.connections(),
+        2,
+        "a connection that sent junk after its sentinel was reused"
+    );
+}

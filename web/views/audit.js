@@ -477,9 +477,16 @@ export async function mount(container, ctx) {
 
   // ---------------------------------------------------------------- render --
 
-  const exportDetail = ctx.can('export_audit')
-    ? 'This session holds export_audit, but no route implements it. A download built in the browser is not an export: it would leave no audit_exported record in the chain and would carry no signature.'
-    : 'A download built in the browser is not an export: it would leave no audit_exported record in the chain and would carry no signature.';
+  const exportPanel = ctx.can('export_audit')
+    ? panel({
+      title: 'Audit export',
+      content: exportControls(ctx, tenant),
+      note: 'The server-side export (specification 11.2): the durable chain for this tenant, with every checkpoint that verifies under the store key. The export is itself recorded as audit_exported.',
+    })
+    : notAvailable(
+      'Audit export',
+      'Exporting needs the export_audit permission, which this session does not hold. A download built in the browser from the records above would not be an export: it would leave no audit_exported record and carry no checkpoints.',
+    );
 
   render(container, [
     pageHeader(meta.title, meta.lede),
@@ -493,7 +500,7 @@ export async function mount(container, ctx) {
       content: [controls, status, tableHost],
       note: `The router returns the most recent records for tenant ${tenant}; filtering below runs in the browser over that page, not across the whole chain.`,
     }),
-    notAvailable('Audit export', exportDetail),
+    exportPanel,
   ]);
 
   syncOptions();
@@ -502,4 +509,52 @@ export async function mount(container, ctx) {
   return () => {
     state.live = false;
   };
+}
+
+/**
+ * The export button and what the last export said about itself.
+ *
+ * The file is the server's response, byte for byte as parsed — the browser adds
+ * nothing to it and filters nothing out of it. It is handed to the browser as
+ * a Blob through a temporary object URL and an `<a download>` built as a DOM
+ * node, so no markup is written from a string and no handler is inline.
+ *
+ * @param {object} ctx
+ * @param {string} tenant
+ * @returns {Node}
+ */
+function exportControls(ctx, tenant) {
+  const outcome = el('p', {
+    class: 'status-line',
+    role: 'status',
+    'aria-live': 'polite',
+    text: 'Nothing exported in this session yet.',
+  });
+  const button = actionButton('Download export', async () => {
+    const { data } = await ctx.api.get('/audit/export');
+    const records = Array.isArray(data.records) ? data.records.length : 0;
+    const checkpoints = Array.isArray(data.checkpoints) ? data.checkpoints.length : 0;
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    try {
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const link = el('a', { href: url, download: `hypellm-audit-${tenant}-${stamp}.json` });
+      link.hidden = true;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+    } finally {
+      // After the click has been dispatched; the download holds its own
+      // reference to the Blob.
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    }
+    replace(
+      outcome,
+      text(
+        `Exported ${formatCount(records)} records and ${formatCount(checkpoints)} checkpoints` +
+          (data.truncated ? ' — truncated at the server\'s export bound; this file is not the whole chain.' : '.'),
+      ),
+    );
+  }, { busyLabel: 'Exporting…' });
+  return el('div', {}, [toolbar([button], { label: 'Audit export' }), outcome]);
 }

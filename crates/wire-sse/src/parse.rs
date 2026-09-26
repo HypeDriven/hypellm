@@ -112,9 +112,18 @@ pub struct SseParser {
     /// Set when the previous chunk ended with a bare CR, so that a following LF
     /// is treated as the second half of one CRLF rather than a blank line.
     pending_cr: bool,
+    /// True until the first line of the stream is known not to begin with a
+    /// byte-order mark. The WHATWG `EventSource` parser strips exactly one
+    /// leading U+FEFF; without that, a BOM-prefixed first line reads as an
+    /// unknown field and its `data:` is silently lost. Tracked across `push`
+    /// calls because the three bytes may arrive in separate reads.
+    bom_pending: bool,
     /// Sticky failure. Once set, every call reports it.
     failed: Option<SseError>,
 }
+
+/// The UTF-8 encoding of U+FEFF.
+const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 
 #[derive(Debug)]
 enum Line {
@@ -134,6 +143,7 @@ impl SseParser {
             current: SseEvent::default(),
             saw_data: false,
             pending_cr: false,
+            bom_pending: true,
             failed: None,
         }
     }
@@ -179,6 +189,14 @@ impl SseParser {
                         return Err(self.fail(SseError::LineTooLong));
                     }
                     self.line_buf.push(byte);
+                    if self.bom_pending {
+                        if self.line_buf.as_slice() == UTF8_BOM {
+                            self.line_buf.clear();
+                            self.bom_pending = false;
+                        } else if !UTF8_BOM.starts_with(&self.line_buf) {
+                            self.bom_pending = false;
+                        }
+                    }
                 }
             }
         }
@@ -208,6 +226,8 @@ impl SseParser {
     }
 
     fn finish_line(&mut self) -> Result<(), SseError> {
+        // A BOM can only lead the first line.
+        self.bom_pending = false;
         let raw = core::mem::take(&mut self.line_buf);
         let text = match String::from_utf8(raw) {
             Ok(t) => t,
@@ -320,6 +340,32 @@ mod tests {
         let mut p = SseParser::with_default_limits();
         p.push(input).expect("push");
         p.drain().expect("drain")
+    }
+
+    #[test]
+    fn one_leading_byte_order_mark_is_stripped_even_when_split_across_reads() {
+        // Without stripping, the first line reads as a field named
+        // "\u{feff}data" and the first event's payload is silently dropped.
+        let input = b"\xEF\xBB\xBFdata: first\n\ndata: second\n\n";
+        for split in 0..=input.len() {
+            let mut p = SseParser::with_default_limits();
+            let (a, b) = input.split_at(split);
+            p.push(a).expect("push");
+            p.push(b).expect("push");
+            let events = p.drain().expect("drain");
+            let data: Vec<&str> = events.iter().map(|e| e.data.as_str()).collect();
+            assert_eq!(data, ["first", "second"], "split at {split}");
+        }
+
+        // Only one: a second BOM is part of the field name, as WHATWG says.
+        assert!(parse_all(b"\xEF\xBB\xBF\xEF\xBB\xBFdata: x\n\n").is_empty());
+        // Only at the start of the stream, not of a later line.
+        let events = parse_all(b"data: a\n\n\xEF\xBB\xBFdata: b\n\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "a");
+        // A prefix of a BOM that is not one is kept, and so still fails UTF-8.
+        let mut p = SseParser::with_default_limits();
+        assert_eq!(p.push(b"\xEF\xBBdata: x\n"), Err(SseError::InvalidUtf8));
     }
 
     #[test]

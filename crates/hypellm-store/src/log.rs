@@ -458,7 +458,38 @@ pub struct Log {
     file: File,
     /// Whether each append is followed by an fsync.
     sync_on_append: bool,
+    /// Bytes of the file known to hold complete, durable frames.
     len: u64,
+    /// Set when a failed append left bytes past `len` that could not be cut
+    /// off. Every later append is refused until the store is reopened.
+    ///
+    /// The file is opened `O_APPEND`, so a write always lands at the *real*
+    /// end of the file, not at `len`. Appending after unremoved partial bytes
+    /// would put a valid frame behind damage — replay then refuses the whole
+    /// log as `MidFileDamage` — and appending after a complete-but-unsynced
+    /// frame would put a record on disk that the caller was told had failed,
+    /// which is how the audit chain came to show a break that was not there.
+    poisoned: bool,
+    /// Fault injection for the append-failure tests.
+    #[cfg(test)]
+    fault: Option<Fault>,
+}
+
+/// A failure to inject into the next append.
+///
+/// Neither shape is reachable from a test otherwise: a write that succeeds and
+/// then an `fsync` that fails is what a failing disk does, and no device
+/// available without privileges behaves that way.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fault {
+    /// The whole frame is written, and then the sync fails.
+    SyncFails,
+    /// Half the frame is written, and then the write fails.
+    PartialWrite,
+    /// The whole frame is written, the sync fails, and so does the attempt to
+    /// cut the frame off again.
+    SyncAndRollbackFail,
 }
 
 impl Log {
@@ -475,7 +506,22 @@ impl Log {
             file,
             sync_on_append,
             len,
+            poisoned: false,
+            #[cfg(test)]
+            fault: None,
         })
+    }
+
+    /// Arrange for the next append to fail in the given way.
+    #[cfg(test)]
+    pub(crate) fn inject_fault(&mut self, fault: Fault) {
+        self.fault = Some(fault);
+    }
+
+    /// Whether an earlier failed append has disabled further appends.
+    #[must_use]
+    pub const fn is_poisoned(&self) -> bool {
+        self.poisoned
     }
 
     /// Current length in bytes.
@@ -497,6 +543,14 @@ impl Log {
     }
 
     /// Append a frame and return its byte offset.
+    ///
+    /// All or nothing. On failure — a short write, a failed `fsync` after a
+    /// complete write — the file is cut back to the last known-good length and
+    /// synced, so the frame the caller was told failed is not on disk and the
+    /// next append does not land behind partial bytes. If even that fails,
+    /// the log is poisoned and refuses every later append: the on-disk state
+    /// is then whatever the kernel kept, and replay at the next start is the
+    /// only thing that can say what that is.
     pub fn append(
         &mut self,
         kind: RecordKind,
@@ -504,14 +558,59 @@ impl Log {
         payload: &[u8],
         mac_key: &[u8],
     ) -> io::Result<u64> {
-        let bytes = frame::encode(kind, sequence, payload, mac_key);
+        if self.poisoned {
+            return Err(io::Error::other(
+                "an earlier append failed and its partial bytes could not be removed; \
+                 the log refuses further appends until the store is reopened",
+            ));
+        }
+        let bytes = frame::encode(kind, sequence, payload, mac_key)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let offset = self.len;
-        self.file.write_all(&bytes)?;
+        if let Err(e) = self.write_frame(&bytes) {
+            self.roll_back();
+            return Err(e);
+        }
+        self.len = self.len.saturating_add(to_u64(bytes.len()));
+        Ok(offset)
+    }
+
+    /// Write and, when configured, sync one encoded frame.
+    fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(fault) = self.fault {
+            let written = if fault == Fault::PartialWrite {
+                bytes.get(..bytes.len().div_euclid(2)).unwrap_or(bytes)
+            } else {
+                bytes
+            };
+            self.file.write_all(written)?;
+            if fault != Fault::SyncAndRollbackFail {
+                self.fault = None;
+            }
+            return Err(io::Error::other("injected append failure"));
+        }
+        self.file.write_all(bytes)?;
         if self.sync_on_append {
             self.file.sync_data()?;
         }
-        self.len += to_u64(bytes.len());
-        Ok(offset)
+        Ok(())
+    }
+
+    /// Cut the file back to `len` after a failed append, or poison the log.
+    fn roll_back(&mut self) {
+        #[cfg(test)]
+        if self.fault.take() == Some(Fault::SyncAndRollbackFail) {
+            self.poisoned = true;
+            return;
+        }
+        let restored = self
+            .file
+            .set_len(self.len)
+            .and_then(|()| self.file.sync_all());
+        if restored.is_err() {
+            self.poisoned = true;
+        }
     }
 
     /// Flush and sync.
@@ -618,10 +717,12 @@ impl Log {
                     // Specification 11.2: "Startup replays only complete valid
                     // frames." Truncating here is right for a torn *tail* — the
                     // only thing a clean crash produces — and wrong for damage
-                    // in the middle of the file, which a partial write on ENOSPC
-                    // can leave behind: `Log::append` returns an error without
-                    // advancing `self.len`, so the next append lands past the
-                    // partial bytes and every record after the damage is
+                    // in the middle of the file. `Log::append` cuts a failed
+                    // append back off, and refuses further appends when it
+                    // cannot, so this process no longer writes past its own
+                    // partial bytes — but damage can still arrive from outside
+                    // it (a bad sector, an edit, an older build that did not
+                    // roll back), and when it does, every record after it is
                     // durable, valid, and about to be discarded without a word.
                     //
                     // The two are distinguishable: look past the damage for a
@@ -690,6 +791,7 @@ impl Log {
         self.file.sync_all()?;
         self.file.seek(SeekFrom::End(0))?;
         self.len = valid_len;
+        self.poisoned = false;
         Ok(())
     }
 
@@ -701,6 +803,7 @@ impl Log {
         self.file.sync_all()?;
         self.file.seek(SeekFrom::Start(0))?;
         self.len = 0;
+        self.poisoned = false;
         Ok(())
     }
 }
@@ -817,7 +920,7 @@ mod tests {
         // never ends: a file being appended to while it is replayed. Modelled
         // with `Cursor` chained to `io::repeat`, which needs no device and no
         // platform support.
-        let valid = frame::encode(RecordKind::AuditEvent, 1, b"payload", KEY);
+        let valid = frame::encode(RecordKind::AuditEvent, 1, b"payload", KEY).expect("encode");
         let endless = std::io::Cursor::new(valid).chain(std::io::repeat(0u8));
         let mut window = Window::new(endless);
 
@@ -887,7 +990,7 @@ mod tests {
         // need manual intervention to start.
         let dir = TempDir::new("torn-first");
         let path = dir.join("log.bin");
-        let whole = frame::encode(RecordKind::AuditEvent, 1, b"payload", KEY);
+        let whole = frame::encode(RecordKind::AuditEvent, 1, b"payload", KEY).expect("encode");
         // Half a frame: the magic is intact, the rest is missing.
         std::fs::write(&path, whole.get(..whole.len() / 2).expect("half")).expect("write");
 
@@ -924,17 +1027,98 @@ mod tests {
             "expected ENOSPC, got {error:?}"
         );
 
-        // And the length must not advance. This is what makes recovery from a
-        // partial write correct: `append` leaves `len` where it was, so the
-        // next append lands past the partial bytes rather than interleaving
-        // with them — which is precisely the mid-file damage `DI-042` was
-        // about, arriving from the other direction.
+        // And the length must not advance: `len` is the boundary a failed
+        // append is cut back to, and the boundary a backup copies up to.
         assert_eq!(
             log.len(),
             before,
-            "a failed append advanced the log length, so the next append would \
-             overlap the partial frame"
+            "a failed append advanced the log length past bytes that are not a frame"
         );
+    }
+
+    /// Frames in a log file, read back through a fresh handle.
+    fn frames_on_disk(dir: &TempDir) -> Vec<u64> {
+        let mut log = open(dir);
+        log.replay(KEY)
+            .expect("the log must replay")
+            .frames
+            .iter()
+            .map(|f| f.sequence)
+            .collect()
+    }
+
+    #[test]
+    fn a_partial_append_is_cut_off_so_the_next_record_is_not_stranded_behind_it() {
+        // A short write used to leave its bytes on disk with `len` unchanged.
+        // The file is `O_APPEND`, so the next append landed *after* the
+        // partial frame, and the next start found valid records behind damage
+        // and refused as `MidFileDamage` — a full disk turned into a router
+        // that will not start until someone edits the log by hand.
+        let dir = TempDir::new("log-partial");
+        let mut log = open(&dir);
+        log.append(RecordKind::AuditEvent, 1, b"one", KEY).expect("first");
+        log.inject_fault(Fault::PartialWrite);
+        assert!(log.append(RecordKind::AuditEvent, 2, b"two", KEY).is_err());
+        log.append(RecordKind::AuditEvent, 3, b"three", KEY).expect("third");
+        drop(log);
+
+        assert_eq!(frames_on_disk(&dir), vec![1, 3]);
+    }
+
+    #[test]
+    fn a_frame_whose_sync_failed_is_not_left_on_disk() {
+        // The caller is told the append failed, so the frame must not be there
+        // afterwards: a record that "failed" and then reappears on replay is
+        // the audit chain showing a break that never happened.
+        let dir = TempDir::new("log-sync-failed");
+        let mut log = open(&dir);
+        log.append(RecordKind::AuditEvent, 1, b"one", KEY).expect("first");
+        log.inject_fault(Fault::SyncFails);
+        assert!(log.append(RecordKind::AuditEvent, 2, b"two", KEY).is_err());
+        assert!(!log.is_poisoned());
+        drop(log);
+
+        assert_eq!(frames_on_disk(&dir), vec![1]);
+    }
+
+    #[test]
+    fn a_failed_append_that_cannot_be_undone_poisons_the_log() {
+        // When the partial bytes cannot be removed either, the only safe thing
+        // left is to write nothing more: any later frame would land behind
+        // bytes this process cannot vouch for.
+        let dir = TempDir::new("log-poisoned");
+        let mut log = open(&dir);
+        log.append(RecordKind::AuditEvent, 1, b"one", KEY).expect("first");
+        log.inject_fault(Fault::SyncAndRollbackFail);
+        assert!(log.append(RecordKind::AuditEvent, 2, b"two", KEY).is_err());
+        assert!(log.is_poisoned());
+        assert!(
+            log.append(RecordKind::AuditEvent, 3, b"three", KEY).is_err(),
+            "a poisoned log accepted another append"
+        );
+        drop(log);
+
+        // Whatever the kernel kept replays cleanly: nothing followed it.
+        let on_disk = frames_on_disk(&dir);
+        assert!(!on_disk.contains(&3), "an append after poisoning reached disk");
+    }
+
+    #[test]
+    fn an_oversize_payload_is_refused_before_anything_is_written() {
+        // `decode` rejects a payload over `MAX_PAYLOAD_LEN`, so writing one
+        // would put a frame on disk that replay can never read back.
+        let dir = TempDir::new("log-oversize-payload");
+        let mut log = open(&dir);
+        log.append(RecordKind::AuditEvent, 1, b"one", KEY).expect("first");
+        let before = log.len();
+        let huge = vec![0u8; frame::MAX_PAYLOAD_LEN + 1];
+        let error = log
+            .append(RecordKind::UsageAggregate, 2, &huge, KEY)
+            .expect_err("an oversize payload must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(log.len(), before);
+        drop(log);
+        assert_eq!(frames_on_disk(&dir), vec![1]);
     }
 
     #[test]
@@ -997,7 +1181,7 @@ mod tests {
                     to_u64(n).saturating_add(1),
                     &payload,
                     KEY,
-                ));
+                ).expect("encode"));
             }
 
             // Then damage it, in one of the shapes recovery has to tell apart.
@@ -1067,11 +1251,11 @@ mod tests {
         let dir = TempDir::new("replay-growth");
         let path = dir.join("log.bin");
         let big = vec![b'q'; WINDOW_START_BYTES * 3];
-        let mut bytes = frame::encode(RecordKind::AuditEvent, 1, &big, KEY);
+        let mut bytes = frame::encode(RecordKind::AuditEvent, 1, &big, KEY).expect("encode");
         // Several more large frames, so the file is much larger than any one
         // frame. If the window tracked the file this would show.
         for n in 2..=4u64 {
-            bytes.extend_from_slice(&frame::encode(RecordKind::AuditEvent, n, &big, KEY));
+            bytes.extend_from_slice(&frame::encode(RecordKind::AuditEvent, n, &big, KEY).expect("encode"));
         }
         std::fs::write(&path, &bytes).expect("write");
 
@@ -1093,7 +1277,7 @@ mod tests {
                 Err(e) => panic!("unexpected {e:?}"),
             }
         }
-        let one_frame = frame::encode(RecordKind::AuditEvent, 1, &big, KEY).len();
+        let one_frame = frame::encode(RecordKind::AuditEvent, 1, &big, KEY).expect("encode").len();
         assert!(
             window.buf.len() < bytes.len(),
             "the window grew to the size of the file ({}) rather than a frame",
@@ -1120,7 +1304,7 @@ mod tests {
                 n,
                 &[b'x'; 256],
                 KEY,
-            ));
+            ).expect("encode"));
         }
         assert!(
             bytes.len() > WINDOW_START_BYTES * 4,
@@ -1225,7 +1409,7 @@ mod tests {
 
         // Simulate a write interrupted mid-frame.
         {
-            let partial = frame::encode(RecordKind::AuditEvent, 3, b"interrupted", KEY);
+            let partial = frame::encode(RecordKind::AuditEvent, 3, b"interrupted", KEY).expect("encode");
             let mut f = OpenOptions::new()
                 .append(true)
                 .open(dir.join("log.bin"))
@@ -1357,8 +1541,8 @@ mod tests {
         // Deleting or reordering audit records must be detectable even if each
         // individual frame verifies.
         let dir = TempDir::new("log-reorder");
-        let first = frame::encode(RecordKind::AuditEvent, 1, b"a", KEY);
-        let second = frame::encode(RecordKind::AuditEvent, 2, b"b", KEY);
+        let first = frame::encode(RecordKind::AuditEvent, 1, b"a", KEY).expect("encode");
+        let second = frame::encode(RecordKind::AuditEvent, 2, b"b", KEY).expect("encode");
         let mut swapped = Vec::new();
         swapped.extend_from_slice(&second);
         swapped.extend_from_slice(&first);
@@ -1443,10 +1627,10 @@ mod tests {
 
     #[test]
     fn mid_file_damage_refuses_rather_than_discarding_what_follows() {
-        // The ENOSPC shape. `Log::append` returns an error without advancing
-        // `self.len`, so a partially written frame stays on disk and the next
-        // append lands past it. Every record after the damage is durable and
-        // valid — and a truncating recovery drops all of them without a word.
+        // Damage with valid records after it — what an older build left after
+        // a partial write on ENOSPC, and what a bad sector leaves now. Every
+        // record after the damage is durable and valid, and a truncating
+        // recovery drops all of them without a word.
         //
         // The records this loses are the ones it can least afford to: key
         // revocations, configuration activations, audit entries.

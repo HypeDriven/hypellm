@@ -192,14 +192,21 @@ pub fn execute(
 
         // The breaker gate. A half-open breaker admits a limited probe here and
         // is told the outcome below, which is what advances its state machine.
+        //
+        // The permit is finished exactly once on every path out of this
+        // iteration: with an outcome when the attempt says something about the
+        // target, and released without one on every other path — refused by a
+        // byte, rate, or admission limit, a failed activation, a client that
+        // went away. A half-open probe slot that was taken and never returned
+        // would refuse the target for good.
         let health = state.health.entry(&target.id, request.operation);
-        if !health.breaker.try_admit(clock.now_millis()) {
+        let Some(permit) = health.breaker.admit(clock.now_millis()) else {
             trace.exclusions.push(hypellm_core::decision::Exclusion {
                 target: target.id.clone(),
                 reason: ExclusionReason::CircuitOpen,
             });
             continue;
-        }
+        };
 
         // Specification 12's Global-layer input byte rate (`DI-053`), checked
         // before the reservation so an exhausted byte budget refuses with no
@@ -215,6 +222,7 @@ pub fn execute(
                 target: target.id.clone(),
                 reason: rejection.exclusion_reason(),
             });
+            permit.release(clock.now_millis());
             continue;
         }
 
@@ -279,7 +287,9 @@ pub fn execute(
                         "the request exceeded a configured capacity or rate limit",
                     ),
                     provider_code: None,
+                    client_cancelled: false,
                 });
+                permit.release(clock.now_millis());
                 continue;
             }
         };
@@ -303,7 +313,9 @@ pub fn execute(
                     target: target.id.clone(),
                     reason,
                 });
-                drop(reservation);
+                // Nothing was sent: the whole estimate goes back.
+                reservation.release_unused();
+                permit.release(clock.now_millis());
                 continue;
             }
         } else if candidate.residency.requires_activation() {
@@ -314,9 +326,11 @@ pub fn execute(
                         target: target.id.clone(),
                         reason,
                     });
-                    // The reservation is dropped here, on this path as on every
-                    // other, before the next candidate asks for capacity.
-                    drop(reservation);
+                    // The reservation is released here, on this path as on
+                    // every other, before the next candidate asks for
+                    // capacity. Nothing was sent, so nothing was consumed.
+                    reservation.release_unused();
+                    permit.release(clock.now_millis());
                     last_failure = Some(AttemptFailure {
                         phase: dispatch::AttemptPhase::BeforeAcceptance,
                         class: hypellm_core::event::UpstreamErrorClass::Connection,
@@ -328,6 +342,7 @@ pub fn execute(
                             "the requested capability is not available",
                         ),
                         provider_code: None,
+                        client_cancelled: false,
                     });
                     continue;
                 }
@@ -491,7 +506,8 @@ pub fn execute(
                     estimate.saturating_sub(actual),
                 );
                 reservation.commit(actual);
-                health.record_success(
+                health.finish_success(
+                    permit,
                     summary.first_byte_millis.unwrap_or(0),
                     summary.total_millis,
                     clock.now_millis(),
@@ -513,9 +529,28 @@ pub fn execute(
                 };
             }
             Err(failure) => {
-                // Drop returns the estimate; nothing was consumed.
-                drop(reservation);
-                health.record_failure(failure.class, clock.now_millis());
+                // Released explicitly, never left to `Drop` (which charges
+                // the whole estimate as if it had been consumed). A failure
+                // before acceptance means the provider refused or never saw
+                // the request, so nothing was consumed and the estimate is
+                // refunded in full; without this, every pre-acceptance
+                // failover attempt cost the caller a full estimate of token
+                // budget. After acceptance the provider may have done the
+                // work and reported nothing, so the estimate is charged —
+                // the conservative direction.
+                match failure.phase {
+                    dispatch::AttemptPhase::BeforeAcceptance => reservation.release_unused(),
+                    dispatch::AttemptPhase::AfterAcceptance
+                    | dispatch::AttemptPhase::AfterOutput => reservation.commit(estimate),
+                }
+                if failure.client_cancelled {
+                    // The caller went away. That is not the target's fault, so
+                    // it is not recorded against it — but a probe slot this
+                    // request held is still returned.
+                    permit.release(clock.now_millis());
+                } else {
+                    health.finish_failure(permit, failure.class, clock.now_millis());
+                }
                 publish_breaker_state(state, &health, &target.id, clock.now_millis());
 
                 let outcome = match failure.phase {

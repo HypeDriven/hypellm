@@ -94,7 +94,7 @@ impl Default for DocumentLimits {
 }
 
 /// The floor that applies to a request: the tenant's, or the caller's if higher.
-fn effective_quality_floor(value: &Value, context: &ParseContext) -> Option<QualityClass> {
+pub(crate) fn effective_quality_floor(value: &Value, context: &ParseContext) -> Option<QualityClass> {
     let requested = value
         .opt_field_i64("min_quality")
         .ok()
@@ -318,7 +318,7 @@ pub fn parse_embeddings_request(
     })
 }
 
-fn require_model(value: &Value) -> Result<AliasId, RouterError> {
+pub(crate) fn require_model(value: &Value) -> Result<AliasId, RouterError> {
     let raw = value.field_str("model").map_err(|_| {
         RouterError::invalid_request("the 'model' field is required").with_param("model")
     })?;
@@ -409,7 +409,7 @@ fn build_request(
     })
 }
 
-fn type_error(e: wire_json::TypeError) -> RouterError {
+pub(crate) fn type_error(e: wire_json::TypeError) -> RouterError {
     RouterError::invalid_request(&e.to_string()).with_param(&e.path)
 }
 
@@ -953,7 +953,7 @@ fn parse_responses_content_part(part: &Value, param: &str) -> Result<ContentPart
         // one; it records the declared media type — matched against a closed
         // allowlist — and forwards the bytes or the URL to a target that
         // declared the modality.
-        "file" | "input_file" => parse_document_part(part, &param)?,
+        "file" | "input_file" => parse_document_part(part, param)?,
         "input_audio" => {
             let audio = part.get("input_audio").unwrap_or(part);
             ContentPart::Audio {
@@ -1248,16 +1248,16 @@ pub fn render_embeddings_response(
 }
 
 fn render_usage(accumulator: &ResponseAccumulator) -> Value {
-    let usage = accumulator.usage.unwrap_or_default();
+    let usage = super::UsageView::of(accumulator.usage);
     let mut object = Object::new();
-    object.push("prompt_tokens", Value::from(usage.input_tokens));
-    object.push("completion_tokens", Value::from(usage.output_tokens));
-    object.push("total_tokens", Value::from(usage.total()));
+    object.push("prompt_tokens", usage.input);
+    object.push("completion_tokens", usage.output);
+    object.push("total_tokens", usage.total);
     // Specification 14: usage is marked provider-reported or router-estimated.
     // The flag lives under the router's own namespace so it cannot collide with
     // a future upstream field.
     let mut hypellm = Object::new();
-    hypellm.push("usage_source", Value::from(usage.source.as_str()));
+    hypellm.push("usage_source", Value::from(usage.source));
     object.push("hypellm", Value::Object(hypellm));
     Value::Object(object)
 }
@@ -1314,18 +1314,21 @@ pub fn render_chat_chunk(
         }
         CanonicalEvent::Finish { reason } => finish = Some(*reason),
         CanonicalEvent::Usage(u) => {
+            let view = super::UsageView::of(Some(*u));
             let mut object = Object::new();
-            object.push("prompt_tokens", Value::from(u.input_tokens));
-            object.push("completion_tokens", Value::from(u.output_tokens));
-            object.push("total_tokens", Value::from(u.total()));
+            object.push("prompt_tokens", view.input);
+            object.push("completion_tokens", view.output);
+            object.push("total_tokens", view.total);
             let mut hypellm = Object::new();
-            hypellm.push("usage_source", Value::from(u.source.as_str()));
+            hypellm.push("usage_source", Value::from(view.source));
             object.push("hypellm", Value::Object(hypellm));
             usage = Some(Value::Object(object));
         }
-        // Embeddings do not stream, and an error is rendered by the caller as
-        // a terminal error event.
-        CanonicalEvent::Embedding { .. } | CanonicalEvent::Error(_) => return None,
+        // Neither embeddings nor rerank scores stream, and an error is
+        // rendered by the caller as a terminal error event.
+        CanonicalEvent::Embedding { .. } | CanonicalEvent::Score { .. } | CanonicalEvent::Error(_) => {
+            return None;
+        }
     }
 
     let mut choice = Object::new();
@@ -1632,15 +1635,15 @@ fn output_items(request: &CanonicalRequest, accumulator: &ResponseAccumulator) -
 }
 
 fn render_responses_usage(usage: Option<hypellm_core::event::CanonicalUsage>) -> Value {
-    let usage = usage.unwrap_or_default();
+    let usage = super::UsageView::of(usage);
     let mut object = Object::new();
-    object.push("input_tokens", Value::from(usage.input_tokens));
-    object.push("output_tokens", Value::from(usage.output_tokens));
-    object.push("total_tokens", Value::from(usage.total()));
+    object.push("input_tokens", usage.input);
+    object.push("output_tokens", usage.output);
+    object.push("total_tokens", usage.total);
     // Specification 14: usage carries its provenance, under the router's own
     // namespace so it cannot collide with a future upstream field.
     let mut hypellm = Object::new();
-    hypellm.push("usage_source", Value::from(usage.source.as_str()));
+    hypellm.push("usage_source", Value::from(usage.source));
     object.push("hypellm", Value::Object(hypellm));
     Value::Object(object)
 }
@@ -2079,8 +2082,8 @@ impl ResponsesStreamState {
                 frames.push(error_frame(error));
                 self.stopped = true;
             }
-            // Embeddings never reach a Responses caller.
-            CanonicalEvent::Embedding { .. } => {}
+            // Neither embeddings nor rerank scores reach a Responses caller.
+            CanonicalEvent::Embedding { .. } | CanonicalEvent::Score { .. } => {}
         }
 
         frames
@@ -2612,6 +2615,30 @@ mod tests {
             value.get("hypellm").unwrap().field_str("native_model").unwrap(),
             "qwen2.5-coder"
         );
+    }
+
+    #[test]
+    fn unreported_input_tokens_render_as_null_not_zero() {
+        let request = parse_chat(r#"{"model":"m","messages":[{"role":"user","content":"x"}]}"#).unwrap();
+        for (events, output) in [
+            (
+                vec![CanonicalEvent::Usage(
+                    hypellm_core::event::CanonicalUsage::output_only(7),
+                )],
+                Value::from(7u64),
+            ),
+            (Vec::new(), Value::Null),
+        ] {
+            let value = parse_str(
+                &render_chat_response(&request, &accumulate(&events), 0),
+                &Limits::DEFAULT,
+            )
+            .unwrap();
+            let usage = value.get("usage").unwrap();
+            assert!(usage.get("prompt_tokens").unwrap().is_null(), "{events:?}");
+            assert!(usage.get("total_tokens").unwrap().is_null(), "{events:?}");
+            assert_eq!(usage.get("completion_tokens").unwrap(), &output);
+        }
     }
 
     #[test]

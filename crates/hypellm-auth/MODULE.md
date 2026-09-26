@@ -190,6 +190,23 @@ specification 9.1: "No discovery URL or redirect is supplied by the browser."
   `;`, and returns only the first occurrence — a lenient parser is how an
   attacker-set sibling cookie gets picked up instead of the real one.
 
+### Roles and accountability on a session
+
+- `Session::roles_version` is the configuration version the roles were
+  resolved against; `None` means never resolved. `SessionStore` does not
+  interpret it: the management API re-resolves a session whose version differs
+  from the active configuration and stores the result with
+  `SessionStore::refresh_roles`, which changes only roles and version — never
+  identity, lifetime or authentication time. `SessionStore::invalidate_digest`
+  ends a session whose authenticating record was withdrawn.
+- `Session::accountable` is, for a key-authenticated caller, the principal that
+  minted the key. `Session::actors` returns the session principal and the
+  accountable one, and is what separation-of-duty checks compare.
+- `KeyRecord::created_by` records who minted a key (`KeyStore::create_by`). It
+  is persisted in the durable key record; a record written before the field
+  existed decodes with `None`, and a present but unreadable value drops the
+  record like any other damaged one. `KeyStore::create` leaves it `None`.
+
 ### Audit-trail fidelity
 
 `Principal::from_key` sets `method: AuthMethod::LocalPeer` for every

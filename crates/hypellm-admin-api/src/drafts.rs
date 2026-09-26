@@ -33,6 +33,13 @@ pub struct Draft {
     /// tenant: without this, one tenant's approver could publish a change
     /// another tenant drafted and nobody in the publishing tenant reviewed.
     pub tenant: TenantId,
+    /// Who is accountable for the author, when the author was an API key: the
+    /// principal that minted it.
+    ///
+    /// Separation of duty is between people, and a key is not one. Without
+    /// this, whoever could mint keys could draft as one principal and approve
+    /// as another.
+    pub author_accountable: Option<PrincipalId>,
     /// When it was created, in wall-clock milliseconds.
     pub created_at_millis: u64,
     /// The digest of the canonical form, once validated.
@@ -66,6 +73,12 @@ impl Draft {
         object.push("text", Value::from(self.text.as_str()));
         object.push("author", Value::from(self.author.as_str()));
         object.push("tenant", Value::from(self.tenant.as_str()));
+        object.push_opt(
+            "author_accountable",
+            self.author_accountable
+                .as_ref()
+                .map(|p| Value::from(p.as_str())),
+        );
         object.push("created_at", Value::from(self.created_at_millis));
         wire_json::to_string(&Value::Object(object)).into_bytes()
     }
@@ -83,6 +96,13 @@ impl Draft {
             text: value.field_str("text").ok()?.to_owned(),
             author: PrincipalId::new(value.field_str("author").ok()?).ok()?,
             tenant: TenantId::new(value.field_str("tenant").ok()?).ok()?,
+            // Absent on drafts written before it existed; present and
+            // unreadable is a damaged record, skipped like any other.
+            author_accountable: match value.opt_field_str("author_accountable") {
+                Ok(None) => None,
+                Ok(Some(text)) => Some(PrincipalId::new(text).ok()?),
+                Err(_) => return None,
+            },
             created_at_millis: value
                 .opt_field_i64("created_at")
                 .ok()
@@ -192,12 +212,25 @@ impl DraftStore {
         tenant: TenantId,
         now_millis: u64,
     ) -> Draft {
+        self.create_by(text, author, None, tenant, now_millis)
+    }
+
+    /// Create a draft, recording who is accountable for its author.
+    pub fn create_by(
+        &self,
+        text: String,
+        author: PrincipalId,
+        author_accountable: Option<PrincipalId>,
+        tenant: TenantId,
+        now_millis: u64,
+    ) -> Draft {
         let id = format!("draft_{}", self.next_id.fetch_add(1, Ordering::SeqCst));
         let draft = Draft {
             id: id.clone(),
             text,
             author,
             tenant,
+            author_accountable,
             created_at_millis: now_millis,
             digest: None,
             errors: Vec::new(),
@@ -311,6 +344,21 @@ impl DraftStore {
         tenant: &TenantId,
         version: u64,
     ) -> Result<ValidatedConfig, PublishRefusal> {
+        self.prepare_publish_by(id, &[publisher], tenant, version)
+    }
+
+    /// As [`DraftStore::prepare_publish`], for a publisher that acts as
+    /// several principals — a key and the principal that minted it.
+    ///
+    /// Self-approval is refused if **any** of them is the draft's author or
+    /// the principal accountable for it.
+    pub fn prepare_publish_by(
+        &self,
+        id: &str,
+        publishers: &[&PrincipalId],
+        tenant: &TenantId,
+        version: u64,
+    ) -> Result<ValidatedConfig, PublishRefusal> {
         let draft = self.get(id, tenant).ok_or(PublishRefusal::NoSuchDraft)?;
         if !draft.validated {
             return Err(PublishRefusal::NotValidated);
@@ -318,7 +366,10 @@ impl DraftStore {
         if !draft.errors.is_empty() {
             return Err(PublishRefusal::Invalid);
         }
-        if !self.allow_self_approval && draft.author == *publisher {
+        let authored = |p: &PrincipalId| {
+            draft.author == *p || draft.author_accountable.as_ref() == Some(p)
+        };
+        if !self.allow_self_approval && publishers.iter().any(|p| authored(p)) {
             return Err(PublishRefusal::SelfApproval);
         }
         hypellm_config::load(&draft.text, version).map_err(|_| PublishRefusal::Invalid)

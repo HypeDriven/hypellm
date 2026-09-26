@@ -972,10 +972,68 @@ fn a_rotation_that_cannot_be_persisted_is_reported_as_a_failure_and_keeps_the_ol
         Some("the-live-secret"),
         "a failed rotation destroyed the working secret"
     );
+    // The intent is recorded before the secret is touched — so a rotation can
+    // never be live without a record — and a rotation that then fails is
+    // closed out in the chain as `failed`, never left reading as done.
     assert_eq!(
         admin.audit_count(),
-        audited,
+        audited + 2,
+        "a failed rotation must leave its intent and its failure in the chain"
+    );
+    let rows = admin.get(&admin.auditor(), "/admin/v1/audit").data();
+    let newest = &rows[0];
+    assert_eq!(newest.field_str("action").unwrap(), "credential_rotated");
+    assert_eq!(
+        newest.field_str("outcome").unwrap(),
+        "failed",
         "a rotation that did not happen was audited as if it had"
+    );
+    assert!(newest.field_str("reason").unwrap().starts_with("not applied"));
+}
+
+#[test]
+fn a_rotation_is_audited_before_the_new_secret_is_stored() {
+    // Specification 18.3 fails security changes closed. Recording after the
+    // store meant a failed audit append answered "not applied" while the new
+    // secret was already carrying traffic. The observable order: when the
+    // secret facility is reached, the rotation's audit record is already in
+    // the durable chain.
+    let admin = Harness::new();
+    let manager = admin.credential_manager();
+    let path = format!("/admin/v1/credentials/{CREDENTIAL}:rotate");
+    let before = admin.audit_count();
+
+    // A failing sink is the moment "the store was reached": nothing after it
+    // runs. If the audit record exists, it was written first.
+    admin.credentials.fail_with("the secret facility is unreachable");
+    let response = admin.post_if_match(
+        &manager,
+        &path,
+        r#"{"secret":"the-new-secret"}"#,
+        &credential_etag(&admin, &manager, CREDENTIAL),
+    );
+    assert_eq!(response.status, 500, "{}", response.body);
+    assert_eq!(admin.credentials.secret_text(CREDENTIAL), None);
+
+    let rows = admin.get(&admin.auditor(), "/admin/v1/audit").data();
+    let actions: Vec<(String, String)> = rows
+        .iter()
+        .take(2)
+        .map(|row| {
+            (
+                row.field_str("action").unwrap().to_owned(),
+                row.field_str("outcome").unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(admin.audit_count(), before + 2);
+    assert_eq!(
+        actions,
+        vec![
+            ("credential_rotated".to_owned(), "failed".to_owned()),
+            ("credential_rotated".to_owned(), "success".to_owned()),
+        ],
+        "the intent must precede the attempt"
     );
 }
 
@@ -1632,4 +1690,206 @@ fn a_credential_listing_reports_when_it_was_last_rotated() {
         "a credential rotated just now is not overdue: {}",
         after.body
     );
+}
+
+// -- What a minted key may carry ---------------------------------------------
+
+#[test]
+fn break_glass_cannot_mint_a_management_key_carrying_a_role_it_holds_only_through_break_glass() {
+    // `ManageKeys` belongs to break-glass alone. Unrestricted, the recovery
+    // path could mint a permanent management key for any principal — an
+    // editor, an approver, another break-glass holder — and so turn a
+    // time-limited, reason-bound session into a string that outlives it.
+    let admin = Harness::new();
+    let recovery = admin.break_glass();
+    let before = admin.state.keys.list().len();
+
+    for principal in [KEY_EDITOR_PRINCIPAL, KEY_ONCALL_PRINCIPAL, KEY_VIEWER_PRINCIPAL] {
+        let response = admin.post(
+            &recovery,
+            "/admin/v1/keys",
+            &format!(r#"{{"principal":"{principal}","scopes":["management:write"]}}"#),
+        );
+        assert_eq!(response.status, 403, "{principal}: {}", response.body);
+    }
+    assert_eq!(
+        admin.state.keys.list().len(),
+        before,
+        "a refused key must not exist, even in memory"
+    );
+
+    // An inference key carries no management role, so it is still available.
+    let (_id, _secret) = create_key(&admin, &recovery, "svc:ci");
+}
+
+#[test]
+fn a_key_minted_under_break_glass_expires_with_the_session_that_minted_it() {
+    let admin = Harness::new();
+    let recovery = admin.break_glass();
+    let remaining = recovery
+        .session
+        .absolute_expiry_millis
+        .saturating_sub(admin.clock.now_millis());
+    let bound = admin.clock.wall_millis() + remaining;
+
+    // No expiry asked for: it gets the session's.
+    let (id, _) = create_key(&admin, &recovery, "svc:ci");
+    let record = admin
+        .state
+        .keys
+        .get(&KeyId::new(&id).unwrap())
+        .expect("the key exists");
+    assert_eq!(record.expires_at_millis, Some(bound), "a break-glass key must not be permanent");
+
+    // A later one is refused, not quietly shortened.
+    let before = admin.state.keys.list().len();
+    let response = admin.post(
+        &recovery,
+        "/admin/v1/keys",
+        &format!(
+            r#"{{"principal":"svc:ci","scopes":["inference"],"expires_at":{}}}"#,
+            bound + 1
+        ),
+    );
+    assert_eq!(response.status, 400, "{}", response.body);
+    assert_eq!(admin.state.keys.list().len(), before);
+}
+
+#[test]
+fn a_person_cannot_approve_a_draft_written_by_a_key_they_minted() {
+    // Separation of duty is between people. A break-glass holder who is also
+    // an editor and an approver could mint an editor key (within their own
+    // roles), author a draft with it, and approve it as themselves: the draft
+    // named the key's principal, the approver was someone else on paper.
+    let admin = Harness::new();
+    let person = admin.session_with_method(
+        "user:oncall-acme",
+        TENANT_A,
+        &[Role::BreakGlassAdmin, Role::PolicyEditor, Role::PolicyApprover],
+        hypellm_auth::AuthMethod::BreakGlass,
+    );
+    let minted = admin.post(
+        &person,
+        "/admin/v1/keys",
+        &format!(r#"{{"principal":"{KEY_EDITOR_PRINCIPAL}","scopes":["management:write"]}}"#),
+    );
+    assert_eq!(minted.status, 201, "{}", minted.body);
+    let secret = minted.str_field("secret");
+
+    let mut text = harness::default_config();
+    text.push_str("tenant id=initech\n");
+    let body = format!(
+        r#"{{"configuration":{}}}"#,
+        wire_json::to_string(&wire_json::Value::from(text.as_str()))
+    );
+    let drafted = admin
+        .request(Method::Post, "/admin/v1/policies")
+        .header("authorization", &format!("Bearer {secret}"))
+        .json(&body)
+        .send();
+    assert_eq!(drafted.status, 201, "{}", drafted.body);
+    let id = drafted.str_field("id");
+    let validated = admin
+        .request(Method::Post, &format!("/admin/v1/policies/{id}:validate"))
+        .header("authorization", &format!("Bearer {secret}"))
+        .json("{}")
+        .send();
+    assert_eq!(validated.status, 200, "{}", validated.body);
+
+    let version = admin.config().snapshot.version;
+    let published = admin.post_if_match(
+        &person,
+        &format!("/admin/v1/policies/{id}:publish"),
+        "{}",
+        ANY_ETAG,
+    );
+    assert_eq!(published.status, 403, "{}", published.body);
+    assert_eq!(
+        admin.config().snapshot.version,
+        version,
+        "the self-approved draft was activated"
+    );
+
+    // Somebody else may.
+    let other = admin.policy_approver();
+    let published = admin.post_if_match(
+        &other,
+        &format!("/admin/v1/policies/{id}:publish"),
+        "{}",
+        ANY_ETAG,
+    );
+    assert_eq!(published.status, 200, "{}", published.body);
+}
+
+#[test]
+fn a_principal_placed_in_one_tenant_holds_no_role_through_a_key_in_another() {
+    // `role_binding` names a principal but no tenant. Resolved by principal
+    // alone, a key minted in tenant B for tenant A's editor carried that
+    // editor's roles into tenant B.
+    let mut text = harness::default_config();
+    text.push_str(
+        "identity issuer=https://issuer.test subject=user:alice \
+         principal=user:alice tenant=acme\n\
+         role_binding subject=principal:user:alice role=policy_editor\n",
+    );
+    let admin = Harness::with_config(&text);
+
+    let (_id, home) = admin.issue_management_key(TENANT_A, "user:alice", &["management:read"]);
+    let at_home = admin
+        .request(Method::Get, "/admin/v1/targets")
+        .header("authorization", &format!("Bearer {home}"))
+        .send();
+    assert_eq!(at_home.status, 200, "{}", at_home.body);
+
+    let (_id, away) = admin.issue_management_key(TENANT_B, "user:alice", &["management:read"]);
+    let abroad = admin
+        .request(Method::Get, "/admin/v1/targets")
+        .header("authorization", &format!("Bearer {away}"))
+        .send();
+    assert_eq!(abroad.status, 403, "{}", abroad.body);
+}
+
+#[test]
+fn a_key_cannot_approve_a_draft_written_by_the_person_who_minted_it() {
+    // The other direction: author as yourself, approve with a key you minted
+    // for an approver principal.
+    let mut text = harness::default_config();
+    text.push_str("role_binding subject=principal:svc:release role=policy_approver\n");
+    let admin = Harness::with_config(&text);
+    let person = admin.session_with_method(
+        "user:oncall-acme",
+        TENANT_A,
+        &[Role::BreakGlassAdmin, Role::PolicyEditor, Role::PolicyApprover],
+        hypellm_auth::AuthMethod::BreakGlass,
+    );
+
+    let mut draft = text.clone();
+    draft.push_str("tenant id=initech\n");
+    let body = format!(
+        r#"{{"configuration":{}}}"#,
+        wire_json::to_string(&wire_json::Value::from(draft.as_str()))
+    );
+    let drafted = admin.post(&person, "/admin/v1/policies", &body);
+    assert_eq!(drafted.status, 201, "{}", drafted.body);
+    let id = drafted.str_field("id");
+    let validated = admin.post(&person, &format!("/admin/v1/policies/{id}:validate"), "{}");
+    assert_eq!(validated.status, 200, "{}", validated.body);
+
+    let minted = admin.post(
+        &person,
+        "/admin/v1/keys",
+        r#"{"principal":"svc:release","scopes":["management:write"]}"#,
+    );
+    assert_eq!(minted.status, 201, "{}", minted.body);
+    let secret = minted.str_field("secret");
+
+    let version = admin.config().snapshot.version;
+    let published = admin
+        .request(Method::Post, &format!("/admin/v1/policies/{id}:publish"))
+        .header("authorization", &format!("Bearer {secret}"))
+        .if_match(ANY_ETAG)
+        .json("{}")
+        .send();
+    assert_eq!(published.status, 403, "{}", published.body);
+    assert_eq!(admin.config().snapshot.version, version, "the draft was activated");
 }

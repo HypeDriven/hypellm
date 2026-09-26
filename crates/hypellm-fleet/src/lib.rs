@@ -79,7 +79,8 @@ pub mod protocol;
 pub mod state;
 
 pub use activation::{
-    ActivationLedger, ActivationOutcome, ActivationRecord, ActivationState, LeaseRelease,
+    AcquireRefusal, ActivationLedger, ActivationOutcome, ActivationRecord, ActivationState,
+    LeaseRelease,
 };
 pub use demand::{DemandSnapshot, DemandTracker};
 pub use durable::{ActivationSummary, FlapRecord};
@@ -88,7 +89,7 @@ pub use model::{
     Accelerator, AcceleratorKind, Arch, Artifact, ArtifactKind, Deployment, FleetAgent,
     FleetConfig, FleetPolicy, Host, HostState, Readiness,
 };
-pub use plan::{Plan, PlanContext, PlanOutcome, PlanStep, PlanTrace, plan, retention_value};
+pub use plan::{Plan, PlanContext, PlanOutcome, PlanStep, PlanTrace, plan, retention_value, revalidate};
 pub use protocol::{AgentReply, AgentRequest, ProtocolError, encode_request, parse_reply};
 pub use state::{
     FleetSnapshot, Inventory, InventoryError, Lease, LeaseOperation, ObservedState, Timings,

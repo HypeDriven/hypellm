@@ -134,7 +134,9 @@ function freshness(fleet) {
  */
 async function load(api) {
   try {
-    return await api.get('/admin/v1/fleet');
+    // `api.get` resolves to `{ data, etag }` and already prefixes `/admin/v1`.
+    const { data } = await api.get('/fleet');
+    return data;
   } catch (error) {
     if (error instanceof ApiError && error.status === 404) {
       return null;
@@ -348,7 +350,7 @@ export async function mount(container, ctx) {
         dismiss();
         try {
           await ctx.api.post(
-            `/admin/v1/fleet/deployments/${encodeURIComponent(deployment.id)}:${verb}`,
+            `/fleet/deployments/${encodeURIComponent(deployment.id)}:${verb}`,
             {},
           );
           ctx.notify('good', `${deployment.id} ${starting ? 'started' : 'stopped'}.`);
@@ -370,9 +372,13 @@ export async function mount(container, ctx) {
 
   async function setPin(deployment) {
     try {
+      // The tag the fleet view disclosed for this deployment, so a pin made
+      // from a stale screen is refused rather than silently undoing someone
+      // else's change.
       await ctx.api.patch(
-        `/admin/v1/fleet/deployments/${encodeURIComponent(deployment.id)}`,
+        `/fleet/deployments/${encodeURIComponent(deployment.id)}`,
         { pinned: !deployment.pinned },
+        deployment.etag,
       );
       ctx.notify('good', `${deployment.id} ${deployment.pinned ? 'unpinned' : 'pinned'}.`);
     } catch (error) {

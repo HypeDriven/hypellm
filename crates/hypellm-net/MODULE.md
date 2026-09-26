@@ -114,7 +114,11 @@ the line at the same place, and this crate sits on the router's side of it.
   becomes the next caller's answer. `UpstreamConnection` poisons itself on a
   head that exceeds `MAX_HEAD_BUFFER`, on truncation before or during the body,
   on `Connection: close`, and in `finish_body` whenever the body ended at EOF
-  rather than at its declared boundary. `ConnectionPool::put` closes rather than
+  rather than at its declared boundary. A connection is also not
+  `is_reusable()` from the moment a request is sent until its response has been
+  read to the end of its framing with nothing buffered past it, so a stream
+  abandoned at `data: [DONE]` or on a client disconnect is closed rather than
+  handed to the next caller half-read. `ConnectionPool::put` closes rather than
   stores anything not `is_reusable()`, so a caller cannot pool a bad socket by
   mistake. TE/CL ambiguity is rejected upstream in `wire-http1` and surfaces as
   `UpstreamError::Protocol`.
@@ -186,6 +190,7 @@ Enforced within this crate:
 | Idle connections per pool key | 32 (default) | `PoolConfig::max_idle_per_key` |
 | Idle connections overall | 512 (default) | `PoolConfig::max_idle_total` |
 | Idle connection lifetime | 60 s (default) | `PoolConfig::idle_timeout_millis`, checked in `take` and `sweep` |
+| Unix-socket connect (TLS helper, verifier, fleet agent, Unix upstreams) | Caller's timeout; at most `MAX_ABANDONED_UNIX_CONNECTS` (16) connect threads left behind by callers that timed out | `egress::connect_unix`: std has no Unix `connect_timeout`, so the connect runs on a helper thread the caller waits on with a deadline; a connect past its deadline keeps its thread until the kernel answers, and the cap bounds how many can; past it, new connects are refused at once |
 | Connect / read / write deadline | Caller-supplied | `Egress::connect_timeout`, `UpstreamConnection::apply_deadline`; clamped to ≥ 1 ms in `Dialer::connect` and `Transport::set_timeouts` so an exhausted budget fails fast instead of meaning "block forever" to the kernel |
 | Destination host syntax | ≤ 253 bytes, labels ≤ 63 | `hypellm_core::netaddr::is_valid_host`, before resolution |
 

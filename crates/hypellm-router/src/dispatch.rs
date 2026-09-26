@@ -84,13 +84,31 @@ pub struct AttemptFailure {
     pub error: RouterError,
     /// The provider's own code, when it supplied one.
     pub provider_code: Option<String>,
+    /// The attempt ended because the *client* went away or stalled.
+    ///
+    /// Classified as a connection failure for the caller's benefit, but it
+    /// says nothing about the target: counting it against the breaker would
+    /// let clients that disconnect — or one that disconnects on purpose — open
+    /// the circuit of a healthy target for everyone else. It also ends the
+    /// request: there is nobody left to fail over for.
+    pub client_cancelled: bool,
 }
 
 impl AttemptFailure {
     /// Whether the router may try another target.
     #[must_use]
     pub fn may_failover(&self, idempotent: bool) -> bool {
-        self.phase.permits_failover(idempotent) && self.class.is_retriable()
+        !self.client_cancelled
+            && self.phase.permits_failover(idempotent)
+            && self.class.is_retriable()
+    }
+
+    /// Whether this failure is evidence about the target's health.
+    ///
+    /// A client cancellation never is, whatever its class says.
+    #[must_use]
+    pub const fn affects_target_health(&self) -> bool {
+        !self.client_cancelled && self.class.affects_health()
     }
 
     fn from_classification(
@@ -110,6 +128,7 @@ impl AttemptFailure {
                 .provider_code
                 .as_ref()
                 .map(|c| c.as_str().to_owned()),
+            client_cancelled: false,
         }
     }
 
@@ -129,6 +148,7 @@ impl AttemptFailure {
                 },
             ),
             provider_code: None,
+            client_cancelled: false,
         }
     }
 }
@@ -252,6 +272,7 @@ pub fn attempt_with(
             class: UpstreamErrorClass::Connection,
             error: RouterError::internal(),
             provider_code: None,
+            client_cancelled: false,
         });
     };
 
@@ -272,6 +293,7 @@ pub fn attempt_with(
             class: UpstreamErrorClass::UnsupportedFeature,
             error: failure.to_router_error(),
             provider_code: None,
+            client_cancelled: false,
         })?;
 
     let path_suffix = adapter.path_for(request).map_err(|failure| AttemptFailure {
@@ -279,6 +301,7 @@ pub fn attempt_with(
         class: UpstreamErrorClass::UnsupportedFeature,
         error: failure.to_router_error(),
         provider_code: None,
+        client_cancelled: false,
     })?;
 
     let body = adapter
@@ -288,6 +311,7 @@ pub fn attempt_with(
             class: UpstreamErrorClass::InvalidRequest,
             error: failure.to_router_error(),
             provider_code: None,
+            client_cancelled: false,
         })?;
 
     let headers = build_headers(state, provider, adapter, &meta, credential)?;
@@ -299,6 +323,7 @@ pub fn attempt_with(
             class: UpstreamErrorClass::Connection,
             error: RouterError::internal(),
             provider_code: None,
+            client_cancelled: false,
         },
     )?;
     for (name, value) in headers.iter() {
@@ -307,6 +332,7 @@ pub fn attempt_with(
             class: UpstreamErrorClass::Connection,
             error: RouterError::internal(),
             provider_code: None,
+            client_cancelled: false,
         })?;
     }
     let wire = builder
@@ -316,6 +342,7 @@ pub fn attempt_with(
             class: UpstreamErrorClass::Connection,
             error: RouterError::internal(),
             provider_code: None,
+            client_cancelled: false,
         })?;
 
     // -- Connect and send --------------------------------------------------
@@ -601,6 +628,7 @@ fn cancelled(saw_output: bool) -> AttemptFailure {
         class: UpstreamErrorClass::Connection,
         error: RouterError::new(ErrorCode::InvalidRequest, "the client closed the connection"),
         provider_code: None,
+        client_cancelled: true,
     }
 }
 
@@ -681,6 +709,7 @@ fn credential_headers(
                     "the target's provider credential is not available",
                 ),
                 provider_code: None,
+                client_cancelled: false,
             }
         })
 }
@@ -703,10 +732,16 @@ fn stream_events(
     // Specification 14's keepalive cadence. Zero disables it, in which case the
     // read simply waits out the whole deadline as it did before.
     let keepalive = state.config().settings.keepalive_interval_ms;
+    // Whether the provider said the generation is over: its sentinel, or a
+    // terminal event. The end of the *body* is not that. With close-delimited
+    // framing a connection dropped mid-generation completes the body exactly
+    // as a finished one does, and treating it as success would deliver a
+    // truncated answer as though it were whole.
+    let mut ended = false;
 
     loop {
         if decoder.is_complete() {
-            return Ok(());
+            return stream_end(ended, *saw_output);
         }
         chunk.clear();
         // Read against the nearer of the request deadline and the next
@@ -752,6 +787,7 @@ fn stream_events(
                     "the upstream sent a malformed event stream",
                 ),
                 provider_code: None,
+                client_cancelled: false,
             })?;
 
             let events = parser.drain().map_err(|_| AttemptFailure {
@@ -762,10 +798,22 @@ fn stream_events(
                     "the upstream sent a malformed event stream",
                 ),
                 provider_code: None,
+                client_cancelled: false,
             })?;
 
-            for sse in events {
+            let batch = events.len();
+            for (position, sse) in events.into_iter().enumerate() {
                 if adapter.is_stream_terminator(&sse.data) {
+                    // Anything after the sentinel — another event in this
+                    // read, or bytes already buffered towards one — is an
+                    // upstream still talking after saying it was done. The
+                    // answer is complete; the connection is not trusted again.
+                    let trailing = position.saturating_add(1) < batch || parser.buffered() > 0;
+                    if trailing {
+                        connection.poison();
+                    } else {
+                        drain_after_terminator(connection, decoder, clock, deadline);
+                    }
                     return Ok(());
                 }
                 let decoded = adapter
@@ -784,6 +832,9 @@ fn stream_events(
                 for event in decoded {
                     if event.is_semantic_output() {
                         *saw_output = true;
+                    }
+                    if event.is_terminal() {
+                        ended = true;
                     }
                     // Delivery is where backpressure lives: a blocked write to
                     // a slow client stops this loop, which stops reading from
@@ -808,9 +859,87 @@ fn stream_events(
         }
 
         if produced == 0 && decoder.is_complete() {
-            return Ok(());
+            return stream_end(ended, *saw_output);
         }
     }
+}
+
+/// The most payload bytes read past a stream's sentinel while looking for the
+/// end of its framing.
+const DRAIN_MAX_BYTES: usize = 4 * 1024;
+
+/// How long to wait for the end of a stream's framing after its sentinel.
+///
+/// The chunked terminator normally arrives in the same write as `[DONE]`; this
+/// only bounds an upstream that sends the sentinel and then stalls.
+const DRAIN_MAX_MS: u64 = 200;
+
+/// Read the rest of a stream's framing after its sentinel, so the connection
+/// can be pooled.
+///
+/// The pool only takes a connection whose response was consumed to the end of
+/// its framing, and stopping at `data: [DONE]` leaves the chunked terminator
+/// (and any trailers) unread — so every streaming exchange used to close its
+/// connection. This reads what is left, bounded in bytes and time. Anything
+/// but whitespace, more than [`DRAIN_MAX_BYTES`], an error, or the deadline,
+/// and the connection is poisoned and closed instead. A close-delimited body
+/// never ends while the connection lives, so it is not waited for at all.
+fn drain_after_terminator(
+    connection: &mut UpstreamConnection,
+    decoder: &mut BodyDecoder,
+    clock: &dyn Clock,
+    deadline: Deadline,
+) {
+    if decoder.is_close_delimited() {
+        connection.poison();
+        return;
+    }
+    let bound = deadline.min(Deadline::after(clock, Duration::from_millis(DRAIN_MAX_MS)));
+    let mut scratch = Vec::new();
+    let mut total = 0usize;
+    while !decoder.is_complete() {
+        scratch.clear();
+        match connection.read_body(decoder, &mut scratch, clock, bound) {
+            Ok(produced) => {
+                total = total.saturating_add(produced);
+                let junk = !scratch.iter().all(u8::is_ascii_whitespace);
+                if junk || total > DRAIN_MAX_BYTES || (produced == 0 && !decoder.is_complete()) {
+                    connection.poison();
+                    return;
+                }
+            }
+            Err(_) => {
+                connection.poison();
+                return;
+            }
+        }
+    }
+}
+
+/// The verdict on a stream whose body has ended.
+///
+/// Without a terminal event this is an upstream failure. After output it is
+/// reported as `AfterOutput`, so the pipeline emits a normalized error and
+/// closes rather than failing over (specification 6.5: never splice failover
+/// output after client-visible semantic bytes).
+fn stream_end(ended: bool, saw_output: bool) -> Result<(), AttemptFailure> {
+    if ended {
+        return Ok(());
+    }
+    Err(AttemptFailure {
+        phase: if saw_output {
+            AttemptPhase::AfterOutput
+        } else {
+            AttemptPhase::AfterAcceptance
+        },
+        class: UpstreamErrorClass::ProtocolViolation,
+        error: RouterError::new(
+            ErrorCode::UpstreamInvalidResponse,
+            "the upstream stream ended before the response was complete",
+        ),
+        provider_code: None,
+        client_cancelled: false,
+    })
 }
 
 #[cfg(test)]
@@ -937,6 +1066,7 @@ mod tests {
             class: UpstreamErrorClass::Connection,
             error: RouterError::internal(),
             provider_code: None,
+            client_cancelled: false,
         };
         assert!(connection_failure.may_failover(false));
 
@@ -946,6 +1076,7 @@ mod tests {
             class: UpstreamErrorClass::Connection,
             error: RouterError::internal(),
             provider_code: None,
+            client_cancelled: false,
         };
         assert!(!after_output.may_failover(true));
 
@@ -956,6 +1087,7 @@ mod tests {
             class: UpstreamErrorClass::InvalidRequest,
             error: RouterError::invalid_request("bad"),
             provider_code: None,
+            client_cancelled: false,
         };
         assert!(!invalid.may_failover(true));
     }
@@ -1025,6 +1157,7 @@ mod tests {
                 class,
                 error: RouterError::internal(),
                 provider_code: None,
+                client_cancelled: false,
             };
             assert!(
                 refusal.may_failover(false),
@@ -1044,6 +1177,7 @@ mod tests {
                 class,
                 error: RouterError::internal(),
                 provider_code: None,
+                client_cancelled: false,
             };
             assert!(
                 !ambiguous.may_failover(false),
@@ -1054,6 +1188,37 @@ mod tests {
                 "{class:?} may be retried with an idempotency key"
             );
         }
+    }
+
+    #[test]
+    fn a_client_cancellation_is_not_evidence_against_the_target() {
+        for saw_output in [false, true] {
+            let failure = cancelled(saw_output);
+            assert!(
+                !failure.affects_target_health(),
+                "a client disconnect must not count against the target"
+            );
+            assert!(
+                !failure.may_failover(true),
+                "there is nobody left to fail over for"
+            );
+        }
+        // A real connection failure still counts.
+        let upstream = AttemptFailure::from_upstream(
+            AttemptPhase::AfterAcceptance,
+            &hypellm_net::UpstreamError::Truncated,
+        );
+        assert!(upstream.affects_target_health());
+    }
+
+    #[test]
+    fn a_stream_that_ends_without_a_terminal_event_is_a_failure() {
+        assert!(stream_end(true, true).is_ok());
+        let truncated = stream_end(false, true).expect_err("no terminal event");
+        assert_eq!(truncated.phase, AttemptPhase::AfterOutput);
+        assert!(!truncated.may_failover(true), "never splice after output");
+        let silent = stream_end(false, false).expect_err("no terminal event");
+        assert_eq!(silent.phase, AttemptPhase::AfterAcceptance);
     }
 
     #[test]

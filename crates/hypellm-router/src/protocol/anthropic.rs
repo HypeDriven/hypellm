@@ -25,7 +25,10 @@ use hypellm_core::canonical::{
     StreamOptions, ToolCall, ToolChoice, ToolDef,
 };
 use hypellm_core::error::{ErrorCode, RouterError};
-use hypellm_core::event::{CanonicalEvent, FinishReason, ResponseAccumulator};
+use hypellm_core::event::{
+    CanonicalEvent, CanonicalUsage, FinishReason, ResponseAccumulator, limits,
+};
+use std::collections::BTreeSet;
 use hypellm_core::ids::{AliasId, RequestId};
 use wire_json::{Limits, Object, Value, parse, to_string};
 
@@ -413,12 +416,62 @@ fn parse_tool_choice(value: &Value) -> Result<Option<ToolChoice>, RouterError> {
 
 // -- Rendering --------------------------------------------------------------
 
+/// Limits for parsing one assembled tool call's arguments.
+///
+/// Matched to what the accumulator will assemble
+/// ([`limits::MAX_TOOL_ARGUMENTS_BYTES`]): anything tighter turns a large but
+/// valid argument object into a parse failure.
+const TOOL_ARGUMENT_LIMITS: Limits = Limits {
+    max_string_bytes: limits::MAX_TOOL_ARGUMENTS_BYTES,
+    max_input_bytes: limits::MAX_TOOL_ARGUMENTS_BYTES,
+    ..Limits::DEFAULT
+};
+
+/// Parse one tool call's assembled arguments into the `input` object.
+///
+/// Empty arguments are an argument-less call. Anything else must be a JSON
+/// object; a call whose arguments cannot be read is refused, never rendered as
+/// `{}` — a client would execute the tool with arguments the model did not
+/// produce.
+fn tool_input(arguments: &str) -> Result<Value, RouterError> {
+    if arguments.trim().is_empty() {
+        return Ok(Value::Object(Object::new()));
+    }
+    match wire_json::parse_str(arguments, &TOOL_ARGUMENT_LIMITS) {
+        Ok(value @ Value::Object(_)) => Ok(value),
+        _ => Err(RouterError::new(
+            ErrorCode::UpstreamInvalidResponse,
+            "the provider returned tool-call arguments that are not a JSON object",
+        )),
+    }
+}
+
 /// Render a complete, non-streaming message response.
+///
+/// Prefer [`try_render_message_response`], whose error the caller can deliver
+/// with its proper status. This form renders that error as the Anthropic
+/// error envelope instead of a message, so a caller that has not moved over
+/// still never receives a tool call with fabricated arguments.
 #[must_use]
 pub fn render_message_response(
     request: &CanonicalRequest,
     accumulator: &ResponseAccumulator,
 ) -> String {
+    try_render_message_response(request, accumulator)
+        .unwrap_or_else(|error| render_error(&error, Some(request.request_id)))
+}
+
+/// Render a complete, non-streaming message response, or the normalized error
+/// for a provider response that cannot be represented faithfully.
+///
+/// # Errors
+///
+/// `UpstreamInvalidResponse` when a tool call's arguments are not a JSON
+/// object.
+pub fn try_render_message_response(
+    request: &CanonicalRequest,
+    accumulator: &ResponseAccumulator,
+) -> Result<String, RouterError> {
     let mut blocks = Vec::new();
     if !accumulator.text.is_empty() {
         let mut block = Object::new();
@@ -431,18 +484,14 @@ pub fn render_message_response(
         block.push("type", Value::from("tool_use"));
         block.push("id", Value::from(call.id.as_str()));
         block.push("name", Value::from(call.name.as_str()));
-        block.push(
-            "input",
-            wire_json::parse_str(&call.arguments, &Limits::SMALL)
-                .unwrap_or_else(|_| Value::Object(Object::new())),
-        );
+        block.push("input", tool_input(&call.arguments)?);
         blocks.push(Value::Object(block));
     }
 
-    let usage = accumulator.usage.unwrap_or_default();
+    let usage = super::UsageView::of(accumulator.usage);
     let mut usage_object = Object::new();
-    usage_object.push("input_tokens", Value::from(usage.input_tokens));
-    usage_object.push("output_tokens", Value::from(usage.output_tokens));
+    usage_object.push("input_tokens", usage.input);
+    usage_object.push("output_tokens", usage.output);
 
     let mut root = Object::new();
     root.push("id", Value::from(format!("msg_{}", request.request_id)));
@@ -461,7 +510,7 @@ pub fn render_message_response(
     );
     root.push("stop_sequence", Value::Null);
     root.push("usage", Value::Object(usage_object));
-    to_string(&Value::Object(root))
+    Ok(to_string(&Value::Object(root)))
 }
 
 /// Render the error envelope.
@@ -496,16 +545,51 @@ pub struct Frame {
 /// be preceded by a `content_block_start` for its block, and every opened block
 /// must be closed before `message_stop`. Encoding that here means the listener
 /// cannot emit a frame order a client SDK will reject.
+///
+/// Anthropic content blocks are strictly sequential: one block is open at a
+/// time, indices are allocated `0, 1, 2, …` in the order blocks start, and a
+/// block is stopped exactly once before the next one starts. The renderer
+/// therefore allocates its own indices rather than reusing the upstream's — an
+/// OpenAI-family upstream numbers its tool calls from zero independently of any
+/// text, so reusing its index would give a text block and the first tool block
+/// the same index.
+///
+/// The closing `message_delta` carries the stop reason *and* the usage, once.
+/// An OpenAI-family upstream reports usage after `finish_reason`, so `Finish`
+/// does not end the stream: the closing frames are held until usage arrives or
+/// the stream ends ([`StreamRenderer::finish`]).
 #[derive(Debug)]
 pub struct StreamRenderer {
     message_started: bool,
-    /// The index of the currently open block, if any.
-    open_block: Option<u32>,
-    /// The next block index to allocate for text.
-    next_text_block: u32,
-    /// Whether a text block has been opened.
-    text_block: Option<u32>,
+    /// The currently open block, if any.
+    open_block: Option<OpenBlock>,
+    /// The next Anthropic block index to allocate.
+    next_block: u32,
+    /// Upstream tool-call indices that already had a block, open or closed.
+    ///
+    /// Bounded by [`limits::MAX_TOOL_CALLS`]: the provider chooses how many
+    /// tool calls it streams.
+    seen_tools: BTreeSet<u32>,
+    /// Usage merged from every `Usage` event so far.
+    usage: Option<CanonicalUsage>,
+    /// The upstream's finish reason, held until usage or end of stream.
+    pending_finish: Option<FinishReason>,
     stopped: bool,
+}
+
+/// What kind of content the open block holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockKind {
+    Text,
+    Thinking,
+    /// A tool call, keyed by the upstream's tool index.
+    Tool(u32),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OpenBlock {
+    index: u32,
+    kind: BlockKind,
 }
 
 impl StreamRenderer {
@@ -515,8 +599,10 @@ impl StreamRenderer {
         Self {
             message_started: false,
             open_block: None,
-            next_text_block: 0,
-            text_block: None,
+            next_block: 0,
+            seen_tools: BTreeSet::new(),
+            usage: None,
+            pending_finish: None,
             stopped: false,
         }
     }
@@ -534,6 +620,24 @@ impl StreamRenderer {
             return frames;
         }
 
+        // After the upstream's finish only usage (which completes the closing
+        // frame) and an error are meaningful; content after the stop reason is
+        // not something a Messages client can receive.
+        if self.pending_finish.is_some() {
+            match event {
+                CanonicalEvent::Usage(usage) => {
+                    self.merge_usage(usage);
+                    self.close_message(&mut frames);
+                }
+                CanonicalEvent::Error(error) => {
+                    frames.push(error_frame(error));
+                    self.stopped = true;
+                }
+                _ => {}
+            }
+            return frames;
+        }
+
         match event {
             CanonicalEvent::Start { upstream_id, .. } => {
                 if !self.message_started {
@@ -543,96 +647,142 @@ impl StreamRenderer {
             }
             CanonicalEvent::TextDelta(text) => {
                 self.ensure_started(request, &mut frames);
-                let index = match self.text_block {
-                    Some(index) => index,
-                    None => {
-                        let index = self.allocate_block();
-                        self.text_block = Some(index);
-                        frames.push(content_block_start_text(index));
-                        self.open_block = Some(index);
-                        index
-                    }
-                };
+                let index = self.enter_block(BlockKind::Text, &mut frames, |index| {
+                    content_block_start_text(index)
+                });
                 frames.push(text_delta(index, text));
             }
             CanonicalEvent::ReasoningDelta(text) => {
                 self.ensure_started(request, &mut frames);
-                let index = match self.text_block {
-                    Some(index) => index,
-                    None => {
-                        let index = self.allocate_block();
-                        self.text_block = Some(index);
-                        frames.push(content_block_start_text(index));
-                        self.open_block = Some(index);
-                        index
-                    }
-                };
+                let index = self.enter_block(BlockKind::Thinking, &mut frames, |index| {
+                    content_block_start_thinking(index)
+                });
                 frames.push(thinking_delta(index, text));
             }
             CanonicalEvent::ToolCallDelta(call) => {
                 self.ensure_started(request, &mut frames);
-                // A tool block interrupts the text block, which must close.
-                if let Some(open) = self.text_block.take() {
-                    frames.push(content_block_stop(open));
+                let kind = BlockKind::Tool(call.index);
+                let continuing = matches!(self.open_block, Some(open) if open.kind == kind);
+                if !continuing {
+                    // A block that has been stopped cannot be reopened, and
+                    // dropping the fragment would hand the client arguments
+                    // that are silently wrong. Fail the stream instead.
+                    if self.seen_tools.contains(&call.index) {
+                        return self.fail(
+                            frames,
+                            "the provider interleaved tool-call fragments, which the \
+                             Messages stream cannot represent",
+                        );
+                    }
+                    if self.seen_tools.len() >= limits::MAX_TOOL_CALLS {
+                        return self.fail(frames, "the provider streamed too many tool calls");
+                    }
+                    self.seen_tools.insert(call.index);
+                    let id = call.id.as_deref().unwrap_or("");
+                    let name = call.name.as_deref().unwrap_or("");
+                    self.enter_block(kind, &mut frames, |index| {
+                        content_block_start_tool(index, id, name)
+                    });
                 }
-                let index = call.index;
-                if call.id.is_some() || call.name.is_some() {
-                    frames.push(content_block_start_tool(
-                        index,
-                        call.id.as_deref().unwrap_or(""),
-                        call.name.as_deref().unwrap_or(""),
-                    ));
-                    self.open_block = Some(index);
-                    self.next_text_block = self.next_text_block.max(index + 1);
-                }
-                if !call.arguments_delta.is_empty() {
-                    frames.push(input_json_delta(index, &call.arguments_delta));
+                if let Some(open) = self.open_block {
+                    if !call.arguments_delta.is_empty() {
+                        frames.push(input_json_delta(open.index, &call.arguments_delta));
+                    }
                 }
             }
             CanonicalEvent::Usage(usage) => {
+                // Held for the closing `message_delta`: emitting a delta here
+                // and another at the finish would report usage twice, the
+                // second time as zero.
                 self.ensure_started(request, &mut frames);
-                frames.push(message_delta(None, Some(usage.output_tokens)));
+                self.merge_usage(usage);
             }
             CanonicalEvent::Finish { reason } => {
                 self.ensure_started(request, &mut frames);
-                if let Some(open) = self.open_block.take() {
-                    frames.push(content_block_stop(open));
-                    self.text_block = None;
-                }
-                frames.push(message_delta(Some(*reason), None));
-                frames.push(message_stop());
-                self.stopped = true;
+                self.close_block(&mut frames);
+                self.pending_finish = Some(*reason);
             }
             CanonicalEvent::Error(error) => {
                 frames.push(error_frame(error));
                 self.stopped = true;
             }
-            CanonicalEvent::Embedding { .. } => {}
+            // Neither embeddings nor rerank scores reach a Messages caller.
+            CanonicalEvent::Embedding { .. } | CanonicalEvent::Score { .. } => {}
         }
 
         frames
     }
 
-    /// Close any open block and end the stream, for a cancellation or a
-    /// deadline.
+    /// Close any open block and end the stream: at the end of a normal stream,
+    /// or for a cancellation or a deadline.
+    ///
+    /// An upstream finish reason already seen wins over `reason`: the stream
+    /// ended after the provider said why, and that is the reason to report.
     pub fn finish(&mut self, reason: FinishReason) -> Vec<Frame> {
         if self.stopped {
             return Vec::new();
         }
         let mut frames = Vec::new();
-        if let Some(open) = self.open_block.take() {
-            frames.push(content_block_stop(open));
+        self.close_block(&mut frames);
+        if self.pending_finish.is_none() {
+            self.pending_finish = Some(reason);
         }
-        frames.push(message_delta(Some(reason), None));
+        self.close_message(&mut frames);
+        frames
+    }
+
+    /// Make a block of `kind` the open one, closing any other first, and
+    /// return its index. A text or thinking block continues while it is the
+    /// open block; once another block has intervened a fresh one starts.
+    fn enter_block(
+        &mut self,
+        kind: BlockKind,
+        frames: &mut Vec<Frame>,
+        start: impl FnOnce(u32) -> Frame,
+    ) -> u32 {
+        if let Some(open) = self.open_block {
+            if open.kind == kind {
+                return open.index;
+            }
+        }
+        self.close_block(frames);
+        let index = self.next_block;
+        self.next_block = self.next_block.saturating_add(1);
+        frames.push(start(index));
+        self.open_block = Some(OpenBlock { index, kind });
+        index
+    }
+
+    fn close_block(&mut self, frames: &mut Vec<Frame>) {
+        if let Some(open) = self.open_block.take() {
+            frames.push(content_block_stop(open.index));
+        }
+    }
+
+    fn close_message(&mut self, frames: &mut Vec<Frame>) {
+        let reason = self.pending_finish.unwrap_or(FinishReason::Stop);
+        frames.push(message_delta(Some(reason), self.usage));
         frames.push(message_stop());
+        self.stopped = true;
+    }
+
+    fn fail(&mut self, mut frames: Vec<Frame>, detail: &str) -> Vec<Frame> {
+        frames.push(error_frame(&RouterError::new(
+            ErrorCode::UpstreamInvalidResponse,
+            detail,
+        )));
         self.stopped = true;
         frames
     }
 
-    fn allocate_block(&mut self) -> u32 {
-        let index = self.next_text_block;
-        self.next_text_block += 1;
-        index
+    /// Merge a usage report into what has been seen. The Anthropic upstream
+    /// reports input tokens in `message_start` and output tokens in
+    /// `message_delta`, so neither report alone is the usage.
+    fn merge_usage(&mut self, usage: &CanonicalUsage) {
+        self.usage = Some(match self.usage {
+            None => *usage,
+            Some(previous) => previous.merge(*usage),
+        });
     }
 
     fn ensure_started(&mut self, request: &CanonicalRequest, frames: &mut Vec<Frame>) {
@@ -643,8 +793,10 @@ impl StreamRenderer {
     }
 
     fn message_start(&self, request: &CanonicalRequest, upstream_id: Option<&str>) -> Frame {
+        // Input is not known yet — the provider reports it later, if at all —
+        // and zero would be a claim. The closing `message_delta` carries it.
         let mut usage = Object::new();
-        usage.push("input_tokens", Value::from(0i64));
+        usage.push("input_tokens", Value::Null);
         usage.push("output_tokens", Value::from(0i64));
 
         let mut message = Object::new();
@@ -684,6 +836,21 @@ fn content_block_start_text(index: u32) -> Frame {
     let mut block = Object::new();
     block.push("type", Value::from("text"));
     block.push("text", Value::from(""));
+    let mut root = Object::new();
+    root.push("type", Value::from("content_block_start"));
+    root.push("index", Value::from(u64::from(index)));
+    root.push("content_block", Value::Object(block));
+    Frame {
+        event: "content_block_start".to_owned(),
+        data: to_string(&Value::Object(root)),
+    }
+}
+
+fn content_block_start_thinking(index: u32) -> Frame {
+    let mut block = Object::new();
+    block.push("type", Value::from("thinking"));
+    block.push("thinking", Value::from(""));
+    block.push("signature", Value::from(""));
     let mut root = Object::new();
     root.push("type", Value::from("content_block_start"));
     root.push("index", Value::from(u64::from(index)));
@@ -752,7 +919,7 @@ fn content_block_stop(index: u32) -> Frame {
     }
 }
 
-fn message_delta(reason: Option<FinishReason>, output_tokens: Option<u64>) -> Frame {
+fn message_delta(reason: Option<FinishReason>, usage: Option<CanonicalUsage>) -> Frame {
     let mut delta = Object::new();
     delta.push(
         "stop_reason",
@@ -760,13 +927,20 @@ fn message_delta(reason: Option<FinishReason>, output_tokens: Option<u64>) -> Fr
     );
     delta.push("stop_sequence", Value::Null);
 
-    let mut usage = Object::new();
-    usage.push("output_tokens", Value::from(output_tokens.unwrap_or(0)));
+    // `output_tokens` is always present; input tokens are added when known,
+    // since `message_start` went out before the provider reported them. An
+    // unreported count is `null`, not zero.
+    let view = super::UsageView::of(usage);
+    let mut usage_object = Object::new();
+    if !matches!(view.input, Value::Null) {
+        usage_object.push("input_tokens", view.input);
+    }
+    usage_object.push("output_tokens", view.output);
 
     let mut root = Object::new();
     root.push("type", Value::from("message_delta"));
     root.push("delta", Value::Object(delta));
-    root.push("usage", Value::Object(usage));
+    root.push("usage", Value::Object(usage_object));
     Frame {
         event: "message_delta".to_owned(),
         data: to_string(&Value::Object(root)),
@@ -953,7 +1127,170 @@ mod tests {
         for event in events {
             frames.extend(renderer.render(&request, event));
         }
+        // The listener ends every successful stream this way.
+        frames.extend(renderer.finish(FinishReason::Stop));
         frames
+    }
+
+    fn tool(index: u32, id: Option<&str>, args: &str) -> CanonicalEvent {
+        CanonicalEvent::ToolCallDelta(hypellm_core::event::ToolCallDelta {
+            index,
+            id: id.map(str::to_owned),
+            name: id.map(|_| "f".to_owned()),
+            arguments_delta: args.to_owned(),
+        })
+    }
+
+    /// Assert `frames` is a stream an Anthropic client SDK accepts, and return
+    /// the started blocks' types in order plus the one `message_delta`.
+    ///
+    /// Blocks are sequential: indices run 0, 1, 2, … in start order, each block
+    /// is stopped exactly once before the next starts, every delta targets the
+    /// open block with a delta type matching the block type, and exactly one
+    /// `message_delta` precedes the final `message_stop`.
+    fn assert_valid_stream(frames: &[Frame]) -> (Vec<String>, Value) {
+        assert_eq!(frames.first().map(|f| f.event.as_str()), Some("message_start"));
+        assert_eq!(frames.last().map(|f| f.event.as_str()), Some("message_stop"));
+        let mut open: Option<(i64, String)> = None;
+        let mut started = Vec::new();
+        let mut message_delta = None;
+        for frame in &frames[1..frames.len() - 1] {
+            let value = parse_str(&frame.data, &Limits::DEFAULT).unwrap();
+            assert_eq!(value.field_str("type").unwrap(), frame.event);
+            assert!(message_delta.is_none(), "{} after message_delta", frame.event);
+            match frame.event.as_str() {
+                "content_block_start" => {
+                    assert!(open.is_none(), "a block started while {open:?} is open");
+                    let index = value.field_i64("index").unwrap();
+                    assert_eq!(index, started.len() as i64, "indices are sequential");
+                    let kind = value
+                        .get("content_block")
+                        .unwrap()
+                        .field_str("type")
+                        .unwrap()
+                        .to_owned();
+                    started.push(kind.clone());
+                    open = Some((index, kind));
+                }
+                "content_block_delta" => {
+                    let (index, kind) = open.clone().expect("a delta with no open block");
+                    assert_eq!(value.field_i64("index").unwrap(), index);
+                    let delta = value.get("delta").unwrap().field_str("type").unwrap();
+                    let expected = match kind.as_str() {
+                        "text" => "text_delta",
+                        "thinking" => "thinking_delta",
+                        "tool_use" => "input_json_delta",
+                        other => panic!("unknown block type {other}"),
+                    };
+                    assert_eq!(delta, expected, "delta type must match block {index}");
+                }
+                "content_block_stop" => {
+                    let (index, _) = open.take().expect("a stop with no open block");
+                    assert_eq!(value.field_i64("index").unwrap(), index);
+                }
+                "message_delta" => {
+                    assert!(open.is_none(), "message_delta with a block still open");
+                    message_delta = Some(value);
+                }
+                other => panic!("unexpected frame {other}"),
+            }
+        }
+        (started, message_delta.expect("exactly one message_delta"))
+    }
+
+    fn output_tokens(message_delta: &Value) -> i64 {
+        message_delta.get("usage").unwrap().field_i64("output_tokens").unwrap()
+    }
+
+    #[test]
+    fn reasoning_gets_its_own_thinking_block_before_the_text() {
+        let frames = render_all(&[
+            CanonicalEvent::ReasoningDelta("hmm".to_owned()),
+            CanonicalEvent::TextDelta("answer".to_owned()),
+            CanonicalEvent::Finish { reason: FinishReason::Stop },
+        ]);
+        let (blocks, _) = assert_valid_stream(&frames);
+        assert_eq!(blocks, vec!["thinking", "text"]);
+    }
+
+    #[test]
+    fn an_openai_tool_index_zero_after_text_gets_a_fresh_block_index() {
+        // An OpenAI-family upstream numbers tool calls from zero regardless of
+        // the text before them.
+        let frames = render_all(&[
+            CanonicalEvent::TextDelta("let me look".to_owned()),
+            tool(0, Some("call_a"), r#"{"q":"#),
+            tool(0, None, "1}"),
+            CanonicalEvent::Finish { reason: FinishReason::ToolCalls },
+        ]);
+        let (blocks, _) = assert_valid_stream(&frames);
+        assert_eq!(blocks, vec!["text", "tool_use"]);
+    }
+
+    #[test]
+    fn two_tool_calls_and_trailing_text_each_close_before_the_next_opens() {
+        let frames = render_all(&[
+            tool(0, Some("call_a"), "{}"),
+            tool(1, Some("call_b"), r#"{"x":"#),
+            tool(1, None, "2}"),
+            CanonicalEvent::TextDelta("done".to_owned()),
+            CanonicalEvent::Finish { reason: FinishReason::ToolCalls },
+        ]);
+        let (blocks, _) = assert_valid_stream(&frames);
+        assert_eq!(blocks, vec!["tool_use", "tool_use", "text"]);
+    }
+
+    #[test]
+    fn an_interleaved_tool_fragment_fails_rather_than_reopening_a_closed_block() {
+        let request = parse_messages(MINIMAL).unwrap();
+        let mut renderer = StreamRenderer::new();
+        let mut frames = Vec::new();
+        for event in [tool(0, Some("a"), "{"), tool(1, Some("b"), "{}"), tool(0, None, "}")] {
+            frames.extend(renderer.render(&request, &event));
+        }
+        assert_eq!(frames.last().unwrap().event, "error");
+        assert!(renderer.finish(FinishReason::Stop).is_empty());
+    }
+
+    #[test]
+    fn anthropic_order_usage_then_finish_reports_usage_once() {
+        let frames = render_all(&[
+            CanonicalEvent::Usage(hypellm_core::event::CanonicalUsage::reported(12, 1)),
+            CanonicalEvent::TextDelta("hi".to_owned()),
+            CanonicalEvent::Usage(hypellm_core::event::CanonicalUsage::reported(0, 7)),
+            CanonicalEvent::Finish { reason: FinishReason::Stop },
+        ]);
+        let (_, delta) = assert_valid_stream(&frames);
+        assert_eq!(output_tokens(&delta), 7);
+        assert_eq!(delta.get("usage").unwrap().field_i64("input_tokens").unwrap(), 12);
+        assert_eq!(
+            delta.get("delta").unwrap().field_str("stop_reason").unwrap(),
+            "end_turn"
+        );
+    }
+
+    #[test]
+    fn openai_order_usage_after_finish_is_not_lost() {
+        let request = parse_messages(MINIMAL).unwrap();
+        let mut renderer = StreamRenderer::new();
+        let mut frames = Vec::new();
+        for event in [
+            CanonicalEvent::TextDelta("hi".to_owned()),
+            CanonicalEvent::Finish { reason: FinishReason::Length },
+            CanonicalEvent::Usage(hypellm_core::event::CanonicalUsage::reported(3, 9)),
+        ] {
+            frames.extend(renderer.render(&request, &event));
+        }
+        // Closed by the usage itself, before the stream's end is signalled.
+        assert_eq!(frames.last().unwrap().event, "message_stop");
+        frames.extend(renderer.finish(FinishReason::Stop));
+        let (_, delta) = assert_valid_stream(&frames);
+        assert_eq!(output_tokens(&delta), 9);
+        assert_eq!(
+            delta.get("delta").unwrap().field_str("stop_reason").unwrap(),
+            "max_tokens",
+            "the upstream's reason, not the end-of-stream default"
+        );
     }
 
     fn names(frames: &[Frame]) -> Vec<&str> {
@@ -1110,9 +1447,16 @@ mod tests {
                 reason: FinishReason::Stop,
             },
         );
+        // Content after the provider's stop reason is dropped.
         let after = renderer.render(&request, &CanonicalEvent::TextDelta("late".to_owned()));
-        assert!(after.is_empty(), "no frame may follow message_stop");
+        assert!(after.is_empty(), "no content may follow the stop reason");
+        assert_eq!(
+            names(&renderer.finish(FinishReason::Stop)),
+            vec!["message_delta", "message_stop"]
+        );
         assert!(renderer.finish(FinishReason::Stop).is_empty());
+        let late = renderer.render(&request, &CanonicalEvent::TextDelta("later".to_owned()));
+        assert!(late.is_empty(), "no frame may follow message_stop");
     }
 
     #[test]
@@ -1200,6 +1544,84 @@ mod tests {
         assert_eq!(block.field_str("type").unwrap(), "tool_use");
         assert_eq!(block.field_str("id").unwrap(), "toolu_1");
         assert_eq!(block.get("input").unwrap().field_str("q").unwrap(), "x");
+    }
+
+    #[test]
+    fn unreported_input_tokens_are_null_in_the_body_and_absent_from_the_delta() {
+        let request = parse_messages(MINIMAL).unwrap();
+        let output_only = CanonicalEvent::Usage(
+            hypellm_core::event::CanonicalUsage::output_only(5),
+        );
+        let mut accumulator = ResponseAccumulator::new();
+        accumulator.push(&CanonicalEvent::TextDelta("x".to_owned()));
+        accumulator.push(&output_only);
+        let value = parse_str(
+            &render_message_response(&request, &accumulator),
+            &Limits::DEFAULT,
+        )
+        .unwrap();
+        let usage = value.get("usage").unwrap();
+        assert!(usage.get("input_tokens").unwrap().is_null(), "unknown, not zero");
+        assert_eq!(usage.field_i64("output_tokens").unwrap(), 5);
+
+        let frames = render_all(&[
+            CanonicalEvent::TextDelta("x".to_owned()),
+            CanonicalEvent::Finish { reason: FinishReason::Stop },
+            output_only,
+        ]);
+        let start = parse_str(&frames[0].data, &Limits::DEFAULT).unwrap();
+        assert!(
+            start.get("message").unwrap().get("usage").unwrap().get("input_tokens").unwrap().is_null()
+        );
+        let (_, delta) = assert_valid_stream(&frames);
+        assert!(delta.get("usage").unwrap().get("input_tokens").is_none());
+        assert_eq!(output_tokens(&delta), 5);
+    }
+
+    fn tool_response(arguments: &str) -> Result<String, RouterError> {
+        let request = parse_messages(MINIMAL).unwrap();
+        let mut accumulator = ResponseAccumulator::new();
+        accumulator.push(&tool(0, Some("toolu_1"), arguments));
+        try_render_message_response(&request, &accumulator)
+    }
+
+    #[test]
+    fn tool_arguments_above_the_small_limit_are_preserved() {
+        // 100 KiB: above `Limits::SMALL`'s string cap, far below the
+        // accumulator's argument bound.
+        let big = "x".repeat(100 * 1024);
+        let rendered = tool_response(&format!(r#"{{"content":"{big}"}}"#)).expect("renders");
+        let value = parse_str(&rendered, &Limits::DEFAULT).unwrap();
+        let block = &value.field_array("content").unwrap()[0];
+        assert_eq!(
+            block.get("input").unwrap().field_str("content").unwrap().len(),
+            big.len()
+        );
+    }
+
+    #[test]
+    fn malformed_tool_arguments_are_an_error_not_an_empty_input() {
+        for bad in [r#"{"q":"#, "[1,2]", "not json"] {
+            let error = tool_response(bad).expect_err(bad);
+            assert_eq!(error.code, ErrorCode::UpstreamInvalidResponse);
+        }
+        // The infallible form must not fabricate a message either.
+        let request = parse_messages(MINIMAL).unwrap();
+        let mut accumulator = ResponseAccumulator::new();
+        accumulator.push(&tool(0, Some("toolu_1"), r#"{"q":"#));
+        let value = parse_str(
+            &render_message_response(&request, &accumulator),
+            &Limits::DEFAULT,
+        )
+        .unwrap();
+        assert_eq!(value.field_str("type").unwrap(), "error");
+    }
+
+    #[test]
+    fn an_argument_less_tool_call_has_an_empty_input() {
+        let value = parse_str(&tool_response("").unwrap(), &Limits::DEFAULT).unwrap();
+        let block = &value.field_array("content").unwrap()[0];
+        assert!(matches!(block.get("input"), Some(Value::Object(o)) if o.is_empty()));
     }
 
     #[test]

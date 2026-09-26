@@ -102,6 +102,15 @@ pub struct ActivationSummary {
     pub decision_id: String,
     /// When it finished, on the router's monotonic clock.
     pub finished_ms: u64,
+    /// What the lease it closes authorised.
+    ///
+    /// Every lease written to the log is closed by one of these, whatever it
+    /// was for: a deactivation lease with no closing record reads, on every
+    /// restart, as an activation that went missing. Recorded so recovery can
+    /// close it without folding a *stop* duration into the start-time
+    /// estimate. Absent in records from before it existed, which were all
+    /// activations.
+    pub operation: LeaseOperation,
 }
 
 impl ActivationSummary {
@@ -116,6 +125,7 @@ impl ActivationSummary {
             evicted: record.evicted.clone(),
             decision_id: record.lease.decision_id.clone(),
             finished_ms: record.finished_ms.unwrap_or(now_ms),
+            operation: record.lease.operation,
         }
     }
 }
@@ -130,6 +140,7 @@ pub fn encode_activation(summary: &ActivationSummary) -> Vec<u8> {
     object.push("duration_ms", Value::from(i64_of(summary.duration_ms)));
     object.push("finished_ms", Value::from(i64_of(summary.finished_ms)));
     object.push("decision", Value::from(summary.decision_id.as_str()));
+    object.push("operation", Value::from(summary.operation.as_str()));
     object.push(
         "evicted",
         Value::Array(
@@ -181,6 +192,10 @@ pub fn decode_activation(payload: &[u8]) -> Option<ActivationSummary> {
             .filter(char::is_ascii_alphanumeric)
             .collect(),
         finished_ms: value.get("finished_ms")?.as_u64()?,
+        operation: match value.get("operation") {
+            None => LeaseOperation::Activate,
+            Some(v) => LeaseOperation::parse(v.as_str()?)?,
+        },
     })
 }
 
@@ -304,7 +319,16 @@ mod tests {
             evicted: vec![DeploymentId::new("spark-h3").expect("id")],
             decision_id: "abc".to_owned(),
             finished_ms: 500_000,
+            operation: LeaseOperation::Activate,
         };
-        assert_eq!(decode_activation(&encode_activation(&summary)), Some(summary));
+        assert_eq!(decode_activation(&encode_activation(&summary)), Some(summary.clone()));
+        let closing_a_stop = ActivationSummary {
+            operation: LeaseOperation::Deactivate,
+            ..summary
+        };
+        assert_eq!(
+            decode_activation(&encode_activation(&closing_a_stop)),
+            Some(closing_a_stop)
+        );
     }
 }

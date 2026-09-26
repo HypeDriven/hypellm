@@ -911,6 +911,14 @@ pub enum ClientProtocol {
     OpenAiEmbeddings,
     /// `POST /v1/messages`
     AnthropicMessages,
+    /// `POST /v1/rerank`
+    ///
+    /// The normalised reranking extension specification 8 admits as a MAY,
+    /// advertised through [`Capability::Rerank`](crate::target::Capability).
+    /// Separate from [`Self::Native`] because it renders a `results` array
+    /// rather than `choices`, and a dialect that renders differently is a
+    /// different dialect.
+    Rerank,
     /// A router-native extension endpoint.
     Native,
 }
@@ -924,6 +932,7 @@ impl ClientProtocol {
             Self::OpenAiResponses => "openai_responses",
             Self::OpenAiEmbeddings => "openai_embeddings",
             Self::AnthropicMessages => "anthropic_messages",
+            Self::Rerank => "rerank",
             Self::Native => "native",
         }
     }

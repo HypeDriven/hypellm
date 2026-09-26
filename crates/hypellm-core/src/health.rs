@@ -103,6 +103,19 @@ impl BreakerState {
 /// incident.
 pub const WEIGHT_RESTORATION_MILLIS: u64 = 30_000;
 
+/// How long a half-open probe may stay outstanding before its slot is
+/// reclaimed.
+///
+/// Every [`BreakerPermit`] returns its slot exactly once — on a recorded
+/// outcome, on an explicit neutral release, or on `Drop` — so in correct code
+/// this never fires. It exists because the cost of a leaked probe slot is
+/// total: a half-open breaker with every slot taken refuses the target forever,
+/// and nothing short of an operator notices. Five minutes is longer than any
+/// request deadline the router accepts, so a probe still genuinely in flight is
+/// not cut short; reclaiming bumps the breaker's epoch, so the late result of
+/// the reclaimed probe is recognised as stale and cannot free a slot twice.
+pub const PROBE_LEASE_MILLIS: u64 = 300_000;
+
 /// A rolling window of successes and failures.
 ///
 /// Two buckets that alternate: samples land in the current bucket, and when the
@@ -184,6 +197,16 @@ struct BreakerInner {
     consecutive_opens: u32,
     /// Probes currently in flight while half-open.
     probes_in_flight: u32,
+    /// When the most recent probe slot was handed out, for the lease fallback.
+    last_probe_admitted_ms: u64,
+    /// Incremented on every state transition and on a probe-lease reclaim.
+    ///
+    /// A [`BreakerPermit`] remembers the epoch it was issued in; an outcome
+    /// reported against an older epoch describes a breaker state that no longer
+    /// exists and must not move the current one. That is what stops a request
+    /// admitted while closed from being counted as a probe when it finishes
+    /// after the breaker has opened and cooled to half-open.
+    epoch: u64,
     /// Consecutive probe successes while half-open.
     probe_successes: u32,
     /// When the breaker last closed after having been open.
@@ -212,6 +235,8 @@ impl Breaker {
                 open_until_ms: 0,
                 consecutive_opens: 0,
                 probes_in_flight: 0,
+                last_probe_admitted_ms: 0,
+                epoch: 0,
                 probe_successes: 0,
                 closed_at_ms: None,
             }),
@@ -278,76 +303,141 @@ impl Breaker {
             inner.state = BreakerState::HalfOpen;
             inner.probes_in_flight = 0;
             inner.probe_successes = 0;
+            inner.epoch = inner.epoch.wrapping_add(1);
         }
     }
 
-    /// Whether a request may be sent right now.
+    /// Ask to send a request right now.
     ///
-    /// While half-open this consumes a probe slot; the caller must report the
-    /// result with [`Breaker::record`], which returns the slot.
-    pub fn try_admit(&self, now_ms: u64) -> bool {
+    /// `None` means the breaker refuses. `Some` is a permit that must be
+    /// finished exactly once — with [`BreakerPermit::record`] when the attempt
+    /// produced an outcome that says something about the target, or with
+    /// [`BreakerPermit::release`] when it did not (the request never left, the
+    /// caller went away, the failure was the caller's fault). Dropping an
+    /// unfinished permit releases it neutrally, as a safety net.
+    ///
+    /// While half-open the permit holds one of the limited probe slots, and
+    /// only a permit that holds one can advance the half-open state machine.
+    pub fn admit(&self, now_ms: u64) -> Option<BreakerPermit<'_>> {
         let mut inner = self.lock();
         self.transition_if_cooled(&mut inner, now_ms);
-        match inner.state {
-            BreakerState::Closed => true,
-            BreakerState::Open => false,
+        let probe = match inner.state {
+            BreakerState::Closed => false,
+            BreakerState::Open => return None,
             BreakerState::HalfOpen => {
+                if inner.probes_in_flight >= self.config.half_open_probes
+                    && inner.probes_in_flight > 0
+                    && now_ms.saturating_sub(inner.last_probe_admitted_ms) >= PROBE_LEASE_MILLIS
+                {
+                    // The lease fallback: every outstanding probe is older than
+                    // any request could legitimately run. Reclaim the slots and
+                    // move to a new epoch so their late results are ignored.
+                    inner.probes_in_flight = 0;
+                    inner.probe_successes = 0;
+                    inner.epoch = inner.epoch.wrapping_add(1);
+                }
                 if inner.probes_in_flight < self.config.half_open_probes {
-                    inner.probes_in_flight += 1;
+                    inner.probes_in_flight = inner.probes_in_flight.saturating_add(1);
+                    inner.last_probe_admitted_ms = now_ms;
                     true
                 } else {
-                    false
+                    return None;
                 }
             }
-        }
+        };
+        Some(BreakerPermit {
+            breaker: self,
+            probe,
+            epoch: inner.epoch,
+            finished: false,
+        })
     }
 
-    /// Record an outcome.
+    /// Record an outcome that was not admitted through a permit.
+    ///
+    /// Counts toward the rolling window and can open a closed breaker, but can
+    /// never advance a half-open one: only a probe permit may do that, so an
+    /// unattributed sample neither consumes nor returns a probe slot.
     pub fn record(&self, success: bool, now_ms: u64) {
         let mut inner = self.lock();
         self.transition_if_cooled(&mut inner, now_ms);
         inner.counts.record(success, now_ms);
+        if inner.state == BreakerState::Closed && !success {
+            self.open_if_over_threshold(&mut inner, now_ms);
+        }
+    }
 
-        match inner.state {
-            BreakerState::HalfOpen => {
-                inner.probes_in_flight = inner.probes_in_flight.saturating_sub(1);
-                if success {
-                    inner.probe_successes += 1;
-                    if inner.probe_successes >= self.config.half_open_successes_to_close {
-                        inner.state = BreakerState::Closed;
-                        inner.consecutive_opens = 0;
-                        inner.probe_successes = 0;
-                        inner.closed_at_ms = Some(now_ms);
-                        // Clear the window so a freshly recovered target is not
-                        // immediately reopened by its own failure history.
-                        inner.counts = RollingCounts::new(self.config.window_millis, now_ms);
-                    }
-                } else {
-                    // A failed probe reopens immediately with a longer cooldown.
-                    self.open(&mut inner, now_ms);
-                }
+    /// Finish a permit with an outcome.
+    fn finish_permit(&self, probe: bool, epoch: u64, outcome: Option<bool>, now_ms: u64) {
+        let mut inner = self.lock();
+        self.transition_if_cooled(&mut inner, now_ms);
+        let current = epoch == inner.epoch;
+
+        if probe {
+            // A probe's slot is returned only to the epoch that issued it. A
+            // stale probe's slot was already reclaimed by the transition or the
+            // lease fallback that changed the epoch, so returning it again
+            // would free a slot twice.
+            if !current || inner.state != BreakerState::HalfOpen {
+                return;
             }
-            BreakerState::Closed => {
-                if !success {
-                    let (ok, fail) = inner.counts.totals(now_ms);
-                    let total = ok.saturating_add(fail);
-                    if total >= self.config.min_samples {
-                        let percent = u64::from(fail)
-                            .saturating_mul(100)
-                            .checked_div(u64::from(total))
-                            .unwrap_or(0);
-                        if percent >= u64::from(self.config.failure_threshold_percent) {
-                            self.open(&mut inner, now_ms);
-                        }
-                    }
+            inner.probes_in_flight = inner.probes_in_flight.saturating_sub(1);
+            let Some(success) = outcome else {
+                return;
+            };
+            inner.counts.record(success, now_ms);
+            if success {
+                inner.probe_successes = inner.probe_successes.saturating_add(1);
+                if inner.probe_successes >= self.config.half_open_successes_to_close {
+                    inner.state = BreakerState::Closed;
+                    inner.epoch = inner.epoch.wrapping_add(1);
+                    inner.consecutive_opens = 0;
+                    inner.probe_successes = 0;
+                    inner.closed_at_ms = Some(now_ms);
+                    // Clear the window so a freshly recovered target is not
+                    // immediately reopened by its own failure history.
+                    inner.counts = RollingCounts::new(self.config.window_millis, now_ms);
                 }
+            } else {
+                // A failed probe reopens immediately with a longer cooldown.
+                self.open(&mut inner, now_ms);
             }
-            BreakerState::Open => {}
+            return;
+        }
+
+        // A request admitted while closed. Its outcome describes the closed
+        // period it was admitted in; if the breaker has since moved on, it is
+        // evidence about a state that no longer exists and must not count as a
+        // probe or reopen a breaker that has already recovered.
+        let Some(success) = outcome else {
+            return;
+        };
+        if !current || inner.state != BreakerState::Closed {
+            return;
+        }
+        inner.counts.record(success, now_ms);
+        if !success {
+            self.open_if_over_threshold(&mut inner, now_ms);
+        }
+    }
+
+    fn open_if_over_threshold(&self, inner: &mut BreakerInner, now_ms: u64) {
+        let (ok, fail) = inner.counts.totals(now_ms);
+        let total = ok.saturating_add(fail);
+        if total >= self.config.min_samples {
+            let percent = u64::from(fail)
+                .saturating_mul(100)
+                .checked_div(u64::from(total))
+                .unwrap_or(0);
+            if percent >= u64::from(self.config.failure_threshold_percent) {
+                self.open(inner, now_ms);
+            }
         }
     }
 
     fn open(&self, inner: &mut BreakerInner, now_ms: u64) {
         inner.state = BreakerState::Open;
+        inner.epoch = inner.epoch.wrapping_add(1);
         inner.probes_in_flight = 0;
         inner.probe_successes = 0;
         inner.consecutive_opens = inner.consecutive_opens.saturating_add(1);
@@ -366,6 +456,7 @@ impl Breaker {
     pub fn force_open(&self, now_ms: u64, duration_ms: u64) {
         let mut inner = self.lock();
         inner.state = BreakerState::Open;
+        inner.epoch = inner.epoch.wrapping_add(1);
         inner.open_until_ms = now_ms.saturating_add(duration_ms);
         inner.probes_in_flight = 0;
         inner.probe_successes = 0;
@@ -375,6 +466,7 @@ impl Breaker {
     pub fn force_close(&self, now_ms: u64) {
         let mut inner = self.lock();
         inner.state = BreakerState::Closed;
+        inner.epoch = inner.epoch.wrapping_add(1);
         inner.consecutive_opens = 0;
         inner.probes_in_flight = 0;
         inner.probe_successes = 0;
@@ -394,6 +486,59 @@ impl Breaker {
             return 0;
         }
         u32::try_from(u64::from(fail).saturating_mul(100) / u64::from(total)).unwrap_or(100)
+    }
+}
+
+/// Permission to send one request past a [`Breaker`].
+///
+/// Finished exactly once: [`Self::record`] with an outcome, [`Self::release`]
+/// with none, or `Drop` as the neutral safety net. Whichever comes first wins
+/// and the rest are no-ops, so a half-open probe slot can neither leak nor be
+/// returned twice.
+#[derive(Debug)]
+#[must_use = "a permit must be finished, or its probe slot is held until dropped"]
+pub struct BreakerPermit<'a> {
+    breaker: &'a Breaker,
+    probe: bool,
+    epoch: u64,
+    finished: bool,
+}
+
+impl BreakerPermit<'_> {
+    /// Whether this permit holds a half-open probe slot.
+    #[must_use]
+    pub const fn is_probe(&self) -> bool {
+        self.probe
+    }
+
+    /// Finish with an outcome that says something about the target.
+    pub fn record(mut self, success: bool, now_ms: u64) {
+        self.finished = true;
+        self.breaker
+            .finish_permit(self.probe, self.epoch, Some(success), now_ms);
+    }
+
+    /// Finish without an outcome: return the probe slot, count nothing.
+    ///
+    /// For every path on which the attempt says nothing about the target — it
+    /// was refused by admission before any I/O, the caller disconnected, or the
+    /// provider rejected the caller's own request.
+    pub fn release(mut self, now_ms: u64) {
+        self.finished = true;
+        self.breaker.finish_permit(self.probe, self.epoch, None, now_ms);
+    }
+}
+
+impl Drop for BreakerPermit<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finished = true;
+            // No clock here. The time is only used to roll the cooldown and the
+            // window forward, and a neutral release records no sample; passing
+            // zero can at worst leave a cooled breaker reported open until the
+            // next caller with a clock looks at it.
+            self.breaker.finish_permit(self.probe, self.epoch, None, 0);
+        }
     }
 }
 
@@ -445,6 +590,40 @@ impl TargetHealth {
         if class.affects_health() {
             self.total_failures.fetch_add(1, Ordering::Relaxed);
             self.breaker.record(false, now_ms);
+        }
+    }
+
+    /// Record a successful exchange admitted by `permit`.
+    pub fn finish_success(
+        &self,
+        permit: BreakerPermit<'_>,
+        first_byte_ms: u64,
+        total_ms: u64,
+        now_ms: u64,
+    ) {
+        self.first_byte_ewma.observe(first_byte_ms);
+        self.latency.observe(total_ms);
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
+        permit.record(true, now_ms);
+    }
+
+    /// Record a failed exchange admitted by `permit`.
+    ///
+    /// A class that says nothing about the target releases the permit without
+    /// an outcome, so a half-open probe that ended in the caller's own error
+    /// returns its slot instead of holding it forever.
+    pub fn finish_failure(
+        &self,
+        permit: BreakerPermit<'_>,
+        class: UpstreamErrorClass,
+        now_ms: u64,
+    ) {
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
+        if class.affects_health() {
+            self.total_failures.fetch_add(1, Ordering::Relaxed);
+            permit.record(false, now_ms);
+        } else {
+            permit.release(now_ms);
         }
     }
 
@@ -822,8 +1001,7 @@ mod tests {
         now += BreakerConfig::DEFAULT.base_cooldown_millis * 4;
         assert_eq!(breaker.state(now), BreakerState::HalfOpen);
         for _ in 0..BreakerConfig::DEFAULT.half_open_successes_to_close {
-            assert!(breaker.try_admit(now));
-            breaker.record(true, now);
+            breaker.admit(now).expect("probe").record(true, now);
         }
         assert_eq!(breaker.state(now), BreakerState::Closed);
 
@@ -865,8 +1043,8 @@ mod tests {
         }
         clock.advance(BreakerConfig::DEFAULT.base_cooldown_millis * 4);
         for _ in 0..BreakerConfig::DEFAULT.half_open_successes_to_close {
-            assert!(health.breaker.try_admit(clock.now_millis()));
-            health.record_success(1, 1, clock.now_millis());
+            let permit = health.breaker.admit(clock.now_millis()).expect("probe");
+            health.finish_success(permit, 1, 1, clock.now_millis());
         }
         assert_eq!(health.breaker.state(clock.now_millis()), BreakerState::Closed);
 
@@ -942,13 +1120,15 @@ mod tests {
             b.record(false, 0);
         }
         assert_eq!(b.state(0), BreakerState::Open);
-        assert!(!b.try_admit(0));
-        assert!(!b.try_admit(999));
+        assert!(b.admit(0).is_none());
+        assert!(b.admit(999).is_none());
 
         // Cooldown elapses.
         assert_eq!(b.state(1_000), BreakerState::HalfOpen);
-        assert!(b.try_admit(1_000), "one probe is allowed");
-        assert!(!b.try_admit(1_000), "only half_open_probes concurrently");
+        let probe = b.admit(1_000);
+        assert!(probe.is_some(), "one probe is allowed");
+        assert!(b.admit(1_000).is_none(), "only half_open_probes concurrently");
+        drop(probe);
     }
 
     #[test]
@@ -959,14 +1139,12 @@ mod tests {
         }
         assert_eq!(b.state(1_000), BreakerState::HalfOpen);
 
-        assert!(b.try_admit(1_000));
-        b.record(true, 1_000);
+        b.admit(1_000).expect("probe").record(true, 1_000);
         assert_eq!(b.state(1_000), BreakerState::HalfOpen, "one success is not enough");
 
-        assert!(b.try_admit(1_100));
-        b.record(true, 1_100);
+        b.admit(1_100).expect("probe").record(true, 1_100);
         assert_eq!(b.state(1_100), BreakerState::Closed);
-        assert!(b.try_admit(1_100));
+        assert!(b.admit(1_100).is_some());
     }
 
     #[test]
@@ -977,8 +1155,7 @@ mod tests {
         }
         // First open: 1s cooldown.
         assert_eq!(b.state(1_000), BreakerState::HalfOpen);
-        assert!(b.try_admit(1_000));
-        b.record(false, 1_000);
+        b.admit(1_000).expect("probe").record(false, 1_000);
         assert_eq!(b.state(1_000), BreakerState::Open);
 
         // Second open: 2s cooldown, so 1s later it is still open.
@@ -997,8 +1174,7 @@ mod tests {
         for _ in 0..20 {
             now += 100_000; // far past any cooldown
             assert_eq!(b.state(now), BreakerState::HalfOpen);
-            assert!(b.try_admit(now));
-            b.record(false, now);
+            b.admit(now).expect("probe").record(false, now);
         }
         // The cooldown is capped at max_cooldown_millis, so the breaker is
         // half-open again that long after the last failure — not longer.
@@ -1027,12 +1203,106 @@ mod tests {
         let b = Breaker::new(config(), 0);
         b.force_open(0, 5_000);
         assert_eq!(b.state(0), BreakerState::Open);
-        assert!(!b.try_admit(4_999));
+        assert!(b.admit(4_999).is_none());
         assert_eq!(b.state(5_000), BreakerState::HalfOpen);
 
         b.force_close(6_000);
         assert_eq!(b.state(6_000), BreakerState::Closed);
-        assert!(b.try_admit(6_000));
+        assert!(b.admit(6_000).is_some());
+    }
+
+    fn half_open(b: &Breaker) -> u64 {
+        for _ in 0..4 {
+            b.record(false, 0);
+        }
+        assert_eq!(b.state(1_000), BreakerState::HalfOpen);
+        1_000
+    }
+
+    #[test]
+    fn a_probe_that_ends_in_a_client_error_returns_its_slot() {
+        // A half-open probe whose request fails for a reason that says nothing
+        // about the target — the caller's own invalid request — used to skip
+        // the breaker entirely, so the slot it took was never returned and the
+        // target was refused for good.
+        let clock = Arc::new(TestClock::new());
+        let registry = HealthRegistry::new(Arc::clone(&clock) as Arc<dyn Clock>, config());
+        let h = registry.entry(&tid("t"), Operation::Chat);
+        let now = half_open(&h.breaker);
+
+        for class in [
+            UpstreamErrorClass::InvalidRequest,
+            UpstreamErrorClass::ContextOverflow,
+            UpstreamErrorClass::RateLimited,
+            UpstreamErrorClass::Authentication,
+        ] {
+            let probe = h.breaker.admit(now).expect("the probe slot is free");
+            assert!(probe.is_probe());
+            h.finish_failure(probe, class, now);
+            assert_eq!(h.breaker.state(now), BreakerState::HalfOpen, "{class:?}");
+        }
+        // And a probe abandoned before any I/O, released or merely dropped.
+        h.breaker.admit(now).expect("free").release(now);
+        drop(h.breaker.admit(now).expect("free"));
+        assert!(h.breaker.admit(now).is_some(), "the slot must still be free");
+    }
+
+    #[test]
+    fn only_a_probe_permit_advances_a_half_open_breaker() {
+        // Requests admitted while closed that finish after the breaker has
+        // opened and cooled are not probes: they must neither close it, nor
+        // reopen it, nor return a probe slot they never took.
+        let b = Breaker::new(config(), 0);
+        let early_ok = b.admit(0).expect("closed");
+        let early_fail = b.admit(0).expect("closed");
+        let now = half_open(&b);
+
+        let probe = b.admit(now).expect("probe");
+        early_ok.record(true, now);
+        early_fail.record(false, now);
+        assert_eq!(b.state(now), BreakerState::HalfOpen, "a stale failure reopened it");
+        assert!(
+            b.admit(now).is_none(),
+            "a stale result freed the probe slot it never held"
+        );
+        for _ in 0..8 {
+            b.record(true, now);
+        }
+        assert_eq!(
+            b.state(now),
+            BreakerState::HalfOpen,
+            "unattributed successes counted as probes"
+        );
+
+        // The real probes still work.
+        probe.record(true, now);
+        b.admit(now).expect("probe").record(true, now);
+        assert_eq!(b.state(now), BreakerState::Closed);
+    }
+
+    #[test]
+    fn a_probe_slot_that_is_never_returned_is_reclaimed_after_its_lease() {
+        let b = Breaker::new(config(), 0);
+        let now = half_open(&b);
+        let leaked = b.admit(now).expect("probe");
+        core::mem::forget(leaked);
+        assert!(b.admit(now + PROBE_LEASE_MILLIS - 1).is_none());
+        let fresh = b.admit(now + PROBE_LEASE_MILLIS).expect("lease reclaimed");
+        assert!(fresh.is_probe());
+        fresh.record(true, now + PROBE_LEASE_MILLIS);
+        assert_eq!(b.state(now + PROBE_LEASE_MILLIS), BreakerState::HalfOpen);
+    }
+
+    #[test]
+    fn a_reclaimed_probe_reporting_late_cannot_free_a_slot_twice() {
+        let b = Breaker::new(config(), 0);
+        let now = half_open(&b);
+        let slow = b.admit(now).expect("probe");
+        let later = now + PROBE_LEASE_MILLIS;
+        let fresh = b.admit(later).expect("reclaimed");
+        slow.release(later);
+        assert!(b.admit(later).is_none(), "the fresh probe's slot was freed by the stale one");
+        drop(fresh);
     }
 
     // -- Per-operation isolation --------------------------------------------

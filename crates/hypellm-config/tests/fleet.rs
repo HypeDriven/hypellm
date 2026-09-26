@@ -184,6 +184,35 @@ fleet_policy scope=fleet max_activations_per_hour=6"
 }
 
 #[test]
+fn a_policy_scope_written_twice_is_refused_rather_than_resolved_by_record_order() {
+    // Two records for one scope made the last one win silently — and a second
+    // `scope=fleet` even inherited from the first — so the effective limits
+    // depended on record order and two different files could share a digest
+    // of intent while enforcing different budgets.
+    let fleet_twice = format!(
+        "{SPARK}
+fleet_policy scope=fleet max_activations_per_hour=6
+fleet_policy scope=fleet max_activations_per_hour=60"
+    );
+    assert!(codes(&fleet_twice).contains(&"duplicate_record".to_owned()));
+
+    let host_twice = format!(
+        "{SPARK}
+fleet_policy scope=host:spark max_eviction_set=1
+fleet_policy scope=host:spark max_eviction_set=4"
+    );
+    assert!(codes(&host_twice).contains(&"duplicate_record".to_owned()));
+
+    // One of each is still fine.
+    let once = format!(
+        "{SPARK}
+fleet_policy scope=fleet max_activations_per_hour=6
+fleet_policy scope=host:spark max_eviction_set=1"
+    );
+    load(&once).expect("one record per scope builds");
+}
+
+#[test]
 fn an_observation_window_shorter_than_its_interval_is_refused() {
     // Belief that expires before the next observation is due means every
     // decision is made against stale state: a fleet that refuses everything and

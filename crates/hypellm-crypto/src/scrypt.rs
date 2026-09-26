@@ -43,6 +43,17 @@ use crate::pbkdf2;
 /// would still let two callers at once take twice it.
 pub const MAX_MEMORY_BYTES: u64 = 128 * 1024 * 1024;
 
+/// The largest `N * r * p` this implementation will run.
+///
+/// Memory is bounded by [`MAX_MEMORY_BYTES`], but `p` multiplies CPU without
+/// multiplying memory, so the memory bound alone admitted
+/// `scrypt$20$1$1000000$…` — a millionfold repetition of a 128 MiB mix that
+/// would pin a core for days on an unauthenticated endpoint. `2^21` is eight
+/// times the default cost (`2^15 * 8 * 1`), the same headroom
+/// [`MAX_MEMORY_BYTES`] gives memory with room for `p = 2` at that bound, and
+/// admits every RFC 7914 vector.
+pub const MAX_WORK: u64 = 1 << 21;
+
 /// Default `log2(N)`: 32 768 iterations of the mixing loop.
 ///
 /// With [`DEFAULT_R`] this is 32 MiB and roughly 100 ms of CPU — the interactive
@@ -79,6 +90,8 @@ pub enum ScryptError {
     /// `128 * N * r` exceeds [`MAX_MEMORY_BYTES`], or the size does not fit a
     /// `usize` on this target.
     TooMuchMemory,
+    /// `N * r * p` exceeds [`MAX_WORK`].
+    TooMuchWork,
 }
 
 impl core::fmt::Display for ScryptError {
@@ -89,6 +102,9 @@ impl core::fmt::Display for ScryptError {
             ),
             Self::TooMuchMemory => f.write_str(
                 "scrypt parameters ask for more memory than this router will allocate",
+            ),
+            Self::TooMuchWork => f.write_str(
+                "scrypt parameters ask for more computation than this router will perform",
             ),
         }
     }
@@ -273,20 +289,22 @@ fn copy_back(block: &mut [u8], scratch: &[u8], block_len: usize) {
     }
 }
 
-/// Derive `output.len()` bytes with scrypt (RFC 7914 section 6).
+/// Whether `(N, r, p)` is a parameter set [`scrypt`] will run, without
+/// running it.
+///
+/// Pure arithmetic: a caller that wants to validate parameters at load — or
+/// before every use — pays nothing for it. [`scrypt`] applies exactly this
+/// check, so the two cannot disagree.
 ///
 /// # Errors
 ///
-/// [`ScryptError`] if the parameters are not a valid scrypt parameter set, or
-/// if they ask for more memory than [`MAX_MEMORY_BYTES`].
-pub fn scrypt(
-    password: &[u8],
-    salt: &[u8],
-    n: u64,
-    r: u32,
-    p: u32,
-    output: &mut [u8],
-) -> Result<(), ScryptError> {
+/// As [`scrypt`].
+pub fn check_parameters(n: u64, r: u32, p: u32) -> Result<(), ScryptError> {
+    sizes(n, r, p).map(|_| ())
+}
+
+/// The `(working, per_lane)` byte sizes for `(N, r, p)`, once every bound holds.
+fn sizes(n: u64, r: u32, p: u32) -> Result<(u64, u64), ScryptError> {
     if n < 2 || !n.is_power_of_two() || r == 0 || p == 0 {
         return Err(ScryptError::Parameters);
     }
@@ -304,6 +322,41 @@ pub fn scrypt(
     if working > MAX_MEMORY_BYTES || per_lane > MAX_MEMORY_BYTES {
         return Err(ScryptError::TooMuchMemory);
     }
+    let work = n
+        .checked_mul(u64::from(r))
+        .and_then(|v| v.checked_mul(u64::from(p)))
+        .ok_or(ScryptError::TooMuchWork)?;
+    if work > MAX_WORK {
+        return Err(ScryptError::TooMuchWork);
+    }
+    Ok((working, per_lane))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many derivations this thread has started, so a test can hold a
+    /// caller to the number of full-cost runs it performs.
+    pub(crate) static DERIVATIONS: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// Derive `output.len()` bytes with scrypt (RFC 7914 section 6).
+///
+/// # Errors
+///
+/// [`ScryptError`] if the parameters are not a valid scrypt parameter set, or
+/// if they ask for more memory than [`MAX_MEMORY_BYTES`] or more work than
+/// [`MAX_WORK`].
+pub fn scrypt(
+    password: &[u8],
+    salt: &[u8],
+    n: u64,
+    r: u32,
+    p: u32,
+    output: &mut [u8],
+) -> Result<(), ScryptError> {
+    let (working, per_lane) = sizes(n, r, p)?;
+    #[cfg(test)]
+    DERIVATIONS.with(|c| c.set(c.get().saturating_add(1)));
     let working = usize::try_from(working).map_err(|_| ScryptError::TooMuchMemory)?;
     let per_lane = usize::try_from(per_lane).map_err(|_| ScryptError::TooMuchMemory)?;
     let n = usize::try_from(n).map_err(|_| ScryptError::TooMuchMemory)?;
@@ -418,6 +471,28 @@ mod tests {
         assert_eq!(
             scrypt(b"p", b"s", 1024, 8, 1 << 20, &mut out),
             Err(ScryptError::TooMuchMemory)
+        );
+    }
+
+    #[test]
+    fn parameters_beyond_the_work_bound_are_refused_rather_than_run() {
+        // The bound is exact: at it is accepted, one lane past is not. These
+        // are arithmetic, so without the bound this test fails here rather
+        // than hanging on the derivation below.
+        assert_eq!(check_parameters(1 << 15, 8, 8), Ok(()));
+        assert_eq!(check_parameters(1 << 15, 8, 9), Err(ScryptError::TooMuchWork));
+        assert_eq!(check_parameters(1 << 20, 1, 1_000_000), Err(ScryptError::TooMuchWork));
+        // Inside the memory bound, but a million lanes of a 128 MiB mix: this
+        // must be refused up front, not attempted.
+        let mut out = [0u8; 32];
+        assert_eq!(
+            scrypt(b"p", b"s", 1 << 20, 1, 1_000_000, &mut out),
+            Err(ScryptError::TooMuchWork)
+        );
+        // And the defaults sit comfortably inside it.
+        assert_eq!(
+            check_parameters(1 << DEFAULT_LOG_N, DEFAULT_R, DEFAULT_P),
+            Ok(())
         );
     }
 

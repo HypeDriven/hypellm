@@ -485,9 +485,17 @@ pub fn plan(
         return PlanOutcome::Infeasible(ExclusionReason::FleetStateStale);
     }
 
-    if state.is_activating() {
+    // An activation lease is a commitment the agent may not have reported
+    // yet. Planning again in that gap is how one cold request's burst became
+    // two ACTIVATE verbs for one deployment.
+    if snapshot.is_coming_up(&deployment.id) {
         let eta = time_to_ready_ms(deployment, &[], 0, snapshot);
         return PlanOutcome::AlreadyActivating { eta_ms: eta };
+    }
+    if snapshot.evicting.contains(&deployment.id) {
+        // Another activation is stopping it right now to make room. Starting
+        // it again would undo that plan halfway through.
+        return PlanOutcome::Infeasible(ExclusionReason::DeploymentInDwell);
     }
 
     // From here the deployment is cold and something has to happen.
@@ -522,7 +530,7 @@ pub fn plan(
                 .config
                 .accelerator_of(d)
                 .is_some_and(|a| a.host == host.id)
-                && snapshot.state_of(&d.id).is_activating()
+                && snapshot.is_coming_up(&d.id)
         })
         .count();
     if u64::try_from(in_flight).unwrap_or(u64::MAX)
@@ -647,6 +655,58 @@ pub fn plan(
     }))
 }
 
+/// Check, at the moment of commitment, that a plan still fits what the router
+/// has already committed to.
+///
+/// `plan` is pure and runs against whatever snapshot the caller holds, so two
+/// decisions taken between two observations can each produce a plan that is
+/// sound alone and unsound together: the same deployment activated twice, the
+/// same victim evicted twice, or two activations each counting the same free
+/// memory. The executor calls this under its admission lock, against a
+/// snapshot carrying every lease held at that instant, immediately before it
+/// takes a lease of its own.
+///
+/// It re-checks only what concurrent plans can invalidate. Everything else in
+/// `plan` — permissions, dwell, budget, deadline — is a property of the
+/// request or of time, and the executor enforces the budget separately.
+pub fn revalidate(snapshot: &FleetSnapshot, plan: &Plan) -> Result<(), ExclusionReason> {
+    let Some(deployment) = snapshot.config.deployments.get(&plan.deployment) else {
+        return Err(ExclusionReason::HostCapacityInsufficient);
+    };
+    if snapshot.is_coming_up(&deployment.id) || snapshot.evicting.contains(&deployment.id) {
+        return Err(ExclusionReason::ActivationBudgetExhausted);
+    }
+    let victims: Vec<&Deployment> = plan
+        .eviction_set()
+        .into_iter()
+        .filter_map(|id| snapshot.config.deployments.get(id))
+        .collect();
+    if victims.len() != plan.eviction_set().len() {
+        return Err(ExclusionReason::HostCapacityInsufficient);
+    }
+    if victims
+        .iter()
+        .any(|v| snapshot.evicting.contains(&v.id) || snapshot.is_coming_up(&v.id))
+    {
+        return Err(ExclusionReason::HostCapacityInsufficient);
+    }
+    let Some(accelerator) = snapshot.config.accelerator_of(deployment) else {
+        return Err(ExclusionReason::HostCapacityInsufficient);
+    };
+    let freed = victims
+        .iter()
+        .filter(|v| snapshot.state_of(&v.id).holds_memory())
+        .map(|v| resident_bytes(snapshot, v))
+        .fold(0u64, u64::saturating_add);
+    let available = snapshot
+        .pool_free_bytes(&accelerator.pool)
+        .saturating_add(freed);
+    if available < deployment.memory_bytes {
+        return Err(ExclusionReason::HostCapacityInsufficient);
+    }
+    Ok(())
+}
+
 /// The verb a deployment's target serves, when the caller supplied a map.
 ///
 /// The fleet crate does not hold `Target` records — that is `PolicySnapshot`'s
@@ -742,7 +802,12 @@ fn select_eviction_set<'a>(
         // Currently activating: stopping something on its way up wastes the
         // load already paid for and produces exactly the ping-pong the dwell
         // floor exists to prevent.
-        if state.is_activating() {
+        if state.is_activating() || snapshot.is_coming_up(&resident.id) {
+            continue;
+        }
+        // Already being stopped by an activation in flight. Choosing it again
+        // counts memory that plan has already spent, and sends a second stop.
+        if snapshot.evicting.contains(&resident.id) {
             continue;
         }
         if snapshot.inflight(&resident.id) > resident.max_drainable_inflight {
@@ -1181,5 +1246,158 @@ mod tests {
             free,
             music.memory_bytes
         );
+    }
+
+    fn activation_lease(id: &str) -> crate::state::Lease {
+        crate::state::Lease {
+            id: hypellm_core::ids::LeaseId::new(format!("l-{id}")).expect("id"),
+            deployment: DeploymentId::new(id).expect("id"),
+            operation: crate::state::LeaseOperation::Activate,
+            issued_ms: 0,
+            expires_ms: u64::MAX,
+            decision_id: String::new(),
+        }
+    }
+
+    fn two_slot_spark() -> FleetConfig {
+        let mut fleet = spark();
+        if let Some(host) = fleet.hosts.get_mut(&HostId::new("spark").expect("id")) {
+            host.max_concurrent_activations = 2;
+        }
+        fleet
+    }
+
+    #[test]
+    fn a_deployment_under_an_activation_lease_is_not_planned_again() {
+        // The window between the router writing a lease and the agent first
+        // reporting the deployment as pending. A second request in that window
+        // saw "stopped" and planned a second ACTIVATE for the same deployment.
+        let mut fleet = two_slot_spark();
+        let music = dep("spark-music3", 64 * GIB);
+        fleet.deployments.insert(music.id.clone(), music.clone());
+        let mut snap = snapshot(fleet);
+        snap.leases
+            .insert(music.id.clone(), activation_lease("spark-music3"));
+
+        let outcome = plan_now(&snap, &DemandSnapshot::default(), &music.target, 2_000);
+        assert!(
+            matches!(outcome, PlanOutcome::AlreadyActivating { .. }),
+            "a leased activation was planned again: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn memory_promised_to_an_activation_in_flight_is_not_offered_twice() {
+        // Two 64 GiB models and 114 GiB of pool. One is on its way up — pending
+        // at the agent, or only leased so far — and holds nothing *yet*.
+        // Counting its memory as free let the second plan start into the same
+        // bytes, and the host ran out of memory minutes into the load.
+        for pending_by_observation in [true, false] {
+            let mut fleet = two_slot_spark();
+            let first = dep("spark-music3", 64 * GIB);
+            let second = dep("spark-video", 64 * GIB);
+            fleet.deployments.insert(first.id.clone(), first.clone());
+            fleet.deployments.insert(second.id.clone(), second.clone());
+            let mut snap = snapshot(fleet);
+            if pending_by_observation {
+                snap.inventory.deployments.insert(
+                    first.id.clone(),
+                    DeploymentObservation {
+                        deployment: first.id.clone(),
+                        state: ObservedState::Pending,
+                        observed_memory_bytes: 0,
+                        state_age_ms: 0,
+                        inflight: 0,
+                    },
+                );
+            } else {
+                snap.leases
+                    .insert(first.id.clone(), activation_lease("spark-music3"));
+            }
+
+            let outcome = plan_now(&snap, &DemandSnapshot::default(), &second.target, 2_000);
+            assert_eq!(
+                outcome,
+                PlanOutcome::Infeasible(ExclusionReason::HostCapacityInsufficient),
+                "pending={pending_by_observation}: the second model was offered memory \
+                 the first is about to map"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deployment_already_being_evicted_is_not_chosen_as_a_victim_again() {
+        // h3 is past its dwell floor and the cheapest thing to stop, so it is
+        // exactly what a second plan wants — but an activation in flight is
+        // already stopping it and has spent the memory that frees.
+        let mut fleet = two_slot_spark();
+        let music = dep("spark-music3", 64 * GIB);
+        let video = dep("spark-video", 40 * GIB);
+        let h3 = dep("spark-h3", 48 * GIB);
+        for d in [&music, &video, &h3] {
+            fleet.deployments.insert(d.id.clone(), (*d).clone());
+        }
+        let mut snap = snapshot(fleet);
+        ready(&mut snap, "spark-h3", 0, 48 * GIB);
+        // Observed starting, so its memory counts whether or not leases do:
+        // what this isolates is the victim choice.
+        snap.inventory.deployments.insert(
+            music.id.clone(),
+            DeploymentObservation {
+                deployment: music.id.clone(),
+                state: ObservedState::Starting,
+                observed_memory_bytes: 0,
+                state_age_ms: 0,
+                inflight: 0,
+            },
+        );
+        snap.evicting.insert(h3.id.clone());
+
+        let now = 2_000_000;
+        let demand = DemandSnapshot {
+            queued: [(Capability::TextToMusic, 20)].into_iter().collect(),
+            ..DemandSnapshot::default()
+        };
+        let outcome = plan_now(&snap, &demand, &video.target, now);
+        if let PlanOutcome::Plan(plan) = &outcome {
+            assert!(
+                !plan.eviction_set().contains(&&h3.id),
+                "a victim already being evicted was chosen again"
+            );
+        }
+        assert!(
+            !matches!(outcome, PlanOutcome::Plan(_)),
+            "the plan spent memory another activation already claimed: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn two_plans_sound_alone_are_caught_when_the_first_is_committed() {
+        // Both plans are made from one snapshot, before either holds a lease.
+        // `revalidate` is what the executor runs at commitment, and it must
+        // refuse the second once the first's lease is visible.
+        let mut fleet = two_slot_spark();
+        let music = dep("spark-music3", 64 * GIB);
+        let video = dep("spark-video", 64 * GIB);
+        fleet.deployments.insert(music.id.clone(), music.clone());
+        fleet.deployments.insert(video.id.clone(), video.clone());
+        let mut snap = snapshot(fleet);
+        snap.observed_at_ms = 2_000;
+
+        let PlanOutcome::Plan(first) = plan(&snap, &DemandSnapshot::default(), &music.target, &context(2_000))
+        else {
+            panic!("the first plan must be feasible alone");
+        };
+        let PlanOutcome::Plan(second) = plan(&snap, &DemandSnapshot::default(), &video.target, &context(2_000))
+        else {
+            panic!("the second plan must be feasible alone");
+        };
+        assert_eq!(revalidate(&snap, &first), Ok(()));
+        assert_eq!(revalidate(&snap, &second), Ok(()));
+
+        snap.leases
+            .insert(music.id.clone(), activation_lease("spark-music3"));
+        assert!(revalidate(&snap, &second).is_err(), "two activations shared one pool's memory");
+        assert!(revalidate(&snap, &first).is_err(), "one deployment was activated twice");
     }
 }

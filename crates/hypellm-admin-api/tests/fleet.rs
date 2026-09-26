@@ -178,9 +178,26 @@ impl FleetControl for Recorder {
     }
 }
 
+/// The default configuration plus the target the fleet's one deployment
+/// serves, reachable by tenant A through an alias. Tenant B's wildcard grant
+/// is removed, so it can reach nothing and is a genuine stranger to the fleet.
+fn fleet_config() -> String {
+    let mut text = harness::default_config()
+        .replace("grant scope=tenant:globex model=* allow=true\n", "");
+    text.push_str(
+        "target id=spark:music3 provider=local model=music3 local=true \
+         operations=chat context=8192 max_output=1024 concurrency=1\n\
+         alias id=music targets=spark:music3\n",
+    );
+    text
+}
+
 fn harness_with(control: Arc<Recorder>) -> (Harness, Arc<Recorder>) {
     let shared: Arc<dyn FleetControl> = Arc::clone(&control) as Arc<dyn FleetControl>;
-    (Harness::builder().fleet(shared).build(), control)
+    (
+        Harness::builder().config(&fleet_config()).fleet(shared).build(),
+        control,
+    )
 }
 
 fn session(admin: &Harness, role: Role) -> TestSession {
@@ -310,15 +327,20 @@ fn a_simulation_touches_nothing_and_needs_only_the_simulate_permission() {
 fn a_deployment_patch_must_ask_for_something() {
     let (admin, recorder) = harness_with(Arc::new(Recorder::default()));
     let operator = session(&admin, Role::Operator);
-    let response =
-        admin.patch_without_if_match(&operator, "/admin/v1/fleet/deployments/spark-music3", "{}");
+    let response = admin.patch(
+        &operator,
+        "/admin/v1/fleet/deployments/spark-music3",
+        "{}",
+        harness::ANY_ETAG,
+    );
     assert_eq!(response.status, 400);
     assert!(recorder.calls().is_empty());
 
-    let response = admin.patch_without_if_match(
+    let response = admin.patch(
         &operator,
         "/admin/v1/fleet/deployments/spark-music3",
         r#"{"pinned":true}"#,
+        harness::ANY_ETAG,
     );
     assert_eq!(response.status, 200);
     assert!(recorder.calls()[0].starts_with("patch:spark-music3"));
@@ -356,4 +378,112 @@ fn an_unknown_fleet_action_is_a_not_found_rather_than_a_silent_success() {
     let response = admin.post(&operator, "/admin/v1/fleet/deployments/spark-music3:obliterate", "{}");
     assert_eq!(response.status, 404);
     assert!(recorder.calls().is_empty());
+}
+
+#[test]
+fn a_tenant_that_cannot_reach_a_deployment_cannot_start_stop_or_pin_it() {
+    // Appendix B. Starting, stopping, or pinning a deployment changes what
+    // serves another tenant's traffic, so a tenant whose grants reach none of
+    // the deployment's target may do none of it. And the refusal is the same
+    // 404 an undeclared deployment gets, so the fleet's contents are not
+    // enumerable from outside it.
+    let (admin, recorder) = harness_with(Arc::new(Recorder::default()));
+    let stranger = admin.session("user:operator", harness::TENANT_B, &[Role::Operator]);
+
+    let paths = [
+        "/admin/v1/fleet/deployments/spark-music3:activate",
+        "/admin/v1/fleet/deployments/spark-music3:deactivate",
+    ];
+    for path in paths {
+        let response = admin.post(&stranger, path, "{}");
+        assert_eq!(response.status, 404, "{path}: {}", response.body);
+    }
+    let response = admin.patch_without_if_match(
+        &stranger,
+        "/admin/v1/fleet/deployments/spark-music3",
+        r#"{"pinned":true}"#,
+    );
+    assert_eq!(response.status, 404, "{}", response.body);
+    assert!(
+        recorder.calls().is_empty(),
+        "an invisible deployment must never reach the fleet: {:?}",
+        recorder.calls()
+    );
+
+    // Indistinguishable from a deployment that does not exist.
+    let unknown = admin.post(&stranger, "/admin/v1/fleet/deployments/no-such:activate", "{}");
+    assert_eq!(unknown.status, 404);
+    assert_eq!(unknown.error_code, response.error_code);
+
+    // And the owner is unaffected.
+    let owner = session(&admin, Role::Operator);
+    let response = admin.post(&owner, "/admin/v1/fleet/deployments/spark-music3:activate", "{}");
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert_eq!(recorder.calls(), vec!["activate:spark-music3".to_owned()]);
+}
+
+#[test]
+fn a_deployment_patch_needs_the_tag_the_fleet_view_disclosed() {
+    // Specification 15.4, "If-Match on mutation". The admin screen used to
+    // send no If-Match at all, and the client library refuses a PATCH without
+    // one — so the pin button threw before any request was made. The tag a
+    // read discloses must be the tag the write accepts.
+    let (admin, recorder) = harness_with(Arc::new(Recorder::default()));
+    let operator = session(&admin, Role::Operator);
+    let path = "/admin/v1/fleet/deployments/spark-music3";
+
+    let missing = admin.patch_without_if_match(&operator, path, r#"{"pinned":true}"#);
+    assert_eq!(missing.status, 428, "{}", missing.body);
+    let stale = admin.patch(&operator, path, r#"{"pinned":true}"#, harness::STALE_ETAG);
+    assert_eq!(stale.status, 412, "{}", stale.body);
+    assert!(recorder.calls().is_empty(), "a refused patch reached the fleet");
+
+    let listing = admin.get(&operator, "/admin/v1/fleet");
+    let etag = listing
+        .json()
+        .field_array("deployments")
+        .unwrap()
+        .iter()
+        .find(|d| d.field_str("id").ok() == Some("spark-music3"))
+        .and_then(|d| d.field_str("etag").ok().map(str::to_owned))
+        .expect("the fleet view discloses each deployment's tag");
+    let accepted = admin.patch(&operator, path, r#"{"pinned":true}"#, &etag);
+    assert_eq!(accepted.status, 200, "{}", accepted.body);
+    assert_eq!(recorder.calls().len(), 1);
+}
+
+#[test]
+fn the_fleet_view_shows_a_tenant_none_of_another_tenants_deployments_or_hosts() {
+    // Specification 26: host identifiers, memory figures and residency are
+    // management-plane data, and management visibility must not exceed the
+    // caller's tenant. The listing used to show every deployment and host to
+    // any `read_fleet` holder — which also made the 404 for an invisible
+    // deployment's actions pointless, since the name was one GET away.
+    let (admin, recorder) = harness_with(Arc::new(Recorder::default()));
+
+    let owner = admin.get(&session(&admin, Role::Operator), "/admin/v1/fleet");
+    assert_eq!(owner.status, 200, "{}", owner.body);
+    assert!(owner.body_contains("spark-music3"), "the owner must still see it");
+    assert!(owner.body_contains("\"spark\""), "and the host it runs on");
+
+    let stranger = admin.session("user:operator", harness::TENANT_B, &[Role::Operator]);
+    let view = admin.get(&stranger, "/admin/v1/fleet");
+    assert_eq!(view.status, 200, "{}", view.body);
+    let json = view.json();
+    assert!(json.field_array("deployments").unwrap().is_empty(), "{}", view.body);
+    assert!(json.field_array("hosts").unwrap().is_empty(), "{}", view.body);
+    for leak in ["spark", "music3", "gb10"] {
+        assert!(!view.body_contains(leak), "'{leak}' leaked: {}", view.body);
+    }
+
+    let activations = admin.get(&stranger, "/admin/v1/fleet/activations");
+    assert_eq!(activations.status, 200);
+    assert!(!activations.body_contains("spark"), "{}", activations.body);
+
+    // A simulation names hosts and residency too: an unreachable target is a
+    // 404, and the planner is never asked.
+    let editor = admin.session("user:editor", harness::TENANT_B, &[Role::PolicyEditor]);
+    let simulated = admin.post(&editor, "/admin/v1/fleet:simulate", r#"{"target":"spark:music3"}"#);
+    assert_eq!(simulated.status, 404, "{}", simulated.body);
+    assert!(recorder.calls().is_empty(), "{:?}", recorder.calls());
 }

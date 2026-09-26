@@ -196,21 +196,19 @@ impl ScopeLimits {
 /// Truncation is the point rather than a defect: rounding a node's share *down*
 /// is what keeps the sum across nodes at or below the configured limit. Rounding
 /// up, or using a float, would let N nodes admit more than was configured.
-#[allow(
-    clippy::integer_division,
-    reason = "truncation is the conservative direction; rounding up would raise every limit"
-)]
 const fn divide_u32(value: u32, by: u32) -> u32 {
-    if by == 0 { value } else { value / by }
+    match value.checked_div(by) {
+        Some(quotient) => quotient,
+        None => value,
+    }
 }
 
 /// [`divide_u32`] for the token counters, which are 64-bit.
-#[allow(
-    clippy::integer_division,
-    reason = "truncation is the conservative direction; rounding up would raise every limit"
-)]
 const fn divide_u64(value: u64, by: u64) -> u64 {
-    if by == 0 { value } else { value / by }
+    match value.checked_div(by) {
+        Some(quotient) => quotient,
+        None => value,
+    }
 }
 
 impl Default for ScopeLimits {
@@ -324,6 +322,25 @@ pub struct TokenBucket {
 struct BucketState {
     level_milli: u64,
     last_ms: u64,
+    /// Units admitted beyond the bucket's capacity and not yet paid for.
+    ///
+    /// Refill and refunds pay this down before they raise the level, so while
+    /// it is non-zero the level is zero and nothing else is admitted. See
+    /// [`TokenBucket::try_take`] for why an oversized request creates debt
+    /// rather than being clamped to the capacity.
+    debt_milli: u64,
+}
+
+impl BucketState {
+    /// Credit `amount` thousandths: pay down debt first, then raise the level.
+    fn credit(&mut self, amount: u64, capacity_milli: u64) {
+        let paid = amount.min(self.debt_milli);
+        self.debt_milli -= paid;
+        self.level_milli = self
+            .level_milli
+            .saturating_add(amount - paid)
+            .min(capacity_milli);
+    }
 }
 
 impl TokenBucket {
@@ -337,6 +354,7 @@ impl TokenBucket {
             state: Mutex::new(BucketState {
                 level_milli: capacity.saturating_mul(1000),
                 last_ms: now_ms,
+                debt_milli: 0,
             }),
         }
     }
@@ -356,6 +374,7 @@ impl TokenBucket {
             state: Mutex::new(BucketState {
                 level_milli: capacity.saturating_mul(1000),
                 last_ms: now_ms,
+                debt_milli: 0,
             }),
         }
     }
@@ -368,14 +387,30 @@ impl TokenBucket {
             return;
         }
         let credit = elapsed.saturating_mul(self.refill_milli_per_ms);
-        state.level_milli = state
-            .level_milli
-            .saturating_add(credit)
-            .min(self.capacity_milli);
+        state.credit(credit, self.capacity_milli);
         state.last_ms = now_ms;
     }
 
     /// Try to take `amount` units.
+    ///
+    /// All or nothing, and when it succeeds the **whole** `amount` is charged.
+    ///
+    /// # Oversized requests
+    ///
+    /// A request larger than the bucket's capacity could never be admitted by
+    /// a plain check, which with `token_burst=0` (capacity is one second of the
+    /// rate) would refuse every realistic prompt. So it is admitted when the
+    /// bucket is full — and charged in full, with the part beyond the capacity
+    /// carried as debt that refill must pay off before anything else is
+    /// admitted. The rate is therefore honoured over time: a request of ten
+    /// minutes' tokens costs ten minutes of refill.
+    ///
+    /// The alternative this replaces clamped the charge to the capacity, so an
+    /// arbitrarily large request cost at most one second of refill — and since
+    /// reconciliation refunds `estimate - actual` against the full estimate, a
+    /// request whose estimate was clamped could have almost all of its real
+    /// usage refunded as well. Charging in full is the fail-closed choice that
+    /// keeps both the admission charge and the later refund in the same units.
     pub fn try_take(&self, amount: u64, now_ms: u64) -> bool {
         let mut state = match self.state.lock() {
             Ok(g) => g,
@@ -383,10 +418,17 @@ impl TokenBucket {
         };
         self.refill_locked(&mut state, now_ms);
         let want = amount.saturating_mul(1000);
-        // A single request larger than the whole bucket would never be
-        // admissible; allow it when the bucket is full, so that one oversized
-        // request does not deadlock behind a limit it can never satisfy.
-        let want = want.min(self.capacity_milli);
+        if state.debt_milli > 0 {
+            return false;
+        }
+        if want > self.capacity_milli {
+            if state.level_milli < self.capacity_milli {
+                return false;
+            }
+            state.debt_milli = want - state.level_milli;
+            state.level_milli = 0;
+            return true;
+        }
         if state.level_milli >= want {
             state.level_milli -= want;
             true
@@ -397,17 +439,16 @@ impl TokenBucket {
 
     /// Return `amount` units, never exceeding capacity.
     ///
-    /// Used for reconciliation when actual usage came in below the estimate.
-    /// Capping at capacity is what stops a refund from becoming free burst.
+    /// Used for reconciliation when actual usage came in below the estimate,
+    /// and to roll back a reservation that was refused elsewhere. Outstanding
+    /// debt is paid first; capping at capacity is what stops a refund from
+    /// becoming free burst.
     pub fn refund(&self, amount: u64) {
         let mut state = match self.state.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        state.level_milli = state
-            .level_milli
-            .saturating_add(amount.saturating_mul(1000))
-            .min(self.capacity_milli);
+        state.credit(amount.saturating_mul(1000), self.capacity_milli);
     }
 
     /// Deduct `amount` units, draining to empty when the level is short.
@@ -657,6 +698,7 @@ impl Scope {
     }
 
     /// Try to reserve one request slot and `tokens` of budget.
+    #[cfg(test)]
     fn try_acquire(&self, tokens: u64, now_ms: u64) -> Result<(), Rejection> {
         self.try_acquire_as(tokens, now_ms, None)
     }
@@ -840,6 +882,30 @@ impl Scope {
         }
     }
 
+    /// Undo a successful [`Scope::try_acquire_as`] whose reservation was
+    /// refused at another scope.
+    ///
+    /// Not [`Scope::release`]: a release reconciles a request that *ran*, so it
+    /// keeps the request-rate token and charges the tokens actually used. A
+    /// rolled-back acquisition ran nothing, so everything it took — the slot,
+    /// the request-rate token, and the whole token estimate — goes back. A
+    /// rejection at a narrow scope must not drain the wider ones, or one
+    /// saturated target would starve its tenant's budget for every other
+    /// target.
+    fn rollback(&self, tokens: u64) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        if let Some(bucket) = &self.request_bucket {
+            bucket.refund(1);
+        }
+        if let Some(bucket) = &self.token_bucket {
+            bucket.refund(tokens);
+        }
+        self.released.fetch_add(1, Ordering::SeqCst);
+        if self.limits.max_queued > 0 {
+            self.slot_freed.notify_all();
+        }
+    }
+
     /// Join the waiting line, if there is room.
     ///
     /// Returns the ticket to pass to [`Scope::wait_for_turn`], or the rejection
@@ -965,6 +1031,18 @@ impl Reservation {
         // no-op.
     }
 
+    /// Release a reservation whose attempt consumed no tokens.
+    ///
+    /// For an attempt that never reached the provider, or that the provider
+    /// refused before producing anything: the token estimate is refunded in
+    /// full. The request-rate token is kept — the attempt was made — and the
+    /// concurrency slot is returned as on every other path. `Drop`, by
+    /// contrast, charges the whole estimate, which is the conservative answer
+    /// for a path that does not know what happened.
+    pub fn release_unused(self) {
+        self.finish(0);
+    }
+
     fn finish(&self, actual_tokens: u64) {
         if self.released.swap(true, Ordering::SeqCst) {
             return;
@@ -987,11 +1065,13 @@ impl Drop for Reservation {
     }
 }
 
+/// Alias scopes, keyed by alias and optional operation qualifier.
+type AliasScopes = BTreeMap<(AliasId, Option<Operation>), Arc<Scope>>;
+
 /// The hierarchical admission controller.
 ///
-/// Layers follow specification 12: global, tenant, principal, target. The alias
-/// and provider layers are expressed as target-scope limits, since every alias
-/// resolves to a target before admission runs.
+/// Layers follow specification 12: global, tenant, principal, alias, target.
+/// The provider layer is expressed as target-scope limits.
 #[derive(Debug)]
 pub struct AdmissionController {
     clock: Arc<dyn Clock>,
@@ -1003,7 +1083,7 @@ pub struct AdmissionController {
     ///
     /// Specification 12's "Alias/model" admission layer. `None` covers every
     /// operation on that alias; a `Some` entry is preferred when it matches.
-    aliases: RwLock<BTreeMap<(AliasId, Option<Operation>), Arc<Scope>>>,
+    aliases: RwLock<AliasScopes>,
     /// Global input/output byte-rate buckets (specification 12's Global layer).
     inbound_bytes: RwLock<Option<TokenBucket>>,
     outbound_bytes: RwLock<Option<TokenBucket>>,
@@ -1350,8 +1430,23 @@ impl AdmissionController {
         target: &TargetId,
         estimated_tokens: u64,
     ) -> Result<Reservation, (Rejection, String)> {
-        let now = self.clock.now_millis();
+        self.acquire_chain(tenant, principal, alias, target, estimated_tokens, None)
+    }
 
+    /// Every scope a request passes through, widest to narrowest.
+    ///
+    /// One function, used by the first attempt, by the queued retry, and by
+    /// the lookup that decides which scope to queue on, so the three cannot
+    /// disagree about which layers apply. They used to be three hand-written
+    /// lists, and the queued retry's omitted the alias layer — a request that
+    /// had waited in line was admitted past the alias's limits.
+    fn chain(
+        &self,
+        tenant: &TenantId,
+        principal: &PrincipalId,
+        alias: Option<(&AliasId, Operation)>,
+        target: &TargetId,
+    ) -> Vec<Arc<Scope>> {
         // Widest to narrowest, so a global overload is rejected before any
         // narrower bookkeeping happens.
         let mut chain: Vec<Arc<Scope>> = vec![
@@ -1369,18 +1464,39 @@ impl AdmissionController {
         if let Some(t) = self.target_scope(target) {
             chain.push(t);
         }
+        chain
+    }
+
+    /// Acquire across the whole chain, all or nothing.
+    ///
+    /// `holder` is a queue ticket and the scope it is honoured at, for a
+    /// request that has waited its turn.
+    fn acquire_chain(
+        &self,
+        tenant: &TenantId,
+        principal: &PrincipalId,
+        alias: Option<(&AliasId, Operation)>,
+        target: &TargetId,
+        estimated_tokens: u64,
+        holder: Option<(&Arc<Scope>, u64)>,
+    ) -> Result<Reservation, (Rejection, String)> {
+        let now = self.clock.now_millis();
+        let chain = self.chain(tenant, principal, alias, target);
 
         let mut held: Vec<Arc<Scope>> = Vec::with_capacity(chain.len());
         for scope in chain {
-            match scope.try_acquire(estimated_tokens, now) {
+            let ticket = holder
+                .and_then(|(queued, ticket)| (queued.name == scope.name).then_some(ticket));
+            match scope.try_acquire_as(estimated_tokens, now, ticket) {
                 Ok(()) => held.push(scope),
                 Err(rejection) => {
                     let name = scope.name.clone();
-                    // Roll back everything acquired so far. Without this, a
-                    // rejection at the target layer would leak a slot in the
-                    // global and tenant layers on every attempt.
+                    // Roll back everything acquired so far, in full. Without
+                    // this, a rejection at the target layer would leak a slot
+                    // — and request and token budget — in the global and
+                    // tenant layers on every attempt.
                     for acquired in held.iter().rev() {
-                        acquired.release(estimated_tokens, estimated_tokens, now);
+                        acquired.rollback(estimated_tokens);
                     }
                     return Err((rejection, name));
                 }
@@ -1453,7 +1569,7 @@ impl AdmissionController {
         match first {
             Ok(reservation) => Ok((reservation, 0)),
             Err((Rejection::ConcurrencyExhausted, name)) => {
-                let Some(scope) = self.scope_named(&name, tenant, principal, target) else {
+                let Some(scope) = self.scope_named(&name, tenant, principal, alias, target) else {
                     return Err((Rejection::ConcurrencyExhausted, name));
                 };
                 if scope.limits.max_queued == 0 || budget.is_zero() {
@@ -1479,13 +1595,13 @@ impl AdmissionController {
                         return Err((Rejection::QueueTimeout, name));
                     }
                     let waited = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    match self.reserve_holding(
+                    match self.acquire_chain(
                         tenant,
                         principal,
+                        alias,
                         target,
                         estimated_tokens,
-                        &scope,
-                        ticket.ticket,
+                        Some((&scope, ticket.ticket)),
                     ) {
                         Ok(reservation) => return Ok((reservation, waited)),
                         Err((Rejection::ConcurrencyExhausted, again)) if again == name => {
@@ -1506,66 +1622,20 @@ impl AdmissionController {
     }
 
     /// The scope a rejection named, so the caller can queue on it.
+    ///
+    /// Searches the same chain the reservation walked, alias layer included,
+    /// so a concurrency limit on an alias can queue like any other.
     fn scope_named(
         &self,
         name: &str,
         tenant: &TenantId,
         principal: &PrincipalId,
+        alias: Option<(&AliasId, Operation)>,
         target: &TargetId,
     ) -> Option<Arc<Scope>> {
-        [
-            Some(Arc::clone(&self.global)),
-            Some(self.tenant_scope(tenant)),
-            Some(self.principal_scope(principal)),
-            self.target_scope(target),
-        ]
-        .into_iter()
-        .flatten()
-        .find(|scope| scope.name == name)
-    }
-
-    /// `reserve`, with `holder`'s ticket honoured at `queued_scope`.
-    fn reserve_holding(
-        &self,
-        tenant: &TenantId,
-        principal: &PrincipalId,
-        target: &TargetId,
-        estimated_tokens: u64,
-        queued_scope: &Arc<Scope>,
-        ticket: u64,
-    ) -> Result<Reservation, (Rejection, String)> {
-        let now = self.clock.now_millis();
-        let mut chain: Vec<Arc<Scope>> = vec![
-            Arc::clone(&self.global),
-            self.tenant_scope(tenant),
-            self.principal_scope(principal),
-        ];
-        if let Some(t) = self.target_scope(target) {
-            chain.push(t);
-        }
-
-        let mut held: Vec<Arc<Scope>> = Vec::with_capacity(chain.len());
-        for scope in chain {
-            let held_ticket = (scope.name == queued_scope.name).then_some(ticket);
-            match scope.try_acquire_as(estimated_tokens, now, held_ticket) {
-                Ok(()) => held.push(scope),
-                Err(rejection) => {
-                    let name = scope.name.clone();
-                    for acquired in held.iter().rev() {
-                        acquired.release(estimated_tokens, estimated_tokens, now);
-                    }
-                    return Err((rejection, name));
-                }
-            }
-        }
-
-        Ok(Reservation {
-            scopes: held,
-            reserved_tokens: estimated_tokens,
-            released: AtomicBool::new(false),
-            clock: Arc::clone(&self.clock),
-            target: target.clone(),
-        })
+        self.chain(tenant, principal, alias, target)
+            .into_iter()
+            .find(|scope| scope.name == name)
     }
 }
 

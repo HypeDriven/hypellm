@@ -106,6 +106,13 @@ pub enum UsageSource {
     ProviderReported,
     /// The router estimated it.
     RouterEstimated,
+    /// The provider reported output tokens but not input tokens.
+    ///
+    /// Kept apart from [`Self::ProviderReported`] because the adapter would
+    /// otherwise have to write `input_tokens: 0`, and zero is a number a
+    /// renderer shows and a meter bills. `input_tokens` is meaningless under
+    /// this source; read it through [`CanonicalUsage::known_input_tokens`].
+    ProviderReportedOutput,
 }
 
 impl UsageSource {
@@ -115,6 +122,7 @@ impl UsageSource {
         match self {
             Self::ProviderReported => "provider_reported",
             Self::RouterEstimated => "router_estimated",
+            Self::ProviderReportedOutput => "provider_reported_partial",
         }
     }
 }
@@ -166,9 +174,66 @@ impl CanonicalUsage {
     }
 
     /// True when the numbers came from the provider.
+    ///
+    /// False for [`UsageSource::ProviderReportedOutput`]: a record whose input
+    /// half is unknown cannot stand in for the router's estimate of it.
     #[must_use]
     pub const fn is_reported(&self) -> bool {
         matches!(self.source, UsageSource::ProviderReported)
+    }
+
+    /// A provider report that carried output tokens but no input tokens.
+    #[must_use]
+    pub const fn output_only(output_tokens: u64) -> Self {
+        Self {
+            input_tokens: 0,
+            output_tokens,
+            cached_input_tokens: 0,
+            reasoning_tokens: 0,
+            source: UsageSource::ProviderReportedOutput,
+        }
+    }
+
+    /// Input tokens, or `None` when the provider did not report them.
+    #[must_use]
+    pub const fn known_input_tokens(&self) -> Option<u64> {
+        match self.source {
+            UsageSource::ProviderReportedOutput => None,
+            UsageSource::ProviderReported | UsageSource::RouterEstimated => {
+                Some(self.input_tokens)
+            }
+        }
+    }
+
+    /// Combine an earlier report with a later one from the same response.
+    ///
+    /// Anthropic reports input in `message_start` and output in
+    /// `message_delta`; taking only the later one would lose the input. Counts
+    /// are cumulative, so each field keeps the larger value, and input is taken
+    /// only from a report that actually carried it.
+    #[must_use]
+    pub fn merge(self, later: Self) -> Self {
+        let source = if self.is_reported() || later.is_reported() {
+            UsageSource::ProviderReported
+        } else if matches!(self.source, UsageSource::ProviderReportedOutput)
+            || matches!(later.source, UsageSource::ProviderReportedOutput)
+        {
+            UsageSource::ProviderReportedOutput
+        } else {
+            UsageSource::RouterEstimated
+        };
+        let input = |u: &Self| match source {
+            UsageSource::ProviderReported if u.is_reported() => u.input_tokens,
+            UsageSource::ProviderReported | UsageSource::ProviderReportedOutput => 0,
+            UsageSource::RouterEstimated => u.input_tokens,
+        };
+        Self {
+            input_tokens: input(&self).max(input(&later)),
+            output_tokens: self.output_tokens.max(later.output_tokens),
+            cached_input_tokens: self.cached_input_tokens.max(later.cached_input_tokens),
+            reasoning_tokens: self.reasoning_tokens.max(later.reasoning_tokens),
+            source,
+        }
     }
 }
 
@@ -231,6 +296,21 @@ pub enum CanonicalEvent {
         /// The vector.
         values: Vec<f32>,
     },
+    /// A relevance score for one candidate, for reranking operations.
+    ///
+    /// The counterpart of [`Self::Embedding`] for
+    /// [`Operation::Rerank`](crate::canonical::Operation::Rerank): one number
+    /// per candidate, at the candidate's position in the request. It is the
+    /// provider's score as reported, never renormalised here — a scorer that
+    /// reports an uncalibrated probability and a reranker that reports a
+    /// cosine similarity are both carried unchanged, because rescaling one to
+    /// look like the other would invent a confidence nobody measured.
+    Score {
+        /// Position in the candidate list the caller sent.
+        index: u32,
+        /// The score, as the provider reported it.
+        score: f32,
+    },
     /// Usage accounting.
     Usage(CanonicalUsage),
     /// Generation finished.
@@ -259,6 +339,7 @@ impl CanonicalEvent {
                 | Self::ReasoningDelta(_)
                 | Self::ToolCallDelta(_)
                 | Self::Embedding { .. }
+                | Self::Score { .. }
         )
     }
 
@@ -282,7 +363,7 @@ impl CanonicalEvent {
             Self::TextDelta(t) | Self::ReasoningDelta(t) => t.len(),
             Self::ToolCallDelta(d) => d.arguments_delta.len(),
             Self::Embedding { values, .. } => values.len() * 4,
-            Self::Usage(_) | Self::Finish { .. } => 0,
+            Self::Score { .. } | Self::Usage(_) | Self::Finish { .. } => 0,
             Self::Error(e) => e.detail.as_str().len(),
         }
     }
@@ -306,6 +387,9 @@ impl fmt::Debug for CanonicalEvent {
             Self::Embedding { index, values } => {
                 write!(f, "Embedding {{ index: {index}, dims: {} }}", values.len())
             }
+            // A score is a number about the caller's own candidate list, not
+            // model-authored text, so it is safe to render in full.
+            Self::Score { index, score } => write!(f, "Score {{ index: {index}, score: {score} }}"),
             Self::Usage(u) => write!(f, "{u:?}"),
             Self::Finish { reason } => write!(f, "Finish {{ reason: {reason:?} }}"),
             Self::Error(e) => write!(f, "Error({})", e.code),
@@ -338,6 +422,12 @@ pub mod limits {
     pub const MAX_TOOL_ARGUMENTS_BYTES: usize = 1024 * 1024;
     /// Embedding vectors in one response.
     pub const MAX_EMBEDDINGS: usize = 100_000;
+    /// Scores in one response.
+    ///
+    /// Far above any reranking request the router will accept — the rerank
+    /// endpoint bounds the candidate list itself — so reaching this means a
+    /// provider answered a question nobody asked.
+    pub const MAX_SCORES: usize = 4_096;
 }
 
 /// Accumulates a stream into a complete response.
@@ -355,6 +445,8 @@ pub struct ResponseAccumulator {
     pub tool_calls: Vec<AccumulatedToolCall>,
     /// Embedding vectors.
     pub embeddings: Vec<(u32, Vec<f32>)>,
+    /// Relevance scores, as `(candidate index, score)`.
+    pub scores: Vec<(u32, f32)>,
     /// Usage, once seen.
     pub usage: Option<CanonicalUsage>,
     /// Finish reason, once seen.
@@ -467,7 +559,19 @@ impl ResponseAccumulator {
                 }
                 self.embeddings.push((*index, values.clone()));
             }
-            CanonicalEvent::Usage(u) => self.usage = Some(*u),
+            CanonicalEvent::Score { index, score } => {
+                if self.scores.len() >= limits::MAX_SCORES {
+                    self.truncated = true;
+                    return;
+                }
+                self.scores.push((*index, *score));
+            }
+            CanonicalEvent::Usage(u) => {
+                self.usage = Some(match self.usage {
+                    Some(previous) => previous.merge(*u),
+                    None => *u,
+                });
+            }
             CanonicalEvent::Finish { reason } => self.finish = Some(*reason),
             CanonicalEvent::Error(e) => self.error = Some(e.clone()),
         }

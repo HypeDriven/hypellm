@@ -65,9 +65,24 @@ Three properties are worth naming, because each is easy to lose:
 - **An absent fleet answers "not configured on this router", not an empty list.**
   Per the honesty rule, a screen with no backing endpoint says so; a plausible
   empty fleet is exactly what stops an operator going to look.
-- **An action is reported as successful only if it was also recorded.** Operator
-  activations and deactivations go through `record_audit`, which fails the
-  request when the audit record does not reach disk.
+- **An action is reported as successful only if it was also recorded.** A fleet
+  action is decided by the agent, so it cannot be audited first: it is recorded
+  through `record_audit_after_effect`, whose failure answers that the action
+  *was* applied and must not be retried, and logs `audit.append_failed_after_effect`
+  critically.
+- **Tenant-scoped, reads and writes alike.** A deployment is visible only when
+  its target is in `visible_targets` for the caller's tenant (Appendix B,
+  specification 26). `GET /fleet` renders only those deployments and the
+  accelerators and hosts they sit on; `GET /fleet/activations` only their
+  activations, with evicted deployments of other tenants counted in
+  `evicted_hidden` rather than named; `fleet:simulate` refuses an unreachable
+  target with 404 and renders an eviction of an invisible deployment with
+  `"deployment": null`. Activate, deactivate and patch answer 404 for an
+  invisible deployment before the fleet is asked, identical to an undeclared
+  one. No role is router-scoped, so there is no unfiltered view. Pool figures
+  on a shown accelerator remain whole-pool figures.
+- **A deployment patch needs `If-Match`.** Each deployment in `GET /fleet`
+  carries an `etag` over its patchable fields (`fleet::deployment_etag`).
 
 `fleet_activate` and `fleet_fetch` are separate permissions, and `fleet_fetch`
 requires a fresh authentication: it is the one action on which a single request
@@ -81,10 +96,33 @@ can cost the fleet hours of bandwidth and hundreds of gigabytes of disk.
   *only* when no session cookie was sent, so a request that is
   cookie-authenticated cannot divert itself to a path with no CSRF check by
   adding an `Authorization` header. The key carries no roles of its own — they
-  are resolved from the active configuration's bindings for its principal on
-  every request — and `require` refuses `BreakGlass` and `ManageKeys` to any
-  key whatever those bindings say, so a key that publishes a policy granting
-  itself `break_glass_admin` still cannot use either.
+  are resolved from the active configuration's bindings for its principal, in
+  the key's tenant, on every request — and `require` refuses `BreakGlass` and
+  `ManageKeys` to any key whatever those bindings say, so a key that publishes
+  a policy granting itself `break_glass_admin` still cannot use either.
+- **Roles are tenant-scoped.** `role_binding` names no tenant, so
+  `management_roles_for(config, principal, tenant)` takes the tenant from where
+  the configuration places the principal (`identity`, `local_user`, group
+  membership). A principal placed in some tenant holds its roles only there; a
+  principal placed nowhere (a service principal known only by its bindings) is
+  not narrowed, and the key's own tenant bounds what it can see.
+- **Session roles follow the active configuration.** A session records the
+  configuration version its roles were resolved against (`roles_version`).
+  `current_roles` re-resolves them whenever the active version differs: an OIDC
+  session must still match an `identity` record, a password session a
+  `local_user`, with the same principal and tenant, or the session is
+  invalidated with 401; otherwise its roles become exactly what the bindings
+  now grant. Break-glass sessions are not re-resolved: their authority is the
+  offline token and a short lifetime, and a recovery path a bad publication
+  could revoke would fail when it is needed.
+- **A minted key cannot exceed its minter.** `ManageKeys` belongs to
+  `break_glass_admin` alone. `create_key` refuses a management-scoped key whose
+  principal's roles (resolved in the caller's tenant) are not a subset of the
+  caller's roles other than `break_glass_admin`. A key minted by a break-glass
+  caller expires no later than the minting session: an absent `expires_at`
+  takes that bound, a later one is refused with 400. Every minted key records
+  its creator (`KeyRecord::created_by`), which a key-authenticated session
+  carries as `Session::accountable`.
 - **Cross-site request forgery against a privileged session.** The gate in
   `AdminApi::handle` runs origin → session → CSRF → permission → freshness →
   `If-Match`, and the order is load-bearing: a caller from a hostile origin is
@@ -107,11 +145,16 @@ can cost the fleet hours of bandwidth and hundreds of gigabytes of disk.
   identifier exists. `UsageAggregate::rows` never crosses a tenant boundary and
   refuses to attribute an overflow row to any principal, so `ReadOwnUsage` can
   never surface another principal's tokens. `list_keys` filters by
-  `session.tenant`. **`list_audit` does not filter by tenant**: `AuditIndex` is
-  a single global ring and `recent()` returns every record in it, so a caller
-  holding `ReadAudit` in one tenant sees audit rows carrying another tenant's
-  identifier. That contradicts 15.4's "management visibility never exceeds the
-  caller's tenant" and needs a tenant predicate on the index read.
+  `session.tenant`, and `list_audit` reads only the caller's tenant's records.
+  `patch_target` (including quarantine) answers 404 for a target outside
+  `visible_targets` before the `If-Match` check, so a stale tag is not an
+  existence oracle. The overview includes the router-wide `audit_records` and
+  `audit_head` only for a caller holding `ReadAudit`, since both move with
+  every tenant's actions.
+- **Durable audit paging.** `scan_audit` advances the cursor record by record
+  and, when its batch budget (`MAX_AUDIT_SCAN_PAGES`) runs out before a page
+  fills, still returns a cursor, so a filtered search is never reported as
+  complete when it was truncated.
 - **A misleading audit view.** `AuditIndex::record` reconstructs the indexed
   event from the session rather than from what was written, and synthesizes
   `AuditAction::SettingsChanged` with timestamp `0` for every action. The
@@ -119,16 +162,25 @@ can cost the fleet hours of bandwidth and hundreds of gigabytes of disk.
   reads, but the audit *screen* currently reports the wrong action and epoch
   time for every management mutation routed through `record_audit`. A wrong
   action label in an audit UI is worse than a missing one.
-- **Fail-closed audit.** `record_audit` propagates an append failure as
-  `internal_fault` and the caller reports the action as not applied
-  (18.3). `publish_draft` writes the `ConfigActivation` record durably *before*
-  the pointer swap: a crash between the two leaves a record of an activation
-  that did not take effect, which an operator can see, whereas the reverse
-  ordering would leave a running configuration nobody is accountable for.
+- **Fail-closed audit, audit first.** `record_audit` propagates an append
+  failure as `internal_fault` reporting the action as not applied (18.3), and
+  every caller applies its change only after it returns. `patch_target`,
+  `publish_draft`, `rollback_policy`, `set_anonymous_access`,
+  `rotate_credential` and `create_key` write the audit record, then the durable
+  state frame (`ConfigActivation`, `AnonymousAccess`, `ApiKey`, the credential
+  sink), then apply the change. If the state write fails after the audit
+  record, `record_abandoned` appends a best-effort record of the same action
+  with outcome `failed` and reason `not applied: …`, so the chain never reads
+  as though an abandoned change took effect; `create_key` also revokes the
+  in-memory key and `publish_draft` returns the reserved version number. Fleet
+  actions are the exception, described above.
 - **Separation of duties on publication.** The self-approval refusal lives in
-  `DraftStore::prepare_publish`, keyed on the draft's author, not on the
-  request. A handler-level check could be bypassed by any second code path that
-  publishes; a property of the draft cannot.
+  `DraftStore::prepare_publish_by`, a property of the draft, not of the
+  request. A draft records its author and, when the author was a key, the key's
+  creator (`Draft::author_accountable`); the publisher is compared as every
+  principal it acts as (`Session::actors`: its own and, for a key, the key's
+  creator). Minting a key for another principal is therefore not a way to
+  become a second person in either direction.
 - **Secret exposure surface.** A key secret is returned exactly once, from
   `create_key`, via `NewKey::into_secret()` (9.2, 15.3). `list_keys` returns no
   verifier material even though it is not the secret. Provider credential

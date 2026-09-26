@@ -125,6 +125,14 @@ eventually acquire a shortcut to it.
   activation now holds. `accounting()` exposes the two counters so the
   conservation property is checked against something other than the map the code
   maintains.
+- **Concurrent plans.** `plan` is pure and runs on whatever snapshot a request
+  holds, so two plans can each be sound alone and unsound together. The planner
+  counts `FleetSnapshot::leases` (a leased deployment is already coming up,
+  holds a concurrency slot, and commits its memory, as do pending and fetching
+  ones) and `FleetSnapshot::evicting` (never a second victim). The executor
+  closes the remaining gap: `revalidate` against the ledger's commitments, then
+  `ActivationLedger::acquire_exclusive`, which refuses the same deployment or an
+  overlapping eviction set atomically.
 - **Poisoned locks.** Every `RwLock` here fails in the direction that cannot
   cause fleet work: budgets refuse, flap counters return the plain cooldown, and
   demand drops a sample. The one exception is `ActivationQueue::admit`, which
@@ -151,6 +159,8 @@ Enforced within this crate:
 | Queued requests per capability | 256 | `governance::MAX_QUEUED_PER_CAPABILITY` |
 | Flap backoff | `max_flap_cooldown_ms`, default 1 hour | `governance::FlapCounter` |
 | Retained activation history | 256 records | `activation::MAX_HISTORY` |
+| Remembered released leases (double-release detection) | 4 096 | `activation::MAX_RELEASED`; an older identifier is refused as `Unknown` instead |
+| Zero samples folded per demand roll | 256 windows | `demand::MAX_WINDOWS_PER_ROLL` |
 | Concurrent activations per host | `max_concurrent_activations`, default 1 | `activation::ActivationLedger::acquire` |
 | Observation-derived timing adjustment | ×¼ to ×4 of the declared figure | `state::TIMING_CLAMP_FACTOR` |
 | Score and value terms | Documented ranges, saturating | `plan::*_TERM_RANGE` |

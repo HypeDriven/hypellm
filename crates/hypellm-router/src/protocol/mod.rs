@@ -9,9 +9,11 @@
 //! |---|---|
 //! | [`openai`] | `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/models` |
 //! | [`anthropic`] | `/v1/messages` |
+//! | [`rerank`] | `/v1/rerank` |
 
 pub mod anthropic;
 pub mod openai;
+pub mod rerank;
 
 pub use openai::{DocumentLimits, ParseContext};
 
@@ -77,4 +79,45 @@ pub fn enforce_document_limits(
     }
 
     Ok(())
+}
+
+/// Token counts as a client may be shown them.
+///
+/// A count the provider did not report renders as `null`, never as `0`: zero is
+/// a claim, and one a caller reconciling a bill would believe. The only
+/// estimate available here is admission's conservative upper bound, which is
+/// deliberately inflated, so it is not substituted either — metering uses it
+/// (specification 12 forbids under-counting there), but a response reporting it
+/// as the caller's usage would overstate it.
+pub(crate) struct UsageView {
+    /// Input tokens, or `null`.
+    pub input: wire_json::Value,
+    /// Output tokens, or `null`.
+    pub output: wire_json::Value,
+    /// Their sum, or `null` when either half is unknown.
+    pub total: wire_json::Value,
+    /// Provenance: a [`UsageSource`](hypellm_core::event::UsageSource) name,
+    /// or `unreported` when the provider sent no usage at all.
+    pub source: &'static str,
+}
+
+impl UsageView {
+    pub(crate) fn of(usage: Option<hypellm_core::event::CanonicalUsage>) -> Self {
+        use wire_json::Value;
+        let Some(usage) = usage else {
+            return Self {
+                input: Value::Null,
+                output: Value::Null,
+                total: Value::Null,
+                source: "unreported",
+            };
+        };
+        let input = usage.known_input_tokens();
+        Self {
+            input: input.map_or(Value::Null, Value::from),
+            output: Value::from(usage.output_tokens),
+            total: input.map_or(Value::Null, |i| Value::from(i.saturating_add(usage.output_tokens))),
+            source: usage.source.as_str(),
+        }
+    }
 }

@@ -12,6 +12,7 @@
 
 use crate::limits::Limits;
 use crate::value::{Number, Object, Value};
+use std::hash::BuildHasher as _;
 
 /// What went wrong, without echoing the input.
 ///
@@ -293,6 +294,13 @@ impl<'a> Parser<'a> {
         }
         self.expect(b'{')?;
         let mut obj = Object::new();
+        // Duplicate detection by linear scan made an object of n distinct keys
+        // cost O(n²) — a hostile body within every size limit could pin a
+        // core. Keys are hashed with a per-process random SipHash key, so a
+        // caller cannot manufacture collisions; a hash hit is confirmed by an
+        // exact comparison, so a collision can never reject a valid object.
+        let key_hasher = std::collections::hash_map::RandomState::new();
+        let mut key_hashes: std::collections::HashSet<u64> = std::collections::HashSet::new();
         self.skip_ws();
         if self.peek() == Some(b'}') {
             self.pos += 1;
@@ -311,7 +319,10 @@ impl<'a> Parser<'a> {
             }
             let key_at = self.pos;
             let key = self.parse_string()?;
-            if self.limits.reject_duplicate_keys && obj.contains_key(&key) {
+            if self.limits.reject_duplicate_keys
+                && !key_hashes.insert(key_hasher.hash_one(key.as_str()))
+                && obj.contains_key(&key)
+            {
                 return Err(JsonError {
                     kind: ErrorKind::DuplicateKey,
                     offset: key_at,
@@ -781,6 +792,62 @@ mod tests {
         let v = parse_str(r#"{"a":1,"a":2}"#, &lenient).unwrap();
         // First occurrence wins when the check is disabled.
         assert_eq!(v.get("a").unwrap().as_i64(), Some(1));
+    }
+
+    fn wide_object(keys: usize, duplicate: Option<usize>) -> String {
+        let mut text = String::from("{");
+        for i in 0..keys {
+            if i > 0 {
+                text.push(',');
+            }
+            text.push_str(&format!("\"k{i}\":{i}"));
+        }
+        if let Some(d) = duplicate {
+            text.push_str(&format!(",\"k{d}\":0"));
+        }
+        text.push('}');
+        text
+    }
+
+    #[test]
+    fn duplicate_detection_in_a_wide_object_is_exact() {
+        // The hashed check must neither miss a duplicate nor reject a
+        // distinct key, wherever in a large object the repeat falls.
+        let text = wide_object(10_000, None);
+        let v = parse_str(&text, &Limits::DEFAULT).unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj.len(), 10_000);
+        assert_eq!(v.get("k9999").unwrap().as_i64(), Some(9999));
+        for d in [0, 4_999, 9_998] {
+            let text = wide_object(9_999, Some(d));
+            let err = parse_str(&text, &Limits::DEFAULT).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::DuplicateKey);
+            // The offset names the repeated key, the last one in the text.
+            assert_eq!(err.offset, text.rfind(&format!("\"k{d}\"")).unwrap());
+        }
+    }
+
+    #[test]
+    fn duplicate_detection_is_not_quadratic_in_object_width() {
+        // 300,000 distinct keys: a linear scan per key is ~4.5e10 string
+        // comparisons (minutes); the hashed check is well under a second even
+        // unoptimised. The generous deadline keeps this deterministic on a slow
+        // machine while still catching the quadratic path.
+        const KEYS: usize = 300_000;
+        let limits = Limits {
+            max_object_entries: KEYS,
+            ..Limits::DEFAULT
+        };
+        let text = wide_object(KEYS, None);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let ok = parse_str(&text, &limits).map(|v| v.as_object().map(Object::len));
+            let _ = tx.send(ok);
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("parsing a wide object must not take quadratic time");
+        assert_eq!(result.unwrap(), Some(KEYS));
     }
 
     #[test]

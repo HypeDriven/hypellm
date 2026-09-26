@@ -279,7 +279,7 @@ fn the_overview_reports_the_length_of_the_durable_audit_chain() {
     // The audit counter is an integrity signal: an operator compares it with
     // what they expect to have happened. It must track the store, not a cache.
     let admin = Harness::new();
-    let viewer = admin.viewer();
+    let viewer = admin.auditor();
 
     let before = admin.get(&viewer, "/admin/v1/overview");
     let counted = before.json().field_i64("audit_records").unwrap();
@@ -302,7 +302,7 @@ fn the_overview_shows_only_a_truncated_digest_of_the_policy_and_the_audit_head()
     // enough to tell two snapshots apart on a screen; the full one belongs to
     // the audit envelope, which is what an integrity check reads.
     let admin = Harness::new();
-    let viewer = admin.viewer();
+    let viewer = admin.auditor();
 
     let response = admin.get(&viewer, "/admin/v1/overview");
 
@@ -310,6 +310,25 @@ fn the_overview_shows_only_a_truncated_digest_of_the_policy_and_the_audit_head()
     assert_eq!(digest, admin.config().digest.short());
     assert_eq!(digest.len(), 12, "a short digest is 6 bytes of hex");
     assert_eq!(response.str_field("audit_head").len(), 12);
+}
+
+#[test]
+fn the_overview_does_not_let_another_tenant_watch_the_router_wide_audit_chain() {
+    // The chain counts and links every tenant's actions. A viewer in tenant B
+    // polling its length and head could watch tenant A's management activity
+    // happen (Appendix B). Only a caller who may read the audit trail is shown
+    // the two figures, and they are what the audit envelope shows it anyway.
+    let admin = Harness::new();
+    let stranger = admin.viewer_in(TENANT_B);
+
+    let response = admin.get(&stranger, "/admin/v1/overview");
+    assert_eq!(response.status, 200, "{}", response.body);
+    let json = response.json();
+    assert!(json.get("audit_records").is_none(), "{}", response.body);
+    assert!(json.get("audit_head").is_none(), "{}", response.body);
+
+    let auditor = admin.get(&admin.auditor_in(TENANT_B), "/admin/v1/overview");
+    assert!(auditor.json().get("audit_records").is_some());
 }
 
 #[test]
@@ -1425,4 +1444,66 @@ fn an_export_is_scoped_to_the_callers_tenant_and_permission() {
         .as_session(&admin.viewer())
         .send();
     assert_eq!(viewer.status, 403, "{}", viewer.body);
+}
+
+// -- Durable audit paging ------------------------------------------------------
+
+/// Page through a filtered durable audit read, returning every sequence seen
+/// and whether each page claimed more remained.
+fn page_durable(admin: &Harness, filter: &str, limit: usize) -> (Vec<i64>, Vec<bool>) {
+    let auditor = admin.auditor();
+    let mut seen = Vec::new();
+    let mut more = Vec::new();
+    let mut after: Option<String> = None;
+    for _ in 0..100 {
+        let mut query = format!("{filter}&durable=true&limit={limit}");
+        if let Some(cursor) = &after {
+            query.push_str(&format!("&after={cursor}"));
+        }
+        let response = admin
+            .request(Method::Get, "/admin/v1/audit")
+            .as_session(&auditor)
+            .query(&query)
+            .send();
+        assert_eq!(response.status, 200, "{}", response.body);
+        let json = response.json();
+        for row in json.field_array("data").unwrap() {
+            seen.push(row.field_i64("sequence").unwrap());
+        }
+        let has_more = json.get("has_more").and_then(Value::as_bool).unwrap();
+        more.push(has_more);
+        after = json
+            .opt_field_str("next_cursor")
+            .ok()
+            .flatten()
+            .map(str::to_owned);
+        assert_eq!(has_more, after.is_some(), "has_more must agree with next_cursor");
+        if after.is_none() {
+            break;
+        }
+    }
+    (seen, more)
+}
+
+#[test]
+fn paging_a_filtered_audit_read_skips_no_record_in_the_batch_that_filled_a_page() {
+    // The durable read scans the chain in batches of 500. The cursor used to be
+    // set to the end of the batch *before* the page was filled, so every
+    // matching record between the one that filled the page and the end of the
+    // batch was skipped: an investigator paging through "everything user:x
+    // did" silently lost most of it.
+    let admin = Harness::new();
+    for i in 0..7 {
+        admin.record_audit(TENANT_A, "user:suspect", AuditAction::TargetStateChanged, LOCAL_TARGET);
+        admin.record_audit(TENANT_A, &format!("user:bystander-{i}"), AuditAction::TargetStateChanged, LOCAL_TARGET);
+    }
+
+    let (seen, _) = page_durable(&admin, "actor=user:suspect", 2);
+
+    let mut unique = seen.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), seen.len(), "a record was returned twice: {seen:?}");
+    assert_eq!(seen.len(), 7, "paging lost records: {seen:?}");
+    assert!(seen.windows(2).all(|w| w[0] > w[1]), "newest first, strictly: {seen:?}");
 }

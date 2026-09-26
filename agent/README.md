@@ -49,7 +49,13 @@ These are normative. An agent that does not keep them is not this agent.
   and `no-X11-forwarding`. The agent's key must not grant an interactive shell.
 - **Never interpolates a router-supplied value into a command line.** Router
   input selects a row in the agent's own table; the row's fields become the
-  argument vector, and `subprocess` is called with `shell=False`.
+  argument vector, and `subprocess` is called with `shell=False`. Because `ssh`
+  joins its command into one string for the remote shell, that vector is quoted
+  once with `shlex.join` and passed after `--`, so each argument arrives intact.
+- **Bounds its own background work.** At most `MAX_INFLIGHT_OPERATIONS`
+  `ACTIVATE`/`DEACTIVATE`/`FETCH` operations run at once (further ones are
+  refused `busy`), at most `MAX_CONCURRENT_COMMANDS` remote commands run at
+  once, and finished activations are pruned past `MAX_RETAINED_ACTIVATIONS`.
 - **Applies its own per-host activation rate limit.** A router bug must not be
   able to exhaust the fleet through the agent.
 - **Verifies artifact digests before an artifact becomes activatable**, and
@@ -203,7 +209,9 @@ to something plausible.
 
 `agent/test_fleet_agent.py` covers the fetch path — retry and resumption, the
 attempt cap, the deadline, per-host exclusion, cancellation during backoff, and
-the digest refusal — with `run_on` replaced by a scripted stub, so no `ssh`, no
+the digest refusal — plus remote argument quoting (checked against a local
+`sh -c`), the line-length bound, the background-work cap and pruning, and a
+cancel during probing, with `run_on` replaced by a scripted stub, so no `ssh`, no
 `docker`, and no network. Run it with `python3 agent/test_fleet_agent.py`. It is
 not part of `cargo test --workspace`, because this agent is deliberately outside
 the Rust workspace.

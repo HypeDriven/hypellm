@@ -299,8 +299,15 @@ function paint(body, snapshot, ctx) {
         ['Providers', formatCount(overview.providers)],
         ['Aliases', formatCount(overview.aliases)],
         ['Tenants', formatCount(overview.tenants)],
-        ['Audit records', formatCount(overview.audit_records)],
-        ['Audit chain head', mono(overview.audit_head)],
+        // The chain is router-wide, so the server includes these two only
+        // for a caller who may read the audit trail. Say so, rather than
+        // rendering a count of zero.
+        ...(overview.audit_records === undefined
+          ? [['Audit chain', 'Visible to roles that may read the audit trail']]
+          : [
+            ['Audit records', formatCount(overview.audit_records)],
+            ['Audit chain head', mono(overview.audit_head)],
+          ]),
       ]),
     }),
   ]);

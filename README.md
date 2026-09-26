@@ -10,7 +10,7 @@ The project is a Rust workspace with a dependency-free static administration UI.
 - **Policy-based routing** through client-facing model aliases, grants, denies, preferences, hard pins, residency requirements and capability filters.
 - **Capability-contract requests**: a caller states a verb, the modalities they are sending (including opaque documents), a reasoning tier and a quality floor, and each is an eligibility filter rather than a hint.
 - **Fleet orchestration.** The router models the accelerator hosts behind its targets and starts and stops declared containers to serve demand — under dwell floors, hysteresis margins, per-host activation budgets and durable leases, through a separate out-of-process agent. It never executes a process itself.
-- **Provider support** for llama.cpp, OpenAI, Anthropic, DeepSeek and Moonshot/Kimi, plus an explicitly enabled generic OpenAI-compatible adapter.
+- **Provider support** for llama.cpp, OpenAI, Anthropic, DeepSeek and Moonshot/Kimi, plus an explicitly enabled generic OpenAI-compatible adapter and SemIf, a local decision scorer reached through `POST /v1/rerank`.
 - **Bounded admission** with concurrency, queue, request-rate, token-rate, byte-rate and spend controls.
 - **Streaming and failover** with backpressure, deadlines, circuit breakers and deterministic candidate ordering.
 - **Separate management plane** with Google OIDC, RBAC, CSRF protection, policy drafts, two-person publication, audit export, usage views and emergency break-glass access.
@@ -125,6 +125,7 @@ Slaves are reached by their **LAN address**, over a Tailscale subnet route adver
 - [Operational runbooks](docs/runbooks.md)
 - [Fleet orchestration](docs/orchestration.md) and the [fleet agent](agent/README.md)
 - [The identity verifier](verifier/README.md) — Google sign-in, and enrolling the first administrator
+- [The Windows tray monitor](tray/README.md) — which models are in flight, and tokens per second per user and key, from the desktop
 - [Threat model](docs/threat-model.md)
 - [Current limitations](docs/deferred-issues.md)
 - [Detailed specification](secure_llm_router_specification.md)

@@ -222,6 +222,7 @@ every endpoint.
 | `POST` | `/v1/responses` | `inference` | OpenAI Responses |
 | `POST` | `/v1/embeddings` | `embeddings` | OpenAI embeddings |
 | `POST` | `/v1/messages` | `inference` | Anthropic Messages |
+| `POST` | `/v1/rerank` | `inference` | Score candidates against a query |
 | `POST` | `/v1/tokenize` | `tokenize` | Token count for a request |
 | `GET` | `/health/live` | — | Process is up |
 | `GET` | `/health/ready` | — | Will accept requests |
@@ -331,6 +332,79 @@ Two things worth knowing:
 Comment lines (`: keepalive`) may appear at intervals to keep an idle
 connection open. Ignore them; every SSE client already does.
 
+### Scoring candidates: `POST /v1/rerank`
+
+Reranking asks one question — *given this, which of these?* — and the answer is
+a score per candidate rather than generated text. The request follows the
+convention reranking services settled on, so an existing rerank client works
+unchanged:
+
+```bash
+curl -sS http://<host>:18000/v1/rerank \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{
+    "model": "decide",
+    "query": "What should the support agent do?",
+    "documents": [
+      "Issue a full refund",
+      "Deny the request politely",
+      "Escalate to a supervisor"
+    ],
+    "return_documents": true
+  }'
+```
+
+```json
+{
+  "object": "list",
+  "results": [
+    {"index": 1, "relevance_score": 0.974, "document": {"text": "Deny the request politely"}},
+    {"index": 0, "relevance_score": 0.021, "document": {"text": "Issue a full refund"}},
+    {"index": 2, "relevance_score": 0.005, "document": {"text": "Escalate to a supervisor"}}
+  ],
+  "model": "decide",
+  "usage": {"prompt_tokens": 133, "completion_tokens": 0, "total_tokens": 133,
+            "hypellm": {"usage_source": "provider_reported"}},
+  "hypellm": {"native_model": "Qwen_Qwen3.5-4B-Q4_K_M.gguf",
+              "documents": 3, "scored_documents": 3,
+              "score_scale": "provider_reported"}
+}
+```
+
+`index` points into the `documents` array you sent, and results are ordered by
+score, highest first, with the candidate's own position breaking a tie.
+
+Fields:
+
+| Field | Required | Meaning |
+|---|---|---|
+| `model` | yes | An alias whose targets declare the `rerank` capability |
+| `query` | yes | The criterion the candidates are scored against |
+| `documents` | yes | The candidates, as strings or `{"text": "…"}` objects |
+| `context` | no | Evidence the criterion applies to (see below) |
+| `top_n` | no | How many results to print. Every candidate is still scored |
+| `return_documents` | no | Echo each candidate's text in the result. Default `false` |
+
+**`context` is the addition worth knowing about.** A decision scorer is asked
+"given this state, which action?", and a request with nowhere to put the state
+can only ask half the question. Supply `context` and it becomes the evidence
+while `query` stays the criterion; omit it and the query serves as both. The
+router composes no prompt text of its own in either case — every string the
+model reads is one you sent.
+
+**Reranking does not stream.** There is no partial ranking to send, so
+`"stream": true` is a `400` rather than a body pretending to be frames.
+
+**Scores mean what the target's scale means.** They are comparable within one
+response and between no two of them; nothing rescales them. Where a scorer calls
+its own numbers uncalibrated — SemIf does — they are a ranking signal, not a
+confidence. `hypellm.scored_documents` says how many candidates came back
+scored, so a short answer is visible rather than looking complete.
+
+**Limits.** A request carries at most 1,024 candidates; each target declares its
+own narrower bound, and a SemIf scorer takes 2 to 16. Asking for more is a `400`
+before anything is sent upstream.
+
 ### Counting tokens
 
 `POST /v1/tokenize` takes a request body of the same shape and returns a count
@@ -415,8 +489,15 @@ router may have chosen a different provider than a previous identical request.
 "hypellm": {"native_model": "qwen3-27b", "upstream_id": "chatcmpl-verify"}
 ```
 
-`usage` carries `"hypellm": {"usage_source": "provider_reported"}` or
-`"router_estimated"`. Do not bill from an estimate.
+`usage` carries `"hypellm": {"usage_source": …}`, one of:
+
+- `provider_reported`: the provider reported both input and output tokens.
+- `provider_reported_partial`: the provider reported output only; the input
+  count is `null`, not `0`.
+- `router_estimated`: the counts are the router's own estimate.
+- `unreported`: no usage arrived at all; the counts are `null`.
+
+Do not bill from an estimate, and do not read a `null` count as zero.
 
 ### Asking for a reasoning tier
 

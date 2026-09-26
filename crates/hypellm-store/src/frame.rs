@@ -327,8 +327,24 @@ impl fmt::Display for FrameError {
 impl std::error::Error for FrameError {}
 
 /// Encode a frame.
-#[must_use]
-pub fn encode(kind: RecordKind, sequence: u64, payload: &[u8], mac_key: &[u8]) -> Vec<u8> {
+///
+/// Refuses a payload larger than [`MAX_PAYLOAD_LEN`] with
+/// [`FrameError::PayloadTooLarge`]. `decode` rejects such a frame, so writing
+/// one would put a record on disk that replay can never read back: at offset
+/// zero that is `UnknownFormat` and a store that will not start, and anywhere
+/// else it is damage that strands every record after it. The length field was
+/// previously saturated to `u32::MAX` instead, which is the same failure with
+/// a wrong number in it.
+pub fn encode(
+    kind: RecordKind,
+    sequence: u64,
+    payload: &[u8],
+    mac_key: &[u8],
+) -> Result<Vec<u8>, FrameError> {
+    if payload.len() > MAX_PAYLOAD_LEN {
+        return Err(FrameError::PayloadTooLarge);
+    }
+    let len = u32::try_from(payload.len()).map_err(|_| FrameError::PayloadTooLarge)?;
     let protected = kind.is_protected();
     let mut out =
         Vec::with_capacity(HEADER_LEN + payload.len() + CRC_LEN + if protected { MAC_LEN } else { 0 });
@@ -339,7 +355,6 @@ pub fn encode(kind: RecordKind, sequence: u64, payload: &[u8], mac_key: &[u8]) -
     out.extend_from_slice(&if protected { FLAG_PROTECTED } else { 0 }.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes()); // reserved
     out.extend_from_slice(&sequence.to_le_bytes());
-    let len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
     out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(payload);
 
@@ -353,7 +368,7 @@ pub fn encode(kind: RecordKind, sequence: u64, payload: &[u8], mac_key: &[u8]) -
         out.extend_from_slice(&mac);
     }
 
-    out
+    Ok(out)
 }
 
 /// A decoded frame together with the number of bytes it occupied.
@@ -488,7 +503,7 @@ mod tests {
 
     #[test]
     fn roundtrip_unprotected() {
-        let bytes = encode(RecordKind::UsageAggregate, 7, b"payload", KEY);
+        let bytes = encode(RecordKind::UsageAggregate, 7, b"payload", KEY).expect("encode");
         let decoded = decode(&bytes, KEY).unwrap();
         assert_eq!(decoded.length, bytes.len());
         assert_eq!(decoded.frame.kind, RecordKind::UsageAggregate);
@@ -499,7 +514,7 @@ mod tests {
 
     #[test]
     fn roundtrip_protected() {
-        let bytes = encode(RecordKind::AuditEvent, 42, b"actor=admin", KEY);
+        let bytes = encode(RecordKind::AuditEvent, 42, b"actor=admin", KEY).expect("encode");
         let decoded = decode(&bytes, KEY).unwrap();
         assert!(decoded.frame.protected);
         assert_eq!(decoded.frame.sequence, 42);
@@ -509,16 +524,27 @@ mod tests {
 
     #[test]
     fn empty_payload_roundtrips() {
-        let bytes = encode(RecordKind::SnapshotMarker, 1, b"", KEY);
+        let bytes = encode(RecordKind::SnapshotMarker, 1, b"", KEY).expect("encode");
         let decoded = decode(&bytes, KEY).unwrap();
         assert!(decoded.frame.payload.is_empty());
         assert_eq!(decoded.length, bytes.len());
     }
 
     #[test]
+    fn a_payload_decode_would_refuse_is_refused_at_encode() {
+        let at_limit = vec![0u8; MAX_PAYLOAD_LEN];
+        assert!(encode(RecordKind::UsageAggregate, 1, &at_limit, KEY).is_ok());
+        let over = vec![0u8; MAX_PAYLOAD_LEN + 1];
+        assert_eq!(
+            encode(RecordKind::UsageAggregate, 1, &over, KEY),
+            Err(FrameError::PayloadTooLarge)
+        );
+    }
+
+    #[test]
     fn large_payload_roundtrips() {
         let payload = vec![0xa5u8; 1_000_000];
-        let bytes = encode(RecordKind::UsageAggregate, 1, &payload, KEY);
+        let bytes = encode(RecordKind::UsageAggregate, 1, &payload, KEY).expect("encode");
         let decoded = decode(&bytes, KEY).unwrap();
         assert_eq!(decoded.frame.payload.len(), payload.len());
     }
@@ -527,7 +553,7 @@ mod tests {
     fn every_prefix_reports_incomplete_not_corruption() {
         // A torn write must be distinguishable from tampering, at every
         // possible truncation point.
-        let bytes = encode(RecordKind::AuditEvent, 1, b"some payload here", KEY);
+        let bytes = encode(RecordKind::AuditEvent, 1, b"some payload here", KEY).expect("encode");
         for cut in 0..bytes.len() {
             let e = decode(&bytes[..cut], KEY).unwrap_err();
             assert_eq!(
@@ -543,7 +569,7 @@ mod tests {
 
     #[test]
     fn a_flipped_payload_bit_fails_the_checksum() {
-        let bytes = encode(RecordKind::UsageAggregate, 1, b"0123456789", KEY);
+        let bytes = encode(RecordKind::UsageAggregate, 1, b"0123456789", KEY).expect("encode");
         for i in HEADER_LEN..HEADER_LEN + 10 {
             let mut corrupt = bytes.clone();
             corrupt[i] ^= 0x01;
@@ -560,7 +586,7 @@ mod tests {
         // The attack: an operator with write access to the state directory
         // edits an audit record and recomputes the CRC. The MAC does not
         // recompute without the key.
-        let bytes = encode(RecordKind::AuditEvent, 1, b"actor=alice action=read", KEY);
+        let bytes = encode(RecordKind::AuditEvent, 1, b"actor=alice action=read", KEY).expect("encode");
         let mut forged = bytes.clone();
         let payload_start = HEADER_LEN;
         forged[payload_start..payload_start + 5].copy_from_slice(b"actor");
@@ -578,7 +604,7 @@ mod tests {
 
     #[test]
     fn a_frame_cannot_be_verified_with_the_wrong_key() {
-        let bytes = encode(RecordKind::AuditEvent, 1, b"x", KEY);
+        let bytes = encode(RecordKind::AuditEvent, 1, b"x", KEY).expect("encode");
         assert_eq!(
             decode(&bytes, b"different-key").unwrap_err(),
             FrameError::MacMismatch
@@ -588,7 +614,7 @@ mod tests {
     #[test]
     fn the_sequence_number_is_covered_by_the_mac() {
         // Reordering or renumbering audit records must be detectable.
-        let bytes = encode(RecordKind::AuditEvent, 1, b"x", KEY);
+        let bytes = encode(RecordKind::AuditEvent, 1, b"x", KEY).expect("encode");
         let mut renumbered = bytes.clone();
         renumbered[12..20].copy_from_slice(&99u64.to_le_bytes());
         let body_len = HEADER_LEN + 1;
@@ -599,7 +625,7 @@ mod tests {
 
     #[test]
     fn the_record_kind_is_covered_by_the_mac() {
-        let bytes = encode(RecordKind::AuditEvent, 1, b"x", KEY);
+        let bytes = encode(RecordKind::AuditEvent, 1, b"x", KEY).expect("encode");
         let mut retyped = bytes.clone();
         retyped[6..8].copy_from_slice(&RecordKind::ApiKey.as_u16().to_le_bytes());
         let body_len = HEADER_LEN + 1;
@@ -612,7 +638,7 @@ mod tests {
     fn stripping_the_protected_flag_is_rejected() {
         // Clearing the flag would drop the MAC requirement if the kind were not
         // also checked.
-        let bytes = encode(RecordKind::AuditEvent, 1, b"x", KEY);
+        let bytes = encode(RecordKind::AuditEvent, 1, b"x", KEY).expect("encode");
         let mut stripped = bytes[..HEADER_LEN + 1 + CRC_LEN].to_vec();
         stripped[8..10].copy_from_slice(&0u16.to_le_bytes());
         let body_len = HEADER_LEN + 1;
@@ -626,7 +652,7 @@ mod tests {
 
     #[test]
     fn adding_a_mac_to_an_unprotected_kind_is_rejected() {
-        let mut bytes = encode(RecordKind::UsageAggregate, 1, b"x", KEY);
+        let mut bytes = encode(RecordKind::UsageAggregate, 1, b"x", KEY).expect("encode");
         bytes[8..10].copy_from_slice(&FLAG_PROTECTED.to_le_bytes());
         let body_len = HEADER_LEN + 1;
         let crc = crc32(&bytes[..body_len]);
@@ -636,11 +662,11 @@ mod tests {
 
     #[test]
     fn bad_magic_and_version_are_rejected() {
-        let mut bytes = encode(RecordKind::UsageAggregate, 1, b"x", KEY);
+        let mut bytes = encode(RecordKind::UsageAggregate, 1, b"x", KEY).expect("encode");
         bytes[0] = b'X';
         assert_eq!(decode(&bytes, KEY).unwrap_err(), FrameError::BadMagic);
 
-        let mut bytes = encode(RecordKind::UsageAggregate, 1, b"x", KEY);
+        let mut bytes = encode(RecordKind::UsageAggregate, 1, b"x", KEY).expect("encode");
         bytes[4..6].copy_from_slice(&999u16.to_le_bytes());
         assert_eq!(
             decode(&bytes, KEY).unwrap_err(),
@@ -651,7 +677,7 @@ mod tests {
     #[test]
     fn an_absurd_length_is_rejected_before_allocation() {
         // A flipped bit in the length field must not ask for a giant buffer.
-        let mut bytes = encode(RecordKind::UsageAggregate, 1, b"x", KEY);
+        let mut bytes = encode(RecordKind::UsageAggregate, 1, b"x", KEY).expect("encode");
         bytes[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(decode(&bytes, KEY).unwrap_err(), FrameError::PayloadTooLarge);
     }

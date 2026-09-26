@@ -265,6 +265,10 @@ pub fn parse(text: &str, limits: &ParseLimits) -> Result<Document, ParseError> {
     let mut logical: String = String::new();
     let mut logical_start: u32 = 0;
     let mut continuations: u32 = 0;
+    // Whether the logical line so far ends inside a quoted string. A `\\` or
+    // `#` inside quotes is text, so continuation and comment detection need
+    // the same view of quoting the tokenizer has.
+    let mut in_quote = false;
 
     for (index, raw_line) in text.split('\n').enumerate() {
         let line_no = u32::try_from(index + 1).unwrap_or(u32::MAX);
@@ -273,8 +277,11 @@ pub fn parse(text: &str, limits: &ParseLimits) -> Result<Document, ParseError> {
 
         // A trailing backslash continues the record onto the next line. This is
         // the only multi-line construct in the grammar, and it joins text — it
-        // does not evaluate anything.
-        if let Some(head) = line.strip_suffix('\\') {
+        // does not evaluate anything. A backslash that ends a comment is part
+        // of the comment: `# C:\\` must not swallow the next record into it,
+        // which for a deny binding would silently drop the deny.
+        let in_comment = comment_starts(line, &mut in_quote);
+        if let Some(head) = line.strip_suffix('\\').filter(|_| !in_comment) {
             if logical.is_empty() {
                 logical_start = line_no;
             }
@@ -298,6 +305,7 @@ pub fn parse(text: &str, limits: &ParseLimits) -> Result<Document, ParseError> {
         }
         logical.push_str(line);
         continuations = 0;
+        in_quote = false;
 
         let source = core::mem::take(&mut logical);
         if let Some(record) = parse_logical_line(&source, logical_start, limits)? {
@@ -325,6 +333,33 @@ pub fn parse(text: &str, limits: &ParseLimits) -> Result<Document, ParseError> {
     }
 
     Ok(doc)
+}
+
+/// Whether `line` enters a comment, given whether it starts inside a quoted
+/// string. `in_quote` is updated to the quoting state at the end of the line,
+/// so a string continued across lines is tracked. The rules mirror the
+/// tokenizer: outside quotes `#` starts a comment and `"` opens a string;
+/// inside, `\\` escapes the next character and `"` closes it.
+fn comment_starts(line: &str, in_quote: &mut bool) -> bool {
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if *in_quote {
+            match c {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => *in_quote = false,
+                _ => {}
+            }
+        } else {
+            match c {
+                '#' => return true,
+                '"' => *in_quote = true,
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 fn parse_logical_line(
@@ -659,6 +694,24 @@ mod tests {
     fn a_hash_inside_a_quoted_value_is_content() {
         let doc = p(r#"alias id=a description="uses #1 model""#).unwrap();
         assert_eq!(doc.records[0].get("description"), Some("uses #1 model"));
+    }
+
+    #[test]
+    fn a_backslash_ending_a_comment_is_part_of_the_comment() {
+        let doc = p("alias id=a # C:\\\nbinding id=b deny=t\n").unwrap();
+        assert_eq!(doc.records.len(), 2, "the second record must not join the comment");
+        assert_eq!(doc.records[1].get("deny"), Some("t"));
+
+        // A `#` or an escaped quote inside a string is not a comment, so a
+        // backslash after it still continues the record.
+        let doc = p("alias id=a description=\"x # \\\" y\" \\\n  targets=t\n").unwrap();
+        assert_eq!(doc.records.len(), 1);
+        assert_eq!(doc.records[0].get("description"), Some("x # \" y"));
+        assert_eq!(doc.records[0].get("targets"), Some("t"));
+
+        // A continued line that then ends in a comment still ends the record.
+        let doc = p("alias id=a \\\n  targets=t # D:\\\nbinding id=b\n").unwrap();
+        assert_eq!(doc.records.len(), 2);
     }
 
     #[test]

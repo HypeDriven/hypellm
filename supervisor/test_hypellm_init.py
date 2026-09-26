@@ -51,7 +51,14 @@ class InitTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.dir.cleanup()
 
-    def fake_router(self, *, obeys: bool = True, refuses_with: int = 0, exits: int = 0) -> None:
+    def fake_router(
+        self,
+        *,
+        obeys: bool = True,
+        refuses_with: int = 0,
+        exits: int = 0,
+        shutdown_lingers: float = 0.0,
+    ) -> None:
         """A stand-in for the router binary.
 
         Invoked two ways, exactly as the real one is: once to *run*, and once
@@ -70,6 +77,9 @@ class InitTest(unittest.TestCase):
             f'echo "$@" >> "{self.log}"\n'
             'if [ "$1" = "--shutdown" ]; then\n'
             f"  {obey}\n"
+            # The real `--shutdown` waits for its acknowledgement, so the
+            # running router can finish while it is still in progress.
+            f"  sleep {shutdown_lingers}\n"
             f"  exit {refuses_with}\n"
             "fi\n"
             # The real router's one-shot commands do their work and exit. The
@@ -87,14 +97,20 @@ class InitTest(unittest.TestCase):
         )
         self.router.chmod(0o755)
 
-    def start(self, deadline: float = 3.0) -> subprocess.Popen[bytes]:
+    def start(
+        self, deadline: float = 3.0, extra_env: dict[str, str] | None = None
+    ) -> subprocess.Popen[bytes]:
         environment = dict(os.environ)
         environment["HYPELLM_ROUTER_BIN"] = str(self.router)
         environment["HYPELLM_DRAIN_DEADLINE"] = str(deadline)
+        environment.update(extra_env or {})
         process = subprocess.Popen(
             [INIT, "--config", self.config, "--secrets", self.secrets, "--log", "info"],
             env=environment,
             stderr=subprocess.PIPE,
+            # Its own process group, so an init that signals its whole group
+            # cannot take the test runner with it.
+            start_new_session=True,
         )
         self.addCleanup(self.close, process)
         return process
@@ -224,6 +240,48 @@ class InitTest(unittest.TestCase):
         self.wait_for_start(process)
         self.sentinel.touch()
         self.assertEqual(process.wait(timeout=15), 4)
+
+    def test_a_router_that_finishes_during_the_shutdown_command_reports_its_own_status(
+        self,
+    ) -> None:
+        # The trap runs `--shutdown` in the foreground; a router that finishes
+        # its drain meanwhile is reaped then, and the interrupted `wait` returns
+        # 143. That used to be the init's exit status — a clean drain reported
+        # as a death by SIGTERM, and a router that failed during its drain
+        # reported the same way instead of with its own code.
+        for exits in (0, 3):
+            with self.subTest(exits=exits):
+                self.sentinel.unlink(missing_ok=True)
+                self.log.unlink(missing_ok=True)
+                self.fake_router(exits=exits, shutdown_lingers=0.5)
+                process = self.start()
+                self.wait_for_start(process)
+                process.send_signal(signal.SIGTERM)
+                status = process.wait(timeout=15)
+                self.assertEqual(
+                    status, exits, process.stderr.read().decode() if process.stderr else ""
+                )
+
+    def test_a_signal_before_the_child_is_recorded_does_not_kill_the_group(self) -> None:
+        # Between `trap` and `child=$!` the handler used to arm its watchdog
+        # with `child=0`, and `kill -KILL 0` is the whole process group — the
+        # init included — so the drain failure was never reported. The signal
+        # is delivered in exactly that window by a DEBUG trap installed through
+        # BASH_ENV, which bash reads before running the script.
+        hook = self.root / "hook.bash"
+        hook.write_text(
+            "trap 'if [ \"$BASH_COMMAND\" = \"child=\\$!\" ] && [ -z \"${__fired:-}\" ]; "
+            "then __fired=1; kill -TERM $$; fi' DEBUG\n"
+        )
+        self.fake_router(obeys=False)
+        process = self.start(deadline=1.0, extra_env={"BASH_ENV": str(hook)})
+        status = process.wait(timeout=20)
+        stderr = process.stderr.read().decode() if process.stderr else ""
+
+        shutdowns = [c for c in self.calls() if c.startswith("--shutdown")]
+        self.assertEqual(len(shutdowns), 1, f"the early signal was lost: {self.calls()}")
+        self.assertEqual(status, EXIT_DRAIN_FAILED, stderr)
+        self.assertIn("killing it", stderr)
 
     def test_missing_arguments_are_refused_before_anything_starts(self) -> None:
         # Without both, a signal would run `--shutdown` against the wrong

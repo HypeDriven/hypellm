@@ -603,7 +603,21 @@ pub struct FleetSnapshot {
     /// must not report an age of zero and route as if the fleet were healthy.
     pub observed: bool,
     /// Leases the router currently holds, by deployment.
+    ///
+    /// The planner reads these as work already committed: a deployment under
+    /// an activation lease is coming up whatever the last observation said,
+    /// takes a concurrent-activation slot on its host, and will occupy its
+    /// declared memory. Ignoring them let two decisions made between two
+    /// observations both plan the same activation, or both spend the same
+    /// free memory.
     pub leases: BTreeMap<DeploymentId, Lease>,
+    /// Deployments an in-flight activation is evicting.
+    ///
+    /// Never an eviction candidate for a second plan — stopping one
+    /// deployment twice is at best a wasted verb and at worst two plans each
+    /// counting the same freed memory — and never re-activated while the
+    /// activation that is stopping it holds its lease.
+    pub evicting: BTreeSet<DeploymentId>,
     /// When each deployment last became ready, by the router's clock.
     ///
     /// The basis of the dwell floor. Taken from the router's own observation
@@ -682,6 +696,7 @@ impl FleetSnapshot {
             observed_at_ms: 0,
             observed: false,
             leases: BTreeMap::new(),
+            evicting: BTreeSet::new(),
             ready_since_ms: BTreeMap::new(),
             unmanaged: BTreeSet::new(),
             cooldown_until_ms: BTreeMap::new(),
@@ -736,6 +751,35 @@ impl FleetSnapshot {
             .map_or(0, |o| o.inflight)
     }
 
+    /// Whether the router holds an activation lease for a deployment.
+    #[must_use]
+    pub fn activation_leased(&self, deployment: &DeploymentId) -> bool {
+        self.leases
+            .get(deployment)
+            .is_some_and(|lease| lease.operation == LeaseOperation::Activate)
+    }
+
+    /// Whether a deployment is on its way up, by observation or by lease.
+    ///
+    /// The lease covers the gap between the router committing to an
+    /// activation and the agent first reporting it, which is exactly when a
+    /// second decision would otherwise plan the same thing again.
+    #[must_use]
+    pub fn is_coming_up(&self, deployment: &DeploymentId) -> bool {
+        self.state_of(deployment).is_activating() || self.activation_leased(deployment)
+    }
+
+    /// Whether memory in a pool is committed to a deployment.
+    ///
+    /// Resident states hold it now. A deployment that is pending, fetching,
+    /// or under an activation lease does not hold it yet but will, and a
+    /// planner that counted it as free would start a second model into memory
+    /// the first is about to map.
+    #[must_use]
+    pub fn commits_memory(&self, deployment: &DeploymentId) -> bool {
+        self.state_of(deployment).holds_memory() || self.is_coming_up(deployment)
+    }
+
     /// Whether the router started this deployment and may therefore stop it.
     #[must_use]
     pub fn is_router_owned(&self, deployment: &DeploymentId) -> bool {
@@ -749,13 +793,18 @@ impl FleetSnapshot {
     /// actually run out, and planning against a declaration the hardware
     /// disagrees with produces an activation that runs out of memory after two
     /// minutes of load — the most expensive possible failure.
+    ///
+    /// The declared side counts every deployment that [commits
+    /// memory](Self::commits_memory), including one only leased or pending:
+    /// the device figure cannot see memory that has been promised but not yet
+    /// mapped.
     #[must_use]
     pub fn pool_used_bytes(&self, pool: &hypellm_core::ids::PoolId) -> u64 {
         let declared: u64 = self
             .config
             .deployments_in_pool(pool)
             .into_iter()
-            .filter(|d| self.state_of(&d.id).holds_memory())
+            .filter(|d| self.commits_memory(&d.id))
             .map(|d| d.memory_bytes)
             .fold(0u64, u64::saturating_add);
 

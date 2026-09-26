@@ -365,6 +365,59 @@ fn render_audit_row(sequence: u64, event: &AuditEvent, link_short: &str) -> Valu
     Value::Object(object)
 }
 
+/// The bounds of one durable audit scan.
+#[derive(Debug, Clone, Copy)]
+struct AuditScan {
+    /// The most records one fetch returns; a shorter batch is the chain's end.
+    batch: usize,
+    /// The most fetches one request may make.
+    max_batches: usize,
+    /// The page size.
+    limit: usize,
+}
+
+/// Page backwards through the audit chain, keeping what `keep` renders.
+///
+/// Returns the page and the cursor to continue from, which is `None` only when
+/// the chain has been read to its oldest record.
+///
+/// The cursor is the sequence of the last record *examined*, advanced record by
+/// record. It used to be set to the end of each batch before the page was
+/// filled, so every matching record between the one that filled the page and
+/// the end of the batch was skipped. And a scan that ran out of batches before
+/// filling the page used to report no cursor at all — a truncated search
+/// presented as a complete one.
+fn scan_audit<R>(
+    mut fetch: impl FnMut(Option<u64>) -> Result<Vec<(u64, R)>, ApiError>,
+    start: Option<u64>,
+    bounds: AuditScan,
+    mut keep: impl FnMut(u64, &R) -> Option<Value>,
+) -> Result<(Vec<Value>, Option<u64>), ApiError> {
+    let mut collected = Vec::new();
+    let mut cursor = start;
+    // Whether older records than `cursor` may remain.
+    let mut more_remain = true;
+    'scan: for _ in 0..bounds.max_batches {
+        let batch = fetch(cursor)?;
+        more_remain = batch.len() >= bounds.batch;
+        for (index, (sequence, record)) in batch.iter().enumerate() {
+            cursor = Some(*sequence);
+            let Some(row) = keep(*sequence, record) else {
+                continue;
+            };
+            collected.push(row);
+            if collected.len() >= bounds.limit {
+                more_remain = more_remain || index.saturating_add(1) < batch.len();
+                break 'scan;
+            }
+        }
+        if !more_remain {
+            break;
+        }
+    }
+    Ok((collected, if more_remain { cursor } else { None }))
+}
+
 /// The shortest rollback reason accepted, for the same reason as break-glass:
 /// this is the record a post-incident review reads.
 const MIN_ROLLBACK_REASON: usize = 8;
@@ -1052,6 +1105,7 @@ impl AdminApi {
             .sessions
             .validate(token, self.state.clock.now_millis())
             .map_err(session_error)?;
+        let session = self.current_roles(session)?;
 
         // 3. CSRF, for anything state-changing.
         if request.is_mutating() {
@@ -1062,6 +1116,38 @@ impl AdminApi {
         }
 
         self.dispatch(request, &session, token)
+    }
+
+    /// Bring a session's roles up to date with the active configuration.
+    ///
+    /// Roles used to be fixed at sign-in, so a publication that removed an
+    /// `identity`, `local_user` or `role_binding` left every session it
+    /// covered holding the withdrawn authority for up to the absolute session
+    /// lifetime. They are now re-resolved whenever the configuration version
+    /// differs from the one they were resolved against — the same rule
+    /// [`Self::key_caller`] applies on every request, at the cost of one
+    /// comparison when nothing has changed.
+    fn current_roles(&self, session: Session) -> Result<Session, ApiError> {
+        if session.method == hypellm_auth::AuthMethod::BreakGlass {
+            return Ok(session);
+        }
+        let config = self.state.config();
+        let version = config.snapshot.version;
+        if session.roles_version == Some(version) {
+            return Ok(session);
+        }
+        let Some(roles) = resolve_session_roles(&config, &session) else {
+            self.state.sessions.invalidate_digest(&session.digest);
+            return Err(ApiError::new(
+                ApiErrorCode::Unauthenticated,
+                "the sign-in this session was issued for is no longer configured; \
+                 sign in again",
+            ));
+        };
+        self.state
+            .sessions
+            .refresh_roles(&session.digest, roles, version)
+            .ok_or_else(|| session_error(SessionRejection::Unknown))
     }
 
     /// Resolve a management caller from a presented API key.
@@ -1125,7 +1211,7 @@ impl AdminApi {
         }
 
         let config = self.state.config();
-        let roles = management_roles_for(&config, &record.principal);
+        let roles = management_roles_for(&config, &record.principal, &record.tenant);
         if roles.is_empty() {
             // The same refusal as an unbound password or break-glass principal,
             // and the same reason: a credential proves who is calling, not what
@@ -1181,6 +1267,8 @@ impl AdminApi {
             // has no second factor to re-prove. The permissions that rule
             // guards hardest are excluded from keys outright instead.
             authenticated_at_millis: now,
+            roles_version: Some(config.snapshot.version),
+            accountable: record.created_by.clone(),
         })
     }
 
@@ -1703,7 +1791,7 @@ impl AdminApi {
         }
 
         let config = self.state.config();
-        let roles = management_roles_for(&config, &policy.principal);
+        let roles = management_roles_for(&config, &policy.principal, &policy.tenant);
         if roles.is_empty() {
             // Holding the token proves who you are, not what you may do. A
             // break-glass principal with no `role_binding` gets a session that
@@ -1868,7 +1956,7 @@ impl AdminApi {
             return Err(refused());
         }
 
-        let roles = management_roles_for(&config, &user.principal);
+        let roles = management_roles_for(&config, &user.principal, &user.tenant);
         if roles.is_empty() {
             // Same refusal as break-glass, and the same reason: knowing the
             // password proves who you are, not what you may do. A session with
@@ -1953,7 +2041,7 @@ impl AdminApi {
             let mut event = AuditEvent::new(now, "anonymous", AuditAction::LoginFailed)
                 .with_outcome(AuditOutcome::Denied)
                 .with_reason("further_failures_suppressed")
-                .with_source(&format!(
+                .with_source(format!(
                     "{count} further password failures in the last window"
                 ));
             if let Some(user) = user {
@@ -2016,7 +2104,7 @@ impl AdminApi {
                     .with_outcome(AuditOutcome::Denied)
                     .with_reason("further_failures_suppressed")
                     .with_tenant(policy.tenant.as_str())
-                    .with_source(&format!(
+                    .with_source(format!(
                         "{count} further break-glass failures in the last window"
                     )),
             );
@@ -2053,7 +2141,7 @@ impl AdminApi {
                 AuditEvent::new(now, "anonymous", AuditAction::LoginFailed)
                     .with_outcome(AuditOutcome::Denied)
                     .with_reason("further_failures_suppressed")
-                    .with_source(&format!("{count} further sign-in failures in the last window")),
+                    .with_source(format!("{count} further sign-in failures in the last window")),
             );
         }
 
@@ -2394,13 +2482,20 @@ impl AdminApi {
                 config.tenants.contains_key(&session.tenant),
             )),
         );
-        root.push(
-            "audit_head",
-            Value::from(
-                hypellm_crypto::Digest::from_bytes(self.state.store.audit_head()).short(),
-            ),
-        );
-        root.push("audit_records", Value::from(self.state.store.audit_count()));
+        // The chain is router-wide: its length counts every tenant's actions
+        // and its head moves with them, so a viewer polling the two could
+        // watch another tenant's activity (Appendix B). Only a caller who may
+        // read the audit trail — and is shown the same two figures there, to
+        // verify it — gets them here.
+        if session.can(Permission::ReadAudit) {
+            root.push(
+                "audit_head",
+                Value::from(
+                    hypellm_crypto::Digest::from_bytes(self.state.store.audit_head()).short(),
+                ),
+            );
+            root.push("audit_records", Value::from(self.state.store.audit_count()));
+        }
         Ok(ApiResponse::ok(&Value::Object(root)))
     }
 
@@ -2892,49 +2987,37 @@ impl AdminApi {
                 .after
                 .as_deref()
                 .and_then(|cursor| cursor.parse::<u64>().ok());
-            let mut collected: Vec<Value> = Vec::new();
-            let mut cursor = before;
-            // The durable read pages backwards through the chain; a page whose
-            // records are mostly another tenant's would otherwise come back
-            // nearly empty and look like the end of the history.
-            for _ in 0..MAX_AUDIT_SCAN_PAGES {
-                let batch = self
-                    .state
-                    .store
-                    .audit_records(cursor, hypellm_store::MAX_AUDIT_PAGE)
-                    .map_err(|_| {
-                        ApiError::new(
-                            ApiErrorCode::InternalFault,
-                            "the durable audit chain could not be read",
+            let (collected, next) = scan_audit(
+                |cursor| {
+                    self.state
+                        .store
+                        .audit_records(cursor, hypellm_store::MAX_AUDIT_PAGE)
+                        .map_err(|_| {
+                            ApiError::new(
+                                ApiErrorCode::InternalFault,
+                                "the durable audit chain could not be read",
+                            )
+                        })
+                },
+                before,
+                AuditScan {
+                    batch: hypellm_store::MAX_AUDIT_PAGE,
+                    max_batches: MAX_AUDIT_SCAN_PAGES,
+                    limit: page.limit,
+                },
+                |sequence, record: &hypellm_store::AuditRecord| {
+                    (record.event.tenant.as_deref() == Some(session.tenant.as_str())
+                        && filter.matches(&record.event))
+                    .then(|| {
+                        render_audit_row(
+                            sequence,
+                            &record.event,
+                            &hypellm_crypto::Digest::from_bytes(record.link()).short(),
                         )
-                    })?;
-                if batch.is_empty() {
-                    break;
-                }
-                cursor = batch.last().map(|(sequence, _)| *sequence);
-                for (sequence, record) in &batch {
-                    if record.event.tenant.as_deref() != Some(session.tenant.as_str()) {
-                        continue;
-                    }
-                    if !filter.matches(&record.event) {
-                        continue;
-                    }
-                    collected.push(render_audit_row(
-                        *sequence,
-                        &record.event,
-                        &hypellm_crypto::Digest::from_bytes(record.link()).short(),
-                    ));
-                    if collected.len() >= page.limit {
-                        break;
-                    }
-                }
-                if collected.len() >= page.limit {
-                    break;
-                }
-            }
-            let next = (collected.len() >= page.limit)
-                .then(|| cursor.map(|c| c.to_string()))
-                .flatten();
+                    })
+                },
+            )?;
+            let next = next.map(|c| c.to_string());
             Ok(ApiResponse::ok(&self.audit_envelope(collected, next)))
         }
     }
@@ -3101,6 +3184,13 @@ impl AdminApi {
             .targets
             .get(&target_id)
             .ok_or_else(|| ApiError::not_found("target"))?;
+        // Appendix B, and before the precondition: a target this caller's
+        // tenant cannot reach is not theirs to drain or quarantine, and
+        // answering 412 for it where an unknown id gets 404 would confirm it
+        // exists.
+        if !visible_targets(&config, session).contains(&target_id) {
+            return Err(ApiError::not_found("target"));
+        }
 
         if_match_satisfied(request.if_match(), &self.target_etag(target))?;
 
@@ -3392,9 +3482,10 @@ impl AdminApi {
             "target id={id} provider={provider} model={model}\n"
         ));
 
-        let draft = self.state.drafts.create(
+        let draft = self.state.drafts.create_by(
             text,
             session.principal.clone(),
+            session.accountable.clone(),
             session.tenant.clone(),
             self.state.clock.wall_millis(),
         );
@@ -3445,9 +3536,10 @@ impl AdminApi {
             )
         })?;
 
-        let draft = self.state.drafts.create(
+        let draft = self.state.drafts.create_by(
             text.to_owned(),
             session.principal.clone(),
+            session.accountable.clone(),
             session.tenant.clone(),
             self.state.clock.wall_millis(),
         );
@@ -3802,32 +3894,37 @@ impl AdminApi {
         })?;
         let digest = restored.digest;
 
-        self.state
+        // Audit first, then the activation frame, then the swap. The reverse
+        // left a restored configuration in force behind a reply saying it
+        // "was not applied" whenever the audit append failed.
+        let event = AuditEvent::new(
+            self.state.clock.wall_millis(),
+            session.principal.as_str(),
+            AuditAction::PolicyRolledBack,
+        )
+        .with_object(digest.short())
+        .with_tenant(session.tenant.as_str())
+        .with_reason(reason);
+        self.record_audit(event.clone())?;
+
+        if self
+            .state
             .store
             .append(
                 hypellm_store::RecordKind::ConfigActivation,
                 restored.canonical.as_bytes(),
             )
-            .map_err(|_| {
-                ApiError::new(
-                    ApiErrorCode::InternalFault,
-                    "the rollback could not be recorded durably",
-                )
-            })?;
+            .is_err()
+        {
+            self.record_abandoned(event, "the activation frame could not be written");
+            return Err(ApiError::new(
+                ApiErrorCode::InternalFault,
+                "the rollback could not be recorded durably and was not applied",
+            ));
+        }
 
         self.state.config.activate(restored);
         let activated = active_etag(&self.state.config());
-
-        self.record_audit(
-            AuditEvent::new(
-                self.state.clock.wall_millis(),
-                session.principal.as_str(),
-                AuditAction::PolicyRolledBack,
-            )
-            .with_object(digest.short())
-            .with_tenant(session.tenant.as_str())
-            .with_reason(reason),
-        )?;
         // Loud, because a rollback is an incident action by definition.
         self.state.telemetry.log(
             &hypellm_telemetry::Event::critical("policy.rolled_back")
@@ -3945,44 +4042,48 @@ impl AdminApi {
             ));
         }
 
-        // Durable first, then in force. The payload is the state and who set
-        // it; the reason lives in the audit chain, which is where a reason
-        // belongs and is hash-chained.
+        // Audit, then the durable frame, then in force. The payload is the
+        // state and who set it; the reason lives in the audit chain, which is
+        // where a reason belongs and is hash-chained. Auditing after the flag
+        // flipped meant a failed append answered "not applied" about a router
+        // that was already serving (or refusing) anonymous traffic.
+        let event = AuditEvent::new(
+            self.state.clock.wall_millis(),
+            session.principal.as_str(),
+            AuditAction::SettingsChanged,
+        )
+        .with_object(if enabled {
+            "anonymous_access_enabled"
+        } else {
+            "anonymous_access_disabled"
+        })
+        .with_tenant(session.tenant.as_str())
+        .with_reason(&reason);
+        self.record_audit(event.clone())?;
+
         let mut record = Object::new();
         record.push("enabled", Value::from(enabled));
         record.push("at", Value::from(self.state.clock.wall_millis()));
         record.push("by", Value::from(session.principal.as_str()));
-        self.state
+        if self
+            .state
             .store
             .append(
                 hypellm_store::RecordKind::AnonymousAccess,
                 wire_json::to_string(&Value::Object(record)).as_bytes(),
             )
-            .map_err(|_| {
-                ApiError::new(
-                    ApiErrorCode::InternalFault,
-                    "the change could not be recorded durably",
-                )
-            })?;
+            .is_err()
+        {
+            self.record_abandoned(event, "the state frame could not be written");
+            return Err(ApiError::new(
+                ApiErrorCode::InternalFault,
+                "the change could not be recorded durably and was not applied",
+            ));
+        }
 
         self.state
             .anonymous_access
             .store(enabled, std::sync::atomic::Ordering::SeqCst);
-
-        self.record_audit(
-            AuditEvent::new(
-                self.state.clock.wall_millis(),
-                session.principal.as_str(),
-                AuditAction::SettingsChanged,
-            )
-            .with_object(if enabled {
-                "anonymous_access_enabled"
-            } else {
-                "anonymous_access_disabled"
-            })
-            .with_tenant(session.tenant.as_str())
-            .with_reason(&reason),
-        )?;
 
         // Critical in both directions. Enabling it is self-evidently critical;
         // disabling it closes a window in which unattributed requests were
@@ -4023,7 +4124,7 @@ impl AdminApi {
         let config = self
             .state
             .drafts
-            .prepare_publish(draft_id, &session.principal, &session.tenant, version)
+            .prepare_publish_by(draft_id, &session.actors(), &session.tenant, version)
             .map_err(|refusal| match refusal {
                 PublishRefusal::NoSuchDraft => ApiError::not_found("draft"),
                 PublishRefusal::SelfApproval => {
@@ -4047,22 +4148,52 @@ impl AdminApi {
 
         let digest = config.digest;
 
+        // Audit, then the durable activation frame, then the pointer swap.
+        // Auditing last left a published configuration in force behind a reply
+        // saying it "was not applied" whenever the append failed. If either
+        // write fails, the reserved number is handed back so a refused publish
+        // leaves no gap in the activation frames.
+        let release_version = || {
+            let _ = self.state.next_version.compare_exchange(
+                version + 1,
+                version,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        };
+        let event = AuditEvent::new(
+            self.state.clock.wall_millis(),
+            session.principal.as_str(),
+            AuditAction::PolicyPublished,
+        )
+        .with_object(draft_id)
+        .with_tenant(session.tenant.as_str())
+        .with_reason(&format!("digest {}", digest.short()));
+        if let Err(error) = self.record_audit(event.clone()) {
+            release_version();
+            return Err(error);
+        }
+
         // Durable first, then the pointer swap. A crash between the two leaves
         // the record of an activation that did not take effect, which an
         // operator can see; the reverse would leave a running configuration
         // with no record of who published it.
-        self.state
+        if self
+            .state
             .store
             .append(
                 hypellm_store::RecordKind::ConfigActivation,
                 config.canonical.as_bytes(),
             )
-            .map_err(|_| {
-                ApiError::new(
-                    ApiErrorCode::InternalFault,
-                    "the activation could not be recorded durably",
-                )
-            })?;
+            .is_err()
+        {
+            self.record_abandoned(event, "the activation frame could not be written");
+            release_version();
+            return Err(ApiError::new(
+                ApiErrorCode::InternalFault,
+                "the activation could not be recorded durably and was not applied",
+            ));
+        }
 
         // The draft is spent. Recording that keeps replay from restoring a
         // draft that has already been published — which would present a
@@ -4080,17 +4211,6 @@ impl AdminApi {
         // something the server would refuse with 412, forcing every real client
         // back to `If-Match: *` and silently defeating the concurrency control.
         let activated = active_etag(&self.state.config());
-
-        self.record_audit(
-            AuditEvent::new(
-                self.state.clock.wall_millis(),
-                session.principal.as_str(),
-                AuditAction::PolicyPublished,
-            )
-            .with_object(draft_id)
-            .with_tenant(session.tenant.as_str())
-            .with_reason(&format!("digest {}", digest.short())),
-        )?;
 
         let mut root = Object::new();
         root.push("version", Value::from(version));
@@ -4187,6 +4307,69 @@ impl AdminApi {
             .flatten()
             .and_then(|v| u64::try_from(v).ok());
 
+        // A key must not carry more authority than the person minting it.
+        // `ManageKeys` belongs to break-glass alone, so without this the
+        // recovery path could mint a management key for any principal —
+        // including an editor and an approver, and then review its own change
+        // — and the result would outlive the incident indefinitely.
+        //
+        // 1. A management-scoped key's roles (resolved in this tenant, as the
+        //    key will be) must be a subset of the minter's roles *other than*
+        //    `break_glass_admin`. Break-glass authority is the offline token
+        //    and a short lifetime; it is not transferable into a string.
+        let management = scopes.iter().any(|scope| {
+            matches!(
+                scope,
+                hypellm_auth::Scope::ManagementRead | hypellm_auth::Scope::ManagementWrite
+            )
+        });
+        if management {
+            let config = self.state.config();
+            let held: Vec<hypellm_core::rbac::Role> = session
+                .roles
+                .iter()
+                .copied()
+                .filter(|role| !role.is_break_glass())
+                .collect();
+            let widened = management_roles_for(&config, &principal, &session.tenant)
+                .into_iter()
+                .any(|role| !held.contains(&role));
+            if widened {
+                return Err(ApiError::new(
+                    ApiErrorCode::Forbidden,
+                    "a management key may not carry a role its creator does not hold \
+                     outside break-glass",
+                ));
+            }
+        }
+
+        // 2. A key minted under break-glass expires with the session that
+        //    minted it. An absent expiry takes that bound; a later one is
+        //    refused rather than silently shortened.
+        let expires_at = if session.is_break_glass() {
+            let now = self.state.clock.now_millis();
+            let bound = self
+                .state
+                .clock
+                .wall_millis()
+                .saturating_add(session.absolute_expiry_millis.saturating_sub(now));
+            match expires_at {
+                None => Some(bound),
+                Some(requested) if requested <= bound => Some(requested),
+                Some(_) => {
+                    return Err(ApiError::new(
+                        ApiErrorCode::InvalidRequest,
+                        format!(
+                            "a key created under break-glass must expire by {bound}, \
+                             when the break-glass session does"
+                        ),
+                    ));
+                }
+            }
+        } else {
+            expires_at
+        };
+
         // Specification 9.2's source-constrained keys. `KeyStore` has enforced
         // this since it existed — `verify` checks it, and a restricted key with
         // an unknown peer address fails closed — but `create_key` always passed
@@ -4197,7 +4380,7 @@ impl AdminApi {
         let new_key = self
             .state
             .keys
-            .create(
+            .create_by(
                 session.tenant.clone(),
                 principal.clone(),
                 scopes,
@@ -4208,42 +4391,61 @@ impl AdminApi {
                     .flatten()
                     .map(str::to_owned),
                 self.state.clock.wall_millis(),
+                // Who is accountable for the key, for separation of duty. A
+                // key cannot mint keys, so the minter is always a person.
+                Some(
+                    session
+                        .accountable
+                        .clone()
+                        .unwrap_or_else(|| session.principal.clone()),
+                ),
             )
             .map_err(|_| ApiError::new(ApiErrorCode::InternalFault, "cannot create a key"))?;
 
         let key_id = new_key.id().clone();
 
-        // Durable before the secret is handed out. A key returned to a caller
-        // but absent from the log would stop working at the next restart, and
-        // the caller would have no way to know until it did.
-        self.state
+        // `KeyStore::create` has already made the key usable in memory, so
+        // every refusal below revokes it again before answering: "not
+        // created" has to be true of the running router, not only of disk.
+        //
+        // Audit first, then the durable record, and only then the secret. A
+        // key returned to a caller but absent from the log would stop working
+        // at the next restart; one live without an audit record is the thing
+        // the chain exists to prevent.
+        let event = AuditEvent::new(
+            self.state.clock.wall_millis(),
+            session.principal.as_str(),
+            AuditAction::KeyCreated,
+        )
+        .with_object(key_id.as_str())
+        .with_tenant(session.tenant.as_str());
+        if let Err(error) = self.record_audit(event.clone()) {
+            self.state.keys.revoke(&key_id);
+            return Err(error);
+        }
+        if self
+            .state
             .store
             .append(
                 hypellm_store::RecordKind::ApiKey,
                 &new_key.record.to_payload(),
             )
-            .map_err(|_| {
-                ApiError::new(
-                    ApiErrorCode::InternalFault,
-                    "the key could not be recorded durably and was not created",
-                )
-            })?;
-
-        self.record_audit(
-            AuditEvent::new(
-                self.state.clock.wall_millis(),
-                session.principal.as_str(),
-                AuditAction::KeyCreated,
-            )
-            .with_object(key_id.as_str())
-            .with_tenant(session.tenant.as_str()),
-        )?;
+            .is_err()
+        {
+            self.state.keys.revoke(&key_id);
+            self.record_abandoned(event, "the key could not be written durably");
+            return Err(ApiError::new(
+                ApiErrorCode::InternalFault,
+                "the key could not be recorded durably and was not created",
+            ));
+        }
 
         // Specification 9.2 and 15.3: displayed once, never retrievable again.
         let secret = new_key.into_secret();
         let mut root = Object::new();
         root.push("id", Value::from(key_id.as_str()));
         root.push("principal", Value::from(principal.as_str()));
+        root.push_opt("expires_at", expires_at.map(Value::from));
         root.push("secret", Value::from(secret.as_str()));
         root.push(
             "notice",
@@ -5081,26 +5283,48 @@ impl AdminApi {
         // provider account they cut over to is not the one the router holds.
         if_match_satisfied(request.if_match(), &self.credential_etag(declared))?;
 
-        let reference = self.store_credential(id, secret)?;
+        // The refusals that need no I/O come first, so a rotation that was
+        // never going to be attempted leaves nothing in the chain.
+        if secret.is_empty() {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidRequest,
+                "the credential secret must not be empty",
+            ));
+        }
+        if self.state.credentials.is_none() {
+            return Err(ApiError::new(
+                ApiErrorCode::InternalFault,
+                "this router has no credential store configured, so the secret was not stored",
+            ));
+        }
 
-        // Specification 22.2 step 17. Done after the store and before the audit
-        // record, so a drained connection always corresponds to a rotation that
-        // actually happened.
+        // Audit first, then the secret. Recording after the store meant a
+        // failed append answered "not applied" while the new secret was
+        // already carrying traffic.
+        let event = AuditEvent::new(
+            self.state.clock.wall_millis(),
+            session.principal.as_str(),
+            AuditAction::CredentialRotated,
+        )
+        .with_object(reference.as_str())
+        .with_tenant(session.tenant.as_str());
+        self.record_audit(event.clone())?;
+
+        let reference = match self.store_credential(id, secret) {
+            Ok(reference) => reference,
+            Err(error) => {
+                self.record_abandoned(event, "the secret could not be stored");
+                return Err(error);
+            }
+        };
+
+        // Specification 22.2 step 17. Done after the store, so a drained
+        // connection always corresponds to a rotation that actually happened.
         let drained = self
             .state
             .credentials
             .as_ref()
             .map_or(0, |sink| sink.drain_connections(&reference));
-
-        self.record_audit(
-            AuditEvent::new(
-                self.state.clock.wall_millis(),
-                session.principal.as_str(),
-                AuditAction::CredentialRotated,
-            )
-            .with_object(reference.as_str())
-            .with_tenant(session.tenant.as_str()),
-        )?;
 
         let mut root = Object::new();
         root.push("id", Value::from(reference.as_str()));
@@ -5142,17 +5366,48 @@ impl AdminApi {
         })
     }
 
+    /// Refuse a deployment whose target the caller's tenant cannot reach.
+    ///
+    /// The same rule `patch_target` applies, for the same reason: starting,
+    /// stopping, or pinning a deployment changes what serves another tenant's
+    /// traffic, and a `404` for an unknown deployment beside a `409` for an
+    /// invisible one would disclose that it exists. Checked before the fleet
+    /// is asked anything, so an invisible deployment never reaches it.
+    fn require_visible_deployment(
+        &self,
+        session: &Session,
+        deployment: &str,
+    ) -> Result<(), ApiError> {
+        let snapshot = self.fleet()?.snapshot();
+        let config = self.state.config();
+        let visible = snapshot
+            .config
+            .deployments
+            .values()
+            .find(|declared| declared.id.as_str() == deployment)
+            .is_some_and(|declared| visible_targets(&config, session).contains(&declared.target));
+        if visible {
+            Ok(())
+        } else {
+            Err(ApiError::not_found("deployment"))
+        }
+    }
+
     fn fleet_overview(&self, session: &Session) -> Result<ApiResponse, ApiError> {
         self.require(session, Permission::ReadFleet)?;
+        let visible = visible_targets(&self.state.config(), session);
         Ok(ApiResponse::ok(&crate::fleet::render_fleet(
             self.fleet()?.as_ref(),
+            &visible,
         )))
     }
 
     fn fleet_activations(&self, session: &Session) -> Result<ApiResponse, ApiError> {
         self.require(session, Permission::ReadFleet)?;
+        let visible = visible_targets(&self.state.config(), session);
         Ok(ApiResponse::ok(&crate::fleet::render_activations(
             self.fleet()?.as_ref(),
+            &visible,
         )))
     }
 
@@ -5181,21 +5436,32 @@ impl AdminApi {
             .flatten()
             .and_then(|v| u64::try_from(v).ok())
             .unwrap_or(120_000);
+        // Only a target the caller's tenant can reach, and the same 404 as an
+        // unknown one: a plan names hosts and residency.
+        let visible = visible_targets(&self.state.config(), session);
+        if !TargetId::new(target).is_ok_and(|id| visible.contains(&id)) {
+            return Err(ApiError::not_found("target"));
+        }
         let outcome = fleet
             .simulate(target, patience_ms)
             .map_err(crate::fleet::control_error)?;
-        Ok(ApiResponse::ok(&crate::fleet::render_plan(&outcome)))
+        let shown = crate::fleet::visible_deployments(fleet.as_ref(), &visible);
+        Ok(ApiResponse::ok(&crate::fleet::render_plan(&outcome, &shown)))
     }
 
     fn fleet_activate(&self, session: &Session, deployment: &str) -> Result<ApiResponse, ApiError> {
         self.require(session, Permission::FleetActivate)?;
+        self.require_visible_deployment(session, deployment)?;
         let activation = self
             .fleet()?
             .activate(deployment)
             .map_err(crate::fleet::control_error)?;
-        // Audited before the response, and through `record_audit`, so an action
-        // whose record did not reach disk is not reported as having happened.
-        self.record_audit(self.fleet_event(
+        // A fleet action is an instruction to an external agent that cannot be
+        // taken back, and whether it is accepted (dwell, cooldown, budget) is
+        // only known by asking — so the record follows the action rather than
+        // preceding it. The reply to a failed append says exactly that, rather
+        // than claiming the action was not applied.
+        self.record_audit_after_effect(self.fleet_event(
             session,
             AuditAction::FleetActivate,
             deployment,
@@ -5209,11 +5475,12 @@ impl AdminApi {
         deployment: &str,
     ) -> Result<ApiResponse, ApiError> {
         self.require(session, Permission::FleetActivate)?;
+        self.require_visible_deployment(session, deployment)?;
         let activation = self
             .fleet()?
             .deactivate(deployment)
             .map_err(crate::fleet::control_error)?;
-        self.record_audit(self.fleet_event(
+        self.record_audit_after_effect(self.fleet_event(
             session,
             AuditAction::FleetDeactivate,
             deployment,
@@ -5242,7 +5509,11 @@ impl AdminApi {
             .fleet()?
             .fetch(artifact, host)
             .map_err(crate::fleet::control_error)?;
-        self.record_audit(self.fleet_event(session, AuditAction::FleetFetch, artifact))?;
+        self.record_audit_after_effect(self.fleet_event(
+            session,
+            AuditAction::FleetFetch,
+            artifact,
+        ))?;
         Ok(crate::fleet::render_accepted(&activation))
     }
 
@@ -5253,6 +5524,21 @@ impl AdminApi {
         deployment: &str,
     ) -> Result<ApiResponse, ApiError> {
         self.require(session, Permission::OperateTargets)?;
+        self.require_visible_deployment(session, deployment)?;
+        // Specification 15.4, "If-Match on mutation", after the visibility
+        // check so a precondition answer is never an existence oracle. Two
+        // operators pinning and unpinning the same deployment from stale
+        // screens would otherwise each silently undo the other.
+        let current = self
+            .fleet()?
+            .snapshot()
+            .config
+            .deployments
+            .values()
+            .find(|declared| declared.id.as_str() == deployment)
+            .map(crate::fleet::deployment_etag)
+            .ok_or_else(|| ApiError::not_found("deployment"))?;
+        if_match_satisfied(request.if_match(), &current)?;
         let body = request.json(&Limits::SMALL)?;
         let patch = crate::fleet::DeploymentPatch {
             pinned: body.opt_field_bool("pinned").ok().flatten(),
@@ -5268,13 +5554,15 @@ impl AdminApi {
         self.fleet()?
             .patch(deployment, patch)
             .map_err(crate::fleet::control_error)?;
-        self.record_audit(self.fleet_event(
+        self.record_audit_after_effect(self.fleet_event(
             session,
             AuditAction::TargetStateChanged,
             deployment,
         ))?;
+        let visible = visible_targets(&self.state.config(), session);
         Ok(ApiResponse::ok(&crate::fleet::render_fleet(
             self.fleet()?.as_ref(),
+            &visible,
         )))
     }
 
@@ -5309,16 +5597,60 @@ impl AdminApi {
             .map_err(session_error)
     }
 
+    /// Append an audit record that **precedes** the change it describes.
+    ///
+    /// Specification 18.3: "security changes fail closed". Every caller of
+    /// this applies its change only after it returns `Ok`, which is what makes
+    /// the refusal's wording true.
     fn record_audit(&self, event: AuditEvent) -> Result<(), ApiError> {
-        // Specification 18.3: "security changes fail closed". An action whose
-        // audit record did not reach disk must not be reported as having
-        // succeeded.
-        let appended = self.state.store.append_audit(event.clone()).map_err(|_| {
-            ApiError::new(
-                ApiErrorCode::InternalFault,
-                "the action could not be recorded durably and was not applied",
-            )
-        })?;
+        self.append_audit_event(
+            event,
+            "the action could not be recorded durably and was not applied",
+        )
+    }
+
+    /// Append an audit record for a change that has **already** taken effect.
+    ///
+    /// Only for an action that cannot be recorded first — one whose acceptance
+    /// is decided by something outside this process. A failed append is still
+    /// an error, but it must not say "not applied": an operator told that
+    /// retries an action that already happened. It is also logged critically,
+    /// because a live change with no audit record is exactly what the chain is
+    /// meant to make impossible.
+    fn record_audit_after_effect(&self, event: AuditEvent) -> Result<(), ApiError> {
+        let action = event.action;
+        self.append_audit_event(
+            event,
+            "the action WAS applied, but its audit record could not be written \
+             durably; do not retry it — check the current state and the storage",
+        )
+        .inspect_err(|_| {
+            self.state.telemetry.log(
+                &hypellm_telemetry::Event::critical("audit.append_failed_after_effect")
+                    .str_field(hypellm_telemetry::Field::Detail, action.as_str()),
+            );
+        })
+    }
+
+    /// Record that a change whose intent was already audited did not happen.
+    ///
+    /// Best effort: the intent record is durable, and this one exists so that
+    /// the chain does not read as though an abandoned change took effect. If it
+    /// cannot be written either, the refusal the caller returns is still true.
+    fn record_abandoned(&self, mut event: AuditEvent, why: &str) {
+        event.timestamp_millis = self.state.clock.wall_millis();
+        let event = event
+            .with_outcome(AuditOutcome::Failed)
+            .with_reason(&format!("not applied: {why}"));
+        let _ = self.append_audit_event(event, "");
+    }
+
+    fn append_audit_event(&self, event: AuditEvent, failure: &str) -> Result<(), ApiError> {
+        let appended = self
+            .state
+            .store
+            .append_audit(event.clone())
+            .map_err(|_| ApiError::new(ApiErrorCode::InternalFault, failure.to_owned()))?;
         // The event that was appended, not a reconstruction of it. Indexing a
         // synthesized placeholder left the durable chain correct and the screen
         // an operator watches blank: the placeholder carried no tenant, and the
@@ -5439,7 +5771,7 @@ fn build_scenario(
                 .opt_field_str("reasoning_effort")
                 .ok()
                 .flatten()
-                .and_then(|v| hypellm_core::canonical::ReasoningEffort::parse(&v))
+                .and_then(hypellm_core::canonical::ReasoningEffort::parse)
                 .unwrap_or_default(),
             limits: RequestLimits {
                 max_output_tokens: body
@@ -5706,14 +6038,49 @@ fn roles_for(config: &ValidatedConfig, principal: &PrincipalId) -> Vec<Value> {
         .collect()
 }
 
-/// The management roles bound to a principal.
+/// The management roles bound to a principal, as it acts in `tenant`.
 ///
-/// Shared by identity resolution and break-glass, so the two cannot drift into
-/// disagreeing about what a `role_binding` means.
+/// Shared by identity resolution, password and break-glass sign-in, key
+/// callers, and per-request session re-resolution, so none of them can drift
+/// into disagreeing about what a `role_binding` means.
+///
+/// `role_binding` names a principal but no tenant, so the tenant comes from
+/// where the configuration places that principal: its `identity` and
+/// `local_user` records and the groups it belongs to. A principal placed in
+/// some tenant holds its roles **only there**. Matching on principal alone
+/// meant that a key minted in tenant B for tenant A's administrator carried
+/// that administrator's roles into tenant B. A principal the configuration
+/// places nowhere — a service principal known only by its bindings — is not
+/// narrowed, since there is no tenant to narrow it to; the key's own tenant
+/// then bounds what it can see.
 fn management_roles_for(
     config: &ValidatedConfig,
     principal: &PrincipalId,
+    tenant: &TenantId,
 ) -> Vec<hypellm_core::rbac::Role> {
+    let placements: Vec<&TenantId> = config
+        .identities
+        .iter()
+        .filter(|identity| identity.principal == *principal)
+        .map(|identity| &identity.tenant)
+        .chain(
+            config
+                .local_users
+                .iter()
+                .filter(|user| user.principal == *principal)
+                .map(|user| &user.tenant),
+        )
+        .chain(
+            config
+                .groups
+                .iter()
+                .filter(|group| group.members.contains(principal))
+                .map(|group| &group.tenant),
+        )
+        .collect();
+    if !placements.is_empty() && !placements.contains(&tenant) {
+        return Vec::new();
+    }
     config
         .roles
         .iter()
@@ -5722,6 +6089,43 @@ fn management_roles_for(
             _ => None,
         })
         .collect()
+}
+
+/// A session's roles, resolved afresh against `config`.
+///
+/// `None` when the record that authenticated the session no longer maps to
+/// the same principal in the same tenant — the `identity` or `local_user` was
+/// removed or re-pointed — in which case the session must end: the thing it
+/// was proof of has been withdrawn.
+///
+/// Break-glass sessions are not re-resolved and never reach here. Their
+/// authority is the offline token and a short lifetime (specification 22.4),
+/// and a recovery path that a bad publication could revoke would fail exactly
+/// when it is needed.
+fn resolve_session_roles(
+    config: &ValidatedConfig,
+    session: &Session,
+) -> Option<Vec<hypellm_core::rbac::Role>> {
+    let placed = match session.method {
+        hypellm_auth::AuthMethod::Oidc => {
+            let subject = session.subject.as_deref()?;
+            config.identities.iter().any(|identity| {
+                identity.principal == session.principal
+                    && identity.tenant == session.tenant
+                    && subject.strip_prefix(identity.issuer.as_str())
+                        .and_then(|rest| rest.strip_prefix('|'))
+                        == Some(identity.subject.as_str())
+            })
+        }
+        hypellm_auth::AuthMethod::Password => config
+            .local_users
+            .iter()
+            .any(|user| user.principal == session.principal && user.tenant == session.tenant),
+        // Any other method reaching the session store is resolved by binding
+        // alone, which is still re-read from the active configuration.
+        _ => true,
+    };
+    placed.then(|| management_roles_for(config, &session.principal, &session.tenant))
 }
 
 /// A claim value, bounded, for inclusion in an error message.
@@ -5754,7 +6158,7 @@ fn resolve_identity(
         .iter()
         .find(|identity| identity.issuer == issuer && identity.subject == subject)?;
 
-    let roles = management_roles_for(config, &binding.principal);
+    let roles = management_roles_for(config, &binding.principal, &binding.tenant);
 
     Some((
         binding.principal.clone(),
@@ -5829,9 +6233,17 @@ fn param(params: &[(String, String)], name: &str) -> Option<String> {
 /// `str` there panics. Any window that is not two valid hexadecimal ASCII
 /// digits — including one that is not valid UTF-8 at all — yields `None`, and
 /// the caller then treats the `%` as a literal byte.
+/// Two hexadecimal digits, and nothing else.
+///
+/// `u8::from_str_radix` accepts a leading sign, so `%+1` decoded to `0x01` —
+/// a filter value that decoded differently here from anywhere else it might
+/// be compared. RFC 3986 section 2.1 says exactly two hex digits.
 fn percent_pair(pair: &[u8]) -> Option<u8> {
-    let text = std::str::from_utf8(pair).ok()?;
-    u8::from_str_radix(text, 16).ok()
+    let [high, low] = pair else {
+        return None;
+    };
+    let digit = |byte: u8| char::from(byte).to_digit(16).and_then(|d| u8::try_from(d).ok());
+    Some(digit(*high)? * 16 + digit(*low)?)
 }
 
 fn percent_decode(value: &str) -> String {
@@ -6069,6 +6481,64 @@ mod tests {
         assert_eq!(percent_decode("%4"), "%4");
     }
 
+    use super::{AuditScan, scan_audit};
+    use crate::response::ApiError;
+    use wire_json::Value;
+
+    /// A chain of `len` records, sequences 1..=len, fetched newest first in
+    /// batches of `batch`, as `Store::audit_records` does.
+    fn chain(len: u64, batch: usize) -> impl FnMut(Option<u64>) -> Result<Vec<(u64, bool)>, ApiError> {
+        move |before| {
+            let top = before.map_or(len, |b| b.saturating_sub(1));
+            Ok((1..=top).rev().take(batch).map(|s| (s, s % 7 == 0)).collect())
+        }
+    }
+
+    fn keep_marked(sequence: u64, marked: &bool) -> Option<Value> {
+        marked.then(|| Value::from(sequence))
+    }
+
+    #[test]
+    fn an_audit_scan_that_runs_out_of_budget_says_more_remain_and_resumes() {
+        // Two batches of four per request; only every seventh record matches.
+        // The first request examines 8 records, finds one, and must hand back
+        // a cursor rather than claim the history is complete.
+        let bounds = AuditScan { batch: 4, max_batches: 2, limit: 3 };
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        let mut requests = 0;
+        loop {
+            requests += 1;
+            let (rows, next) = scan_audit(chain(40, 4), cursor, bounds, keep_marked).unwrap();
+            seen.extend(rows.iter().filter_map(Value::as_u64));
+            if requests == 1 {
+                assert_eq!(seen, vec![35], "the first request examines 40..=33");
+                assert_eq!(next, Some(33), "and must say where it stopped");
+            }
+            match next {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+            assert!(requests < 20);
+        }
+        assert_eq!(seen, vec![35, 28, 21, 14, 7], "every match, once, newest first");
+    }
+
+    #[test]
+    fn an_audit_page_filled_mid_batch_resumes_after_its_last_row() {
+        // One batch holds all 40 records; a page of 2 fills at 28. The next
+        // page must start below 28, not below the end of the batch.
+        let bounds = AuditScan { batch: 500, max_batches: 20, limit: 2 };
+        let (rows, next) = scan_audit(chain(40, 500), None, bounds, keep_marked).unwrap();
+        assert_eq!(rows.iter().filter_map(Value::as_u64).collect::<Vec<_>>(), vec![35, 28]);
+        assert_eq!(next, Some(28));
+        let (rows, next) = scan_audit(chain(40, 500), next, bounds, keep_marked).unwrap();
+        assert_eq!(rows.iter().filter_map(Value::as_u64).collect::<Vec<_>>(), vec![21, 14]);
+        let (rows, next) = scan_audit(chain(40, 500), next, bounds, keep_marked).unwrap();
+        assert_eq!(rows.iter().filter_map(Value::as_u64).collect::<Vec<_>>(), vec![7]);
+        assert_eq!(next, None, "the short batch was the chain's end");
+    }
+
     #[test]
     fn percent_decode_still_decodes_ordinary_escapes() {
         assert_eq!(percent_decode("a%2Fb"), "a/b");
@@ -6078,9 +6548,11 @@ mod tests {
         assert_eq!(percent_decode(""), "");
         // Not hexadecimal: the `%` stays literal and decoding resumes after it.
         assert_eq!(percent_decode("%zz"), "%zz");
-        // `u8::from_str_radix` accepts a leading `+`, so this pair decodes to
-        // 0x01 rather than staying literal. Pinned because it is surprising.
-        assert_eq!(percent_decode("%+1"), "\u{1}");
+        // A sign is not a hex digit. `u8::from_str_radix` accepts a leading
+        // `+`, which once decoded this to 0x01; the `%` now stays literal and
+        // the `+` is then a space, as it would be anywhere else.
+        assert_eq!(percent_decode("%+1"), "% 1");
+        assert_eq!(percent_decode("%-1"), "%-1");
     }
 
     #[test]

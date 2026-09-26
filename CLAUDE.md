@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The specification is `secure_llm_router_specification.md` (v1.0, "HypeLLM Router"). It is the authority: when this file and the specification disagree, the specification wins.
 
-The implementation is a Rust workspace of 17 crates, a static admin SPA under `web/`, and three reference out-of-process components that are deliberately **not** workspace members: the fleet agent under `agent/`, the identity verifier under `verifier/`, and the container init under `supervisor/`. It is **not** feature-complete against the specification; `docs/deferred-issues.md` lists only the current limitations and accepted deviations.
+The implementation is a Rust workspace of 17 crates, a static admin SPA under `web/`, and four reference out-of-process components that are deliberately **not** workspace members: the fleet agent under `agent/`, the identity verifier under `verifier/`, the container init under `supervisor/`, and the Windows tray monitor under `tray/`. It is **not** feature-complete against the specification; `docs/deferred-issues.md` lists only the current limitations and accepted deviations.
 
 The repository uses Git. Do not assume an edited working tree is disposable.
 
@@ -46,7 +46,7 @@ Provider credentials are files at `<secrets>/credentials/<credential-id>`, one p
 
 HypeLLM Router: an LLM routing gateway in Rust plus a standalone static admin SPA. It accepts OpenAI-/Anthropic-compatible HTTP from coding harnesses, authenticates the caller, resolves a model alias under per-user/per-model priority policy, ranks eligible targets, reserves capacity, translates to a provider-native wire format, and streams back with backpressure.
 
-Providers in scope: llama.cpp (local, OpenAI-compatible), OpenAI, Anthropic, DeepSeek, Moonshot/Kimi.
+Providers in scope: llama.cpp (local, OpenAI-compatible), OpenAI, Anthropic, DeepSeek, Moonshot/Kimi, and SemIf (a local semantic-decision scorer — the one family that is not OpenAI-shaped; it serves `POST /v1/rerank` only).
 
 Explicit non-goals: agent framework, vector DB, secrets vault, billing system, model host, general reverse proxy, and any browser automation/cookie reuse against consumer chat sites.
 
@@ -132,6 +132,7 @@ A fuzz target that only asserts "does not panic" is close to worthless here. Eac
 Keep fuzz documentation aligned with the suites that exist. The required seven areas are present; module-specific optional targets may still be absent and must not be claimed as implemented.
 
 - **The out-of-workspace components have their own suites**, outside `cargo test` because they are deliberately outside the workspace. `python3 supervisor/test_hypellm_init.py` covers the container init — a signal becoming `--shutdown`, a second signal not cutting the drain, a wedged drain being killed *and reported*. Run it when touching `supervisor/hypellm-init`.
+- `tray/` is C++ against Win32 and builds with CMake; `ctest --test-dir tray/build` runs its portable core suite (JSON reader, rate arithmetic, what the monitor shows) on any host, and `x86_64-w64-mingw32-g++` cross-compiles the whole application, so a change there is checkable from Linux. Run both when touching `tray/`.
 - `python3 agent/test_fleet_agent.py` covers the `FETCH` path — retry and resumption, the attempt cap, the router's deadline, one-fetch-per-host, cancellation during backoff, and the digest refusal — with `run_on` replaced by a scripted stub. No SSH, no Docker, no network. Run it when touching `agent/fleet-agent`.
 - **Fleet integration** — `crates/hypellm-router/tests/fleet.rs` drives the real client over a real Unix socket against `hypellm_net::fleet_sim::SimulatedAgent`, which verifies the handshake HMAC and enforces its own allowlist. `Clock::sleep` advances a `TestClock` rather than blocking, so a three-minute model load takes microseconds and the deadline arithmetic is exact. No SSH, no Docker, no network.
 

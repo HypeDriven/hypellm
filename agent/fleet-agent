@@ -21,9 +21,12 @@ The design rules it exists to keep
    the command that runs is built from the *table's* fields. Nothing the router
    sends is ever interpolated into a command line, so a fully compromised router
    can reorder declared deployments and cannot introduce one.
-2. **Everything is a list, never a shell string.** `subprocess.run` is called
-   with an argument vector and `shell=False`, so there is no quoting to get
-   wrong.
+2. **Everything is a list until the one place it cannot be.** `subprocess.run`
+   is called with an argument vector and `shell=False`. `ssh` itself, though,
+   joins its command arguments with spaces and hands the result to the remote
+   user's shell, which splits it again. So the remote vector is quoted exactly
+   once, with `shlex.join`, after `--`: a tab in a `--format` template or a
+   `;` in a table value reaches the remote program as the argument it was.
 3. **Bounded output.** Every command's output is read with a byte cap and a
    timeout; every reported field is truncated.
 4. **Its own rate limit.** A router bug must not be able to exhaust the fleet
@@ -44,6 +47,7 @@ import hmac
 import json
 import os
 import re
+import shlex
 import socket
 import socketserver
 import subprocess
@@ -80,6 +84,24 @@ MAX_FETCH_ATTEMPTS = 5
 # cancellation is noticed while waiting.
 FETCH_BACKOFF_SECONDS = 5.0
 MAX_FETCH_BACKOFF_SECONDS = 60.0
+
+# Background work. Every ACTIVATE, DEACTIVATE and FETCH runs on its own thread
+# and holds one `ssh`; the verbs that start them are refused `busy` past this
+# many in flight, so no stream of verbs — DEACTIVATE included, which the
+# activation rate limit deliberately does not cover — can grow threads or child
+# processes without bound.
+MAX_INFLIGHT_OPERATIONS = 16
+# Remote commands at once, across every connection and every background thread.
+# OBSERVE runs several per host; this is what keeps several routers observing
+# at once from forking an `ssh` apiece per host per command.
+MAX_CONCURRENT_COMMANDS = 32
+# Finished activations kept for STATUS. The router polls an activation until it
+# settles, so a finished one must outlive its thread for a while — but not
+# forever: the oldest finished entries (and their leases) are dropped past this.
+MAX_RETAINED_ACTIVATIONS = 1024
+
+# Activation states after which nothing more happens to an activation.
+TERMINAL_STATES = {"ready", "failed", "stopped", "cancelled"}
 
 # The identifier alphabet the router validates on its side. Anything else is
 # refused before it is looked up, so a malformed identifier cannot reach a
@@ -310,6 +332,59 @@ class Agent:
         self._nonces: set[str] = set()
         self._lock = threading.Lock()
         self._next = 1
+        # Background threads currently running a verb. Guarded by `_lock`.
+        self._inflight = 0
+        self._commands = threading.BoundedSemaphore(MAX_CONCURRENT_COMMANDS)
+
+    # -- Bookkeeping -------------------------------------------------------
+
+    def _admit_locked(self) -> bool:
+        """Reserve a background slot. Caller holds `_lock`."""
+        if self._inflight >= MAX_INFLIGHT_OPERATIONS:
+            return False
+        self._inflight += 1
+        return True
+
+    def _finish(self) -> None:
+        """Release a background slot and prune what has settled."""
+        with self._lock:
+            self._inflight -= 1
+            self._prune_locked()
+
+    def _prune_locked(self) -> None:
+        """Drop the oldest finished activations past the retention bound.
+
+        In-flight activations are never dropped: the router is still polling
+        them, and a pruned one would read `unknown_activation`.
+        """
+        excess = len(self._activations) - MAX_RETAINED_ACTIVATIONS
+        if excess <= 0:
+            return
+        dropped: set[str] = set()
+        for activation_id, activation in self._activations.items():
+            if len(dropped) >= excess:
+                break
+            if activation.state in TERMINAL_STATES:
+                dropped.add(activation_id)
+        for activation_id in dropped:
+            del self._activations[activation_id]
+        for lease in [k for k, v in self._leases.items() if v in dropped]:
+            del self._leases[lease]
+
+    def _spawn(self, target: Any, *args: Any) -> None:
+        """Run `target` on a thread holding the slot `_admit_locked` reserved."""
+
+        def run() -> None:
+            try:
+                target(*args)
+            finally:
+                self._finish()
+
+        try:
+            threading.Thread(target=run, daemon=True).start()
+        except RuntimeError:
+            self._finish()
+            raise
 
     # -- Command execution -------------------------------------------------
 
@@ -318,24 +393,26 @@ class Agent:
     ) -> tuple[int, str]:
         """Run an argument vector on a host, bounded and deadlined.
 
-        `argv` comes from this agent's own table. It is passed as a list with
-        `shell=False`, so there is nothing to quote and no way for a value to
-        become a second command.
+        `argv` comes from this agent's own table. Locally it is passed as a
+        list with `shell=False`; remotely it is quoted by `ssh_command`, because
+        `ssh` hands its command to the remote shell as one string.
 
         `timeout` overrides `--command-timeout` for the one command that
         legitimately takes longer than any other: an artifact pull. It is a
         parameter rather than a raised global so that a wedged `docker ps`
         still fails in two minutes.
         """
-        command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
-        command.extend(host.ssh_options)
-        command.append(host.ssh)
-        command.extend(argv)
+        command = ssh_command(host, argv)
+        limit = self.command_timeout if timeout is None else timeout
+        # Waiting for a slot counts against the command's own deadline, so a
+        # saturated agent reports a timeout rather than queueing forever.
+        if not self._commands.acquire(timeout=max(limit, 0.0)):
+            return (124, "timeout")
         try:
             completed = subprocess.run(  # noqa: S603 - argv is from the agent's own table
                 command,
                 capture_output=True,
-                timeout=self.command_timeout if timeout is None else timeout,
+                timeout=limit,
                 check=False,
                 shell=False,
             )
@@ -343,6 +420,8 @@ class Agent:
             return (124, "timeout")
         except OSError as error:
             return (125, truncate(error.__class__.__name__))
+        finally:
+            self._commands.release()
         output = completed.stdout[:MAX_COMMAND_OUTPUT].decode("utf-8", "replace")
         return (completed.returncode, output)
 
@@ -541,8 +620,11 @@ class Agent:
             existing = self._leases.get(lease)
             if existing:
                 return f"ACCEPTED {existing}"
+            if self._inflight >= MAX_INFLIGHT_OPERATIONS:
+                return "ERR busy"
             if starting and not self.limiter.allow(host.id, host.max_activations_per_hour):
                 return "ERR rate_limited"
+            self._admit_locked()
             activation_id = f"act-{self._next}"
             self._next += 1
             activation = Activation(activation_id, deployment_id, starting)
@@ -550,10 +632,7 @@ class Agent:
             self._leases[lease] = activation_id
             self._states[deployment_id] = "starting" if starting else "stopping"
 
-        thread = threading.Thread(
-            target=self._run_activation, args=(activation, deployment, host), daemon=True
-        )
-        thread.start()
+        self._spawn(self._run_activation, activation, deployment, host)
         return f"ACCEPTED {activation_id}"
 
     def _run_activation(
@@ -582,10 +661,16 @@ class Agent:
                     activation.progress = 1000
                     break
                 time.sleep(2.0)
+            if activation.state == "ready":
+                pass
+            elif activation.cancelled.is_set():
+                # Not `probe_timeout`: the loop also ends on a CANCEL, and a
+                # router told "failed" retries what the operator stopped.
+                activation.state = "cancelled"
+                activation.detail = "cancelled"
             else:
-                if activation.state != "ready":
-                    activation.state = "failed"
-                    activation.detail = "probe_timeout"
+                activation.state = "failed"
+                activation.detail = "probe_timeout"
         else:
             activation.state = "stopped"
             activation.detail = "stopped"
@@ -650,6 +735,8 @@ class Agent:
                     if running.deployment == artifact_id:
                         return f"ACCEPTED {in_flight}"
                     return "ERR host_busy"
+            if not self._admit_locked():
+                return "ERR busy"
 
             activation_id = f"act-{self._next}"
             self._next += 1
@@ -667,7 +754,7 @@ class Agent:
                     if self._fetches.get(host_id) == activation.id:
                         del self._fetches[host_id]
 
-        threading.Thread(target=run, daemon=True).start()
+        self._spawn(run)
         return f"ACCEPTED {activation_id}"
 
     def _run_fetch(
@@ -778,6 +865,26 @@ class Agent:
         return "OK"
 
 
+def ssh_command(host: Host, argv: list[str]) -> list[str]:
+    """The local argument vector that runs `argv` on `host`.
+
+    `ssh` does not pass an argument vector through: it joins everything after
+    the destination with spaces and the remote user's shell splits the result.
+    Unquoted, `docker ps --format "{{.Names}}\t{{.Status}}"` arrives as
+    several arguments with the tab collapsed, and a `;` or `$(...)` in a table
+    value runs remotely. `shlex.join` makes the joined string re-split into
+    exactly `argv`.
+    """
+    command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
+    command.extend(host.ssh_options)
+    # `--` before the destination: OpenSSH then stops option parsing for good,
+    # so neither the destination nor the command is ever read as an option.
+    command.append("--")
+    command.append(host.ssh)
+    command.append(shlex.join(argv))
+    return command
+
+
 class Handler(socketserver.BaseRequestHandler):
     """One connection."""
 
@@ -795,6 +902,12 @@ class Handler(socketserver.BaseRequestHandler):
             if not chunk:
                 return
             buffer += chunk
+            # Bounded while accumulating, not only once a newline arrives: a
+            # peer that never sends one would otherwise grow this forever.
+            end = buffer.find(b"\n")
+            if (end if end >= 0 else len(buffer)) > MAX_LINE:
+                self.send(b"ERR malformed\n")
+                return
             while b"\n" in buffer:
                 raw, _, buffer = buffer.partition(b"\n")
                 if len(raw) > MAX_LINE:

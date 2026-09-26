@@ -65,6 +65,15 @@ fn amended_config() -> String {
     let mut text = default_config();
     text.push_str("tenant id=initech\n");
     text.push_str("grant scope=tenant:initech model=* allow=true\n");
+    // The harness's approver, configured for real. Session roles are
+    // re-resolved against every newly active configuration, so an approver
+    // who publishes and then acts again must be one the configuration they
+    // published still recognizes — as a real one would have to be.
+    text.push_str(
+        "identity issuer=https://issuer.test subject=user:approver-acme \
+         principal=user:approver-acme tenant=acme\n",
+    );
+    text.push_str("role_binding subject=principal:user:approver-acme role=policy_approver\n");
     text
 }
 
@@ -2130,6 +2139,7 @@ fn a_restored_identifier_cannot_collide_with_a_new_one() {
         text: "tenant id=acme\n".to_owned(),
         author: author.clone(),
         tenant: tenant.clone(),
+        author_accountable: None,
         created_at_millis: 1,
         digest: None,
         errors: Vec::new(),
@@ -2178,4 +2188,68 @@ fn the_active_bundle_needs_more_than_read_summary() {
     let response = admin.get(&admin.viewer(), "/admin/v1/policies/active");
     assert_eq!(response.status, 403, "{}", response.body);
     assert!(!response.body_contains("tenant id="), "{}", response.body);
+}
+
+// -- Audit precedes activation (specification 18.3) --------------------------
+
+/// The position in the durable log of the first frame of `kind` whose payload
+/// contains `needle`, and of the last `ConfigActivation` frame.
+fn log_position(admin: &Harness, kind: RecordKind, needle: &str) -> Option<usize> {
+    let path = admin.state.store.dir().join("log.bin");
+    let mut log = Log::open(&path, false).expect("open the durable log for reading");
+    let replay = log.replay(STORE_MAC_KEY).expect("replay the durable log");
+    replay.frames.iter().position(|frame| {
+        frame.kind == kind && String::from_utf8_lossy(&frame.payload).contains(needle)
+    })
+}
+
+fn last_activation(admin: &Harness) -> usize {
+    let path = admin.state.store.dir().join("log.bin");
+    let mut log = Log::open(&path, false).expect("open the durable log for reading");
+    let replay = log.replay(STORE_MAC_KEY).expect("replay the durable log");
+    replay
+        .frames
+        .iter()
+        .rposition(|frame| frame.kind == RecordKind::ConfigActivation)
+        .expect("an activation frame")
+}
+
+#[test]
+fn a_publication_is_audited_before_it_is_activated() {
+    // The audit append used to follow the activation, so a failed append
+    // answered "not applied" about a configuration already in force. The
+    // durable log shows the order: the audit record comes first.
+    let admin = Harness::new();
+    let editor = admin.policy_editor();
+    let approver = admin.policy_approver();
+    let id = validated_draft(&admin, &editor, &amended_config());
+    let published =
+        admin.post_if_match(&approver, &format!("/admin/v1/policies/{id}:publish"), "{}", ANY_ETAG);
+    assert_eq!(published.status, 200, "{}", published.body);
+
+    let audit = log_position(&admin, RecordKind::AuditEvent, "policy_published").expect("audited");
+    assert!(audit < last_activation(&admin), "activated before it was audited");
+}
+
+#[test]
+fn a_rollback_is_audited_before_it_is_activated() {
+    let admin = Harness::new();
+    let editor = admin.policy_editor();
+    let approver = admin.policy_approver();
+    let id = validated_draft(&admin, &editor, &amended_config());
+    let published =
+        admin.post_if_match(&approver, &format!("/admin/v1/policies/{id}:publish"), "{}", ANY_ETAG);
+    assert_eq!(published.status, 200, "{}", published.body);
+
+    let rolled = admin.post_if_match(
+        &approver,
+        "/admin/v1/policies:rollback",
+        r#"{"reason":"routing regression, incident 4711"}"#,
+        ANY_ETAG,
+    );
+    assert_eq!(rolled.status, 200, "{}", rolled.body);
+
+    let audit =
+        log_position(&admin, RecordKind::AuditEvent, "policy_rolled_back").expect("audited");
+    assert!(audit < last_activation(&admin), "rolled back before it was audited");
 }

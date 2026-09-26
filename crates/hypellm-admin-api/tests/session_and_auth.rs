@@ -1102,3 +1102,101 @@ fn a_refused_origin_is_not_handed_a_grant_by_the_error_path() {
         "a refused origin was handed a cross-origin grant"
     );
 }
+
+// -- Roles follow the active configuration -----------------------------------
+
+/// The default configuration, with `user:alice` signed in through a configured
+/// identity and bound to `operator`, and an approver bound so a publication
+/// can be made through the real endpoint.
+fn alice_config(with_binding: bool, with_identity: bool) -> String {
+    let mut text = harness::default_config();
+    if with_identity {
+        text.push_str(
+            "identity issuer=https://issuer.test subject=user:alice \
+             principal=user:alice tenant=acme\n",
+        );
+    }
+    if with_binding {
+        text.push_str("role_binding subject=principal:user:alice role=operator\n");
+    }
+    text
+}
+
+/// Publish `text` through the API, as an editor and a distinct approver.
+fn publish(admin: &Harness, text: &str) {
+    let editor = admin.policy_editor();
+    let approver = admin.policy_approver();
+    let body = wire_json::to_string(&wire_json::Value::Object({
+        let mut o = wire_json::Object::new();
+        o.push("configuration", wire_json::Value::from(text));
+        o
+    }));
+    let created = admin.post(&editor, "/admin/v1/policies", &body);
+    assert_eq!(created.status, 201, "{}", created.body);
+    let id = created.str_field("id");
+    let validated = admin.post(&editor, &format!("/admin/v1/policies/{id}:validate"), "{}");
+    assert_eq!(validated.status, 200, "{}", validated.body);
+    let published = admin.post_if_match(
+        &approver,
+        &format!("/admin/v1/policies/{id}:publish"),
+        "{}",
+        harness::ANY_ETAG,
+    );
+    assert_eq!(published.status, 200, "{}", published.body);
+}
+
+#[test]
+fn a_published_withdrawal_of_a_role_binding_takes_effect_on_live_sessions() {
+    // Roles were resolved once, at sign-in, and never again: publishing a
+    // configuration that withdrew someone's `role_binding` left their session
+    // holding the withdrawn authority for up to the twelve-hour lifetime.
+    let admin = Harness::with_config(&alice_config(true, true));
+    let alice = admin.session("user:alice", TENANT_A, &[Role::Operator]);
+    let target = hypellm_core::ids::TargetId::new(LOCAL_TARGET).unwrap();
+
+    let drained = admin.patch(&alice, "/admin/v1/targets/local:model", r#"{"state":"draining"}"#, "*");
+    assert_eq!(drained.status, 200, "{}", drained.body);
+
+    publish(&admin, &alice_config(false, true));
+
+    let refused = admin.patch(&alice, "/admin/v1/targets/local:model", r#"{"state":"enabled"}"#, "*");
+    assert_eq!(refused.status, 403, "{}", refused.body);
+    assert_eq!(
+        admin.state.health.admin_state(&target),
+        Some(hypellm_core::target::AdminState::Draining),
+        "the withdrawn operator still changed the target"
+    );
+    // The session itself is still valid — it proves who alice is — but it now
+    // carries exactly what the configuration grants her: nothing.
+    let me = admin.get(&alice, "/admin/v1/session");
+    assert_eq!(me.status, 200, "{}", me.body);
+    assert!(!me.body_contains("operator"), "{}", me.body);
+}
+
+#[test]
+fn a_published_removal_of_the_identity_ends_the_session() {
+    let admin = Harness::with_config(&alice_config(true, true));
+    let alice = admin.session("user:alice", TENANT_A, &[Role::Operator]);
+    assert_eq!(admin.get(&alice, "/admin/v1/targets").status, 200);
+
+    publish(&admin, &alice_config(true, false));
+
+    let refused = admin.get(&alice, "/admin/v1/targets");
+    assert_eq!(refused.status, 401, "{}", refused.body);
+    assert!(
+        admin.state.sessions.validate(&alice.token, admin.clock.now_millis()).is_err(),
+        "the session must be gone from the store, not merely refused once"
+    );
+}
+
+#[test]
+fn a_break_glass_session_survives_a_publication_that_does_not_mention_it() {
+    // The recovery path is authorized by the offline token, not by the
+    // configuration, and must keep working after a bad publication — which is
+    // the case it exists for.
+    let admin = Harness::with_config(&alice_config(true, true));
+    let recovery = admin.break_glass();
+    publish(&admin, &alice_config(false, false));
+    let response = admin.get(&recovery, "/admin/v1/keys");
+    assert_eq!(response.status, 200, "{}", response.body);
+}

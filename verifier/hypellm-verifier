@@ -105,6 +105,9 @@ DEFAULT_JWKS_TTL_SECONDS = 3600
 DEFAULT_HTTP_TIMEOUT = 10.0
 DEFAULT_OPENSSL_TIMEOUT = 5.0
 DEFAULT_CONNECTION_TIMEOUT = 30.0
+# Connections served at once, one thread each. Past this a connection is
+# answered `ERR busy` and closed by the accepting thread, without a thread.
+MAX_CONCURRENT_CONNECTIONS = 32
 
 # The algorithm allowlist. Rule 1: the token does not get to choose.
 #
@@ -781,10 +784,38 @@ class Handler(socketserver.BaseRequestHandler):
 class Server(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
     allow_reuse_address = True
-    # Bounded, like everything else. Past this the kernel's backlog holds
-    # connections and the router's own read timeout applies; what must not
-    # happen is one thread per arriving connection without limit.
+    # The kernel's listen backlog, and nothing more: it bounds connections not
+    # yet accepted, not threads. `ThreadingMixIn` starts one thread per accepted
+    # connection without limit, so the thread count is capped separately below.
     request_queue_size = 64
+    max_connections = MAX_CONCURRENT_CONNECTIONS
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._slots = threading.BoundedSemaphore(self.max_connections)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        # Runs on the accepting thread. Refusing here costs no thread; a peer
+        # holding every slot open is bounded by the connection timeout.
+        if not self._slots.acquire(blocking=False):
+            try:
+                request.setblocking(False)
+                request.send(b"ERR busy\n")
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
 
 def serve(verifier: Verifier, socket_path: str, mode: int, connection_timeout: float) -> int:
@@ -1065,6 +1096,60 @@ def selftest(openssl: str = "openssl") -> int:
                 check(f"{name} (ACCEPTED)", False)
             except Refused as refused:
                 check(f"{name} -> {refused.code}", refused.code == "insecure_endpoint")
+
+        # Rule 5: concurrent connections are bounded, not just the backlog.
+        socket_path = os.path.join(workspace, "verifier.sock")
+
+        class SmallServer(Server):
+            max_connections = 2
+
+        server = SmallServer(socket_path, Handler)
+        server.verifier = verifier  # type: ignore[attr-defined]
+        server.connection_timeout = 10.0  # type: ignore[attr-defined]
+        serving = threading.Thread(target=server.serve_forever, daemon=True)
+        serving.start()
+
+        def connect() -> socket.socket:
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(3.0)
+            client.connect(socket_path)
+            return client
+
+        def reply(client: socket.socket) -> bytes:
+            data = b""
+            try:
+                while True:
+                    chunk = client.recv(64)
+                    if not chunk:
+                        return data
+                    data += chunk
+            except (TimeoutError, socket.timeout):
+                return data + b"<timeout>"
+
+        try:
+            holders = [connect(), connect()]
+            extra = connect()
+            check(
+                "a connection past the cap is refused without a thread",
+                reply(extra) == b"ERR busy\n",
+            )
+            extra.close()
+            for holder in holders:
+                holder.close()
+            freed = False
+            for _ in range(200):
+                probe = connect()
+                probe.sendall(b"NOPE 0\n")
+                answer = reply(probe)
+                probe.close()
+                if answer == b"ERR unknown_verb\n":
+                    freed = True
+                    break
+                time.sleep(0.01)
+            check("a slot is released when its connection ends", freed)
+        finally:
+            server.shutdown()
+            server.server_close()
 
         # The whole suite must have run without touching the network. Asserted
         # rather than assumed: the first draft of this file refetched the key

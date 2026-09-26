@@ -85,8 +85,8 @@ struct TrackerState {
     rate: BTreeMap<Capability, Ewma>,
     /// Arrivals in the current window, per capability.
     window: BTreeMap<Capability, u64>,
-    /// When the current window opened.
-    window_started_ms: u64,
+    /// When the current window opened, or `None` before the first sample.
+    window_started_ms: Option<u64>,
     /// Requests waiting for a capability right now.
     queued: BTreeMap<Capability, u32>,
     /// When each deployment last served a request.
@@ -146,23 +146,36 @@ impl DemandTracker {
     }
 
     /// Take an immutable snapshot for one planning decision.
+    ///
+    /// Rolls every window that has closed by `now_ms` first, so a capability
+    /// that has gone quiet decays whether or not anything else is being asked
+    /// for. The rates used to move only when a request arrived, so a fleet
+    /// that fell idle kept its last busy figures indefinitely and the planner
+    /// protected models nobody had called for an hour.
     #[must_use]
     pub fn snapshot(&self, now_ms: u64) -> DemandSnapshot {
-        let Ok(state) = self.inner.read() else {
+        let Ok(mut state) = self.inner.write() else {
             return DemandSnapshot::default();
         };
+        state.roll_window(now_ms);
 
-        // The open window is included at its pro-rata rate rather than
-        // ignored, so that the first burst of demand for a cold capability is
-        // visible immediately instead of ten seconds later — which is exactly
-        // the moment the planner is being asked whether to start it.
-        let elapsed = now_ms.saturating_sub(state.window_started_ms).max(1);
+        // The open window is included rather than ignored, so that the first
+        // burst of demand for a cold capability is visible immediately instead
+        // of ten seconds later — which is exactly the moment the planner is
+        // being asked whether to start it.
+        //
+        // It is scaled over the *whole* window, never over the part that has
+        // elapsed. Pro-rating over elapsed time made one request a millisecond
+        // after a roll read as 60 000 a minute, which is enough demand for a
+        // single call to evict a warm resident. Over the full window the open
+        // bucket can only ever report what the same count would report once
+        // the window closed: an early burst reads low, never high.
         let mut rate_per_minute = BTreeMap::new();
         for (capability, ewma) in &state.rate {
             rate_per_minute.insert(*capability, ewma.value_or(0));
         }
         for (capability, count) in &state.window {
-            let partial = count.saturating_mul(60_000).div_euclid(elapsed);
+            let partial = count.saturating_mul(60_000).div_euclid(DEMAND_WINDOW_MS);
             let entry = rate_per_minute.entry(*capability).or_insert(0);
             *entry = (*entry).max(partial);
         }
@@ -184,16 +197,30 @@ impl DemandTracker {
     }
 }
 
+/// The most closed windows folded in one roll.
+///
+/// A tracker idle for a day would otherwise fold thousands of zero samples in
+/// one call. At a 10% weight, 256 zero samples shrink a rate by a factor of
+/// roughly 10^11, which takes any rate a request path can produce to zero in
+/// integer arithmetic; folding more changes nothing but the time taken.
+const MAX_WINDOWS_PER_ROLL: u64 = 256;
+
 impl TrackerState {
-    /// Close the current window if it has elapsed, folding it into the average.
+    /// Close every window that has elapsed, folding each into the average.
+    ///
+    /// The window holding the open bucket's counts is folded first; every
+    /// further elapsed window saw no traffic and folds as a zero. Pure: the
+    /// time is passed in.
     fn roll_window(&mut self, now_ms: u64) {
-        if self.window_started_ms == 0 {
-            self.window_started_ms = now_ms;
+        let Some(started) = self.window_started_ms else {
+            self.window_started_ms = Some(now_ms);
+            return;
+        };
+        let elapsed = now_ms.saturating_sub(started);
+        if elapsed < DEMAND_WINDOW_MS {
             return;
         }
-        if now_ms.saturating_sub(self.window_started_ms) < DEMAND_WINDOW_MS {
-            return;
-        }
+        let closed = elapsed.div_euclid(DEMAND_WINDOW_MS);
         // Every capability that has ever been seen gets a sample, including a
         // zero for the ones that saw nothing this window. Without the zeroes an
         // idle capability's rate would stay at whatever it last was, and a
@@ -208,13 +235,18 @@ impl TrackerState {
         for capability in seen {
             let count = self.window.get(&capability).copied().unwrap_or(0);
             let per_minute = count.saturating_mul(60_000).div_euclid(DEMAND_WINDOW_MS);
-            self.rate
-                .entry(capability)
-                .or_insert_with(Ewma::smooth)
-                .observe(per_minute);
+            let ewma = self.rate.entry(capability).or_insert_with(Ewma::smooth);
+            ewma.observe(per_minute);
+            for _ in 1..closed.min(MAX_WINDOWS_PER_ROLL) {
+                ewma.observe(0);
+            }
         }
         self.window.clear();
-        self.window_started_ms = now_ms;
+        // Aligned to the window grid rather than reset to `now_ms`, so the
+        // open window's age — and therefore when it next closes — does not
+        // depend on when somebody happened to look.
+        self.window_started_ms =
+            Some(started.saturating_add(closed.saturating_mul(DEMAND_WINDOW_MS)));
     }
 }
 
@@ -260,6 +292,59 @@ mod tests {
             0,
             "an idle capability must not keep the value it had when it was busy"
         );
+    }
+
+    #[test]
+    fn one_request_just_after_a_window_opens_is_not_read_as_a_flood() {
+        // Pro-rating the open window over the milliseconds elapsed made a
+        // single request one millisecond in read as 60 000 a minute — more
+        // than enough for one call to evict a warm resident.
+        let tracker = DemandTracker::new();
+        tracker.record_request(Capability::TextToMusic, 1_000);
+        let snapshot = tracker.snapshot(1_001);
+        let rate = snapshot.rate(Capability::TextToMusic);
+        assert!(rate > 0, "the open window must still contribute");
+        assert!(
+            rate <= 60_000u64.div_euclid(DEMAND_WINDOW_MS),
+            "one request read as {rate} a minute"
+        );
+    }
+
+    #[test]
+    fn demand_decays_while_nothing_at_all_is_asked_for() {
+        // The average used to move only on `record_request`. A fleet that went
+        // completely quiet kept its busy figures forever, so the planner kept
+        // protecting models nobody was calling.
+        let tracker = DemandTracker::new();
+        let mut now = 0;
+        for _ in 0..30 {
+            for _ in 0..50 {
+                tracker.record_request(Capability::Chat, now);
+            }
+            now += DEMAND_WINDOW_MS;
+        }
+        let busy = tracker.snapshot(now).rate(Capability::Chat);
+        assert!(busy > 0, "the fixture must build up some demand");
+
+        // An hour with no requests of any kind; only snapshots are taken.
+        let idle = tracker.snapshot(now + 3_600_000).rate(Capability::Chat);
+        assert_eq!(idle, 0, "an hour of silence left the rate at {idle} (was {busy})");
+    }
+
+    #[test]
+    fn a_snapshot_does_not_change_what_a_later_snapshot_reports() {
+        // Rolling at snapshot time must be the same arithmetic as rolling at
+        // request time: taking a snapshot mid-way is an observation, not an
+        // event.
+        let observed = DemandTracker::new();
+        let unobserved = DemandTracker::new();
+        for step in 0..40u64 {
+            let now = step * 3_000;
+            observed.record_request(Capability::Chat, now);
+            unobserved.record_request(Capability::Chat, now);
+            let _ = observed.snapshot(now + 1_500);
+        }
+        assert_eq!(observed.snapshot(200_000), unobserved.snapshot(200_000));
     }
 
     #[test]

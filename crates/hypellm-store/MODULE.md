@@ -93,17 +93,26 @@ anchor; a chain verified without a checkpoint proves very little.
 **Snapshot metadata is MACed on write and verified on read.** `encode_meta`
 appends an HMAC over the magic, sequence, audit head, audit count, and a SHA-256
 of the payload; `read_snapshot` recomputes that MAC and rejects a mismatch as
-`SnapshotIntegrity`, using a constant-time compare. Editing `snapshot.meta` to
+`SnapshotIntegrity`, using a constant-time compare. Editing the metadata to
 rewind the sequence number or substitute an audit head therefore fails startup
 rather than being accepted.
 
-**The two files are cross-checked.** `Store::compact` writes `snapshot.bin` and
-`snapshot.meta` as two separate atomic replacements, so a crash between them
-leaves a new payload paired with the previous metadata. That pair is now caught:
-the metadata carries a digest of the payload it describes, and `read_snapshot`
-compares it against the payload actually on disk. A mismatched pair is
-`SnapshotIntegrity`, not a silent acceptance of stale sequence and audit head.
-The log reset still happens last, so no records are lost either way.
+**The snapshot is one file.** The metadata leads `snapshot.bin` and the payload
+follows it, so `Store::compact` replaces both with a single atomic rename; a
+crash cannot pair a new payload with old metadata. The metadata still carries a
+digest of the payload, so a substituted body is `SnapshotIntegrity`. A
+`snapshot.meta` left by the earlier two-file format is removed on the next
+compaction, and a `snapshot.bin` in that format fails closed as
+`CorruptSnapshotMetadata`. The log reset happens last; if it does not happen,
+startup and every later read skip frames at or below the snapshot's sequence,
+so no record is applied twice.
+
+**A failed append leaves nothing behind.** `Log::append` cuts the file back to
+its last known-good length and syncs it when a write or `fsync` fails, so a
+frame the caller was told failed is not on disk and the next frame does not
+land behind partial bytes. If the cut itself fails, the log is poisoned and
+refuses every later append until the store is reopened. `append_audit`'s chain
+rollback depends on this.
 
 **Recovery verifies integrity and continuity.** `Store::open` authenticates
 protected frames, checks monotonic sequence numbers, decodes every audit record
@@ -130,7 +139,10 @@ re-reads the lock under it, so two starters that both observe the same stale
 lock cannot both proceed; a claim left by a starter that died mid-reclaim
 carries an identity of its own and is swept, so it cannot wedge the directory.
 `Drop` removes the lock file only if the identity on disk is still this
-process's.
+process's. A lock (or claim) is written to a staging file and hard-linked into
+place, so it never appears without its identity; an empty lock — which only an
+older build, or a filesystem without hard links, can produce — is treated as
+held for `EMPTY_LOCK_GRACE` and reclaimable after it.
 
 What remains: where `/proc` is absent or will not answer, the liveness check
 degrades to pid existence — which never steals a live lock but can refuse a
@@ -159,13 +171,13 @@ Enforced:
 
 | Input / resource | Limit | Enforced by |
 |---|---|---|
-| Declared frame payload length | 64 MiB | `frame::MAX_PAYLOAD_LEN`, checked in `frame::decode` **before** any allocation |
+| Declared frame payload length | 64 MiB | `frame::MAX_PAYLOAD_LEN`, checked in `frame::decode` **before** any allocation, and in `frame::encode` so an unreadable frame is never written |
 | Frame header / CRC / MAC | 24 / 4 / 32 bytes, fixed | `frame::HEADER_LEN`, `CRC_LEN`, `MAC_LEN` |
 | Frame format version | Exactly `1` | `frame::FORMAT_VERSION`; anything else is `UnsupportedVersion` |
 | Audit record JSON | depth 32, 64 KiB per string, 1 MiB total, 10 000 array items, 2 000 object entries, duplicate keys rejected | `wire_json::Limits::SMALL` in `AuditRecord::from_payload` |
 | Audit reason text | 512 bytes, truncated on a char boundary | `Capped::new(reason, 512)` in `AuditEvent::with_reason` and `from_json` |
 | Audit checkpoint payload | Exactly 80 bytes | `AuditCheckpoint::from_payload` |
-| Snapshot metadata | Exactly 116 bytes (`META_LEN`) with `HYMT` magic | `read_snapshot` |
+| Snapshot metadata | The first 116 bytes (`META_LEN`) of `snapshot.bin`, with `HYMT` magic | `read_snapshot` |
 | Retained activation history | 8 versions by default, caller-chosen via `Activatable::with_history`; 0 disables rollback | `history_limit` plus `Vec::truncate` in `activate` |
 | Audit checkpoint cadence | Caller-supplied record interval; `0` disables automatic checkpoints | `Store::checkpoint_interval` |
 | Sequence ordering | Strictly increasing across the log | `Log::replay` → `LogError::NonMonotonicSequence` |
@@ -174,12 +186,11 @@ Not enforced — stated so the gap is visible rather than assumed:
 
 | Input / resource | Status |
 |---|---|
-| Total log file size | Unbounded. Compaction is caller-driven; `Log::replay` buffers the entire file. |
+| Total log file size | Not bounded on write. Compaction is caller-driven; replay refuses a log over `log::MAX_LOG_BYTES` rather than reading it. |
 | Snapshot payload size | Unbounded on both write (`Store::compact`) and read (`read_optional`). |
 | Frames materialised by one replay | Unbounded; `Replay::frames` grows with the log. |
 | `AuditEvent` actor / tenant / object / request_id / source | Unbounded on write; only the read path is bounded, which is the asymmetry noted above. |
 | Reserved header field (bytes 10..12) | Not validated on decode. Covered by CRC and MAC, so it cannot be edited in place, but a non-zero value decodes successfully. |
-| Snapshot metadata MAC | Computed and stored, never verified. |
 
 ## Fuzz targets
 

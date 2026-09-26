@@ -36,14 +36,19 @@ use hypellm_test_corpus::golden;
 
 const ITERATIONS: u32 = 20_000;
 
-fn families() -> [ProviderFamily; 2] {
-    [ProviderFamily::OpenAi, ProviderFamily::Anthropic]
+fn families() -> [ProviderFamily; 3] {
+    [
+        ProviderFamily::OpenAi,
+        ProviderFamily::Anthropic,
+        ProviderFamily::SemIf,
+    ]
 }
 
 fn family_for(family: golden::GoldenFamily) -> ProviderFamily {
     match family {
         golden::GoldenFamily::OpenAiCompatible => ProviderFamily::OpenAi,
         golden::GoldenFamily::Anthropic => ProviderFamily::Anthropic,
+        golden::GoldenFamily::SemIf => ProviderFamily::SemIf,
     }
 }
 
@@ -62,6 +67,7 @@ fn body_seeds() -> Vec<&'static [u8]> {
         .iter()
         .map(|r| r.body.as_bytes())
         .chain(golden::failures().iter().map(|f| f.body.as_bytes()))
+        .chain(golden::scores().iter().map(|s| s.body.as_bytes()))
         .collect()
 }
 
@@ -256,13 +262,68 @@ fn random_bytes_are_handled_without_panicking() {
 }
 
 #[test]
+fn a_mutated_scorer_reply_never_yields_a_misattributed_score() {
+    // The defect this guards is one line of plausible code. The embeddings
+    // decoder beside it reads its position with
+    // `.and_then(as_u64).unwrap_or(0)`, which is harmless for a vector — the
+    // caller gets its own embedding back under a wrong index and the numbers
+    // are still its own. For a score it is not harmless: index 0 is one of the
+    // caller's candidates, and a reply whose option id is absent, negative,
+    // fractional or a word would silently hand candidate 0 somebody else's
+    // relevance. Every mutation that decodes at all must produce scores whose
+    // indices are ones this adapter could have sent: unique, and inside the
+    // option range the scorer itself enforces.
+    let seeds: Vec<&[u8]> = golden::scores().iter().map(|s| s.body.as_bytes()).collect();
+    assert!(!seeds.is_empty(), "the corpus supplied no scorer replies");
+    let adapter = adapter_for(ProviderFamily::SemIf);
+    let mut rng = Rng::new(0xada9_0009);
+    let mut decoded_any = false;
+
+    for _ in 0..ITERATIONS {
+        let case = fuzz::mutate(rng.pick(&seeds).copied().unwrap_or(b""), &mut rng);
+        let Ok(events) = adapter.decode_response(200, &case) else {
+            continue;
+        };
+        let mut seen: Vec<u32> = Vec::new();
+        for event in &events {
+            let hypellm_core::event::CanonicalEvent::Score { index, score } = event else {
+                continue;
+            };
+            decoded_any = true;
+            assert!(
+                *index < 16,
+                "a score was attributed to candidate {index}, which no request can have offered"
+            );
+            assert!(
+                score.is_finite(),
+                "candidate {index} was scored with a non-finite number"
+            );
+            assert!(
+                !seen.contains(index),
+                "candidate {index} was scored twice, so one of the two scores belongs to nobody"
+            );
+            seen.push(*index);
+        }
+        assert!(
+            seen.len() <= 16,
+            "a reply produced {} scores for a scorer that takes at most 16 options",
+            seen.len()
+        );
+    }
+    assert!(
+        decoded_any,
+        "no mutation decoded to a score, so this target asserted nothing"
+    );
+}
+
+#[test]
 fn every_recorded_fixture_is_reachable_as_a_seed() {
     // A seed set that silently shrank would leave these targets fuzzing a
     // fraction of the corpus while still passing.
     assert!(stream_seeds().len() >= golden::streams().len());
     assert_eq!(
         body_seeds().len(),
-        golden::responses().len() + golden::failures().len()
+        golden::responses().len() + golden::failures().len() + golden::scores().len()
     );
     for stream in golden::streams() {
         // Every fixture names a family this test can build an adapter for.

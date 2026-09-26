@@ -106,6 +106,12 @@ pub fn classify_ipv4(addr: Ipv4Addr) -> AddressClass {
     if addr.is_unspecified() {
         return AddressClass::Unspecified;
     }
+    // The rest of 0.0.0.0/8, "this network" (RFC 1122 3.2.1.3). Never a valid
+    // destination, and some stacks route it to the local host the way they do
+    // 0.0.0.0 itself, so it must not fall through to `Global`.
+    if o[0] == 0 {
+        return AddressClass::Reserved;
+    }
     if addr.is_loopback() {
         return AddressClass::Loopback;
     }
@@ -162,6 +168,32 @@ pub fn classify_ipv6(addr: Ipv6Addr) -> AddressClass {
         return AddressClass::Multicast;
     }
     let segments = addr.segments();
+    // 64:ff9b:1::/48, NAT64 local-use (RFC 8215). Unlike the well-known
+    // 64:ff9b::/96 prefix, where the IPv4 address sits in the last 32 bits,
+    // a local-use prefix may be any length up to /96 and RFC 6052 places the
+    // embedded address differently for each — so which IPv4 destination it
+    // translates to depends on the operator's NAT64 configuration, which the
+    // router cannot see. It is by definition a network-local translation
+    // service, so it is refused rather than guessed at.
+    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001 {
+        return AddressClass::Reserved;
+    }
+    // 2002::/16, 6to4 (RFC 3056): the IPv4 address of the 6to4 site sits in
+    // the second and third segments. An embedded non-global address keeps its
+    // own class (so `2002:a9fe:a9fe::` is reported as metadata), and a global
+    // one is still refused: 6to4 is deprecated (RFC 7526), the packet is
+    // delivered by whichever anycast relay is nearest, and no configured
+    // provider is legitimately reached this way.
+    if segments[0] == 0x2002 {
+        let [a, b] = segments[1].to_be_bytes();
+        let [c, d] = segments[2].to_be_bytes();
+        let embedded = classify_ipv4(Ipv4Addr::new(a, b, c, d));
+        return if embedded.is_global() {
+            AddressClass::Reserved
+        } else {
+            embedded
+        };
+    }
     // fe80::/10 link-local.
     if segments[0] & 0xffc0 == 0xfe80 {
         return AddressClass::LinkLocal;
@@ -431,6 +463,38 @@ mod tests {
     }
     fn v6(s: &str) -> IpAddr {
         IpAddr::V6(s.parse().expect("valid IPv6"))
+    }
+
+    #[test]
+    fn translation_prefixes_and_this_network_never_classify_as_global() {
+        // NAT64 local-use: which IPv4 host it reaches depends on a translator
+        // the router cannot see, so it is refused whatever the suffix.
+        assert_eq!(classify(v6("64:ff9b:1::a9fe:a9fe")), AddressClass::Reserved);
+        assert_eq!(classify(v6("64:ff9b:1:1234::8.8.8.8")), AddressClass::Reserved);
+        // 6to4 carries its IPv4 address in the second and third segments; a
+        // non-global one keeps its own class...
+        assert_eq!(classify(v6("2002:a9fe:a9fe::1")), AddressClass::Metadata);
+        assert_eq!(classify(v6("2002:7f00:0001::")), AddressClass::Loopback);
+        assert_eq!(classify(v6("2002:0a00:0001::1")), AddressClass::Private);
+        // ...and a global one is still not a destination.
+        assert_eq!(classify(v6("2002:0808:0808::1")), AddressClass::Reserved);
+        // All of 0.0.0.0/8, not only 0.0.0.0.
+        assert_eq!(classify(v4("0.0.0.0")), AddressClass::Unspecified);
+        assert_eq!(classify(v4("0.1.2.3")), AddressClass::Reserved);
+        assert_eq!(classify(v4("0.255.255.255")), AddressClass::Reserved);
+        for addr in [
+            v6("64:ff9b:1::1"),
+            v6("2002:0808:0808::1"),
+            v4("0.0.0.1"),
+        ] {
+            assert!(
+                !EgressProfile::REMOTE.permits_address(addr),
+                "{addr} must not be reachable under the remote profile"
+            );
+        }
+        // The well-known NAT64 prefix and ordinary global space are unchanged.
+        assert_eq!(classify(v6("64:ff9b::808:808")), AddressClass::Global);
+        assert_eq!(classify(v6("2606:4700::1111")), AddressClass::Global);
     }
 
     #[test]

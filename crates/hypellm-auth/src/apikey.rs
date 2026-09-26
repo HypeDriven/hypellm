@@ -187,6 +187,13 @@ pub struct KeyRecord {
     pub description: Option<String>,
     /// Whether the key has been revoked.
     pub revoked: bool,
+    /// The principal that minted the key, when it was minted through the
+    /// management API.
+    ///
+    /// The key authenticates as `principal`; this is who is accountable for
+    /// it. Separation-of-duty checks compare both, so a person who mints a key
+    /// for another principal does not thereby become a second approver.
+    pub created_by: Option<PrincipalId>,
 }
 
 impl KeyRecord {
@@ -247,6 +254,10 @@ impl KeyRecord {
             self.description.as_deref().map(wire_json::Value::from),
         );
         object.push("revoked", wire_json::Value::from(self.revoked));
+        object.push_opt(
+            "created_by",
+            self.created_by.as_ref().map(|p| wire_json::Value::from(p.as_str())),
+        );
         wire_json::to_string(&wire_json::Value::Object(object)).into_bytes()
     }
 
@@ -277,6 +288,12 @@ impl KeyRecord {
                 .and_then(|v| v.as_str())
                 .map(str::to_owned),
             revoked: value.get("revoked").and_then(wire_json::Value::as_bool).unwrap_or(false),
+            // Absent on records written before it existed. Present but
+            // unreadable is a damaged record, and is dropped like any other.
+            created_by: match value.get("created_by") {
+                None | Some(wire_json::Value::Null) => None,
+                Some(v) => Some(PrincipalId::new(v.as_str()?).ok()?),
+            },
         })
     }
 }
@@ -565,6 +582,35 @@ impl KeyStore {
         description: Option<String>,
         now_wall_millis: u64,
     ) -> Result<NewKey, KeyCreationError> {
+        self.create_by(
+            tenant,
+            principal,
+            scopes,
+            expires_at_millis,
+            source,
+            description,
+            now_wall_millis,
+            None,
+        )
+    }
+
+    /// Create a new key, recording the principal accountable for it.
+    ///
+    /// # Errors
+    ///
+    /// As [`KeyStore::create`].
+    #[allow(clippy::too_many_arguments, reason = "a key record has this many attributes")]
+    pub fn create_by(
+        &self,
+        tenant: TenantId,
+        principal: PrincipalId,
+        scopes: Vec<Scope>,
+        expires_at_millis: Option<u64>,
+        source: SourceRestriction,
+        description: Option<String>,
+        now_wall_millis: u64,
+        created_by: Option<PrincipalId>,
+    ) -> Result<NewKey, KeyCreationError> {
         let id_bytes = random::bytes::<8>()?;
         let id_text = hex::encode(&id_bytes);
         let key_id = KeyId::new(&id_text).map_err(|_| KeyCreationError::Identifier)?;
@@ -583,6 +629,7 @@ impl KeyStore {
             created_at_millis: now_wall_millis,
             description,
             revoked: false,
+            created_by,
         };
         self.insert(record.clone());
 
@@ -716,6 +763,25 @@ mod tests {
 
         let decoded = KeyRecord::from_payload(&record.to_payload()).expect("decodes");
         assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn the_accountable_creator_survives_a_restart_and_older_records_still_load() {
+        // Separation of duty compares the key's creator. A creator lost on
+        // replay would make every key minted before a restart anonymous for
+        // that check — and so a way to approve one's own change.
+        let store = store();
+        let mut record = create(&store).record;
+        record.created_by = Some(PrincipalId::new("user:oncall").expect("principal"));
+        let decoded = KeyRecord::from_payload(&record.to_payload()).expect("decodes");
+        assert_eq!(decoded.created_by, record.created_by);
+
+        // A record written before the field existed decodes with no creator
+        // rather than being dropped.
+        record.created_by = None;
+        let legacy = record.to_payload();
+        assert!(!String::from_utf8_lossy(&legacy).contains("created_by"));
+        assert_eq!(KeyRecord::from_payload(&legacy).expect("decodes").created_by, None);
     }
 
     #[test]

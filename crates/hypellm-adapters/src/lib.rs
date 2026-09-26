@@ -21,6 +21,7 @@
 //! | DeepSeek | [`openai::OpenAiAdapter`] | OpenAI-compatible, capabilities declared per target |
 //! | Moonshot / Kimi | [`openai::OpenAiAdapter`] | as above; "no assumptions from model name" |
 //! | Generic OpenAI | [`openai::OpenAiAdapter`] | opt-in only, see `hypellm-config` |
+//! | SemIf | [`semif::SemIfAdapter`] | `POST /score`; rerank only, never streams |
 
 #![forbid(unsafe_code)]
 // Specification 18.2: no panics on data-plane input, all integer conversions
@@ -49,6 +50,7 @@
 pub mod anthropic;
 pub mod contract;
 pub mod openai;
+pub mod semif;
 #[cfg(any(test, feature = "test-harness"))]
 pub mod testing;
 
@@ -58,6 +60,7 @@ pub use contract::{
     ValidationFailure, ValidationResult, is_usable_credential,
 };
 pub use openai::OpenAiAdapter;
+pub use semif::SemIfAdapter;
 
 use hypellm_core::target::ProviderFamily;
 
@@ -67,6 +70,7 @@ static DEEPSEEK: OpenAiAdapter = OpenAiAdapter::new(ProviderFamily::DeepSeek);
 static MOONSHOT: OpenAiAdapter = OpenAiAdapter::new(ProviderFamily::Moonshot);
 static GENERIC: OpenAiAdapter = OpenAiAdapter::new(ProviderFamily::GenericOpenAi);
 static ANTHROPIC: AnthropicAdapter = AnthropicAdapter;
+static SEMIF: SemIfAdapter = SemIfAdapter;
 
 /// The adapter for a provider family.
 ///
@@ -81,6 +85,7 @@ pub fn adapter_for(family: ProviderFamily) -> &'static dyn Adapter {
         ProviderFamily::DeepSeek => &DEEPSEEK,
         ProviderFamily::Moonshot => &MOONSHOT,
         ProviderFamily::GenericOpenAi => &GENERIC,
+        ProviderFamily::SemIf => &SEMIF,
     }
 }
 
@@ -88,7 +93,6 @@ pub fn adapter_for(family: ProviderFamily) -> &'static dyn Adapter {
 mod tests {
     use super::*;
     use crate::testing::{endpoint_fixture, meta_fixture, request_fixture, target_fixture};
-    use hypellm_core::canonical::Operation;
     use hypellm_core::event::CanonicalEvent;
     use wire_json::{Limits, parse};
 
@@ -220,15 +224,23 @@ mod tests {
 
     #[test]
     fn validation_is_capability_driven_for_every_family() {
-        let mut target = target_fixture();
-        target.capabilities.streaming = false;
-        let mut request = request_fixture();
-        request.stream.enabled = true;
-        request.operation = Operation::Chat;
-
+        // Every family, each asked with work it actually serves, so that the
+        // refusal under test is the streaming one rather than "this family
+        // does not do that at all". A new family has to be given a case here
+        // before it can pass, which is the point of iterating `all()`.
         for family in ProviderFamily::all() {
+            let (mut request, mut capabilities) = match family {
+                ProviderFamily::SemIf => (
+                    crate::testing::rerank_request_fixture(),
+                    crate::testing::rerank_capabilities(),
+                ),
+                _ => (request_fixture(), target_fixture().capabilities),
+            };
+            request.stream.enabled = true;
+            capabilities.streaming = false;
+
             let failure = adapter_for(*family)
-                .validate(&request, &target.capabilities)
+                .validate(&request, &capabilities)
                 .expect_err("streaming is not declared");
             assert_eq!(
                 failure.code, "streaming_unsupported",

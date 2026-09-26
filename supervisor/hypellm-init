@@ -108,6 +108,7 @@ drain_failed=0
 shutting_down=0
 child=0
 watchdog=0
+pending_signal=""
 
 usage() {
     cat >&2 <<'USAGE'
@@ -151,6 +152,14 @@ fi
 # component exists to remove.
 on_signal() {
     local name="$1"
+    # A signal between installing the trap and recording the child's pid. The
+    # watchdog below with `child=0` would be `kill -KILL 0` — the whole process
+    # group, this init included — so the signal is held and acted on the moment
+    # there is a child to act on.
+    if [ "$child" -eq 0 ]; then
+        pending_signal="$name"
+        return
+    fi
     if [ "$shutting_down" -eq 1 ]; then
         echo "hypellm-init: ${name} again; a drain is already running (up to ${DRAIN_DEADLINE}s)" >&2
         return
@@ -168,7 +177,7 @@ on_signal() {
     # finishes first.
     (
         sleep "$DRAIN_DEADLINE"
-        if kill -0 "$child" 2>/dev/null; then
+        if [ "$child" -gt 0 ] && kill -0 "$child" 2>/dev/null; then
             echo "hypellm-init: the router did not exit within ${DRAIN_DEADLINE}s of the drain starting; killing it" >&2
             kill -KILL "$child" 2>/dev/null
         fi
@@ -181,6 +190,9 @@ trap 'on_signal SIGINT' INT
 
 "$ROUTER" "$@" &
 child=$!
+if [ -n "$pending_signal" ]; then
+    on_signal "$pending_signal"
+fi
 
 # `wait` returns a status above 128 when a trap interrupts it, and the child is
 # still running at that point. Testing the *status* to tell those apart does not
@@ -188,11 +200,24 @@ child=$!
 # treating that as an interruption loops onto an already-reaped child and
 # reports 127 instead. So the loop asks whether the child is still there, which
 # is the actual question.
+#
+# The loop's last status is not the child's, though. The trap runs `--shutdown`
+# in the foreground, and a router that finishes its drain meanwhile is reaped
+# then; the interrupted `wait` returns 143 and the loop ends on that. A child
+# that exits before the loop's first test is never waited on inside it at all.
+# So the status is collected once more afterwards: bash keeps a reaped
+# background job's status and `wait <pid>` returns it. A shell that has already
+# forgotten it answers 127, and then the loop's own status stands.
 status=0
 while kill -0 "$child" 2>/dev/null; do
     wait "$child"
     status=$?
 done
+wait "$child"
+final=$?
+if [ "$final" -ne 127 ]; then
+    status=$final
+fi
 
 # The watchdog has nothing left to guard.
 if [ "$watchdog" -ne 0 ]; then

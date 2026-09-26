@@ -28,6 +28,8 @@ use hypellm_fleet::activation::ActivationRecord;
 use hypellm_fleet::demand::DemandSnapshot;
 use hypellm_fleet::plan::PlanOutcome;
 use hypellm_fleet::state::FleetSnapshot;
+use hypellm_core::ids::{AcceleratorId, DeploymentId, HostId, TargetId};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use wire_json::{Object, Value};
 
@@ -86,6 +88,21 @@ pub trait FleetControl: Send + Sync + core::fmt::Debug {
 
     /// The monotonic clock reading the snapshot should be read against.
     fn now_ms(&self) -> u64;
+}
+
+/// The part of a deployment `If-Match` is compared against on a patch.
+///
+/// Exactly the fields a patch can change, plus the identifier. Observed state
+/// is left out deliberately: it moves on every observation, and a tag that did
+/// would refuse every pin an operator tried to make on a busy fleet.
+#[must_use]
+pub fn deployment_etag(deployment: &hypellm_fleet::model::Deployment) -> String {
+    let mut object = Object::new();
+    object.push("id", Value::from(deployment.id.as_str()));
+    object.push("pinned", Value::from(deployment.pinned));
+    object.push("evictable", Value::from(deployment.evictable));
+    object.push("autostart", Value::from(deployment.autostart));
+    crate::response::etag_for(&Value::Object(object))
 }
 
 /// Map a control failure onto a stable API error.
@@ -160,12 +177,38 @@ pub fn control_error(code: &'static str) -> ApiError {
 /// allowance remaining, and how old the belief is. The last of those is first
 /// among equals: it gates every other decision, and an operator reading a
 /// healthy-looking fleet against a two-hour-old observation is being misled.
+///
+/// # Tenant scope
+///
+/// Specification 26: host identifiers, memory figures, residency and history
+/// are management-plane data, and "management visibility MUST NOT exceed the
+/// caller's tenant and permissions". `visible` is the set of targets the
+/// caller's tenant can reach. Only deployments serving one of them are
+/// rendered, and only the accelerators and hosts those deployments sit on — an
+/// operator in one tenant learns nothing of another tenant's models, or of
+/// hosts that carry none of theirs. Pool figures on a shown accelerator remain
+/// whole-pool figures: they are the capacity the caller's own deployments
+/// compete for, and a per-tenant share of a physical pool does not exist.
+/// No role in the model is router-scoped, so there is no unfiltered view.
 #[must_use]
-pub fn render_fleet(control: &dyn FleetControl) -> Value {
+pub fn render_fleet(control: &dyn FleetControl, visible: &BTreeSet<TargetId>) -> Value {
     let snapshot = control.snapshot();
     let demand = control.demand();
     let now = control.now_ms();
     let config = &snapshot.config;
+    let shown: Vec<&hypellm_fleet::model::Deployment> = config
+        .deployments
+        .values()
+        .filter(|deployment| visible.contains(&deployment.target))
+        .collect();
+    let shown_accelerators: BTreeSet<&AcceleratorId> =
+        shown.iter().map(|deployment| &deployment.accelerator).collect();
+    let shown_hosts: BTreeSet<&HostId> = config
+        .accelerators
+        .values()
+        .filter(|accelerator| shown_accelerators.contains(&accelerator.id))
+        .map(|accelerator| &accelerator.host)
+        .collect();
 
     let mut root = Object::new();
     root.push("enabled", Value::from(config.enabled));
@@ -188,7 +231,7 @@ pub fn render_fleet(control: &dyn FleetControl) -> Value {
     );
 
     let mut hosts = Vec::new();
-    for host in config.hosts.values() {
+    for host in config.hosts.values().filter(|host| shown_hosts.contains(&host.id)) {
         let mut object = Object::new();
         object.push("id", Value::from(host.id.as_str()));
         object.push("arch", Value::from(host.arch.as_str()));
@@ -220,7 +263,7 @@ pub fn render_fleet(control: &dyn FleetControl) -> Value {
         let accelerators: Vec<Value> = config
             .accelerators
             .values()
-            .filter(|a| a.host == host.id)
+            .filter(|a| a.host == host.id && shown_accelerators.contains(&a.id))
             .map(|accelerator| {
                 let mut object = Object::new();
                 object.push("id", Value::from(accelerator.id.as_str()));
@@ -261,9 +304,8 @@ pub fn render_fleet(control: &dyn FleetControl) -> Value {
     }
     root.push("hosts", Value::Array(hosts));
 
-    let deployments: Vec<Value> = config
-        .deployments
-        .values()
+    let deployments: Vec<Value> = shown
+        .iter()
         .map(|deployment| {
             let state = snapshot.state_of(&deployment.id);
             let mut object = Object::new();
@@ -274,6 +316,7 @@ pub fn render_fleet(control: &dyn FleetControl) -> Value {
             object.push("pinned", Value::from(deployment.pinned));
             object.push("evictable", Value::from(deployment.evictable));
             object.push("autostart", Value::from(deployment.autostart));
+            object.push("etag", Value::from(deployment_etag(deployment).as_str()));
             object.push(
                 "router_owned",
                 Value::from(snapshot.is_router_owned(&deployment.id)),
@@ -329,13 +372,20 @@ pub fn render_fleet(control: &dyn FleetControl) -> Value {
 ///
 /// The "why was this evicted" view: every finished activation, what it
 /// displaced, how it ended, and how long it took.
+///
+/// Tenant-scoped like [`render_fleet`]: only activations of deployments the
+/// caller can see. A deployment of another tenant's that one of these evicted
+/// is counted in `evicted_hidden` rather than named — the operator learns why
+/// their model had room, not whose model made it.
 #[must_use]
-pub fn render_activations(control: &dyn FleetControl) -> Value {
+pub fn render_activations(control: &dyn FleetControl, visible: &BTreeSet<TargetId>) -> Value {
     let now = control.now_ms();
+    let shown = visible_deployments(control, visible);
     let items: Vec<Value> = control
         .history()
         .iter()
         .rev()
+        .filter(|record| shown.contains(&record.lease.deployment))
         .map(|record| {
             let mut object = Object::new();
             object.push("deployment", Value::from(record.lease.deployment.as_str()));
@@ -366,9 +416,14 @@ pub fn render_activations(control: &dyn FleetControl) -> Value {
                     record
                         .evicted
                         .iter()
+                        .filter(|d| shown.contains(*d))
                         .map(|d| Value::from(d.as_str()))
                         .collect(),
                 ),
+            );
+            object.push(
+                "evicted_hidden",
+                Value::from(record.evicted.iter().filter(|d| !shown.contains(*d)).count()),
             );
             Value::Object(object)
         })
@@ -385,8 +440,12 @@ pub fn render_activations(control: &dyn FleetControl) -> Value {
 /// do, and why, without the fleet moving. Being able to ask a scheduler what it
 /// is about to do is the difference between an operable system and a haunted
 /// one.
+///
+/// A step that would evict a deployment the caller cannot see is rendered with
+/// `"deployment": null`: that something must make room is the caller's to
+/// know, what it is is not.
 #[must_use]
-pub fn render_plan(outcome: &PlanOutcome) -> Value {
+pub fn render_plan(outcome: &PlanOutcome, shown: &BTreeSet<DeploymentId>) -> Value {
     let mut root = Object::new();
     root.push("class", Value::from(outcome.residency_class().as_str()));
     root.push(
@@ -411,7 +470,14 @@ pub fn render_plan(outcome: &PlanOutcome) -> Value {
                     match step {
                         hypellm_fleet::plan::PlanStep::Evict(d)
                         | hypellm_fleet::plan::PlanStep::Activate(d) => {
-                            object.push("deployment", Value::from(d.as_str()));
+                            object.push(
+                                "deployment",
+                                if shown.contains(d) {
+                                    Value::from(d.as_str())
+                                } else {
+                                    Value::Null
+                                },
+                            );
                         }
                         hypellm_fleet::plan::PlanStep::Fetch { artifact, host } => {
                             object.push("artifact", Value::from(artifact.as_str()));
@@ -453,6 +519,22 @@ pub fn render_plan(outcome: &PlanOutcome) -> Value {
     Value::Object(root)
 }
 
+/// The deployments serving a target in `visible`.
+#[must_use]
+pub fn visible_deployments(
+    control: &dyn FleetControl,
+    visible: &BTreeSet<TargetId>,
+) -> BTreeSet<DeploymentId> {
+    control
+        .snapshot()
+        .config
+        .deployments
+        .values()
+        .filter(|deployment| visible.contains(&deployment.target))
+        .map(|deployment| deployment.id.clone())
+        .collect()
+}
+
 /// The body of a successful operator action.
 #[must_use]
 pub fn render_accepted(activation: &str) -> ApiResponse {
@@ -465,9 +547,7 @@ pub fn render_accepted(activation: &str) -> ApiResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hypellm_core::ids::{
-        AcceleratorId, AgentId, DeploymentId, HostId, PoolId, TargetId,
-    };
+    use hypellm_core::ids::{AgentId, PoolId};
     use hypellm_fleet::model::{
         Accelerator, AcceleratorKind, Arch, Deployment, FleetAgent, FleetConfig, Host, HostState,
         Readiness,
@@ -579,7 +659,14 @@ mod tests {
             snapshot: Arc::new(snapshot),
             now: 60_000,
         };
-        let rendered = render_fleet(&control);
+        let every: BTreeSet<TargetId> = control
+            .snapshot
+            .config
+            .deployments
+            .values()
+            .map(|d| d.target.clone())
+            .collect();
+        let rendered = render_fleet(&control, &every);
         assert_eq!(rendered.get("observation_age_ms"), Some(&Value::Null));
     }
 
@@ -593,7 +680,14 @@ mod tests {
             snapshot: Arc::new(snapshot),
             now: 2_000,
         };
-        let rendered = render_fleet(&control);
+        let every: BTreeSet<TargetId> = control
+            .snapshot
+            .config
+            .deployments
+            .values()
+            .map(|d| d.target.clone())
+            .collect();
+        let rendered = render_fleet(&control, &every);
         let hosts = rendered.get("hosts").and_then(Value::as_array).expect("hosts");
         let accelerators = hosts
             .first()

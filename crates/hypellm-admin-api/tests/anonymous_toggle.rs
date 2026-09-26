@@ -363,3 +363,39 @@ fn the_settings_view_reports_an_undeclared_subject_as_unavailable() {
         view.body
     );
 }
+
+// ------------------------------------------------------------------ order --
+
+/// The position in the durable log of the first frame of `kind` whose payload
+/// contains `needle`.
+fn position(admin: &Harness, kind: RecordKind, needle: &str) -> Option<usize> {
+    let path = admin.state.store.dir().join("log.bin");
+    let mut log = Log::open(&path, false).expect("open the log for reading");
+    let replay = log.replay(STORE_MAC_KEY).expect("replay the log");
+    replay.frames.iter().position(|frame| {
+        frame.kind == kind && String::from_utf8_lossy(&frame.payload).contains(needle)
+    })
+}
+
+#[test]
+fn the_audit_record_reaches_disk_before_the_switch_does() {
+    // Specification 18.3: security changes fail closed. The flag used to be
+    // flipped and its frame written before the audit append, so a failed
+    // append answered "not applied" about a router already serving anonymous
+    // traffic. The observable order is the durable log's: the audit record
+    // must precede the state frame.
+    let admin = Harness::with_config(&ready_but_off());
+    let session = admin.break_glass();
+
+    let response = admin.post(&session, "/admin/v1/settings/anonymous", &body(true));
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    assert!(switched_on(&admin));
+
+    let audit = position(&admin, RecordKind::AuditEvent, "anonymous_access_enabled")
+        .expect("the change is audited");
+    let state = position(&admin, RecordKind::AnonymousAccess, "true").expect("the frame");
+    assert!(
+        audit < state,
+        "the switch was recorded before its audit record (audit at {audit}, frame at {state})"
+    );
+}

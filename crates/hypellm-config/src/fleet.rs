@@ -275,6 +275,12 @@ pub fn build_fleet(
     }
 
     // -- Policies ---------------------------------------------------------
+    // Each scope may be written once. A second record for the same scope would
+    // otherwise replace the first by record order — and the fleet-wide one
+    // would even inherit from it — so a stray duplicate changes the effective
+    // limits with no error.
+    let mut fleet_scope_seen = false;
+    let mut host_scopes_seen: BTreeSet<HostId> = BTreeSet::new();
     for record in document.of_kind("fleet_policy") {
         let f = Fields::new(record);
         let scope = match f.str_field("scope") {
@@ -296,6 +302,15 @@ pub fn build_fleet(
             }
         };
         if scope == "fleet" {
+            if fleet_scope_seen {
+                errors.push(ConfigError::new(
+                    "duplicate_record",
+                    "fleet_policy scope=fleet is defined more than once",
+                    f.position(),
+                ));
+                continue;
+            }
+            fleet_scope_seen = true;
             fleet.default_policy = policy;
             continue;
         }
@@ -319,6 +334,14 @@ pub fn build_fleet(
             errors.push(ConfigError::new(
                 "unresolved_reference",
                 format!("fleet_policy names host '{host}', which is not defined"),
+                f.position(),
+            ));
+            continue;
+        }
+        if !host_scopes_seen.insert(host.clone()) {
+            errors.push(ConfigError::new(
+                "duplicate_record",
+                format!("fleet_policy scope=host:{host} is defined more than once"),
                 f.position(),
             ));
             continue;

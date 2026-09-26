@@ -109,6 +109,7 @@ struct Harness {
     runtime: Arc<FleetRuntime>,
     clock: Arc<TestClock>,
     agent: SimulatedAgent,
+    store: Arc<Store>,
     _dir: TempDir,
 }
 
@@ -127,12 +128,13 @@ fn harness(fleet: FleetConfig, script: impl FnOnce(AgentScript) -> AgentScript) 
     let (store, _) = Store::open(dir.path(), b"a-store-mac-key-for-these-tests", 0).unwrap();
     let telemetry = Arc::new(Telemetry::new(logger(&clock), b"pseudonym-key"));
     let dynamic: Arc<dyn Clock> = Arc::clone(&clock) as Arc<dyn Clock>;
+    let store = Arc::new(store);
     let runtime = FleetRuntime::new(
         Arc::new(fleet),
         KEY.to_vec(),
         dynamic,
         telemetry,
-        Arc::new(store),
+        Arc::clone(&store),
     )
     .expect("an enabled fleet with deployments yields a runtime");
 
@@ -140,6 +142,7 @@ fn harness(fleet: FleetConfig, script: impl FnOnce(AgentScript) -> AgentScript) 
         runtime: Arc::new(runtime),
         clock,
         agent,
+        store,
         _dir: dir,
     }
 }
@@ -1159,4 +1162,207 @@ fn prewarm_spends_the_same_activation_budget() {
         None,
         "pre-warm activated past the host's hourly ceiling"
     );
+}
+
+#[test]
+fn a_plan_made_before_another_activation_committed_is_not_executed() {
+    // Two requests plan from one snapshot, before either holds a lease: each
+    // sees 114 GiB free and each plans a 64 GiB model into it. Executing the
+    // second after the first had taken the memory oversubscribed the pool —
+    // an out-of-memory failure minutes into a load. The executor re-checks the
+    // plan against what is committed at the moment it takes its own lease.
+    let socket = socket_in("stale-plan");
+    let mut fleet = spark(&socket);
+    let music = deployment("spark-music3", "spark:music3", 64 * GIB);
+    let video = deployment("spark-video", "spark:video", 64 * GIB);
+    fleet.deployments.insert(music.id.clone(), music.clone());
+    fleet.deployments.insert(video.id.clone(), video.clone());
+
+    let h = harness(fleet, |script| {
+        script
+            .with_deployment("spark-music3", Behaviour::ReadyAfter(2))
+            .with_state("spark-music3", "stopped")
+            .with_deployment("spark-video", Behaviour::ReadyAfter(2))
+            .with_state("spark-video", "stopped")
+    });
+    h.runtime.observe();
+    let snapshot = h.runtime.snapshot();
+    let now = h.clock.now_millis();
+    let demand = DemandSnapshot::default();
+    let PlanOutcome::Plan(first) =
+        hypellm_fleet::plan::plan(&snapshot, &demand, &music.target, &context(now, 900_000))
+    else {
+        panic!("the first plan must be feasible alone");
+    };
+    let PlanOutcome::Plan(second) =
+        hypellm_fleet::plan::plan(&snapshot, &demand, &video.target, &context(now, 900_000))
+    else {
+        panic!("the second plan must be feasible alone");
+    };
+    assert!(!first.evicts() && !second.evicts(), "each fits alone");
+
+    assert_eq!(
+        h.runtime.ensure_ready(&music.target, &first, "first", 900_000),
+        ActivationResult::Ready
+    );
+    assert_eq!(
+        h.runtime.ensure_ready(&video.target, &second, "second", 900_000),
+        ActivationResult::Failed { code: "fleet_busy" },
+        "a plan for memory another activation had already taken was executed"
+    );
+    let verbs = h.agent.verbs();
+    assert!(
+        !verbs.iter().any(|v| v.starts_with("ACTIVATE spark-video ")),
+        "the stale plan reached the agent: {verbs:?}"
+    );
+    let (acquired, released) = h.runtime.ledger().accounting();
+    assert_eq!((acquired, released), (1, 1));
+}
+
+#[test]
+fn an_activation_refused_a_host_slot_leaves_no_lease_in_the_log() {
+    // The lease used to be made durable *before* the host slot was taken.
+    // When the slot was refused there was no closing record, so every
+    // restart found an outstanding lease and audited an activation that had
+    // never been attempted.
+    use hypellm_core::ids::LeaseId;
+    use hypellm_fleet::activation::ActivationRecord;
+    use hypellm_fleet::plan::{Plan, PlanStep, PlanTrace};
+    use hypellm_fleet::state::{Lease, LeaseOperation};
+    use hypellm_store::frame::RecordKind;
+
+    let socket = socket_in("busy-lease");
+    let mut fleet = spark(&socket);
+    let music = deployment("spark-music3", "spark:music3", 64 * GIB);
+    fleet.deployments.insert(music.id.clone(), music.clone());
+    let h = harness(fleet, |script| {
+        script
+            .with_deployment("spark-music3", Behaviour::ReadyAfter(2))
+            .with_state("spark-music3", "stopped")
+    });
+    h.runtime.observe();
+    let snapshot = h.runtime.snapshot();
+    let PlanOutcome::Plan(plan) = hypellm_fleet::plan::plan(
+        &snapshot,
+        &DemandSnapshot::default(),
+        &music.target,
+        &context(h.clock.now_millis(), 900_000),
+    ) else {
+        panic!("the activation must be plannable");
+    };
+
+    // Another activation holds the host's only slot.
+    let other = Plan {
+        deployment: did("spark-elsewhere"),
+        host: HostId::new("spark").unwrap(),
+        steps: vec![PlanStep::Activate(did("spark-elsewhere"))],
+        eta_ms: 1_000,
+        trace: PlanTrace::default(),
+    };
+    let lease = Lease {
+        id: LeaseId::new("l-held").unwrap(),
+        deployment: did("spark-elsewhere"),
+        operation: LeaseOperation::Activate,
+        issued_ms: 0,
+        expires_ms: u64::MAX,
+        decision_id: String::new(),
+    };
+    assert!(h.runtime.ledger().acquire(ActivationRecord::from_plan(&other, lease, 0), 1));
+
+    assert_eq!(
+        h.runtime.ensure_ready(&music.target, &plan, "refused", 900_000),
+        ActivationResult::Failed { code: "fleet_busy" }
+    );
+    let leases = h.store.records_of_kinds(&[RecordKind::FleetLease]).unwrap();
+    assert!(
+        leases.is_empty(),
+        "a refused activation left {} lease record(s) with no closing record",
+        leases.len()
+    );
+    assert!(h.agent.verbs().iter().all(|v| !v.starts_with("ACTIVATE")));
+}
+
+#[test]
+fn the_planner_sees_each_host_against_its_own_activation_budget() {
+    // `budget_snapshot` measured every host against `default_policy`. A host
+    // whose own policy allows one activation an hour, having spent it, still
+    // read as having the default's allowance left, so the planner kept
+    // offering plans for it.
+    use hypellm_core::decision::ExclusionReason;
+
+    let socket = socket_in("host-budget");
+    let mut fleet = spark(&socket);
+    let music = deployment("spark-music3", "spark:music3", 64 * GIB);
+    let video = deployment("spark-video", "spark:video", 40 * GIB);
+    fleet.deployments.insert(music.id.clone(), music.clone());
+    fleet.deployments.insert(video.id.clone(), video.clone());
+    let spark_host = HostId::new("spark").unwrap();
+    let mut strict = fleet.policy_for(&spark_host);
+    strict.max_activations_per_hour = 1;
+    fleet.host_policies.insert(spark_host.clone(), strict);
+    assert!(fleet.default_policy.max_activations_per_hour > 1);
+
+    let h = harness(fleet, |script| {
+        script
+            .with_deployment("spark-music3", Behaviour::ReadyAfter(2))
+            .with_state("spark-music3", "stopped")
+            .with_deployment("spark-video", Behaviour::ReadyAfter(2))
+            .with_state("spark-video", "stopped")
+    });
+    assert_eq!(h.runtime.budget_snapshot().get(&spark_host), Some(&1));
+    start_through_router(&h, &music.target);
+    assert_eq!(h.runtime.budget_snapshot().get(&spark_host), Some(&0));
+
+    h.runtime.observe();
+    let outcome = hypellm_fleet::plan::plan(
+        &h.runtime.snapshot(),
+        &DemandSnapshot::default(),
+        &video.target,
+        &context(h.clock.now_millis(), 900_000),
+    );
+    assert_eq!(
+        outcome,
+        PlanOutcome::Infeasible(ExclusionReason::ActivationBudgetExhausted),
+        "a host that had spent its own allowance was offered another plan"
+    );
+}
+
+#[test]
+fn a_deactivation_leaves_no_open_lease_for_recovery_to_find() {
+    // `deactivate` wrote a lease and never a closing record, so every restart
+    // found it outstanding and audited a lost activation — once per stop the
+    // operator had ever asked for, success or failure.
+    use hypellm_store::audit::AuditAction;
+
+    let socket = socket_in("deactivate-close");
+    let mut fleet = spark(&socket);
+    let music = deployment("spark-music3", "spark:music3", 64 * GIB);
+    let h3 = deployment("spark-h3", "spark:h3", 40 * GIB);
+    fleet.deployments.insert(music.id.clone(), music.clone());
+    fleet.deployments.insert(h3.id.clone(), h3.clone());
+    let h = harness(fleet, |script| {
+        script
+            .with_deployment("spark-music3", Behaviour::ReadyAfter(1))
+            .with_state("spark-music3", "ready")
+            .with_deployment("spark-h3", Behaviour::Refuses("busy"))
+            .with_state("spark-h3", "ready")
+    });
+    h.runtime.observe();
+
+    assert_eq!(h.runtime.deactivate(&music.id), Ok(()));
+    assert!(h.runtime.deactivate(&h3.id).is_err(), "the refusing agent must fail the stop");
+
+    let expired_before = lease_expired_audits(&h);
+    h.runtime.recover();
+    let found = lease_expired_audits(&h) - expired_before;
+    assert_eq!(found, 0, "recovery found {found} open lease(s) after two deactivations");
+
+    fn lease_expired_audits(h: &Harness) -> usize {
+        h.store
+            .audit_records(None, 500)
+            .unwrap()
+            .iter()
+            .filter(|(_, r)| r.event.action == AuditAction::FleetLeaseExpired)
+            .count()
+    }
 }

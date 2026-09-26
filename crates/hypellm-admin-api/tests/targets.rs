@@ -1508,3 +1508,48 @@ fn proposing_a_target_that_already_exists_is_a_conflict() {
         .send();
     assert_eq!(response.status, 409, "{}", response.body);
 }
+
+#[test]
+fn a_tenant_that_cannot_reach_a_target_can_neither_change_it_nor_learn_it_exists() {
+    // Appendix B: "Management visibility never exceeds the caller's tenant and
+    // permissions." Tenant B is granted nothing, so no target is reachable by
+    // it. Its operator must not drain or quarantine tenant A's target — and
+    // the refusal must come before the precondition, or a stale `If-Match`
+    // answered 412 for a real target and 404 for an absent one, which is an
+    // existence oracle for every target name.
+    let admin = Harness::builder().config(&two_tenant_config()).build();
+    let stranger = admin.operator_in(TENANT_B);
+    let audited = admin.audit_count();
+
+    for (body, etag) in [
+        (r#"{"state":"disabled"}"#, ANY_ETAG),
+        (r#"{"state":"disabled"}"#, STALE_ETAG),
+        (
+            r#"{"state":"quarantined","reason":"not yours to quarantine"}"#,
+            ANY_ETAG,
+        ),
+    ] {
+        let response = admin.patch(&stranger, LOCAL_PATH, body, etag);
+        assert_eq!(response.status, 404, "{body} / {etag}: {}", response.body);
+        let absent = admin.patch(&stranger, ABSENT_PATH, body, etag);
+        assert_eq!(
+            (absent.status, absent.error_code),
+            (response.status, response.error_code),
+            "a reachable-by-nobody target must be indistinguishable from an absent one"
+        );
+    }
+
+    // Nothing changed, and nothing was recorded as having changed.
+    assert_eq!(override_state(&admin, LOCAL_TARGET), None);
+    assert!(!admin.state.health.is_quarantined(&target_id(LOCAL_TARGET)));
+    assert_eq!(admin.audit_count(), audited);
+
+    // The owning tenant still can.
+    let owner = admin.operator();
+    let response = admin.patch(&owner, LOCAL_PATH, r#"{"state":"draining"}"#, ANY_ETAG);
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert_eq!(
+        override_state(&admin, LOCAL_TARGET),
+        Some(AdminState::Draining)
+    );
+}

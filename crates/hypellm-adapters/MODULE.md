@@ -9,10 +9,10 @@ input/resource limits.
 | Owner | Security (primary), Platform (secondary) |
 | Unsafe code | None. `#![forbid(unsafe_code)]` declared in `lib.rs` and inherited from the workspace. |
 | External dependencies | None. Rust standard library plus the workspace path dependencies `hypellm-core`, `wire-json`, `wire-sse`. |
-| Fuzz targets | `tests/fuzz.rs` — 9 targets over recorded provider events, driven by `hypellm-test-corpus::fuzz`. See [Fuzz targets](#fuzz-targets). |
+| Fuzz targets | `tests/fuzz.rs` — 10 targets over recorded provider events, driven by `hypellm-test-corpus::fuzz`. See [Fuzz targets](#fuzz-targets). |
 
 Specification 21.1 requires two-person review for "adapter credential handling".
-That gate applies to `contract.rs` and to either adapter's `encode_headers`.
+That gate applies to `contract.rs` and to any adapter's `encode_headers`.
 
 ## Scope and the "adapters decide nothing" rule
 
@@ -46,6 +46,13 @@ Two further boundaries the code holds deliberately:
   (specification 7, Moonshot row). `validate` reads only the target's declared
   `Capabilities`; the five OpenAI-compatible families share one encoder and
   differ solely in what their targets declare.
+- **No prompt authorship.** `semif.rs` maps a rerank request onto a scorer that
+  requires both an evidence and a criterion field. Where the caller supplied one
+  string, it is sent as both rather than padded with text the adapter composed:
+  an adapter that wrote "which option best answers the question?" would be
+  supplying part of the prompt that decides the answer, and the score returned
+  would be partly the router's opinion. Asserted by
+  `every_word_the_scorer_reads_came_from_the_caller`.
 
 Prompt content is inert throughout: decoded provider text becomes
 `CanonicalEvent` payloads and is never consulted for a destination, a path, or a
@@ -129,7 +136,20 @@ conversation replayed to the provider rather than failing.
 **Embedding values are narrowed lossily.** `openai::decode_response` maps each
 element through `f64 as f32`; magnitudes outside the `f32` range saturate to
 infinity and precision is lost without a diagnostic. The client receives a vector
-that is not exactly what the provider returned.
+that is not exactly what the provider returned. `semif::decode_response` narrows
+scores the same way, where the loss is immaterial — the scorer labels its own
+numbers uncalibrated — and where saturation cannot mislead, because a non-finite
+score is refused rather than narrowed.
+
+**A misattributed score is worse than a misattributed vector, and is refused.**
+The embeddings decoder reads its position with `unwrap_or(0)`, which is
+survivable: the caller gets its own vector back under a wrong index. The same
+default in a scorer would hand candidate 0 a relevance the scorer computed for
+somebody else's candidate, and the caller has no way to detect it. `semif.rs`
+therefore refuses the whole response when an option id is absent, unparsable,
+out of range or repeated, classifying it `ProtocolViolation` — retriable, so a
+scorer talking nonsense is failed away from rather than believed. Asserted by
+`a_mutated_scorer_reply_never_yields_a_misattributed_score`.
 
 **Resource shape.** Streaming decode is per-event, so specification 14's
 "MUST NOT buffer an entire completion" holds on the stream path. Non-streaming
@@ -152,6 +172,8 @@ a check on the result, not a cap on the work.
 | Client-visible error detail | 200 bytes | `Capped::new(_, 200)` in `ErrorClassification::safe_detail` and `ValidationFailure::new` |
 | Requested output tokens | Target's declared `capabilities.max_output_tokens` | `validate`, code `max_tokens_too_large` |
 | Anthropic `max_tokens` when the client omits one | Target's declared `capabilities.max_output_tokens`; a target declaring `0` is refused | `anthropic::encode_request`, `validate` code `max_tokens_undeclared` |
+| Candidates in one scoring request | 2 to 16 | `semif::MIN_OPTIONS`/`MAX_OPTIONS` in `validate` and `encode_request`, matching the scorer's own `validate_row` |
+| Scores decoded from one scoring reply | 16, and each index distinct and in range | `semif::decode_response`; anything else is a `ProtocolViolation` |
 
 Bounds this module does **not** enforce, stated plainly so no one reads the table
 as complete:
@@ -186,7 +208,7 @@ All seven areas specification 21 names have a suite; see
 `docs/deferred-issues.md`, `DI-002`, for the table.
 
 Specification 21 requires fuzzing of "provider events", and `tests/fuzz.rs` is
-that suite: nine targets seeded from every recorded fixture in
+that suite: ten targets seeded from every recorded fixture in
 `hypellm-test-corpus::golden`, so each mutation starts from bytes a real provider
 sent.
 
@@ -200,6 +222,7 @@ sent.
 | `an_oversize_stream_event_is_refused_rather_than_decoded` | `Limits::STREAM_EVENT`, whose length the provider controls entirely |
 | `deeply_nested_provider_json_is_refused_rather_than_overflowing_the_stack` | The recursion bound is a refusal, not a crash |
 | `random_bytes_are_handled_without_panicking` | Unstructured input |
+| `a_mutated_scorer_reply_never_yields_a_misattributed_score` | Every score a mutated SemIf reply produces carries an index this adapter could have sent: unique, in range, finite. The defect it guards is one `unwrap_or(0)` |
 | `every_recorded_fixture_is_reachable_as_a_seed` | A seed set that silently shrank would leave the rest fuzzing a fraction of the corpus while still passing |
 
 Note what the fourth target does *not* assert: `provider_code` deliberately

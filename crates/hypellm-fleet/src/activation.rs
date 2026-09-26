@@ -27,7 +27,7 @@ use crate::plan::{Plan, PlanStep};
 use crate::state::{Lease, LeaseOperation};
 use core::fmt;
 use hypellm_core::ids::{DeploymentId, HostId, LeaseId};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::RwLock;
 
 /// Where an activation has got to.
@@ -279,7 +279,16 @@ struct LedgerState {
     active: BTreeMap<LeaseId, ActivationRecord>,
     /// Leases already released, so a second release can be refused rather than
     /// mistaken for a first.
+    ///
+    /// Bounded at [`MAX_RELEASED`], oldest forgotten first, in the order kept
+    /// by `released_order`. It grew by one entry per activation for the life
+    /// of the process. Forgetting an old entry is safe: a release of a lease
+    /// that is neither active nor remembered is refused as
+    /// [`LeaseRelease::Unknown`], which returns no slot either — the refusal
+    /// only loses its more specific name.
     released: BTreeMap<LeaseId, ActivationOutcome>,
+    /// Insertion order of `released`, for eviction.
+    released_order: VecDeque<LeaseId>,
     /// Host slots currently held.
     slots: BTreeMap<HostId, u32>,
     /// Bounded history, newest last, for the "why was this evicted" view.
@@ -295,6 +304,26 @@ struct LedgerState {
 /// the durable log, which is where an operator looks for anything beyond the
 /// recent past.
 pub const MAX_HISTORY: usize = 256;
+
+/// How many released lease identifiers are remembered for double-release
+/// detection.
+///
+/// Far more than can be in flight at once — a double release comes from the
+/// same activation's cleanup paths, seconds apart — and small enough that a
+/// router running for a year holds a fixed amount.
+pub const MAX_RELEASED: usize = 4_096;
+
+/// Why [`ActivationLedger::acquire_exclusive`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcquireRefusal {
+    /// The host is at `max_concurrent_activations`.
+    HostBusy,
+    /// The lease identifier is already active or was already released.
+    Duplicate,
+    /// The activation overlaps one already in flight: the same deployment, or
+    /// a deployment one of them is evicting.
+    Conflict,
+}
 
 impl ActivationLedger {
     /// Create an empty ledger.
@@ -327,6 +356,61 @@ impl ActivationLedger {
         state.acquired = state.acquired.saturating_add(1);
         state.active.insert(record.lease.id.clone(), record);
         true
+    }
+
+    /// Take a host slot, refusing an activation that overlaps one in flight.
+    ///
+    /// [`Self::acquire`] checks only the host's slot count, so two decisions
+    /// made from one snapshot could both acquire: one deployment activated
+    /// twice, or one victim evicted by two plans. This refuses, atomically
+    /// under the ledger lock, when the new activation's deployment is already
+    /// being activated or evicted, or when either side's eviction set touches
+    /// the other's deployments.
+    pub fn acquire_exclusive(
+        &self,
+        record: ActivationRecord,
+        max_concurrent: u32,
+    ) -> Result<(), AcquireRefusal> {
+        let Ok(mut state) = self.inner.write() else {
+            return Err(AcquireRefusal::HostBusy);
+        };
+        if state.active.contains_key(&record.lease.id)
+            || state.released.contains_key(&record.lease.id)
+        {
+            return Err(AcquireRefusal::Duplicate);
+        }
+        let incoming = &record.lease.deployment;
+        let conflict = state.active.values().any(|held| {
+            held.lease.deployment == *incoming
+                || held.evicted.contains(incoming)
+                || record.evicted.contains(&held.lease.deployment)
+                || record.evicted.iter().any(|v| held.evicted.contains(v))
+        });
+        if conflict {
+            return Err(AcquireRefusal::Conflict);
+        }
+        let held = state.slots.get(&record.host).copied().unwrap_or(0);
+        if held >= max_concurrent.max(1) {
+            return Err(AcquireRefusal::HostBusy);
+        }
+        state.slots.insert(record.host.clone(), held.saturating_add(1));
+        state.acquired = state.acquired.saturating_add(1);
+        state.active.insert(record.lease.id.clone(), record);
+        Ok(())
+    }
+
+    /// Deployments that in-flight activations are evicting.
+    #[must_use]
+    pub fn evicting(&self) -> BTreeSet<DeploymentId> {
+        self.inner
+            .read()
+            .map(|s| {
+                s.active
+                    .values()
+                    .flat_map(|r| r.evicted.iter().cloned())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Advance an activation, refusing an invalid transition.
@@ -373,6 +457,12 @@ impl ActivationLedger {
         record.outcome = Some(outcome);
         record.detail = detail;
         state.released.insert(lease.clone(), outcome);
+        state.released_order.push_back(lease.clone());
+        while state.released_order.len() > MAX_RELEASED {
+            if let Some(oldest) = state.released_order.pop_front() {
+                state.released.remove(&oldest);
+            }
+        }
         state.releases = state.releases.saturating_add(1);
         state.history.push(record);
         // Bounded: `MAX_HISTORY` entries, oldest dropped first.
@@ -676,6 +766,79 @@ mod tests {
             );
         }
         assert_eq!(ledger.history().len(), MAX_HISTORY);
+    }
+
+    #[test]
+    fn the_released_set_is_bounded() {
+        // One entry per activation for the life of the process was a slow
+        // leak on the one structure every activation touches.
+        let ledger = ActivationLedger::new();
+        let total = MAX_RELEASED + 100;
+        for i in 0..total {
+            let id = LeaseId::new(format!("l{i}")).expect("id");
+            let mut r = record("x");
+            r.lease.id = id.clone();
+            assert!(ledger.acquire(r, u32::MAX));
+            assert_eq!(
+                ledger.release(&id, ActivationOutcome::Succeeded, "ready", 0),
+                LeaseRelease::Released
+            );
+        }
+        let remembered = ledger.inner.read().map(|s| s.released.len()).unwrap_or(usize::MAX);
+        assert_eq!(remembered, MAX_RELEASED);
+
+        // A recent double release is still named as one; an ancient one is
+        // still refused, and neither returns a slot.
+        let recent = LeaseId::new(format!("l{}", total - 1)).expect("id");
+        assert_eq!(
+            ledger.release(&recent, ActivationOutcome::Failed, "again", 1),
+            LeaseRelease::AlreadyReleased
+        );
+        let ancient = LeaseId::new("l0").expect("id");
+        assert_ne!(
+            ledger.release(&ancient, ActivationOutcome::Failed, "again", 1),
+            LeaseRelease::Released
+        );
+        assert_eq!(ledger.slots_held(&HostId::new("spark").expect("id")), 0);
+        let total = u64::try_from(total).expect("fits");
+        assert_eq!(ledger.accounting(), (total, total));
+    }
+
+    #[test]
+    fn an_activation_overlapping_one_in_flight_is_refused() {
+        // Two decisions from one snapshot: the same deployment twice, and two
+        // plans that both want to stop spark-h3.
+        let ledger = ActivationLedger::new();
+        assert_eq!(ledger.acquire_exclusive(record("l1"), 4), Ok(()));
+        assert_eq!(
+            ledger.acquire_exclusive(record("l2"), 4),
+            Err(AcquireRefusal::Conflict),
+            "one deployment activated twice"
+        );
+
+        let mut other = record("l3");
+        other.lease.deployment = DeploymentId::new("spark-video").expect("id");
+        assert_eq!(
+            ledger.acquire_exclusive(other.clone(), 4),
+            Err(AcquireRefusal::Conflict),
+            "one victim evicted by two plans"
+        );
+
+        other.evicted.clear();
+        assert_eq!(ledger.acquire_exclusive(other, 4), Ok(()));
+        assert_eq!(
+            ledger.evicting(),
+            [DeploymentId::new("spark-h3").expect("id")].into_iter().collect()
+        );
+
+        let mut reviving = record("l4");
+        reviving.lease.deployment = DeploymentId::new("spark-h3").expect("id");
+        reviving.evicted.clear();
+        assert_eq!(
+            ledger.acquire_exclusive(reviving, 4),
+            Err(AcquireRefusal::Conflict),
+            "a deployment was activated while another plan was stopping it"
+        );
     }
 
     #[test]

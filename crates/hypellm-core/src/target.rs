@@ -158,6 +158,14 @@ pub enum ProviderFamily {
     /// Specification 25: "Disabled by default; fixed endpoint and explicit
     /// capabilities required."
     GenericOpenAi,
+    /// A SemIf semantic-decision scorer.
+    ///
+    /// The one family here that does not speak an OpenAI-shaped dialect at
+    /// all. SemIf serves a single `POST /score`, reads the logits of typed
+    /// option slots in one forward pass and generates nothing, so it serves
+    /// [`Operation::Rerank`] and no other operation
+    /// (`crates/hypellm-adapters/src/semif.rs`).
+    SemIf,
 }
 
 impl ProviderFamily {
@@ -171,6 +179,7 @@ impl ProviderFamily {
             Self::DeepSeek => "deepseek",
             Self::Moonshot => "moonshot",
             Self::GenericOpenAi => "generic_openai",
+            Self::SemIf => "semif",
         }
     }
 
@@ -184,6 +193,7 @@ impl ProviderFamily {
             "deepseek" => Self::DeepSeek,
             "moonshot" | "kimi" => Self::Moonshot,
             "generic_openai" => Self::GenericOpenAi,
+            "semif" => Self::SemIf,
             _ => return None,
         })
     }
@@ -204,6 +214,7 @@ impl ProviderFamily {
             Self::DeepSeek,
             Self::Moonshot,
             Self::GenericOpenAi,
+            Self::SemIf,
         ]
     }
 }

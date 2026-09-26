@@ -32,7 +32,7 @@ use hypellm_core::ids::{PrincipalId, RequestId, TenantId};
 use hypellm_core::canonical::{CostClass, Residency};
 use hypellm_core::time::{Deadline, SystemClock};
 use hypellm_router::protocol::openai::{DocumentLimits, ParseContext};
-use hypellm_router::protocol::{anthropic, openai};
+use hypellm_router::protocol::{anthropic, openai, rerank};
 use hypellm_test_corpus::fuzz::{self, Rng};
 use std::time::Duration;
 use wire_json::Limits;
@@ -84,10 +84,16 @@ const MESSAGES_SEEDS: &[&[u8]] = &[
     br#"{"model":"a","max_tokens":16,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"f","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"c1","content":"ok"}]}]}"#,
 ];
 
-/// Every parser, behind one signature, so a target covers all four.
+const RERANK_SEEDS: &[&[u8]] = &[
+    br#"{"model":"a","query":"which","documents":["one","two"]}"#,
+    br#"{"model":"a","query":"which","context":"given this","documents":[{"text":"one"},"two"],"top_n":1,"return_documents":true}"#,
+    br#"{"model":"a","query":"which","documents":["one","two","three"],"min_quality":3}"#,
+];
+
+/// Every parser, behind one signature, so a target covers all five.
 type Parser = fn(&[u8], &ParseContext, &Limits) -> Result<hypellm_core::canonical::CanonicalRequest, hypellm_core::error::RouterError>;
 
-fn parsers() -> [(&'static str, Parser, &'static [&'static [u8]]); 4] {
+fn parsers() -> [(&'static str, Parser, &'static [&'static [u8]]); 5] {
     [
         ("chat", openai::parse_chat_request, CHAT_SEEDS),
         ("responses", openai::parse_responses_request, RESPONSES_SEEDS),
@@ -97,6 +103,7 @@ fn parsers() -> [(&'static str, Parser, &'static [&'static [u8]]); 4] {
             EMBEDDINGS_SEEDS,
         ),
         ("messages", anthropic::parse_messages_request, MESSAGES_SEEDS),
+        ("rerank", rerank::parse_rerank_request, RERANK_SEEDS),
     ]
 }
 

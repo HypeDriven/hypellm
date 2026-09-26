@@ -44,6 +44,7 @@ use crate::dispatch::AccumulatingSink;
 use crate::pipeline;
 use crate::state::RouterState;
 use hypellm_core::canonical::{CanonicalRequest, ClientProtocol};
+use hypellm_core::error::RouterError;
 use hypellm_core::ids::{GroupId, KeyId, TenantId};
 use hypellm_core::rbac::PermissionSet;
 use hypellm_crypto::{hex, random};
@@ -431,7 +432,7 @@ impl JobStore {
             .filter(|job| job.tenant == *tenant)
             .map(|job| job.view.clone())
             .collect();
-        out.sort_by(|a, b| b.created_ms.cmp(&a.created_ms));
+        out.sort_by_key(|job| std::cmp::Reverse(job.created_ms));
         out.truncate(limit.min(usize::try_from(self.limits.max_per_tenant).unwrap_or(usize::MAX)));
         out
     }
@@ -619,17 +620,30 @@ pub fn worker_loop(state: &Arc<RouterState>) {
                 now_wall,
                 now,
             ),
-            None => {
-                let payload = render_result(state, &pending.request, &sink);
-                jobs.finish(
+            None => match render_result(state, &pending.request, &sink) {
+                Ok(payload) => jobs.finish(
                     &pending.id,
                     JobState::Succeeded,
                     Some(payload),
                     None,
                     now_wall,
                     now,
-                );
-            }
+                ),
+                // The upstream's output could not be represented faithfully
+                // (for example tool arguments that are not a JSON object): the
+                // job failed, rather than succeeding with a substituted body.
+                Err(error) => jobs.finish(
+                    &pending.id,
+                    JobState::Failed,
+                    None,
+                    Some((
+                        error.code.as_str().to_owned(),
+                        error.detail.as_str().to_owned(),
+                    )),
+                    now_wall,
+                    now,
+                ),
+            },
         }
     }
 }
@@ -639,11 +653,11 @@ fn render_result(
     state: &RouterState,
     request: &CanonicalRequest,
     sink: &AccumulatingSink,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, RouterError> {
     let seconds = crate::routes::wall_seconds(state.clock.as_ref());
     let rendered = match request.protocol {
         ClientProtocol::AnthropicMessages => {
-            crate::protocol::anthropic::render_message_response(request, &sink.accumulator)
+            crate::protocol::anthropic::try_render_message_response(request, &sink.accumulator)?
         }
         ClientProtocol::OpenAiEmbeddings => {
             crate::protocol::openai::render_embeddings_response(request, &sink.accumulator)
@@ -655,7 +669,7 @@ fn render_result(
         ),
         _ => crate::protocol::openai::render_chat_response(request, &sink.accumulator, seconds),
     };
-    rendered.into_bytes()
+    Ok(rendered.into_bytes())
 }
 
 /// The JSON body describing a job.

@@ -55,6 +55,8 @@ pub enum GoldenFamily {
     OpenAiCompatible,
     /// The Anthropic Messages wire format.
     Anthropic,
+    /// The SemIf scorer's `POST /score` wire format.
+    SemIf,
 }
 
 impl GoldenFamily {
@@ -70,6 +72,7 @@ impl GoldenFamily {
         match self {
             Self::OpenAiCompatible => "openai",
             Self::Anthropic => "anthropic",
+            Self::SemIf => "semif",
         }
     }
 }
@@ -330,6 +333,39 @@ pub enum FailurePath {
     },
 }
 
+/// One score a decoder must produce.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExpectedScore {
+    /// The candidate's position in the list the router sent.
+    pub index: u32,
+    /// The score.
+    ///
+    /// Exactly representable in binary floating point, so a consumer compares
+    /// with `==` and a failure is a decoding fault rather than rounding.
+    pub score: f32,
+}
+
+/// A recorded scoring response.
+#[derive(Debug, Clone, Copy)]
+pub struct GoldenScores {
+    /// Stable identifier.
+    pub name: &'static str,
+    /// Which wire format it is in.
+    pub family: GoldenFamily,
+    /// The HTTP status it was served with.
+    pub status: u16,
+    /// The response body.
+    pub body: &'static str,
+    /// The scores the decoder must produce, in the order it produces them.
+    pub expect: &'static [ExpectedScore],
+    /// Provider-reported input tokens.
+    pub input_tokens: u64,
+    /// The native model the decoder must report, when the body names one.
+    pub expect_native_model: Option<&'static str>,
+    /// What this fixture is for.
+    pub why: &'static str,
+}
+
 /// A recorded provider failure.
 #[derive(Debug, Clone, Copy)]
 pub struct GoldenFailure {
@@ -376,6 +412,12 @@ pub const fn streams() -> &'static [GoldenStream] {
 #[must_use]
 pub const fn embeddings() -> &'static [GoldenEmbeddings] {
     EMBEDDINGS
+}
+
+/// Every scoring fixture.
+#[must_use]
+pub const fn scores() -> &'static [GoldenScores] {
+    SCORES
 }
 
 /// Every failure fixture.
@@ -981,7 +1023,74 @@ const EMBEDDINGS: &[GoldenEmbeddings] = &[GoldenEmbeddings {
     why: "Two vectors, so a decoder that returns only the first fails. Every component is exactly representable, so a mismatch is a decoding fault and never a rounding artefact.",
 }];
 
+const SCORES: &[GoldenScores] = &[
+    GoldenScores {
+        name: "golden/semif_score",
+        family: GoldenFamily::SemIf,
+        status: 200,
+        body: r#"{"id":"req_hypellm_golden_score","option_ids":["0","1","2"],"probabilities":[0.25,0.5,0.25],"option_logits":[20.5,21.5,20.5],"answer_token_ids":[32,33,34],"input_tokens":131,"allowed_token_mass":0.996,"full_vocab_argmax_id":33,"prompt_sha256":"0000000000000000000000000000000000000000000000000000000000000000","prompt_version":"direct-options-v1","model":{"source":"Qwen/Qwen3.5-4B","revision":"851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a","backend":"llamacpp","dtype":"gguf-quantized","gguf":{"file":"Qwen_Qwen3.5-4B-Q4_K_M.gguf","bytes":3013027808,"sha256":"1111111111111111111111111111111111111111111111111111111111111111"},"vocab_size":248320,"max_prompt_tokens":4096},"readout":"quantized last-position logits restricted to declared answer slots; no generated tokens","probability_status":"conditional option score over quantized weights; uncalibrated as decision confidence","forward_seconds":0.48,"total_seconds":0.48}"#,
+        expect: &[
+            ExpectedScore { index: 0, score: 0.25 },
+            ExpectedScore { index: 1, score: 0.5 },
+            ExpectedScore { index: 2, score: 0.25 },
+        ],
+        input_tokens: 131,
+        expect_native_model: Some("Qwen_Qwen3.5-4B-Q4_K_M.gguf"),
+        why: "The whole scorer reply, with every field it actually sends. The two lower scores are equal so that a decoder which sorts, dedups or renormalises is caught, and the quantisation file rather than the source repository identifies the model — two instances serving different quantisations must be distinguishable in a trace.",
+    },
+    GoldenScores {
+        name: "golden/semif_score_out_of_order",
+        family: GoldenFamily::SemIf,
+        status: 200,
+        body: r#"{"id":"req_hypellm_golden_reordered","option_ids":["2","0","1"],"probabilities":[0.5,0.25,0.25],"input_tokens":64,"model":{"source":"Qwen/Qwen3.5-4B"}}"#,
+        expect: &[
+            ExpectedScore { index: 2, score: 0.5 },
+            ExpectedScore { index: 0, score: 0.25 },
+            ExpectedScore { index: 1, score: 0.25 },
+        ],
+        input_tokens: 64,
+        expect_native_model: Some("Qwen/Qwen3.5-4B"),
+        why: "Scores are attached by the option id the router sent, never by position in the reply. A decoder that paired the arrays positionally would give candidate 0 the winning score here, which is the caller's decision inverted rather than a formatting difference.",
+    },
+];
+
 const FAILURES: &[GoldenFailure] = &[
+    GoldenFailure {
+        name: "golden/semif_error_invalid_row",
+        family: GoldenFamily::SemIf,
+        path: FailurePath::Response,
+        status: 400,
+        body: r#"{"error":"ValueError: options must contain 2-16 entries"}"#,
+        expect_class: "invalid_request",
+        expect_provider_code: Some("ValueError"),
+        expect_retriable: false,
+        must_not_leak: &["options must contain"],
+        why: "The scorer answers every failure with a Python exception rendered as free text. The type is worth recording; the message is provider prose and stays out of the client's error.",
+    },
+    GoldenFailure {
+        name: "golden/semif_score_count_mismatch",
+        family: GoldenFamily::SemIf,
+        path: FailurePath::Response,
+        status: 200,
+        body: r#"{"id":"req_hypellm_golden_mismatch","option_ids":["0","1","2"],"probabilities":[0.5,0.5],"input_tokens":12}"#,
+        expect_class: "protocol_violation",
+        expect_provider_code: Some("length"),
+        expect_retriable: true,
+        must_not_leak: &[],
+        why: "Three options, two probabilities. Zipping the shorter array would silently drop a candidate's score and rank it last; a reply the router cannot read is refused instead, and refused as retriable — an instance talking nonsense is one to fail away from, which is the whole reason for running more than one.",
+    },
+    GoldenFailure {
+        name: "golden/semif_score_unknown_option",
+        family: GoldenFamily::SemIf,
+        path: FailurePath::Response,
+        status: 200,
+        body: r#"{"id":"req_hypellm_golden_unknown","option_ids":["0","refund"],"probabilities":[0.5,0.5],"input_tokens":12}"#,
+        expect_class: "protocol_violation",
+        expect_provider_code: Some("option_id"),
+        expect_retriable: true,
+        must_not_leak: &["refund"],
+        why: "An id the router never sent names a candidate the caller never offered. Defaulting it to position zero would attach a score to somebody else's document.",
+    },
     GoldenFailure {
         name: "golden/openai_error_rate_limited",
         family: GoldenFamily::OpenAiCompatible,

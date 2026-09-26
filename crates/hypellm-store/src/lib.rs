@@ -8,8 +8,8 @@
 //! ```text
 //! <state_dir>/
 //!   lock              exclusive single-writer lock (specification 11.2)
-//!   snapshot.bin      the last compacted state
-//!   snapshot.meta     sequence and audit head at the snapshot point
+//!   snapshot.bin      the last compacted state: authenticated metadata
+//!                     (sequence, audit head, payload digest) then the payload
 //!   log.bin           frames appended since the snapshot
 //! ```
 //!
@@ -18,7 +18,8 @@
 //! 1. Acquire the process lock, reclaiming it if the recorded process is gone.
 //! 2. Read the snapshot, if any.
 //! 3. Replay the log. A torn tail truncates; a protected-record integrity
-//!    failure aborts startup (specification 11.2).
+//!    failure aborts startup (specification 11.2). Frames at or below the
+//!    snapshot's sequence are already reflected in it and are skipped.
 //! 4. Resume the audit chain from the snapshot's recorded head.
 //!
 //! # Compaction
@@ -27,8 +28,9 @@
 //! prior snapshot until the replacement is durable." [`Store::compact`] writes
 //! the new snapshot atomically *first* and only then resets the log, so a crash
 //! at any point leaves either the old snapshot plus the full log, or the new
-//! snapshot plus an empty log — never a new snapshot with records that predate
-//! it already discarded.
+//! snapshot plus a log whose frames it already covers — which startup skips by
+//! sequence number — never a new snapshot with records that predate it already
+//! discarded, and never a record applied twice.
 
 #![forbid(unsafe_code)]
 // Specification 18.2: no panics on data-plane input, all integer conversions
@@ -184,7 +186,13 @@ impl From<LockError> for StoreError {
 pub const MAX_AUDIT_PAGE: usize = 500;
 
 const SNAPSHOT_FILE: &str = "snapshot.bin";
-const SNAPSHOT_META: &str = "snapshot.meta";
+/// The metadata file an earlier format kept beside `snapshot.bin`.
+///
+/// Two files written by two renames cannot be replaced atomically together:
+/// a crash between them paired a new payload with the previous metadata, and
+/// the digest check then refused to start. The metadata now leads
+/// `snapshot.bin` itself, and compaction removes this file if it finds one.
+const LEGACY_SNAPSHOT_META: &str = "snapshot.meta";
 const LOG_FILE: &str = "log.bin";
 /// Snapshot-metadata magic.
 ///
@@ -197,6 +205,8 @@ const LOG_FILE: &str = "log.bin";
 /// no separate guard.
 const META_MAGIC: &[u8; 4] = b"HYMT";
 /// magic + sequence + audit head + audit count + payload digest + MAC.
+///
+/// The leading bytes of `snapshot.bin`; the payload follows.
 const META_LEN: usize = 4 + 8 + 32 + 8 + 32 + 32;
 
 /// The durable store.
@@ -210,6 +220,14 @@ pub struct Store {
     audit: Mutex<AuditChain>,
     audit_since_checkpoint: AtomicU64,
     checkpoint_interval: u64,
+    /// The sequence the current snapshot covers up to.
+    ///
+    /// Frames at or below it are already reflected in the snapshot. They are
+    /// in the log only when compaction was interrupted between writing the
+    /// snapshot and resetting the log, and every reader skips them: applying
+    /// one twice re-runs a key record or an activation, and re-chaining an
+    /// audit record from a head that already includes it reads as tampering.
+    snapshot_sequence: AtomicU64,
 }
 
 impl fmt::Debug for Store {
@@ -251,9 +269,18 @@ impl Store {
             log.truncate(replay.valid_len)?;
         }
 
+        // Frames the snapshot already covers. Present only if compaction was
+        // interrupted between the snapshot rename and the log reset.
+        let snapshot_sequence = snapshot.as_ref().map_or(0, |s| s.sequence);
+        let frames = replay
+            .frames
+            .into_iter()
+            .filter(|f| f.sequence > snapshot_sequence)
+            .collect();
+
         let recovery = Recovery {
             snapshot: snapshot.clone(),
-            frames: replay.frames,
+            frames,
             truncated,
             stop_reason: replay.stop_reason,
             audit_chain_broken_at: None,
@@ -311,6 +338,7 @@ impl Store {
             audit: Mutex::new(audit),
             audit_since_checkpoint: AtomicU64::new(0),
             checkpoint_interval,
+            snapshot_sequence: AtomicU64::new(snapshot_sequence),
         };
 
         Ok((store, recovery))
@@ -401,6 +429,12 @@ impl Store {
         // rebuild the chain without it — reporting the links as broken. A full
         // disk presenting as tampering is the wrong incident: one is a page to
         // whoever owns the storage, the other is a security response.
+        //
+        // Restoring the head is only correct because a failed `Log::append`
+        // leaves nothing on disk: it cuts the frame back off, or — when it
+        // cannot — poisons the log so nothing chains after the frame that may
+        // have survived. A write that landed and an `fsync` that failed would
+        // otherwise leave the record on disk and the head behind it.
         let restore = (chain.head(), chain.count());
         let record = chain.append(event);
         let sequence =
@@ -469,7 +503,9 @@ impl Store {
     ///
     /// A crash before step 2 leaves the previous snapshot and the full log — no
     /// data is lost. A crash between 2 and 3 leaves the new snapshot and a log
-    /// whose records are already reflected in it, which replays harmlessly.
+    /// whose records are already reflected in it; startup and every later read
+    /// skip frames at or below the snapshot's sequence, so none is applied
+    /// twice.
     ///
     /// # `payload` must represent everything the log holds
     ///
@@ -502,12 +538,17 @@ impl Store {
             (chain.head(), chain.count())
         };
 
-        write_atomic(&self.dir, SNAPSHOT_FILE, payload)?;
-        write_atomic(
-            &self.dir,
-            SNAPSHOT_META,
-            &encode_meta(sequence, audit_head, audit_count, payload, &self.mac_key),
-        )?;
+        // One file, one rename: the metadata and the payload it vouches for
+        // are replaced together or not at all.
+        let mut file = encode_meta(sequence, audit_head, audit_count, payload, &self.mac_key);
+        file.extend_from_slice(payload);
+        write_atomic(&self.dir, SNAPSHOT_FILE, &file)?;
+        self.snapshot_sequence.store(sequence, Ordering::SeqCst);
+        match std::fs::remove_file(self.dir.join(LEGACY_SNAPSHOT_META)) {
+            Ok(()) => durable::sync_dir(&self.dir)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         log.reset()?;
         Ok(())
     }
@@ -538,8 +579,9 @@ impl Store {
         // Only audit frames are kept. Every frame is still verified; this
         // decides what is materialised, so a page of the chain does not cost
         // the whole log in memory.
+        let covered = self.snapshot_sequence.load(Ordering::SeqCst);
         let replay = log.replay_retaining(&self.mac_key, |frame| {
-            frame.kind == RecordKind::AuditEvent
+            frame.kind == RecordKind::AuditEvent && frame.sequence > covered
         })?;
 
         let mut out: Vec<(u64, AuditRecord)> = replay
@@ -564,8 +606,9 @@ impl Store {
     /// without being able to read them, and until this existed nothing could.
     pub fn checkpoints(&self) -> Result<Vec<AuditCheckpoint>, StoreError> {
         let mut log = self.lock_log();
+        let covered = self.snapshot_sequence.load(Ordering::SeqCst);
         let replay = log.replay_retaining(&self.mac_key, |frame| {
-            frame.kind == RecordKind::AuditCheckpoint
+            frame.kind == RecordKind::AuditCheckpoint && frame.sequence > covered
         })?;
         Ok(replay
             .frames
@@ -590,7 +633,10 @@ impl Store {
         kinds: &[RecordKind],
     ) -> Result<Vec<(RecordKind, Vec<u8>)>, StoreError> {
         let mut log = self.lock_log();
-        let replay = log.replay_retaining(&self.mac_key, |frame| kinds.contains(&frame.kind))?;
+        let covered = self.snapshot_sequence.load(Ordering::SeqCst);
+        let replay = log.replay_retaining(&self.mac_key, |frame| {
+            kinds.contains(&frame.kind) && frame.sequence > covered
+        })?;
         Ok(replay
             .frames
             .iter()
@@ -614,8 +660,7 @@ impl Store {
         let log = self.lock_log();
         let log_len = log.len();
 
-        let snapshot_payload = read_optional(&self.dir.join(SNAPSHOT_FILE))?;
-        let snapshot_meta = read_optional(&self.dir.join(SNAPSHOT_META))?;
+        let snapshot_file = read_optional(&self.dir.join(SNAPSHOT_FILE))?;
         let log_bytes = read_optional(&self.dir.join(LOG_FILE))?.unwrap_or_default();
         // Copy up to the recorded boundary, and never past what the file
         // actually holds: `log_len` is the writer's view, while `log_bytes` is
@@ -626,11 +671,8 @@ impl Store {
             .min(log_bytes.len());
         let bounded_log = log_bytes.get(..boundary).unwrap_or(&log_bytes);
 
-        if let Some(payload) = &snapshot_payload {
-            write_atomic(target, SNAPSHOT_FILE, payload)?;
-        }
-        if let Some(meta) = &snapshot_meta {
-            write_atomic(target, SNAPSHOT_META, meta)?;
+        if let Some(file) = &snapshot_file {
+            write_atomic(target, SNAPSHOT_FILE, file)?;
         }
         write_atomic(target, LOG_FILE, bounded_log)?;
 
@@ -641,8 +683,10 @@ impl Store {
             // shorter than the writer's view it is the smaller figure, so the
             // manifest never overstates the backup.
             log_bytes: u64::try_from(bounded_log.len()).unwrap_or(u64::MAX),
-            snapshot_bytes: snapshot_payload
-                .map_or(0, |p| u64::try_from(p.len()).unwrap_or(u64::MAX)),
+            // The payload, not the metadata that leads the file.
+            snapshot_bytes: snapshot_file.map_or(0, |f| {
+                u64::try_from(f.len().saturating_sub(META_LEN)).unwrap_or(u64::MAX)
+            }),
             audit_head: self.lock_audit().head(),
         })
     }
@@ -672,10 +716,10 @@ pub struct AuditAppended {
     pub checkpoint: Option<AuditCheckpoint>,
 }
 
-/// Encode `snapshot.meta`.
+/// Encode the snapshot metadata that leads `snapshot.bin`.
 ///
 /// The MAC covers a digest of the snapshot payload as well as the position
-/// fields. Authenticating the metadata alone would leave `snapshot.bin`
+/// fields. Authenticating the metadata alone would leave the payload
 /// unprotected: an attacker with write access to the state directory could
 /// substitute a different snapshot body and keep the genuine metadata, and the
 /// store would accept it as authentic state at the recorded sequence.
@@ -700,19 +744,21 @@ fn encode_meta(
 /// Read and authenticate the snapshot.
 ///
 /// Specification 11.2: startup "fails closed on protected-record integrity
-/// errors". The MAC was previously written and never checked, so `snapshot.meta`
+/// errors". The MAC was previously written and never checked, so the metadata
 /// could be edited to rewind the sequence or substitute an audit head — either
 /// of which lets a tampered log verify against a chain that never covered it.
 fn read_snapshot(dir: &Path, mac_key: &[u8]) -> Result<Option<SnapshotState>, StoreError> {
-    let Some(payload) = read_optional(&dir.join(SNAPSHOT_FILE))? else {
+    let Some(file) = read_optional(&dir.join(SNAPSHOT_FILE))? else {
         return Ok(None);
     };
-    let Some(meta) = read_optional(&dir.join(SNAPSHOT_META))? else {
-        return Err(StoreError::CorruptSnapshotMetadata);
-    };
-    if meta.len() != META_LEN || meta.get(0..4) != Some(&META_MAGIC[..]) {
+    if file.len() < META_LEN {
         return Err(StoreError::CorruptSnapshotMetadata);
     }
+    let (meta, payload) = file.split_at(META_LEN);
+    if meta.get(0..4) != Some(&META_MAGIC[..]) {
+        return Err(StoreError::CorruptSnapshotMetadata);
+    }
+    let payload = payload.to_vec();
 
     let (signed, presented) = meta.split_at(META_LEN - 32);
     let expected = hypellm_crypto::hmac_sha256(mac_key, signed);
@@ -792,13 +838,10 @@ mod tests {
         // one is a page to whoever owns the storage, the other is a security
         // response.
         //
-        // Tested against the chain directly. Injecting a write failure into an
-        // open `Store` is not reachable from safe Rust with no dependencies —
-        // the file descriptor is already open, so permissions no longer apply,
-        // and `/dev/full` cannot be replayed to open a store on it at all (see
-        // the test above). What is testable is that the restore is exact, which
-        // is the part with logic in it; the two-line wiring in `append_audit`
-        // is verified by reading.
+        // Tested against the chain directly here; the wiring through an open
+        // `Store` is covered by the fault-injection tests below
+        // (`an_audit_record_whose_sync_failed_does_not_break_the_chain_on_restart`
+        // and its neighbours).
         let mut chain = AuditChain::new();
         chain.append(AuditEvent::new(1, "admin", AuditAction::KeyCreated));
         let head = chain.head();
@@ -989,11 +1032,11 @@ mod tests {
             store.compact(b"snapshot-state").expect("compact");
         }
 
-        let meta_path = dir.path().join(SNAPSHOT_META);
-        let mut meta = std::fs::read(&meta_path).expect("read meta");
+        let snapshot_path = dir.path().join(SNAPSHOT_FILE);
+        let mut file = std::fs::read(&snapshot_path).expect("read snapshot");
         // Rewind the recorded sequence.
-        meta[4] ^= 0xff;
-        std::fs::write(&meta_path, &meta).expect("write meta");
+        file[4] ^= 0xff;
+        std::fs::write(&snapshot_path, &file).expect("write snapshot");
 
         match Store::open(dir.path(), KEY, 0) {
             Err(StoreError::SnapshotIntegrity) => {}
@@ -1011,7 +1054,11 @@ mod tests {
             store.compact(b"the-real-state").expect("compact");
         }
 
-        std::fs::write(dir.path().join(SNAPSHOT_FILE), b"substituted-state").expect("write");
+        let snapshot_path = dir.path().join(SNAPSHOT_FILE);
+        let mut file = std::fs::read(&snapshot_path).expect("read snapshot");
+        file.truncate(META_LEN);
+        file.extend_from_slice(b"substituted-state");
+        std::fs::write(&snapshot_path, &file).expect("write");
 
         match Store::open(dir.path(), KEY, 0) {
             Err(StoreError::SnapshotIntegrity) => {}
@@ -1180,13 +1227,13 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_snapshot_metadata_file_fails_closed() {
+    fn a_snapshot_too_short_to_hold_its_metadata_fails_closed() {
         let dir = TempDir::new("store-meta-missing");
         {
             let (store, _) = open(dir.path());
             store.compact(b"state").unwrap();
         }
-        std::fs::remove_file(dir.join("snapshot.meta")).unwrap();
+        std::fs::write(dir.join(SNAPSHOT_FILE), b"state").unwrap();
         match Store::open(dir.path(), KEY, 0) {
             Err(StoreError::CorruptSnapshotMetadata) => {}
             other => panic!("expected corrupt metadata, got {other:?}"),
@@ -1200,11 +1247,163 @@ mod tests {
             let (store, _) = open(dir.path());
             store.compact(b"state").unwrap();
         }
-        std::fs::write(dir.join("snapshot.meta"), b"garbage").unwrap();
+        std::fs::write(dir.join(SNAPSHOT_FILE), vec![b'g'; META_LEN + 5]).unwrap();
         assert!(matches!(
             Store::open(dir.path(), KEY, 0),
             Err(StoreError::CorruptSnapshotMetadata)
         ));
+    }
+
+    #[test]
+    fn a_snapshot_is_one_file_so_its_metadata_cannot_be_left_behind() {
+        // Two files replaced by two renames cannot be replaced together: a
+        // crash between them paired the new payload with the previous
+        // metadata, the digest no longer matched, and the store refused to
+        // start. With the metadata inside `snapshot.bin`, a second compaction
+        // replaces both at once, and no second file exists to go stale.
+        let dir = TempDir::new("store-snapshot-one-file");
+        {
+            let (store, _) = open(dir.path());
+            store.compact(b"first").unwrap();
+            // An earlier format's metadata file is swept rather than trusted.
+            std::fs::write(dir.join(LEGACY_SNAPSHOT_META), b"stale").unwrap();
+            store.append(RecordKind::UsageAggregate, b"x").unwrap();
+            store.compact(b"second").unwrap();
+        }
+        assert!(!dir.join(LEGACY_SNAPSHOT_META).exists());
+        let (_store, recovery) = open(dir.path());
+        let snapshot = recovery.snapshot.expect("a snapshot");
+        assert_eq!(snapshot.payload, b"second");
+        assert_eq!(snapshot.sequence, 1);
+    }
+
+    #[test]
+    fn frames_a_snapshot_already_covers_are_not_replayed_twice() {
+        // Compaction writes the snapshot and then resets the log. A crash
+        // between the two leaves every frame in the log *and* reflected in the
+        // snapshot. Replaying them re-applied each one — and re-chaining the
+        // audit records from the snapshot's head, which already includes them,
+        // reported the chain as broken: an interrupted maintenance task
+        // presenting as tampering.
+        let dir = TempDir::new("store-compact-interrupted");
+        let log_path = dir.join(LOG_FILE);
+        {
+            let (store, _) = open(dir.path());
+            for n in 0..4u64 {
+                store
+                    .append_audit(AuditEvent::new(n, "admin", AuditAction::KeyCreated))
+                    .unwrap();
+            }
+            store.append(RecordKind::UsageAggregate, b"before").unwrap();
+            let before_reset = std::fs::read(&log_path).unwrap();
+            store.compact(b"state").unwrap();
+            // The crash: the snapshot is in place, the log reset never happened.
+            drop(store);
+            std::fs::write(&log_path, &before_reset).unwrap();
+        }
+
+        let (store, recovery) = open(dir.path());
+        assert!(
+            recovery.frames.is_empty(),
+            "frames the snapshot covers were replayed: {:?}",
+            recovery.frames.iter().map(|f| f.sequence).collect::<Vec<_>>()
+        );
+        assert_eq!(recovery.audit_chain_broken_at, None);
+        assert_eq!(store.audit_count(), 4);
+        assert!(store.records_of_kinds(&[RecordKind::UsageAggregate]).unwrap().is_empty());
+        assert!(store.audit_records(None, 10).unwrap().is_empty());
+
+        // And the store carries on from the snapshot's position.
+        let appended = store
+            .append_audit(AuditEvent::new(9, "admin", AuditAction::KeyCreated))
+            .unwrap();
+        assert_eq!(appended.sequence, 6);
+        drop(store);
+        let (_store, recovery) = open(dir.path());
+        assert_eq!(recovery.audit_chain_broken_at, None);
+        assert_eq!(recovery.frames.len(), 1);
+    }
+
+    #[test]
+    fn an_audit_record_whose_sync_failed_does_not_break_the_chain_on_restart() {
+        // `append_audit` restores the chain head when the write fails. If the
+        // frame had in fact reached disk — written, then `fsync` failed — the
+        // next record chained from the restored head while replay saw the
+        // "failed" one in between, and startup reported a chain break.
+        let dir = TempDir::new("store-audit-sync-failed");
+        {
+            let (store, _) = open(dir.path());
+            store
+                .append_audit(AuditEvent::new(1, "admin", AuditAction::KeyCreated))
+                .unwrap();
+            store.lock_log().inject_fault(log::Fault::SyncFails);
+            assert!(
+                store
+                    .append_audit(AuditEvent::new(2, "admin", AuditAction::KeyCreated))
+                    .is_err()
+            );
+            store
+                .append_audit(AuditEvent::new(3, "admin", AuditAction::KeyCreated))
+                .unwrap();
+        }
+        let (store, recovery) = open(dir.path());
+        assert_eq!(recovery.audit_chain_broken_at, None);
+        assert_eq!(store.audit_count(), 2);
+    }
+
+    #[test]
+    fn a_partial_audit_append_does_not_strand_the_records_after_it() {
+        let dir = TempDir::new("store-audit-partial");
+        {
+            let (store, _) = open(dir.path());
+            store
+                .append_audit(AuditEvent::new(1, "admin", AuditAction::KeyCreated))
+                .unwrap();
+            store.lock_log().inject_fault(log::Fault::PartialWrite);
+            assert!(
+                store
+                    .append_audit(AuditEvent::new(2, "admin", AuditAction::KeyCreated))
+                    .is_err()
+            );
+            store
+                .append_audit(AuditEvent::new(3, "admin", AuditAction::KeyCreated))
+                .unwrap();
+        }
+        let (store, recovery) = open(dir.path());
+        assert_eq!(recovery.audit_chain_broken_at, None);
+        assert_eq!(store.audit_count(), 2);
+    }
+
+    #[test]
+    fn an_append_that_cannot_be_undone_stops_the_store_writing() {
+        // If the failed frame cannot be cut off, it may be on disk. Chaining
+        // anything after it from the restored head would break the chain, so
+        // the store refuses further appends until it is reopened — at which
+        // point replay decides what is actually there.
+        let dir = TempDir::new("store-audit-poisoned");
+        {
+            let (store, _) = open(dir.path());
+            store
+                .append_audit(AuditEvent::new(1, "admin", AuditAction::KeyCreated))
+                .unwrap();
+            store.lock_log().inject_fault(log::Fault::SyncAndRollbackFail);
+            assert!(
+                store
+                    .append_audit(AuditEvent::new(2, "admin", AuditAction::KeyCreated))
+                    .is_err()
+            );
+            assert!(
+                store
+                    .append_audit(AuditEvent::new(3, "admin", AuditAction::KeyCreated))
+                    .is_err(),
+                "the store kept writing after an append it could not undo"
+            );
+        }
+        let (store, recovery) = open(dir.path());
+        assert_eq!(recovery.audit_chain_broken_at, None);
+        store
+            .append_audit(AuditEvent::new(4, "admin", AuditAction::KeyCreated))
+            .expect("a reopened store writes again");
     }
 
     #[test]

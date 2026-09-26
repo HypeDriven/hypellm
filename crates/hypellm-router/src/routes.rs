@@ -33,7 +33,7 @@ use wire_json::Limits as JsonLimits;
 
 use crate::dispatch::{AccumulatingSink, EventSink, SinkClosed};
 use crate::pipeline;
-use crate::protocol::{ParseContext, anthropic, openai};
+use crate::protocol::{ParseContext, anthropic, openai, rerank};
 use crate::server::{ClientWriter, Disposition, Handler};
 use crate::state::RouterState;
 
@@ -176,6 +176,15 @@ impl Handler for InferenceHandler {
                 Operation::Chat,
                 started,
             ),
+            (Method::Post, "/v1/rerank") => self.inference(
+                head,
+                body,
+                writer,
+                &principal,
+                request_id,
+                Operation::Rerank,
+                started,
+            ),
             (Method::Post, "/v1/tokenize") => self.inference(
                 head,
                 body,
@@ -280,6 +289,7 @@ impl InferenceHandler {
             ClientProtocol::OpenAiResponses => {
                 openai::parse_responses_request(body, &context, &limits)
             }
+            ClientProtocol::Rerank => rerank::parse_rerank_request(body, &context, &limits),
             _ => openai::parse_chat_request(body, &context, &limits),
         };
 
@@ -303,7 +313,16 @@ impl InferenceHandler {
         if request.stream.enabled {
             self.stream(&request, principal, writer, started)
         } else {
-            self.buffered(&request, principal, writer, started)
+            // Read from the body rather than carried on the canonical request:
+            // neither `top_n` nor `return_documents` is a routing input, and a
+            // field that reached the router core could eventually influence a
+            // decision. They only shape what is printed.
+            let render = if request.protocol == ClientProtocol::Rerank {
+                rerank::RenderOptions::from_body(body, &limits)
+            } else {
+                rerank::RenderOptions::default()
+            };
+            self.buffered(&request, principal, writer, started, render)
         }
     }
 
@@ -650,6 +669,7 @@ impl InferenceHandler {
         principal: &Principal,
         writer: &mut ClientWriter,
         started: u64,
+        render: rerank::RenderOptions,
     ) -> io::Result<Disposition> {
         let state = &self.state;
         let mut sink = AccumulatingSink::default();
@@ -671,7 +691,20 @@ impl InferenceHandler {
 
         let payload = match request.protocol {
             ClientProtocol::AnthropicMessages => {
-                anthropic::render_message_response(request, &sink.accumulator)
+                match anthropic::try_render_message_response(request, &sink.accumulator) {
+                    Ok(payload) => payload,
+                    // Nothing has been written yet, so an unrepresentable
+                    // upstream reply is still a clean error rather than a 200
+                    // carrying a substituted body.
+                    Err(error) => {
+                        return respond_error(
+                            writer,
+                            &error,
+                            Some(request.request_id),
+                            request.protocol,
+                        );
+                    }
+                }
             }
             ClientProtocol::OpenAiEmbeddings => {
                 openai::render_embeddings_response(request, &sink.accumulator)
@@ -684,6 +717,9 @@ impl InferenceHandler {
                 &sink.accumulator,
                 wall_seconds(state.clock.as_ref()),
             ),
+            ClientProtocol::Rerank => {
+                rerank::render_rerank_response(request, &sink.accumulator, render)
+            }
             _ => openai::render_chat_response(
                 request,
                 &sink.accumulator,
@@ -979,6 +1015,7 @@ fn protocol_for(path: &str) -> ClientProtocol {
         "/v1/embeddings" => ClientProtocol::OpenAiEmbeddings,
         "/v1/responses" => ClientProtocol::OpenAiResponses,
         "/v1/chat/completions" => ClientProtocol::OpenAiChat,
+        "/v1/rerank" => ClientProtocol::Rerank,
         _ => ClientProtocol::Native,
     }
 }
@@ -1000,6 +1037,7 @@ fn is_known_path(path: &str) -> bool {
             | "/v1/embeddings"
             | "/v1/messages"
             | "/v1/models"
+            | "/v1/rerank"
             | "/v1/tokenize"
             | "/v1/jobs"
             | "/health/live"

@@ -33,6 +33,7 @@ fn adapter_for(family: GoldenFamily) -> Box<dyn Adapter> {
             Box::new(OpenAiAdapter::new(ProviderFamily::OpenAi))
         }
         GoldenFamily::Anthropic => Box::new(AnthropicAdapter),
+        GoldenFamily::SemIf => Box::new(hypellm_adapters::SemIfAdapter),
     }
 }
 
@@ -243,6 +244,56 @@ fn recorded_embeddings_decode_to_the_expected_vectors() {
             adapter.usage_from_events(&events).input_tokens,
             fixture.input_tokens,
             "{}: input tokens",
+            fixture.name
+        );
+    }
+}
+
+#[test]
+fn recorded_scores_decode_to_the_expected_numbers() {
+    for fixture in golden::scores() {
+        let adapter = adapter_for(fixture.family);
+        let events = adapter
+            .decode_response(fixture.status, fixture.body.as_bytes())
+            .unwrap_or_else(|error| {
+                panic!("{}: decoding failed: {:?}", fixture.name, error.class)
+            });
+
+        let mut accumulator = ResponseAccumulator::new();
+        for event in &events {
+            accumulator.push(event);
+        }
+        assert_eq!(
+            accumulator.scores.len(),
+            fixture.expect.len(),
+            "{}: decoded {} scores, the corpus expects {}\n  why: {}",
+            fixture.name,
+            accumulator.scores.len(),
+            fixture.expect.len(),
+            fixture.why
+        );
+        // Compared in order, so a decoder that sorted by score would fail: the
+        // ranking is the *dialect's* job, and a decoder that did it here would
+        // make the two orderings drift.
+        for ((index, score), want) in accumulator.scores.iter().zip(fixture.expect) {
+            assert_eq!(*index, want.index, "{}: score index differs", fixture.name);
+            assert_eq!(*score, want.score, "{}: score differs", fixture.name);
+        }
+        assert_eq!(
+            adapter.usage_from_events(&events).input_tokens,
+            fixture.input_tokens,
+            "{}: input tokens",
+            fixture.name
+        );
+        assert!(
+            adapter.usage_from_events(&events).is_reported(),
+            "{}: the scorer counted these tokens, so they are not an estimate",
+            fixture.name
+        );
+        assert_eq!(
+            accumulator.native_model.as_deref(),
+            fixture.expect_native_model,
+            "{}: native model",
             fixture.name
         );
     }

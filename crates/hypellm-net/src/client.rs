@@ -127,6 +127,15 @@ pub struct UpstreamConnection {
     pool_key: String,
     /// Whether the connection may be reused after this exchange.
     reusable: bool,
+    /// Whether a request has been sent whose response has not been read to
+    /// the end of its framing.
+    ///
+    /// The pool must never hold such a connection. A stream abandoned at
+    /// `data: [DONE]` before the chunked terminator, or on a client
+    /// disconnect, leaves the rest of that response in the socket, and the
+    /// next caller to take the connection reads it as the head of *its*
+    /// response.
+    response_open: bool,
     /// Whether this connection was taken from the pool rather than dialed for
     /// this exchange.
     ///
@@ -153,6 +162,7 @@ impl UpstreamConnection {
             eof: false,
             pool_key,
             reusable: true,
+            response_open: false,
             pooled: false,
         })
     }
@@ -167,6 +177,7 @@ impl UpstreamConnection {
             eof: false,
             pool_key,
             reusable: true,
+            response_open: false,
             pooled: false,
         }
     }
@@ -188,8 +199,6 @@ impl UpstreamConnection {
         self.pooled = true;
     }
 
-    /// Whether the connection may be returned to the pool.
-    #[must_use]
     /// Whether any byte has ever arrived from the peer on this connection.
     ///
     /// The signal a caller needs to tell a socket the peer closed while it was
@@ -197,12 +206,19 @@ impl UpstreamConnection {
     /// was never processed and may be replayed; the second says nothing of the
     /// kind, and replaying a non-idempotent request on it would run the
     /// exchange twice (specification 6.5).
+    #[must_use]
     pub fn has_received_any(&self) -> bool {
         !self.buffer.is_empty()
     }
 
-    pub const fn is_reusable(&self) -> bool {
-        self.reusable && !self.eof
+    /// Whether the connection may be returned to the pool.
+    ///
+    /// Only when the last response was consumed exactly to the end of its
+    /// framing: not closed, not marked unusable, no response still in the
+    /// socket, and no bytes buffered past the end of the one that was read.
+    #[must_use]
+    pub fn is_reusable(&self) -> bool {
+        self.reusable && !self.eof && !self.response_open && self.pending().is_empty()
     }
 
     /// Mark the connection unusable, so it is closed rather than pooled.
@@ -219,6 +235,8 @@ impl UpstreamConnection {
         deadline: Deadline,
     ) -> Result<(), UpstreamError> {
         self.apply_deadline(clock, deadline)?;
+        // From the first byte written, the connection owes a response.
+        self.response_open = true;
         self.transport.write_all(head)?;
         if !body.is_empty() {
             self.transport.write_all(body)?;
@@ -313,6 +331,10 @@ impl UpstreamConnection {
                     if head.connection_close {
                         self.reusable = false;
                     }
+                    // An interim response (1xx) is followed by the real one.
+                    if head.status >= 200 && !head.body.has_body() {
+                        self.response_open = false;
+                    }
                     return Ok(head);
                 }
                 ParseStatus::Incomplete => {
@@ -334,6 +356,23 @@ impl UpstreamConnection {
     /// Returns the number of payload bytes produced. A return of zero with the
     /// decoder complete means the body has ended.
     pub fn read_body(
+        &mut self,
+        decoder: &mut BodyDecoder,
+        out: &mut Vec<u8>,
+        clock: &dyn Clock,
+        deadline: Deadline,
+    ) -> Result<usize, UpstreamError> {
+        let result = self.read_body_inner(decoder, out, clock, deadline);
+        if result.is_ok() && decoder.is_complete() {
+            // The framing says the response has ended. Anything still
+            // buffered beyond it is a second response nobody asked for, which
+            // `is_reusable` refuses on its own.
+            self.response_open = false;
+        }
+        result
+    }
+
+    fn read_body_inner(
         &mut self,
         decoder: &mut BodyDecoder,
         out: &mut Vec<u8>,
@@ -626,6 +665,105 @@ mod tests {
         assert_eq!(events.len(), 5);
         assert_eq!(events.first().expect("first event").data, r#"{"i":0}"#);
         assert_eq!(events.get(4).expect("fifth event").data, r#"{"i":4}"#);
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn a_stream_abandoned_before_its_terminator_is_not_pooled() {
+        // The router stops reading at `data: [DONE]` or when its client goes
+        // away. The chunked terminator — and anything else the upstream sends —
+        // is still in the socket, and the next caller to take this connection
+        // from the pool would read it as the start of its own response.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("timeout");
+            let mut scratch = [0u8; 1024];
+            let _ = socket.read(&mut scratch);
+            let mut wire = Vec::from(
+                &b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
+            );
+            wire_http1::encode_chunk(&mut wire, b"data: [DONE]\n\n");
+            socket.write_all(&wire).expect("write");
+            socket.flush().expect("flush");
+            // Hold the connection open, terminator unsent, until the client
+            // closes it.
+            let _ = socket.read(&mut scratch);
+        });
+
+        let destination =
+            PinnedDestination::for_tests(DestinationAddress::Socket(addr), "127.0.0.1", None, false);
+        let clock = clock();
+        let deadline = deadline(&clock);
+        let mut conn =
+            UpstreamConnection::connect(&destination, "k".to_owned(), Duration::from_secs(5))
+                .expect("connect");
+        assert!(conn.is_reusable(), "a fresh connection is poolable");
+        conn.send(b"POST / HTTP/1.1\r\nhost: a\r\n\r\n", b"", clock.as_ref(), deadline)
+            .expect("send");
+        let head = conn
+            .read_head(&Method::Post, &Limits::UPSTREAM, clock.as_ref(), deadline)
+            .expect("head");
+        assert_eq!(head.body, BodyFraming::Chunked);
+        let mut decoder = BodyDecoder::new(head.body, Limits::UPSTREAM);
+        let mut chunk = Vec::new();
+        let produced = conn
+            .read_body(&mut decoder, &mut chunk, clock.as_ref(), deadline)
+            .expect("read");
+        assert!(produced > 0);
+        assert!(!decoder.is_complete(), "the fixture must stop short of the terminator");
+
+        assert!(
+            !conn.is_reusable(),
+            "a half-read response would be handed to the next caller"
+        );
+        conn.close();
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn a_response_read_to_the_end_of_its_framing_is_pooled() {
+        // The other half: pooling still happens when it is safe, or the fix
+        // is just "never reuse".
+        let mut wire = Vec::from(&b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"[..]);
+        wire_http1::encode_chunk(&mut wire, b"complete");
+        wire_http1::encode_last_chunk(&mut wire);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("timeout");
+            let mut scratch = [0u8; 1024];
+            let _ = socket.read(&mut scratch);
+            socket.write_all(&wire).expect("write");
+            socket.flush().expect("flush");
+            let _ = socket.read(&mut scratch);
+        });
+        let destination =
+            PinnedDestination::for_tests(DestinationAddress::Socket(addr), "127.0.0.1", None, false);
+        let clock = clock();
+        let deadline = deadline(&clock);
+        let mut conn =
+            UpstreamConnection::connect(&destination, "k".to_owned(), Duration::from_secs(5))
+                .expect("connect");
+        conn.send(b"GET / HTTP/1.1\r\nhost: a\r\n\r\n", b"", clock.as_ref(), deadline)
+            .expect("send");
+        let head = conn
+            .read_head(&Method::Get, &Limits::UPSTREAM, clock.as_ref(), deadline)
+            .expect("head");
+        assert!(!conn.is_reusable(), "a response whose body is unread is not poolable");
+        let mut decoder = BodyDecoder::new(head.body, Limits::UPSTREAM);
+        let body = conn
+            .read_body_to_end(&mut decoder, clock.as_ref(), deadline)
+            .expect("body");
+        assert_eq!(body, b"complete");
+        assert!(conn.is_reusable(), "a fully consumed response must still be poolable");
+        conn.close();
         server.join().expect("server");
     }
 

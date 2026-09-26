@@ -96,6 +96,49 @@ impl CannedResponse {
         }
     }
 
+    /// An event stream framed with chunked encoding on a keep-alive
+    /// connection: one chunk per event, `[DONE]`, then `after_done` as a
+    /// further chunk if given, then the terminator.
+    ///
+    /// The shape a real provider sends, and the only one whose connection the
+    /// router can reuse. The fake keeps serving requests on the connection
+    /// until the router closes it, so [`FakeUpstream::connections`] shows
+    /// whether it did.
+    #[must_use]
+    pub fn chunked_event_stream(frames: &[&str], after_done: Option<&str>) -> Self {
+        let mut body = Vec::new();
+        for frame in frames {
+            let mut event = String::new();
+            wire_sse::encode_data(&mut event, frame);
+            wire_http1::encode_chunk(&mut body, event.as_bytes());
+        }
+        let mut done = String::new();
+        wire_sse::encode_done(&mut done);
+        wire_http1::encode_chunk(&mut body, done.as_bytes());
+        if let Some(extra) = after_done {
+            wire_http1::encode_chunk(&mut body, extra.as_bytes());
+        }
+        wire_http1::encode_last_chunk(&mut body);
+        Self {
+            status: 200,
+            headers: vec![
+                ("Content-Type".to_owned(), "text/event-stream".to_owned()),
+                ("Transfer-Encoding".to_owned(), "chunked".to_owned()),
+            ],
+            body,
+            streaming: true,
+            delay: std::time::Duration::ZERO,
+            body_delay: std::time::Duration::ZERO,
+        }
+    }
+
+    /// Whether the body is chunked, and the connection therefore kept alive.
+    fn keeps_alive(&self) -> bool {
+        self.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("transfer-encoding") && value.eq_ignore_ascii_case("chunked")
+        })
+    }
+
     /// An Anthropic-style named event stream.
     #[must_use]
     pub fn named_event_stream(frames: &[(&str, &str)]) -> Self {
@@ -122,7 +165,9 @@ impl CannedResponse {
         for (name, value) in &self.headers {
             out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
         }
-        if self.streaming {
+        if self.keeps_alive() {
+            out.extend_from_slice(b"\r\n");
+        } else if self.streaming {
             out.extend_from_slice(b"Connection: close\r\n\r\n");
         } else {
             out.extend_from_slice(format!("Content-Length: {}\r\n\r\n", self.body.len()).as_bytes());
@@ -135,7 +180,9 @@ impl CannedResponse {
         for (name, value) in &self.headers {
             out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
         }
-        if self.streaming {
+        if self.keeps_alive() {
+            out.extend_from_slice(b"\r\n");
+        } else if self.streaming {
             out.extend_from_slice(b"Connection: close\r\n\r\n");
         } else {
             out.extend_from_slice(format!("Content-Length: {}\r\n\r\n", self.body.len()).as_bytes());
@@ -152,6 +199,8 @@ pub struct FakeUpstream {
     pub address: std::net::SocketAddr,
     /// How many requests it has served.
     served: Arc<AtomicU64>,
+    /// How many connections it has accepted.
+    connections: Arc<AtomicU64>,
     /// The bodies it received.
     received: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     /// Set on drop so the accept loop exits instead of blocking forever.
@@ -190,6 +239,8 @@ impl FakeUpstream {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake upstream");
         let address = listener.local_addr().expect("upstream address");
         let served = Arc::new(AtomicU64::new(0));
+        let connections = Arc::new(AtomicU64::new(0));
+        let thread_connections = Arc::clone(&connections);
         let received = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -204,34 +255,61 @@ impl FakeUpstream {
                     break;
                 }
                 let Ok(mut socket) = stream else { break };
-                let index = usize::try_from(thread_served.fetch_add(1, Ordering::SeqCst))
-                    .unwrap_or(usize::MAX);
-                // `responses` is non-empty (asserted above), so `last` always
-                // answers and the `else` arm is unreachable.
-                let Some(response) = responses.get(index).or_else(|| responses.last()) else {
-                    break;
-                };
-
+                thread_connections.fetch_add(1, Ordering::SeqCst);
                 let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
-                let mut buffer = vec![0u8; 64 * 1024];
-                if let Ok(n) = socket.read(&mut buffer) {
+                // One request per iteration. A keep-alive response keeps the
+                // connection for the next request; anything else ends it.
+                loop {
+                    let mut buffer = vec![0u8; 64 * 1024];
+                    let n = match socket.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    let index = usize::try_from(thread_served.fetch_add(1, Ordering::SeqCst))
+                        .unwrap_or(usize::MAX);
+                    // `responses` is non-empty (asserted above), so `last`
+                    // always answers and the `else` arm is unreachable.
+                    let Some(response) = responses.get(index).or_else(|| responses.last())
+                    else {
+                        break;
+                    };
                     buffer.truncate(n);
                     if let Ok(mut log) = thread_received.lock() {
                         log.push(buffer);
                     }
-                }
-                if !response.delay.is_zero() {
-                    std::thread::sleep(response.delay);
-                }
-                if response.body_delay.is_zero() {
-                    let _ = socket.write_all(&response.to_wire());
-                } else {
-                    // Head first, then silence, then the body: what a provider
-                    // that has accepted the request and is thinking looks like.
-                    let _ = socket.write_all(&response.head_wire());
+                    if !response.delay.is_zero() {
+                        std::thread::sleep(response.delay);
+                    }
+                    if response.keeps_alive() {
+                        // The terminator in its own write, a moment later: a
+                        // real provider flushes `[DONE]` as soon as it has it,
+                        // and the router must not depend on the end of the
+                        // framing arriving in the same read.
+                        let wire = response.to_wire();
+                        let split = wire.len().saturating_sub(b"0\r\n\r\n".len());
+                        let (events, terminator) = wire.split_at(split);
+                        let _ = socket.write_all(events);
+                        let _ = socket.flush();
+                        std::thread::sleep(Duration::from_millis(20));
+                        let _ = socket.write_all(terminator);
+                    } else if response.body_delay.is_zero() {
+                        let _ = socket.write_all(&response.to_wire());
+                    } else {
+                        // Head first, then silence, then the body: what a
+                        // provider that has accepted the request and is
+                        // thinking looks like.
+                        let _ = socket.write_all(&response.head_wire());
+                        let _ = socket.flush();
+                        std::thread::sleep(response.body_delay);
+                        let _ = socket.write_all(&response.body);
+                    }
                     let _ = socket.flush();
-                    std::thread::sleep(response.body_delay);
-                    let _ = socket.write_all(&response.body);
+                    if !response.keeps_alive() || thread_stopping.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    // Waiting on an idle pooled connection blocks the accept
+                    // loop, so the wait for a follow-up request is short.
+                    let _ = socket.set_read_timeout(Some(Duration::from_secs(1)));
                 }
                 let _ = socket.flush();
                 let _ = socket.shutdown(std::net::Shutdown::Write);
@@ -241,6 +319,7 @@ impl FakeUpstream {
         Self {
             address,
             served,
+            connections,
             received,
             stopping,
             handle: Some(handle),
@@ -251,6 +330,12 @@ impl FakeUpstream {
     #[must_use]
     pub fn served(&self) -> u64 {
         self.served.load(Ordering::SeqCst)
+    }
+
+    /// How many connections it has accepted.
+    #[must_use]
+    pub fn connections(&self) -> u64 {
+        self.connections.load(Ordering::SeqCst)
     }
 
     /// The raw requests it received.

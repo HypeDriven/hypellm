@@ -242,6 +242,7 @@ mod tests {
             created_at_millis: 0,
             description: None,
             revoked: false,
+            created_by: None,
         };
         let principal = Principal::from_key(&key, Vec::new(), Vec::new());
         assert_eq!(principal.method, AuthMethod::ApiKey);

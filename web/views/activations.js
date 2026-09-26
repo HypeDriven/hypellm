@@ -61,7 +61,9 @@ function outcomeTone(outcome) {
  */
 async function load(api) {
   try {
-    return await api.get('/admin/v1/fleet/activations');
+    // `api.get` resolves to `{ data, etag }` and already prefixes `/admin/v1`.
+    const { data } = await api.get('/fleet/activations');
+    return data;
   } catch (error) {
     if (error instanceof ApiError && error.status === 404) {
       return null;

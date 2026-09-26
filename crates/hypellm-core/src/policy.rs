@@ -632,6 +632,7 @@ impl PolicySnapshot {
             if let Some(pin) = &binding.pin {
                 if merged.pin.is_none() {
                     merged.pin = Some(pin.clone());
+                    merged.pin_level = Some(level);
                     merged.pin_fallback.clone_from(&binding.emergency_fallback);
                 }
             }
@@ -852,7 +853,8 @@ impl PolicySnapshot {
             if merged.pin.as_ref() == Some(&target.id)
                 || merged.pin_fallback.contains(&target.id)
             {
-                return Ok(self.score(req, target, 0, 0, pin_rank, residency, live));
+                let level = merged.pin_level.unwrap_or(0);
+                return Ok(self.score(req, target, level, 0, 0, pin_rank, residency, live));
             }
             return Err(ExclusionReason::NotSelectedByAnyBinding);
         };
@@ -860,6 +862,7 @@ impl PolicySnapshot {
         Ok(self.score(
             req,
             target,
+            pref.level,
             pref.rank,
             pref.weight,
             pin_rank,
@@ -878,6 +881,7 @@ impl PolicySnapshot {
         &self,
         req: &CanonicalRequest,
         target: &Target,
+        binding_precedence: u8,
         rank: u16,
         weight: i64,
         pin_rank: u8,
@@ -932,7 +936,7 @@ impl PolicySnapshot {
         Candidate {
             target: target.id.clone(),
             terms,
-            binding_precedence: 0,
+            binding_precedence,
             rank,
             pin_rank,
             residency,
@@ -953,6 +957,8 @@ struct MergedBindings {
     pin: Option<TargetId>,
     /// Emergency fallback targets from that same binding.
     pin_fallback: Vec<TargetId>,
+    /// The precedence level of the binding that declared the pin.
+    pin_level: Option<u8>,
     /// The highest precedence level seen.
     top_level: Option<u8>,
 }
@@ -1496,6 +1502,78 @@ mod tests {
                 .iter()
                 .all(|c| c.target.as_str() != "deepseek:coder")
         );
+    }
+
+    #[test]
+    fn a_candidate_reports_the_precedence_of_the_binding_that_placed_it() {
+        // The decision trace's `binding_precedence` was always zero, so the
+        // explorer attributed every candidate to the highest level whatever
+        // placed it.
+        let mut s = snapshot();
+        let principal_binding = Binding {
+            id: bid("principal-exact"),
+            scope: BindingScope::Principal(PrincipalId::new("user:42").unwrap()),
+            model: ModelSelector::Exact(aid("code-premium")),
+            preferences: vec![TargetPreference {
+                selector: TargetSelector::Exact(tid("deepseek:coder")),
+                rank: 0,
+                weight: 0,
+            }],
+            allows: Vec::new(),
+            denies: Vec::new(),
+            pin: None,
+            emergency_fallback: Vec::new(),
+            priority: 0,
+        };
+        let tenant_binding = Binding {
+            id: bid("tenant-any"),
+            scope: BindingScope::Tenant(TenantId::new("acme").unwrap()),
+            model: ModelSelector::Any,
+            preferences: vec![TargetPreference {
+                selector: TargetSelector::Exact(tid("local:qwen")),
+                rank: 1,
+                weight: 0,
+            }],
+            ..principal_binding.clone()
+        };
+        let req = request("code-premium");
+        let groups: Vec<GroupId> = Vec::new();
+        let attempted: Vec<TargetId> = Vec::new();
+        let c = ctx(&req.principal, &groups, &req.tenant, &attempted);
+        let principal_level = principal_binding.precedence(&c, &aid("code-premium")).unwrap();
+        let tenant_level = tenant_binding.precedence(&c, &aid("code-premium")).unwrap();
+        assert_ne!(principal_level, tenant_level, "the fixture must distinguish them");
+        s.bindings.push(principal_binding);
+        s.bindings.push(tenant_binding);
+
+        let outcome = route(&s, &req);
+        let level_of = |t: &str| {
+            outcome
+                .candidates
+                .iter()
+                .find(|c| c.target.as_str() == t)
+                .map(|c| c.binding_precedence)
+        };
+        assert_eq!(level_of("deepseek:coder"), Some(principal_level));
+        assert_eq!(level_of("local:qwen"), Some(tenant_level));
+
+        // A pinned target reachable only through its pin reports the pinning
+        // binding's level.
+        let mut pinned = snapshot();
+        pinned.bindings.push(Binding {
+            id: bid("tenant-pin"),
+            scope: BindingScope::Tenant(TenantId::new("acme").unwrap()),
+            model: ModelSelector::Any,
+            preferences: Vec::new(),
+            allows: Vec::new(),
+            denies: Vec::new(),
+            pin: Some(tid("openai:gpt")),
+            emergency_fallback: Vec::new(),
+            priority: 0,
+        });
+        let outcome = route(&pinned, &req);
+        assert_eq!(chosen(&outcome), Some("openai:gpt"));
+        assert_eq!(outcome.candidates[0].binding_precedence, tenant_level);
     }
 
     #[test]

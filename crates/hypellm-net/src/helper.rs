@@ -37,7 +37,6 @@ use crate::egress::{PinnedDestination, Transport};
 use hypellm_auth::oidc::{IdTokenClaims, OidcError, TokenVerifier};
 use core::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
 use std::time::Duration;
 use wire_json::{Limits, Value, parse};
 
@@ -165,7 +164,8 @@ impl TlsHelper {
             return Err(HelperError::ProtocolViolation);
         };
 
-        let stream = UnixStream::connect(&self.socket_path).map_err(HelperError::Unavailable)?;
+        let stream = crate::egress::connect_unix(std::path::Path::new(&self.socket_path), self.timeout)
+            .map_err(HelperError::Unavailable)?;
         stream
             .set_read_timeout(Some(self.timeout))
             .map_err(HelperError::Unavailable)?;
@@ -229,7 +229,8 @@ impl VerifierClient {
             return Err(HelperError::ReplyTooLarge);
         }
 
-        let stream = UnixStream::connect(&self.socket_path).map_err(HelperError::Unavailable)?;
+        let stream = crate::egress::connect_unix(std::path::Path::new(&self.socket_path), self.timeout)
+            .map_err(HelperError::Unavailable)?;
         stream
             .set_read_timeout(Some(self.timeout))
             .map_err(HelperError::Unavailable)?;

@@ -350,9 +350,9 @@ impl PasswordVerifier {
             salt,
             expected,
         };
-        // Checked here rather than at sign-in. A verifier whose parameters ask
-        // for more memory than the router will allocate must be a configuration
-        // error at load, not a refusal discovered by the one person who needed
+        // Checked here as well as at sign-in. A verifier whose parameters ask
+        // for more memory or work than the router will spend must be a
+        // configuration error at load, not a refusal discovered by the one person who needed
         // to sign in — and never an allocation on an unauthenticated endpoint.
         verifier
             .scrypt_cost()
@@ -371,12 +371,12 @@ impl PasswordVerifier {
             return None;
         }
         let n = 1u64.checked_shl(u32::from(*log_n))?;
-        let mut probe = [0u8; 1];
-        // The parameter and memory checks live in one place — `scrypt` itself —
-        // so a bound raised there cannot be missed here. A zero-length output
-        // is not permitted, so this derives one byte at the real cost; it runs
-        // once, at configuration load.
-        scrypt::scrypt(b"", b"", n, *r, *p, &mut probe).ok()?;
+        // The parameter, memory and work bounds live in one place —
+        // `scrypt::check_parameters`, which `scrypt` itself applies — so a
+        // bound raised there cannot be missed here. It is arithmetic only: no
+        // derivation runs, so calling this before every verification costs
+        // nothing.
+        scrypt::check_parameters(n, *r, *p).ok()?;
         Some((n, *r, *p))
     }
 
@@ -788,6 +788,34 @@ mod tests {
             PasswordVerifier::parse(&format!("scrypt$1$8$1${salt}${key}")).err(),
             Some(VerifierError::Parameters)
         );
+    }
+
+    #[test]
+    fn a_verifier_beyond_the_work_bound_is_refused_without_deriving() {
+        // Inside the memory bound, but p = 1,000,000 lanes of a 128 MiB mix.
+        // Parsing once ran a full derivation as a probe, so this hung the load
+        // instead of failing it.
+        let salt = base64::encode_url_nopad(b"0123456789abcdef");
+        let key = base64::encode_url_nopad(&[0u8; DERIVED_LEN]);
+        assert_eq!(
+            PasswordVerifier::parse(&format!("scrypt$20$1$1000000${salt}${key}")).err(),
+            Some(VerifierError::Parameters)
+        );
+    }
+
+    #[test]
+    fn verification_runs_exactly_one_derivation_and_parsing_runs_none() {
+        // The admissibility check used to derive a probe at full cost, doubling
+        // the work of every sign-in attempt on an unauthenticated endpoint.
+        let count = || crate::scrypt::DERIVATIONS.with(core::cell::Cell::get);
+        let encoded = cheap("correct horse").encode();
+        let before = count();
+        let verifier = PasswordVerifier::parse(&encoded).expect("parses");
+        assert_eq!(count(), before, "parsing must not derive");
+        assert!(verifier.verify("correct horse"));
+        assert_eq!(count(), before + 1, "one verification, one derivation");
+        assert!(!verifier.verify("wrong"));
+        assert_eq!(count(), before + 2);
     }
 
     #[test]

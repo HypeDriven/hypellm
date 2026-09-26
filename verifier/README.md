@@ -172,9 +172,11 @@ both. Both must be true before a sign-in can complete.
 just verifier-acceptance     # both layers
 ```
 
-**`--selftest`** — twenty-eight cases over the JOSE logic in-process:
+**`--selftest`** — thirty cases, most over the JOSE logic in-process:
 algorithm confusion in its three usual shapes, key selection, tampering after
-signing, token shape, bounds, and the `EXCHANGE` pinning rules. It needs
+signing, token shape, bounds, the `EXCHANGE` pinning rules, and the cap on
+concurrent connections (at most `MAX_CONCURRENT_CONNECTIONS` handler threads;
+a connection past it is answered `ERR busy` and closed). It needs
 `openssl` and **no network**, and the last case asserts that — because the
 first draft of this file refetched the key set on every unknown `kid` and so
 silently reached Google's live endpoint.

@@ -1097,6 +1097,77 @@ role_binding subject=group:ghost role=operator
         assert!(codes(&load_err(role)).contains(&"unresolved_reference"));
     }
 
+    #[test]
+    fn a_backslash_ending_a_comment_does_not_join_the_next_record_into_it() {
+        // A trailing `\\` was read as a continuation before comments were
+        // stripped, so a Windows path at the end of a comment swallowed the
+        // following deny binding — which then silently never applied.
+        let text = "\
+tenant id=acme
+provider id=p family=openai scheme=https host=a.example
+target id=t provider=p model=m
+alias id=a targets=t # weights live in C:\\
+binding id=deny-t scope=tenant:acme model=a deny=t
+";
+        let c = load_ok(text);
+        let binding = c.snapshot.bindings.first().expect("the deny binding survives");
+        assert_eq!(binding.id.as_str(), "deny-t");
+        assert_eq!(binding.denies.len(), 1);
+    }
+
+    #[test]
+    fn an_explicitly_empty_operation_list_is_rejected_rather_than_granting_every_operation() {
+        // An empty list means every operation to the policy engine, so
+        // `operations=` widened a grant exactly as `model=` once did.
+        let text = "\
+tenant id=acme
+grant scope=tenant:acme operations= allow=true
+";
+        assert!(codes(&load_err(text)).contains(&"empty_field"));
+
+        let omitted = "\
+tenant id=acme
+grant scope=tenant:acme allow=true
+";
+        let c = load_ok(omitted);
+        assert!(c.snapshot.grants.first().expect("grant").operations.is_empty());
+    }
+
+    #[test]
+    fn a_binding_or_grant_naming_an_undefined_tenant_group_or_alias_is_rejected() {
+        // A typo in any of these makes the record match nothing. For a deny,
+        // that is a policy that silently fails open.
+        let base = "\
+tenant id=acme
+group id=eng tenant=acme
+provider id=p family=openai scheme=https host=a.example
+target id=t provider=p model=m
+alias id=code targets=t
+";
+        for extra in [
+            "binding id=b scope=tenant:acmee model=* deny=t",
+            "binding id=b scope=tenant:acme model=cod deny=t",
+            "grant scope=tenant:acmee allow=false",
+            "grant scope=group:engg allow=false",
+            "grant scope=tenant:acme model=cod allow=false",
+        ] {
+            let text = format!("{base}{extra}\n");
+            assert!(
+                codes(&load_err(&text)).contains(&"unresolved_reference"),
+                "{extra} must be refused"
+            );
+        }
+
+        // Wildcards and prefixes are selectors, not references: legal even
+        // when nothing currently matches them.
+        let text = format!(
+            "{base}grant scope=group:eng model=zz* allow=false\n\
+             binding id=b scope=tenant:acme model=code deny=t\n\
+             grant scope=tenant:acme model=code allow=true\n"
+        );
+        load_ok(&text);
+    }
+
     // -- Field validation ----------------------------------------------------
 
     #[test]

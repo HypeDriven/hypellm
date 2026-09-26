@@ -176,6 +176,13 @@ pub struct FleetRuntime {
     queue: ActivationQueue,
     /// In-flight activations and the exactly-once lease accounting.
     ledger: ActivationLedger,
+    /// Serialises the commit step of an activation: re-checking a plan
+    /// against every lease held right now, and taking its own.
+    ///
+    /// Plans are made concurrently from whatever snapshot each request holds,
+    /// so two can each be sound alone and unsound together. Held only for the
+    /// in-memory check and the ledger update — never across I/O.
+    admission: Mutex<()>,
     /// Observed lifecycle durations, refining the declared ones.
     timings: RwLock<BTreeMap<DeploymentId, Timings>>,
     /// Deployments observed running that this router did not start.
@@ -247,6 +254,7 @@ impl FleetRuntime {
             flap: FlapCounter::new(),
             queue: ActivationQueue::new(),
             ledger: ActivationLedger::new(),
+            admission: Mutex::new(()),
             timings: RwLock::new(BTreeMap::new()),
             unmanaged: RwLock::new(BTreeSet::new()),
             lease_counter: AtomicU64::new(0),
@@ -296,12 +304,48 @@ impl FleetRuntime {
         &self.ledger
     }
 
-    /// Per-host activation allowances, for the management view.
+    /// Per-host activation allowances, for the management view and the
+    /// planner.
+    ///
+    /// Each host is measured against its *own* policy. Reading every host
+    /// through `default_policy` reported a host with a per-host override
+    /// against the wrong ceiling — and the planner reads this figure, so a
+    /// host allowed fewer activations than the default looked as if it had
+    /// allowance left, and one allowed more looked exhausted.
     #[must_use]
     pub fn budget_snapshot(&self) -> BTreeMap<HostId, u32> {
         let config = self.config();
-        self.budgets
-            .snapshot(&config.default_policy, self.clock.now_millis())
+        let now = self.clock.now_millis();
+        config
+            .hosts
+            .keys()
+            .map(|host| {
+                let policy = config.policy_for(host);
+                (host.clone(), self.budgets.remaining(host, &policy, now))
+            })
+            .collect()
+    }
+
+    /// The current snapshot with the ledger's commitments as of now.
+    ///
+    /// Leases and eviction sets change on every activation, far more often
+    /// than observation runs, so they are refreshed here rather than waiting
+    /// for the next inventory.
+    fn with_commitments(&self) -> FleetSnapshot {
+        let mut next = (*self.snapshot()).clone();
+        next.leases = self.ledger.leases_by_deployment();
+        next.evicting = self.ledger.evicting();
+        next
+    }
+
+    /// Publish the ledger's current commitments into the planner's snapshot.
+    fn publish_commitments(&self) {
+        if let Ok(mut guard) = self.snapshot.write() {
+            let mut next = (**guard).clone();
+            next.leases = self.ledger.leases_by_deployment();
+            next.evicting = self.ledger.evicting();
+            *guard = Arc::new(next);
+        }
     }
 
     /// Record that a request asked for a capability.
@@ -516,6 +560,7 @@ impl FleetRuntime {
         next.observed_at_ms = now_ms;
         next.observed = agents_reachable || !next.inventory.deployments.is_empty();
         next.leases = self.ledger.leases_by_deployment();
+        next.evicting = self.ledger.evicting();
         next.ready_since_ms = ready_since;
         next.unmanaged = self
             .unmanaged
@@ -546,7 +591,11 @@ impl FleetRuntime {
             .map(|a| a.pool.clone())
             .collect();
         for pool in pools {
-            let policy = config.default_policy;
+            // The pool's own host's policy, as for the budget.
+            let policy = config
+                .accelerators_in_pool(&pool)
+                .first()
+                .map_or(config.default_policy, |a| config.policy_for(&a.host));
             if next.memory_drift(&pool, policy.memory_drift_tolerance_permille) {
                 self.audit_drift(&pool);
             }
@@ -824,10 +873,45 @@ impl FleetRuntime {
         let lease_id = self.next_lease_id();
         let lease = lease_for(plan, lease_id.clone(), decision_id.to_owned(), &policy, now);
 
+        // Commit: re-check the plan against every lease held at this instant
+        // and take the host slot, as one step. The plan was made from a
+        // snapshot that may predate another request's commitment, and
+        // without this two plans that were each sound alone — the same
+        // deployment, the same victim, the same free memory — both ran.
+        {
+            let _commit = match self.admission.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let committed = self.with_commitments();
+            if hypellm_fleet::plan::revalidate(&committed, plan).is_err() {
+                self.budgets.refund(&plan.host, &policy, now);
+                return ActivationResult::Failed {
+                    code: "fleet_busy",
+                };
+            }
+            let record = ActivationRecord::from_plan(plan, lease.clone(), now);
+            if self
+                .ledger
+                .acquire_exclusive(record, host.max_concurrent_activations)
+                .is_err()
+            {
+                self.budgets.refund(&plan.host, &policy, now);
+                return ActivationResult::Failed {
+                    code: "fleet_busy",
+                };
+            }
+            self.publish_commitments();
+        }
+
         // Durable before the mutating verb. This is the whole basis of crash
         // recovery: a router that died between the write and the verb replays
         // the lease and asks the agent what happened; one that died between the
         // verb and the write would have no idea it had started anything.
+        //
+        // After the slot, not before it. Written first, a lease refused a slot
+        // stayed in the log with no closing record, and every restart audited
+        // it as an activation that had gone missing.
         if self
             .store
             .append(
@@ -836,22 +920,19 @@ impl FleetRuntime {
             )
             .is_err()
         {
+            let _ = self.ledger.release(
+                &lease_id,
+                ActivationOutcome::Failed,
+                "the lease could not be made durable",
+                now,
+            );
+            self.publish_commitments();
             self.budgets.refund(&plan.host, &policy, now);
             return ActivationResult::Failed {
                 code: "fleet_unavailable",
             };
         }
 
-        let record = ActivationRecord::from_plan(plan, lease.clone(), now);
-        if !self
-            .ledger
-            .acquire(record, host.max_concurrent_activations)
-        {
-            self.budgets.refund(&plan.host, &policy, now);
-            return ActivationResult::Failed {
-                code: "fleet_busy",
-            };
-        }
         self.ledger.transition(&lease_id, ActivationState::LeaseHeld);
         self.activations_total.fetch_add(1, Ordering::SeqCst);
 
@@ -1106,7 +1187,9 @@ impl FleetRuntime {
             }
             ActivationOutcome::Cancelled => "the activation was cancelled",
         };
-        match self.ledger.release(lease, outcome, detail, now) {
+        let released = self.ledger.release(lease, outcome, detail, now);
+        self.publish_commitments();
+        match released {
             LeaseRelease::Released => {}
             LeaseRelease::AlreadyReleased | LeaseRelease::Unknown => {
                 // Not a panic and not silence: releasing a lease twice would
@@ -1134,6 +1217,7 @@ impl FleetRuntime {
             evicted: plan.eviction_set().into_iter().cloned().collect(),
             decision_id: String::new(),
             finished_ms: now,
+            operation: hypellm_fleet::state::LeaseOperation::Activate,
         };
         let _ = self.store.append(
             RecordKind::FleetActivation,
@@ -1186,16 +1270,50 @@ impl FleetRuntime {
             return Err("fleet_unavailable");
         }
 
-        let activation = self
-            .call(&agent, |session| {
-                session.deactivate(deployment, &lease, record.drain_ms)
-            })
-            .map_err(|_| "fleet_unavailable")?;
-        let expiry = self
-            .clock
-            .now_millis()
-            .saturating_add(record.declared_stop_ms().saturating_mul(3).max(60_000));
-        self.await_terminal(&agent, &activation, expiry)?;
+        // Every path from here closes the lease exactly once: this is the only
+        // exit between writing it and returning. An unclosed lease is audited
+        // as a lost activation on every restart.
+        let started = self.clock.now_millis();
+        let outcome = (|| {
+            let activation = self
+                .call(&agent, |session| {
+                    session.deactivate(deployment, &lease, record.drain_ms)
+                })
+                .map_err(|_| "fleet_unavailable")?;
+            let expiry = self
+                .clock
+                .now_millis()
+                .saturating_add(record.declared_stop_ms().saturating_mul(3).max(60_000));
+            self.await_terminal(&agent, &activation, expiry)
+        })();
+        let finished = self.clock.now_millis();
+        let closing = ActivationSummary {
+            deployment: deployment.clone(),
+            host: accelerator.host.clone(),
+            outcome: if outcome.is_ok() {
+                ActivationOutcome::Succeeded
+            } else {
+                ActivationOutcome::Failed
+            },
+            duration_ms: finished.saturating_sub(started),
+            evicted: Vec::new(),
+            decision_id: String::new(),
+            finished_ms: finished,
+            operation: hypellm_fleet::state::LeaseOperation::Deactivate,
+        };
+        let closed = self.store.append(
+            RecordKind::FleetActivation,
+            &hypellm_fleet::durable::encode_activation(&closing),
+        );
+        outcome?;
+        if closed.is_err() {
+            // The stop happened; only its closing record is missing, and the
+            // next restart will say so. Reported, not hidden.
+            self.telemetry.log(
+                &hypellm_telemetry::Event::warn("fleet.lease_close_failed")
+                    .str_field(Field::Detail, "the deactivation's closing record was not written"),
+            );
+        }
         let now = self.clock.now_millis();
         let until = self.flap.record_eviction(deployment, &policy, now);
         self.persist_flap(deployment, until, now);
@@ -1341,7 +1459,11 @@ impl FleetRuntime {
                         // The activation's own record closes its lease: an
                         // outcome exists, so nothing is outstanding.
                         leases.retain(|_, lease| lease.deployment != summary.deployment);
-                        self.record_timing(&summary.deployment, summary.duration_ms);
+                        // Only a start teaches the start-time estimate; a
+                        // closed deactivation is a stop.
+                        if summary.operation == hypellm_fleet::state::LeaseOperation::Activate {
+                            self.record_timing(&summary.deployment, summary.duration_ms);
+                        }
                     }
                 }
                 RecordKind::FleetFlap => {
@@ -1386,7 +1508,11 @@ impl FleetRuntime {
     /// whatever should have reported back did not.
     pub fn expire_leases(&self) {
         let now = self.clock.now_millis();
-        for lease in self.ledger.expired(now) {
+        let expired = self.ledger.expired(now);
+        if expired.is_empty() {
+            return;
+        }
+        for lease in expired {
             if self.ledger.release(
                 &lease,
                 ActivationOutcome::Cancelled,
@@ -1400,6 +1526,7 @@ impl FleetRuntime {
                 );
             }
         }
+        self.publish_commitments();
     }
 
     // -- Plumbing ----------------------------------------------------------

@@ -684,6 +684,17 @@ impl Harness {
                 self.clock.now_millis(),
             )
             .expect("issue a session");
+        // The roles are the harness's by fiat, so stamp them as resolved
+        // against the configuration active now. A later publication or
+        // rollback re-resolves them against the configuration, exactly as it
+        // would a real sign-in's — which is the point: a session minted here
+        // outlives no configuration change a real one would not.
+        let version = self.state.config().snapshot.version;
+        let session = self
+            .state
+            .sessions
+            .refresh_roles(&issued.session.digest, roles.to_vec(), version)
+            .expect("the session just issued");
 
         TestSession {
             token: issued.token,
@@ -691,7 +702,7 @@ impl Harness {
             principal,
             tenant,
             roles: roles.to_vec(),
-            session: issued.session,
+            session,
         }
     }
 

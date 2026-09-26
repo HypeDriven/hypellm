@@ -547,11 +547,12 @@ fn narrow_embedding_component(component: f64) -> f32 {
 
 fn decode_usage(value: &Value) -> Option<CanonicalUsage> {
     let usage = value.get("usage")?;
-    let input = usage.get("prompt_tokens").and_then(|v| v.as_u64())?;
-    let output = usage
-        .get("completion_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let input = usage.get("prompt_tokens").and_then(|v| v.as_u64());
+    let completion = usage.get("completion_tokens").and_then(|v| v.as_u64());
+    if input.is_none() && completion.is_none() {
+        return None;
+    }
+    let output = completion.unwrap_or(0);
     let cached = usage
         .get("prompt_tokens_details")
         .and_then(|d| d.get("cached_tokens"))
@@ -563,13 +564,18 @@ fn decode_usage(value: &Value) -> Option<CanonicalUsage> {
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     Some(CanonicalUsage {
-        input_tokens: input,
+        input_tokens: input.unwrap_or(0),
         output_tokens: output,
         cached_input_tokens: cached,
         reasoning_tokens: reasoning,
         // Provider-reported, and marked as such: specification 14 requires the
-        // provenance to travel with the number.
-        source: hypellm_core::event::UsageSource::ProviderReported,
+        // provenance to travel with the number. A report without
+        // `prompt_tokens` is marked partial rather than given an input of zero.
+        source: if input.is_some() {
+            hypellm_core::event::UsageSource::ProviderReported
+        } else {
+            hypellm_core::event::UsageSource::ProviderReportedOutput
+        },
     })
 }
 
@@ -1103,7 +1109,11 @@ fn decode_responses_usage(value: &Value) -> Option<CanonicalUsage> {
             .and_then(|d| d.get("reasoning_tokens"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
-        source: hypellm_core::event::UsageSource::ProviderReported,
+        source: if input.is_some() {
+            hypellm_core::event::UsageSource::ProviderReported
+        } else {
+            hypellm_core::event::UsageSource::ProviderReportedOutput
+        },
     })
 }
 
@@ -1822,6 +1832,18 @@ mod tests {
         assert_eq!(usage.input_tokens, 12);
         assert_eq!(usage.output_tokens, 3);
         assert!(usage.is_reported(), "provider-reported usage must be marked");
+    }
+
+    #[test]
+    fn usage_without_prompt_tokens_keeps_the_output_and_does_not_claim_zero_input() {
+        let body = br#"{"id":"x","choices":[{"message":{"content":"hi"},"finish_reason":"stop"}],
+            "usage":{"completion_tokens":3}}"#;
+        let events = adapter().decode_response(200, body).expect("decodes");
+        let usage = adapter().usage_from_events(&events);
+        assert_eq!(usage.output_tokens, 3, "the reported half is kept");
+        assert_eq!(usage.known_input_tokens(), None, "an omitted input is not zero");
+        // Not "reported", so metering keeps its conservative input estimate.
+        assert!(!usage.is_reported());
     }
 
     #[test]

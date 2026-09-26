@@ -469,6 +469,98 @@ impl io::Write for Transport {
     }
 }
 
+/// The most abandoned Unix-socket connects that may exist at once.
+///
+/// Each connect runs on its own short-lived thread (see [`connect_unix`]). One
+/// whose caller is still waiting is bounded by that caller; one that outlived
+/// its caller's deadline keeps its thread until the kernel answers, and those
+/// are what this bounds — a wedged local service costs a fixed number of
+/// threads rather than one per request. Past it, a connect is refused at once.
+pub const MAX_ABANDONED_UNIX_CONNECTS: usize = 16;
+
+static ABANDONED_UNIX_CONNECTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// A connect still running.
+const CONNECT_PENDING: u8 = 0;
+/// A connect that finished while its caller was still waiting.
+const CONNECT_DONE: u8 = 1;
+/// A connect whose caller stopped waiting.
+const CONNECT_ABANDONED: u8 = 2;
+
+/// Connect to a Unix socket within `timeout`, and set that timeout on the
+/// stream's reads and writes.
+///
+/// `UnixStream::connect` has no timeout, and blocks for as long as the
+/// listener's accept queue is full — a local helper, verifier or fleet agent
+/// that has stopped accepting holds the caller indefinitely. The standard
+/// library offers no `connect_timeout` for Unix sockets and a non-blocking
+/// connect would need `unsafe` FFI, which specification 18.2 forbids, so the
+/// connect runs on a helper thread and the caller waits for it with a
+/// deadline. At most [`MAX_ABANDONED_UNIX_CONNECTS`] threads may be left
+/// behind by callers that gave up.
+pub fn connect_unix(path: &std::path::Path, timeout: Duration) -> io::Result<UnixStream> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    let timeout = timeout.max(Duration::from_millis(1));
+
+    if ABANDONED_UNIX_CONNECTS.load(Ordering::SeqCst) >= MAX_ABANDONED_UNIX_CONNECTS {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "too many earlier Unix-socket connects are still stuck",
+        ));
+    }
+    let state = Arc::new(AtomicU8::new(CONNECT_PENDING));
+    let thread_state = Arc::clone(&state);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let target = path.to_path_buf();
+    std::thread::Builder::new()
+        .name("unix-connect".to_owned())
+        .spawn(move || {
+            // The receiver may have given up; a stream nobody takes is dropped
+            // here, which closes it.
+            let _ = sender.send(UnixStream::connect(&target));
+            if thread_state
+                .compare_exchange(CONNECT_PENDING, CONNECT_DONE, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                // The caller abandoned this connect and counted it; uncount it.
+                ABANDONED_UNIX_CONNECTS.fetch_sub(1, Ordering::SeqCst);
+            }
+        })?;
+
+    let stream = match receiver.recv_timeout(timeout) {
+        Ok(result) => result?,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // Counted before the state changes, so the thread can never
+            // uncount a connect that was not yet counted.
+            ABANDONED_UNIX_CONNECTS.fetch_add(1, Ordering::SeqCst);
+            if state
+                .compare_exchange(
+                    CONNECT_PENDING,
+                    CONNECT_ABANDONED,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_err()
+            {
+                // It finished in the meantime: nothing was left behind.
+                ABANDONED_UNIX_CONNECTS.fetch_sub(1, Ordering::SeqCst);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the Unix-socket connect did not complete within its deadline",
+            ));
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(io::Error::other("the Unix-socket connect thread ended without a result"));
+        }
+    };
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    Ok(stream)
+}
+
 /// Opens connections to pinned destinations.
 #[derive(Debug, Default)]
 pub struct Dialer;
@@ -493,9 +585,15 @@ impl Dialer {
                         EgressError::ConnectFailed(e)
                     }
                 })?,
-            DestinationAddress::Unix(path) => UnixStream::connect(path)
+            DestinationAddress::Unix(path) => connect_unix(std::path::Path::new(path), timeout)
                 .map(Transport::Unix)
-                .map_err(EgressError::ConnectFailed)?,
+                .map_err(|e| {
+                    if e.kind() == io::ErrorKind::TimedOut {
+                        EgressError::Timeout
+                    } else {
+                        EgressError::ConnectFailed(e)
+                    }
+                })?,
         };
         transport
             .set_timeouts(Some(timeout))
@@ -508,6 +606,61 @@ impl Dialer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_unix_listener_that_stops_accepting_cannot_hold_a_connect_forever() {
+        // `UnixStream::connect` blocks while the listener's accept queue is
+        // full. A local helper that has wedged would hold every caller that
+        // tries to reach it — with no deadline, the request never ends.
+        let dir = std::env::temp_dir().join(format!("hypellm-unix-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("wedged.sock");
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+
+        // Run the whole probe on a thread so that a connect with no deadline
+        // fails this test instead of hanging the suite.
+        let probe_path = path.clone();
+        let (done, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            // Fill the accept queue. Never accepted, so each connect that
+            // succeeds occupies a slot until the queue is full.
+            for _ in 0..70_000 {
+                match connect_unix(&probe_path, Duration::from_millis(200)) {
+                    Ok(stream) => held.push(stream),
+                    Err(e) => {
+                        let _ = done.send(Some(e.kind()));
+                        return;
+                    }
+                }
+            }
+            let _ = done.send(None);
+        });
+        let kind = outcome
+            .recv_timeout(Duration::from_secs(60))
+            .expect("a Unix connect blocked with no deadline");
+        assert_eq!(kind, Some(io::ErrorKind::TimedOut));
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_unix_connect_sets_the_deadline_on_the_stream() {
+        let dir = std::env::temp_dir().join(format!("hypellm-unix-t-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("ok.sock");
+        let _ = std::fs::remove_file(&path);
+        let _listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        let stream = connect_unix(&path, Duration::from_millis(750)).expect("connect");
+        // The kernel rounds to its tick, so compare within one.
+        let near = |d: Option<Duration>| {
+            d.is_some_and(|d| d >= Duration::from_millis(740) && d <= Duration::from_millis(760))
+        };
+        assert!(near(stream.read_timeout().expect("read")), "no read deadline");
+        assert!(near(stream.write_timeout().expect("write")), "no write deadline");
+        let _ = std::fs::remove_file(&path);
+    }
 
     fn endpoint(scheme: EndpointScheme, host: &str, port: u16) -> Endpoint {
         Endpoint {

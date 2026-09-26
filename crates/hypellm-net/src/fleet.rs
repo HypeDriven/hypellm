@@ -151,7 +151,8 @@ impl FleetAgentClient {
     /// warning, and the session is not returned: without a shared
     /// understanding of what each identifier means, no verb is safe to send.
     pub fn open(&self, key: &[u8], fleet_digest: &str) -> Result<FleetSession, FleetError> {
-        let stream = UnixStream::connect(&self.socket_path).map_err(FleetError::Unavailable)?;
+        let stream = crate::egress::connect_unix(std::path::Path::new(&self.socket_path), self.timeout)
+            .map_err(FleetError::Unavailable)?;
         stream
             .set_read_timeout(Some(self.timeout))
             .map_err(FleetError::Unavailable)?;

@@ -85,6 +85,14 @@ pub fn read_optional_bounded(path: &Path, limit: u64) -> io::Result<Option<Vec<u
     }
 }
 
+/// How long an empty lock file is presumed to be mid-write rather than left
+/// behind by a starter that died between creating and writing it.
+///
+/// Writing a few dozen bytes takes microseconds; this is generous so that a
+/// stalled disk does not turn into two writers, and short enough that a
+/// genuinely abandoned empty lock is reclaimed by the next supervisor retry.
+pub const EMPTY_LOCK_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// An exclusive single-writer lock over a state directory.
 ///
 /// Held for the lifetime of the process. Released on drop, and reclaimed on
@@ -106,6 +114,14 @@ pub enum LockError {
     },
     /// The lock file could not be created or read.
     Io(io::Error),
+    /// The lock file exists but records no identity yet, and is too young to
+    /// be a leftover: another starter is between creating it and writing it.
+    ///
+    /// Only a lock written by an older build can be seen in this state — this
+    /// one publishes the file with its identity already inside — so it is
+    /// treated as held until it has been empty for longer than any write
+    /// takes, and reclaimable after that.
+    BeingCreated,
     /// A reclaim left behind by a dead starter was swept; retry once.
     ///
     /// Internal to [`ProcessLock::acquire`] and never returned from it. It
@@ -123,6 +139,10 @@ impl core::fmt::Display for LockError {
                 "the state directory is locked by a running process (pid {pid})"
             ),
             Self::Io(e) => write!(f, "lock file error: {e}"),
+            Self::BeingCreated => write!(
+                f,
+                "the state directory's lock file is being created by another starter"
+            ),
             Self::ClaimSwept => write!(f, "a stale reclaim marker was swept; retrying"),
         }
     }
@@ -241,6 +261,12 @@ impl ProcessLock {
         let Some(existing) = read_optional(path)? else {
             return Ok(None);
         };
+        if existing.is_empty() && Self::is_young(path) {
+            // Created and not yet written. Reading that as stale is how two
+            // starters both came to hold the lock: the second removed the
+            // first's file between its `create_new` and its `write`.
+            return Err(LockError::BeingCreated);
+        }
         let recorded = core::str::from_utf8(&existing)
             .ok()
             .and_then(ProcessIdentity::parse);
@@ -250,13 +276,70 @@ impl ProcessLock {
         })
     }
 
+    /// Whether a file was modified recently enough that its writer may still
+    /// be writing it.
+    ///
+    /// An unreadable modification time counts as young, which is the
+    /// direction that never steals a lock from a live writer.
+    fn is_young(path: &Path) -> bool {
+        fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+            .is_none_or(|age| age < EMPTY_LOCK_GRACE)
+    }
+
+    /// Create `path` holding this process's identity, failing if it exists.
+    ///
+    /// The identity is written to a private temporary file first and then
+    /// hard-linked into place. `link` fails with `AlreadyExists` exactly as
+    /// `O_EXCL` does, but the name only ever appears with its content already
+    /// inside: no other starter can observe an empty lock, decide it is stale,
+    /// and remove it out from under its owner.
     fn try_create(path: &Path) -> io::Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)?;
-        file.write_all(ProcessIdentity::current().render().as_bytes())?;
-        file.sync_all()
+        let identity = ProcessIdentity::current().render();
+        let staged = Self::staging_path(path);
+        {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staged)?;
+            file.write_all(identity.as_bytes())?;
+            file.sync_all()?;
+        }
+        let linked = fs::hard_link(&staged, path);
+        let _ = fs::remove_file(&staged);
+        match linked {
+            Ok(()) => {
+                if let Some(dir) = path.parent() {
+                    sync_dir(dir)?;
+                }
+                Ok(())
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
+            // A filesystem with no hard links. Fall back to create-then-write,
+            // whose empty window `live_holder` covers by treating a young
+            // empty lock as held.
+            Err(_) => {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)?;
+                file.write_all(identity.as_bytes())?;
+                file.sync_all()
+            }
+        }
+    }
+
+    /// A staging name unique to this process and this attempt.
+    fn staging_path(path: &Path) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static ATTEMPT: AtomicU64 = AtomicU64::new(0);
+        let attempt = ATTEMPT.fetch_add(1, Ordering::Relaxed);
+        let name = path
+            .file_name()
+            .map_or_else(|| "lock".into(), |n| n.to_string_lossy().into_owned());
+        path.with_file_name(format!(".{name}.{}.{attempt}.staging", std::process::id()))
     }
 
     /// The lock file path.
@@ -800,6 +883,54 @@ mod tests {
         let dir = TempDir::new("garbage-lock");
         fs::write(dir.path().join("lock"), b"\xff\xfe not a pid").unwrap();
         let _lock = ProcessLock::acquire(dir.path()).expect("garbage lock should be reclaimed");
+    }
+
+    #[test]
+    fn a_lock_file_still_being_written_is_not_reclaimed() {
+        // A starter that has created the lock but not yet written its identity
+        // leaves an empty file for a moment. A second starter used to read
+        // that as stale, remove it, and create its own — and then both held
+        // the single-writer lock over one log.
+        let dir = TempDir::new("lock-being-created");
+        let path = dir.path().join("lock");
+        fs::write(&path, b"").unwrap();
+        match ProcessLock::acquire(dir.path()) {
+            Err(LockError::BeingCreated) => {}
+            other => panic!("a lock mid-creation was taken over: {other:?}"),
+        }
+        assert!(path.exists(), "the other starter's lock file was removed");
+        assert_eq!(fs::read(&path).unwrap(), b"", "the other starter's lock file was replaced");
+    }
+
+    #[test]
+    fn an_empty_lock_abandoned_long_ago_is_still_reclaimed() {
+        // The other half: a starter that died between create and write must
+        // not wedge the directory forever.
+        let dir = TempDir::new("lock-empty-old");
+        let path = dir.path().join("lock");
+        fs::write(&path, b"").unwrap();
+        let old = std::time::SystemTime::now() - EMPTY_LOCK_GRACE * 6;
+        File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
+        let lock = ProcessLock::acquire(dir.path()).expect("an abandoned empty lock wedged");
+        let written = fs::read_to_string(lock.path()).unwrap();
+        assert_eq!(ProcessIdentity::parse(&written), Some(ProcessIdentity::current()));
+    }
+
+    #[test]
+    fn a_new_lock_appears_with_its_identity_and_leaves_no_staging_file() {
+        let dir = TempDir::new("lock-staged");
+        let lock = ProcessLock::acquire(dir.path()).expect("acquire");
+        let written = fs::read_to_string(lock.path()).unwrap();
+        assert_eq!(ProcessIdentity::parse(&written), Some(ProcessIdentity::current()));
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".staging"))
+            .collect();
+        assert!(leftovers.is_empty(), "staging files left behind: {leftovers:?}");
+        // And a second acquisition still sees it as held.
+        assert!(matches!(ProcessLock::acquire(dir.path()), Err(LockError::Held { .. })));
     }
 
     #[test]

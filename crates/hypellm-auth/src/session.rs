@@ -136,6 +136,22 @@ pub struct Session {
     ///
     /// Sensitive actions require a recent one (specification 9.1).
     pub authenticated_at_millis: u64,
+    /// The configuration version `roles` were resolved against, if any.
+    ///
+    /// Roles come from `role_binding`, `identity` and `local_user` records, all
+    /// of which a publication can withdraw. A session whose roles were resolved
+    /// against an older configuration than the active one is re-resolved
+    /// before it is used; `None` means "never resolved", which is re-resolved
+    /// too, so an unstamped session fails towards the configuration rather
+    /// than away from it.
+    pub roles_version: Option<u64>,
+    /// For a key-authenticated caller, the principal accountable for the key:
+    /// whoever minted it.
+    ///
+    /// A key authenticates as its own principal, but a person chose that
+    /// principal. Separation-of-duty checks compare both, so minting a key for
+    /// another principal is not a way to become a second person.
+    pub accountable: Option<PrincipalId>,
 }
 
 impl Session {
@@ -155,6 +171,19 @@ impl Session {
     #[must_use]
     pub fn is_break_glass(&self) -> bool {
         self.method == AuthMethod::BreakGlass || self.roles.contains(&Role::BreakGlassAdmin)
+    }
+
+    /// Every principal this caller acts as for separation of duty: its own,
+    /// and, for a key, the principal that minted it.
+    #[must_use]
+    pub fn actors(&self) -> Vec<&PrincipalId> {
+        let mut actors = vec![&self.principal];
+        if let Some(accountable) = &self.accountable {
+            if accountable != &self.principal {
+                actors.push(accountable);
+            }
+        }
+        actors
     }
 }
 
@@ -409,6 +438,8 @@ impl SessionStore {
             last_seen_millis: now_millis,
             absolute_expiry_millis: now_millis.saturating_add(absolute_millis),
             authenticated_at_millis: now_millis,
+            roles_version: None,
+            accountable: None,
         };
 
         if let Ok(mut map) = self.sessions.write() {
@@ -517,6 +548,34 @@ impl SessionStore {
             session,
             token,
         })
+    }
+
+    /// Replace a live session's roles with ones resolved against
+    /// configuration `version`.
+    ///
+    /// Returns the updated session, or `None` if it is no longer held. The
+    /// session's identity, lifetime and authentication time are untouched: a
+    /// withdrawn binding narrows what the session may do, and never extends
+    /// how long it may do it.
+    pub fn refresh_roles(
+        &self,
+        digest: &Digest,
+        roles: Vec<Role>,
+        version: u64,
+    ) -> Option<Session> {
+        let mut map = self.sessions.write().ok()?;
+        let session = map.get_mut(digest)?;
+        session.roles = roles;
+        session.roles_version = Some(version);
+        Some(session.clone())
+    }
+
+    /// Invalidate a session by its digest.
+    pub fn invalidate_digest(&self, digest: &Digest) -> bool {
+        self.sessions
+            .write()
+            .map(|mut m| m.remove(digest).is_some())
+            .unwrap_or(false)
     }
 
     /// Invalidate a session.

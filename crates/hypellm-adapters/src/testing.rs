@@ -150,6 +150,45 @@ pub fn request_fixture() -> CanonicalRequest {
     }
 }
 
+/// A rerank request, as `hypellm-router::protocol::rerank` builds one.
+///
+/// The criterion is the last message, the evidence the first, and the
+/// candidates are `inputs` — the encoding the SemIf adapter reads. Kept beside
+/// [`request_fixture`] so that a change to that encoding breaks one fixture
+/// rather than silently passing adapter tests that build their own.
+#[must_use]
+pub fn rerank_request_fixture() -> CanonicalRequest {
+    CanonicalRequest {
+        protocol: ClientProtocol::Rerank,
+        operation: Operation::Rerank,
+        messages: vec![
+            Message::text(Role::System, "The customer asked for a refund after 40 days."),
+            Message::text(Role::User, "What should the agent do?"),
+        ],
+        inputs: vec![
+            "Issue a full refund".to_owned(),
+            "Deny the request politely".to_owned(),
+            "Escalate to a supervisor".to_owned(),
+        ],
+        ..request_fixture()
+    }
+}
+
+/// Capabilities for a target that serves reranking and nothing else.
+#[must_use]
+pub fn rerank_capabilities() -> Capabilities {
+    Capabilities {
+        operations: vec![Operation::Rerank],
+        verbs: vec![hypellm_core::target::Capability::Rerank],
+        streaming: false,
+        tools: false,
+        parallel_tool_calls: false,
+        json_mode: false,
+        structured_output: false,
+        ..target_fixture().capabilities
+    }
+}
+
 /// Request metadata for an exchange.
 #[must_use]
 pub fn meta_fixture<'a>(
