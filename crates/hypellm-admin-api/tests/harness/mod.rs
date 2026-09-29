@@ -1409,7 +1409,13 @@ impl HarnessBuilder {
             next_version: AtomicU64::new(version + 1),
             break_glass: self.break_glass,
             credentials: sink,
-            fleet: self.fleet.clone(),
+            fleet: {
+                let slot = hypellm_admin_api::FleetSlot::default();
+                if let Some(fleet) = self.fleet.clone() {
+                    let _ = slot.set(fleet);
+                }
+                slot
+            },
         });
 
         Harness {

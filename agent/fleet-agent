@@ -99,6 +99,11 @@ MAX_CONCURRENT_COMMANDS = 32
 # settles, so a finished one must outlive its thread for a while — but not
 # forever: the oldest finished entries (and their leases) are dropped past this.
 MAX_RETAINED_ACTIVATIONS = 1024
+# How often the table on disk is checked for a change. A stat per second is
+# cheap; an edit taking effect within a second is fast enough to add a machine.
+RELOAD_CHECK_SECONDS = 1.0
+# Distinct invalid versions of the file remembered, so each is reported once.
+MAX_REJECTED_STAMPS = 64
 
 # Activation states after which nothing more happens to an activation.
 TERMINAL_STATES = {"ready", "failed", "stopped", "cancelled"}
@@ -298,6 +303,16 @@ class RateLimiter:
             self._events[host] = window
             return True
 
+    def retain(self, hosts: set[str]) -> None:
+        """Forget hosts a reload removed; keep the window for those that stay.
+
+        Keeping it is the point: a reload must not hand a host a fresh hourly
+        budget.
+        """
+        with self._lock:
+            for host in [h for h in self._events if h not in hosts]:
+                del self._events[host]
+
 
 class Activation:
     """One in-flight verb."""
@@ -315,11 +330,29 @@ class Activation:
 class Agent:
     """The agent's state and behaviour."""
 
-    def __init__(self, fleet: Fleet, key: bytes, command_timeout: int) -> None:
+    def __init__(
+        self,
+        fleet: Fleet,
+        key: bytes,
+        command_timeout: int,
+        config_path: str | None = None,
+    ) -> None:
+        # `fleet` and `digest` are replaced together, under `_lock`, by
+        # `maybe_reload`. A verb reads `self.fleet` once and works from that
+        # table, so an in-flight operation keeps the rows it started with.
         self.fleet = fleet
         self.key = key
         self.command_timeout = command_timeout
         self.digest = fleet.digest()
+        # The table on disk is the only source of a new allowlist. Nothing the
+        # router sends selects the path or triggers a reload.
+        self._config_path = config_path
+        self._config_stamp = file_stamp(config_path) if config_path else None
+        self._last_check = time.monotonic()
+        # Stamps already found invalid, so a broken file is reported once
+        # rather than every second. Bounded: cleared past a small size.
+        self._rejected: set[tuple[int, int]] = set()
+        self._reload_lock = threading.Lock()
         # host id -> the activation currently pulling on it. Specification
         # extension 12's "one fetch per host", enforced here as well as in the
         # router: two pulls against one disk and one link make each other
@@ -335,6 +368,57 @@ class Agent:
         # Background threads currently running a verb. Guarded by `_lock`.
         self._inflight = 0
         self._commands = threading.BoundedSemaphore(MAX_CONCURRENT_COMMANDS)
+
+    # -- Reloading ---------------------------------------------------------
+
+    def maybe_reload(self) -> bool:
+        """Adopt the table on disk if it has changed and is valid.
+
+        Checked at most once per `RELOAD_CHECK_SECONDS`, by `(mtime_ns, size)`.
+        A file that fails validation leaves the current table in force: a
+        half-written edit must not empty the allowlist, and a partially applied
+        one would be a table nobody wrote. Returns whether a new table was
+        adopted.
+        """
+        if self._config_path is None:
+            return False
+        now = time.monotonic()
+        if now - self._last_check < RELOAD_CHECK_SECONDS:
+            return False
+        # One reloader at a time; a concurrent caller simply skips the check.
+        if not self._reload_lock.acquire(blocking=False):
+            return False
+        try:
+            self._last_check = now
+            stamp = file_stamp(self._config_path)
+            if stamp is None or stamp == self._config_stamp or stamp in self._rejected:
+                return False
+            try:
+                with open(self._config_path, "rb") as handle:
+                    fleet = Fleet(json.load(handle))
+                # Inside the guard: the digest walks accelerator rows, and a
+                # malformed one is as much a rejected file as a missing key.
+                digest = fleet.digest()
+            except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+                if len(self._rejected) >= MAX_REJECTED_STAMPS:
+                    self._rejected.clear()
+                self._rejected.add(stamp)
+                print(
+                    f"fleet agent: {self._config_path} changed but is invalid "
+                    f"({truncate(error.__class__.__name__)}: {truncate(str(error))}); "
+                    f"keeping digest {self.digest}",
+                    file=sys.stderr,
+                )
+                return False
+            with self._lock:
+                self.fleet = fleet
+                self.digest = digest
+                self._config_stamp = stamp
+            self.limiter.retain(set(fleet.hosts))
+            print(f"fleet agent: reloaded {self._config_path}; digest {digest}", file=sys.stderr)
+            return True
+        finally:
+            self._reload_lock.release()
 
     # -- Bookkeeping -------------------------------------------------------
 
@@ -460,8 +544,11 @@ class Agent:
         hosts = []
         accelerators = []
         artifacts = []
+        # One table for the whole report, so a reload mid-observation cannot
+        # mix hosts from one file with deployments from another.
+        fleet = self.fleet
 
-        for host in self.fleet.hosts.values():
+        for host in fleet.hosts.values():
             reachable = True
             free_disk = 0
             code, output = self.run_on(host, ["df", "-B1", "--output=avail", host.disk_path])
@@ -534,7 +621,7 @@ class Agent:
                     name, _, status = line.partition("\t")
                     running[name.strip()] = status.strip()
 
-            for deployment in self.fleet.deployments.values():
+            for deployment in fleet.deployments.values():
                 if deployment.host != host.id:
                     continue
                 with self._lock:
@@ -555,7 +642,7 @@ class Agent:
                     }
                 )
 
-            for artifact in self.fleet.artifacts.values():
+            for artifact in fleet.artifacts.values():
                 if artifact.arch != host.arch:
                     continue
                 artifacts.append(
@@ -583,16 +670,19 @@ class Agent:
             payload = json.dumps({"hosts": hosts}, separators=(",", ":")).encode("utf-8")
         return payload
 
-    def probe(self, deployment: Deployment) -> bool:
+    def probe(self, deployment: Deployment, host: Host) -> bool:
         """Whether the deployment is actually serving.
 
         A TCP connect is not readiness: a llama.cpp server accepts connections
         long before it has finished mapping twenty gigabytes of weights. The
         probe is a command from this agent's table.
+
+        `host` is passed in rather than looked up, so an activation that began
+        before a reload keeps probing the machine it started on even if the
+        new table no longer names it.
         """
         if not deployment.probe:
             return True
-        host = self.fleet.hosts[deployment.host]
         code, _ = self.run_on(host, deployment.probe)
         return code == 0
 
@@ -607,11 +697,14 @@ class Agent:
             return "ERR malformed"
         if not IDENTIFIER.match(lease or ""):
             return "ERR malformed"
-        deployment = self.fleet.deployments.get(deployment_id)
+        # One table for the whole verb: a reload between these two lookups
+        # must not pair a deployment with a host from a different file.
+        fleet = self.fleet
+        deployment = fleet.deployments.get(deployment_id)
         if deployment is None:
             # The allowlist. This is the trust boundary in one line.
             return "ERR unknown_deployment"
-        host = self.fleet.hosts[deployment.host]
+        host = fleet.hosts[deployment.host]
 
         with self._lock:
             # Idempotent per lease: re-sending returns the same activation
@@ -655,7 +748,7 @@ class Agent:
             activation.progress = 750
             deadline = time.monotonic() + self.command_timeout
             while time.monotonic() < deadline and not activation.cancelled.is_set():
-                if self.probe(deployment):
+                if self.probe(deployment, host):
                     activation.state = "ready"
                     activation.detail = "ready"
                     activation.progress = 1000
@@ -707,8 +800,9 @@ class Agent:
             return "ERR malformed"
         if not deadline_ms.isdigit() or len(deadline_ms) > 12:
             return "ERR malformed"
-        artifact = self.fleet.artifacts.get(artifact_id)
-        host = self.fleet.hosts.get(host_id)
+        fleet = self.fleet
+        artifact = fleet.artifacts.get(artifact_id)
+        host = fleet.hosts.get(host_id)
         if artifact is None:
             return "ERR unknown_artifact"
         if host is None:
@@ -865,6 +959,15 @@ class Agent:
         return "OK"
 
 
+def file_stamp(path: str) -> tuple[int, int] | None:
+    """`(mtime_ns, size)`, or None when the file cannot be read."""
+    try:
+        status = os.stat(path)
+    except OSError:
+        return None
+    return (status.st_mtime_ns, status.st_size)
+
+
 def ssh_command(host: Host, argv: list[str]) -> list[str]:
     """The local argument vector that runs `argv` on `host`.
 
@@ -891,6 +994,8 @@ class Handler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         agent: Agent = self.server.agent  # type: ignore[attr-defined]
         authenticated = False
+        # The digest this connection's HELLO was answered with.
+        session_digest = ""
         buffer = b""
         self.request.settimeout(300.0)
 
@@ -916,9 +1021,21 @@ class Handler(socketserver.BaseRequestHandler):
                 line = raw.decode("utf-8", "replace").strip()
                 if not line:
                     return
+                agent.maybe_reload()
+                if authenticated and session_digest != agent.digest:
+                    # The table changed under an authenticated session, and the
+                    # digests are compared only at HELLO. Answering on the old
+                    # session would let the router keep acting on a comparison
+                    # made against a table that no longer exists. Refuse, then
+                    # close: every `ERR` is non-fatal to the router's session,
+                    # but the closed socket is, so its next call re-handshakes
+                    # and the new digest is compared.
+                    self.send(b"ERR fleet_configuration_changed\n")
+                    return
                 reply, body = self.dispatch(agent, line, authenticated)
                 if line.startswith("HELLO ") and reply.startswith("OK "):
                     authenticated = True
+                    session_digest = reply.rsplit(" ", 1)[-1]
                 self.send(reply.encode("utf-8") + b"\n")
                 if body is not None:
                     self.send(body)
@@ -1005,7 +1122,7 @@ def main() -> int:
         print("fleet.key must be at least 32 bytes", file=sys.stderr)
         return 2
 
-    agent = Agent(fleet, key, args.command_timeout)
+    agent = Agent(fleet, key, args.command_timeout, config_path=args.config)
 
     if os.path.exists(args.socket):
         os.unlink(args.socket)

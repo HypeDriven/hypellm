@@ -156,6 +156,7 @@ mod invariant_tests {
                 credential_ref: None,
                 enabled: true,
                 egress_profile: "local".to_owned(),
+                recovery_wait_ms: 0,
             },
         );
         s.targets.insert(

@@ -598,6 +598,8 @@ pub fn router_with_config(_upstream: &FakeUpstream, config_text: &str) -> TestRo
         usage: Arc::new(hypellm_admin_api::UsageAggregate::default()),
         traffic: Arc::new(hypellm_admin_api::TrafficWindow::default()),
         fleet: std::sync::OnceLock::new(),
+        admin_fleet: hypellm_admin_api::FleetSlot::default(),
+        recovery_waiters: std::sync::atomic::AtomicU32::new(0),
     };
 
     TestRouter {

@@ -336,6 +336,9 @@ pub struct Provider {
     pub enabled: bool,
     /// The egress profile name applied to its connections.
     pub egress_profile: String,
+    /// How long a request may wait for this provider to come back when every
+    /// candidate is unreachable, in milliseconds. Zero fails at once.
+    pub recovery_wait_ms: u64,
 }
 
 /// What a target can do.

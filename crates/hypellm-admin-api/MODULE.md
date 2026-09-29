@@ -48,6 +48,14 @@ rather than escaping it. The grammar is line-oriented and space-separated, so an
 unchecked value adds records rather than a field — and a draft is approved by a
 second person who reads what they were shown (`DI-047`).
 
+`POST /admin/v1/policies:edit` is the structured sibling: a batch of record
+`set`/`remove` edits, rendered by `hypellm_config::edit` against the active
+configuration into a draft that is validated at once and still published
+through `:publish`. It needs `EditPolicy`, and cannot reach keys, credentials,
+local users, role bindings, quotas or any `settings` field but `fleet_enabled`.
+`GET /admin/v1/policies/active` returns the records alongside the canonical
+text for the forms, without `local_user` records.
+
 ### The fleet surface
 
 Seven endpoints under `/admin/v1/fleet` (specification 26). The live fleet is

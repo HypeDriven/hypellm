@@ -489,6 +489,32 @@ impl Registry {
         );
     }
 
+    /// Observe a histogram sample against explicit bucket bounds.
+    ///
+    /// The bounds are fixed by the first observation of a series; a metric
+    /// name must always be observed with the same set.
+    pub fn histogram_observe_in(
+        &self,
+        name: &'static str,
+        help: &'static str,
+        labels: &Labels,
+        buckets: &'static [u64],
+        value: u64,
+    ) {
+        self.with_series(
+            name,
+            MetricKind::Histogram,
+            help,
+            labels,
+            || Series::Histogram(Histogram::new(buckets)),
+            |s| {
+                if let Series::Histogram(h) = s {
+                    h.observe(value);
+                }
+            },
+        );
+    }
+
     /// Read a counter, for tests and self-checks.
     #[must_use]
     pub fn counter_value(&self, name: &str, labels: &Labels) -> Option<u64> {
@@ -808,7 +834,29 @@ pub mod names {
     /// Reserved minus reconciled tokens, validating the effort multipliers and
     /// the document constants.
     pub const TOKEN_ESTIMATE_ERROR: &str = "hypellm_token_estimate_error";
+
+    // -- Per-model throughput and waiting ----------------------------------
+
+    /// Input tokens by target and alias. `rate()` over it is tokens per second.
+    pub const MODEL_INPUT_TOKENS: &str = "hypellm_model_input_tokens_total";
+    /// Output tokens by target and alias. `rate()` over it is tokens per second.
+    pub const MODEL_OUTPUT_TOKENS: &str = "hypellm_model_output_tokens_total";
+    /// Generation speed of one completed request, in output tokens per second.
+    pub const OUTPUT_TOKENS_PER_SECOND: &str = "hypellm_output_tokens_per_second";
+    /// Requests waiting for a model right now, by alias and what they wait for.
+    pub const PENDING_REQUESTS: &str = "hypellm_pending_requests";
+    /// Requests that waited for a target to recover, by alias and outcome.
+    pub const RECOVERY_WAITS: &str = "hypellm_recovery_waits_total";
 }
+
+/// Buckets for a rate in tokens per second.
+///
+/// A local model decodes at single to low hundreds of tokens per second and a
+/// hosted one rarely above a thousand; the latency buckets would put every
+/// sample in the first few bounds.
+pub const RATE_BUCKETS_PER_SECOND: &[u64] = &[
+    1, 2, 5, 10, 15, 20, 30, 40, 50, 75, 100, 150, 200, 300, 500, 1_000,
+];
 
 #[cfg(test)]
 mod tests {

@@ -195,6 +195,12 @@ can report a parse failure differently from a validation failure:
   `on`, and `1` are errors, so `enabled=yse` cannot silently read as false.
 - `build::{build, ValidatedConfig, Settings, …}` — reference resolution,
   invariants, canonical text, digest.
+- `edit::{apply, Edit, Identity}` — structured record edits over a document,
+  for the management API's `policies:edit`. Field names are checked against
+  the schema (they are written bare) and values are quoted on rendering, so an
+  edit changes fields and never adds a record; only routing and fleet kinds are
+  editable, and of `settings` only `fleet_enabled`. At most 64 edits a batch,
+  applied all or nothing.
 
 `load(text, version)` composes all three. The surface is intentionally narrow:
 no partial builds, no lenient mode, no merge or overlay of documents, and no

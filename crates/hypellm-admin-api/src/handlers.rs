@@ -535,7 +535,9 @@ pub struct AdminState {
     /// rule: a screen with no backing endpoint renders "not available yet", and
     /// an idle-looking fleet that is in fact absent is exactly the kind of
     /// plausible emptiness that stops an operator from going to look.
-    pub fleet: Option<Arc<dyn crate::fleet::FleetControl>>,
+    ///
+    /// Empty until the router starts a fleet, which may be after startup.
+    pub fleet: crate::fleet::FleetSlot,
 }
 
 /// Somewhere a provider credential can be put.
@@ -1323,6 +1325,7 @@ impl AdminApi {
             (Method::Get, "/admin/v1/policies/active") => self.active_policy(session),
             (Method::Post, "/admin/v1/policies") => self.create_draft(request, session),
             (Method::Post, "/admin/v1/policies:rollback") => self.rollback_policy(request, session),
+            (Method::Post, "/admin/v1/policies:edit") => self.edit_policy(request, session),
             (Method::Post, "/admin/v1/policies/active:simulate") => {
                 self.simulate_active(request, session)
             }
@@ -3365,8 +3368,95 @@ impl AdminApi {
         // digest is running the same policy — which is the whole guarantee this
         // endpoint offers, and it is checkable rather than asserted.
         root.push("canonical", Value::from(config.canonical.as_str()));
+        root.push("records", active_records(&config.canonical));
 
         Ok(ApiResponse::ok(&Value::Object(root)).with_header("ETag", active_etag(&config)))
+    }
+
+    /// `POST /admin/v1/policies:edit` — record edits, as a validated draft.
+    ///
+    /// The structured sibling of `propose_target`: the dashboard's machine and
+    /// priority screens describe *which records change*, and this renders them
+    /// against the active configuration with `hypellm_config::edit`, which
+    /// checks every field name against its schema and quotes every value. The
+    /// output is a draft like any other — validated here so the screen can
+    /// show errors at once, and published only through `:publish`, with the
+    /// same approver rule. Nothing here activates anything.
+    fn edit_policy(
+        &self,
+        request: &AdminRequest<'_>,
+        session: &Session,
+    ) -> Result<ApiResponse, ApiError> {
+        self.require(session, Permission::EditPolicy)?;
+        let body = request.json(&Limits::SMALL)?;
+        let invalid = |message: String| ApiError::new(ApiErrorCode::InvalidRequest, message);
+
+        let items = body
+            .get("edits")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid("an edit request requires an 'edits' array".to_owned()))?;
+        if items.is_empty() || items.len() > hypellm_config::edit::MAX_EDITS {
+            return Err(invalid(format!(
+                "'edits' must hold between 1 and {} edits",
+                hypellm_config::edit::MAX_EDITS
+            )));
+        }
+        let mut edits = Vec::with_capacity(items.len());
+        for (index, item) in items.iter().enumerate() {
+            edits.push(parse_edit(item).map_err(|m| invalid(format!("edit {index}: {m}")))?);
+        }
+
+        let config = self.state.config();
+        let applied = hypellm_config::edit::apply(&config.canonical, &edits)
+            .map_err(|e| invalid(echo(&e.to_string())))?;
+        if applied.changed == 0 {
+            return Err(invalid("the edits change nothing".to_owned()));
+        }
+
+        let draft = self.state.drafts.create_by(
+            applied.text,
+            session.principal.clone(),
+            session.accountable.clone(),
+            session.tenant.clone(),
+            self.state.clock.wall_millis(),
+        );
+        self.state
+            .store
+            .append(hypellm_store::RecordKind::PolicyDraft, &draft.to_payload())
+            .map_err(|_| {
+                self.state.drafts.close(&draft.id);
+                ApiError::new(
+                    ApiErrorCode::InternalFault,
+                    "the draft could not be recorded durably and was not created",
+                )
+            })?;
+        self.record_audit(
+            AuditEvent::new(
+                self.state.clock.wall_millis(),
+                session.principal.as_str(),
+                AuditAction::PolicyDrafted,
+            )
+            .with_object(draft.id.as_str())
+            .with_tenant(session.tenant.as_str()),
+        )?;
+
+        let version = self.state.next_version.load(Ordering::SeqCst);
+        let validated = self
+            .state
+            .drafts
+            .validate(&draft.id, &session.tenant, version)
+            .ok_or_else(|| ApiError::not_found("draft"))?;
+
+        let mut root = Object::new();
+        root.push("draft_id", Value::from(validated.id.as_str()));
+        root.push("author", Value::from(validated.author.as_str()));
+        root.push("valid", Value::from(validated.is_valid()));
+        root.push_opt("digest", validated.digest.map(|d| Value::from(d.to_hex())));
+        root.push("errors", config_errors(&validated.errors));
+        root.push("changed", Value::from(applied.changed));
+        // Stated so a client cannot read a created draft as an applied change.
+        root.push("published", Value::from(false));
+        Ok(ApiResponse::created(&Value::Object(root)))
     }
 
     fn list_drafts(&self, session: &Session) -> Result<ApiResponse, ApiError> {
@@ -5358,11 +5448,22 @@ impl AdminApi {
 
     /// The configured fleet, or the reason there is nothing to show.
     fn fleet(&self) -> Result<&Arc<dyn crate::fleet::FleetControl>, ApiError> {
-        self.state.fleet.as_ref().ok_or_else(|| {
-            ApiError::new(
-                ApiErrorCode::NotFound,
-                "fleet orchestration is not configured on this router",
-            )
+        self.state.fleet.get().ok_or_else(|| {
+            // Enabled but not running is a different fact from not configured,
+            // and the one an operator who just published a fleet needs told.
+            if self.state.config().fleet.is_active() {
+                ApiError::new(
+                    ApiErrorCode::NotFound,
+                    "fleet orchestration is enabled in the active configuration but is not \
+                     running yet; it starts within one housekeeping interval, and only if \
+                     the router holds a fleet.key",
+                )
+            } else {
+                ApiError::new(
+                    ApiErrorCode::NotFound,
+                    "fleet orchestration is not configured on this router",
+                )
+            }
         })
     }
 
@@ -6273,6 +6374,111 @@ fn percent_decode(value: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Every record of the active configuration, for the dashboard's forms.
+///
+/// `local_user` records are left out: they carry password verifiers, and a
+/// screen that edits hosts has no use for them. The full canonical text above
+/// is still there for a policy editor, as it always was.
+fn active_records(canonical: &str) -> Value {
+    let Ok(document) = hypellm_config::parse(canonical, &hypellm_config::ParseLimits::DEFAULT)
+    else {
+        return Value::Array(Vec::new());
+    };
+    Value::Array(
+        document
+            .records
+            .iter()
+            .filter(|r| r.kind != "local_user")
+            .map(|r| {
+                let mut fields = Object::new();
+                for (k, v) in &r.fields {
+                    fields.push(k.as_str(), Value::from(v.as_str()));
+                }
+                let mut record = Object::new();
+                record.push("kind", Value::from(r.kind.as_str()));
+                record.push("fields", Value::Object(fields));
+                Value::Object(record)
+            })
+            .collect(),
+    )
+}
+
+/// Validation errors in the shape `:validate` answers with.
+fn config_errors(errors: &[hypellm_config::ConfigError]) -> Value {
+    Value::Array(
+        errors
+            .iter()
+            .map(|error| {
+                let mut object = Object::new();
+                object.push("code", Value::from(error.code));
+                object.push("message", Value::from(error.message.as_str()));
+                object.push("line", Value::from(u64::from(error.position.line)));
+                object.push("column", Value::from(u64::from(error.position.column)));
+                Value::Object(object)
+            })
+            .collect(),
+    )
+}
+
+/// One `{"op", "kind", "id"|"scope", "fields"}` object.
+fn parse_edit(item: &Value) -> Result<hypellm_config::edit::Edit, String> {
+    use hypellm_config::edit::{Edit, Identity};
+    let op = item.get("op").and_then(Value::as_str).ok_or("'op' is required")?;
+    let kind = item
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or("'kind' is required")?
+        .to_owned();
+    let identity = match (
+        item.get("id").and_then(Value::as_str),
+        item.get("scope").and_then(Value::as_str),
+    ) {
+        (Some(id), None) => Identity::Id(id.to_owned()),
+        (None, Some(scope)) => Identity::Scope(scope.to_owned()),
+        (None, None) => Identity::Singleton,
+        (Some(_), Some(_)) => return Err("give 'id' or 'scope', not both".to_owned()),
+    };
+    match op {
+        "remove" => Ok(Edit::Remove { kind, identity }),
+        "set" => {
+            let mut fields = Vec::new();
+            if let Some(object) = item.get("fields") {
+                let object = object.as_object().ok_or("'fields' must be an object")?;
+                for (name, value) in object.iter() {
+                    fields.push((name.to_owned(), field_text(name, value)?));
+                }
+            }
+            Ok(Edit::Set { kind, identity, fields })
+        }
+        other => Err(format!("unknown op '{}'; expected set or remove", echo(other))),
+    }
+}
+
+/// A JSON field value as configuration text. `null` removes the field.
+fn field_text(name: &str, value: &Value) -> Result<Option<String>, String> {
+    let item_text = |v: &Value| -> Result<String, String> {
+        match v {
+            Value::String(s) if !s.contains(',') => Ok(s.clone()),
+            Value::String(_) => Err(format!("an item of '{}' may not contain a comma", echo(name))),
+            _ => Err(format!("items of '{}' must be strings", echo(name))),
+        }
+    };
+    match value {
+        Value::Null => Ok(None),
+        Value::String(s) => Ok(Some(s.clone())),
+        Value::Bool(b) => Ok(Some(b.to_string())),
+        Value::Number(n) => n
+            .as_i64()
+            .map(|i| Some(i.to_string()))
+            .ok_or_else(|| format!("'{}' must be an integer", echo(name))),
+        Value::Array(items) => {
+            let parts: Result<Vec<String>, String> = items.iter().map(item_text).collect();
+            Ok(Some(parts?.join(",")))
+        }
+        Value::Object(_) => Err(format!("'{}' may not be an object", echo(name))),
+    }
 }
 
 fn peer_text(peer: Option<IpAddr>) -> String {

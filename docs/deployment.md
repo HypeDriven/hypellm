@@ -69,10 +69,11 @@ The router listens on 8000/8001 because llama.cpp commonly listens on 8080.
 Keep the inference and provider addresses distinct to avoid routing the router
 back to itself.
 
-Cleartext `http` is permitted **only** to a loopback literal or the name
-`localhost`; anything else is refused at load time
-(`crates/hypellm-config/src/build.rs`, `validate_endpoint`). A remote provider in
-this profile still needs the TLS helper.
+Cleartext `http` is permitted to a loopback literal or the name `localhost`,
+and — under `egress=private_network` only — to a private address or a host
+*name* (see [Fleet records](#fleet-records)); anything else is refused at load
+time (`crates/hypellm-config/src/build.rs`, `validate_endpoint`). A remote
+provider in this profile still needs the TLS helper.
 
 ### Behind an overlay network (Tailscale, WireGuard)
 
@@ -419,7 +420,29 @@ fleet-agent --config /etc/hypellm/fleet.json --print-digest
 ```
 
 The two are computed independently from two different files. When they differ
-the router issues no mutating verb at all. See
+the router issues no mutating verb at all.
+
+#### Managing the fleet from the dashboard
+
+None of this has to be in the configuration file. The Fleet screen's Machines
+panel adds and edits agents, hosts, accelerators, deployments, their providers
+(by hostname) and fleet policies, and the Policies screen's Routing priority
+panel reorders alias targets and binding preferences. Each change becomes a
+**draft** (`POST /admin/v1/policies:edit`) that still validates and publishes
+through the usual workflow; a published configuration survives restarts, and
+a fleet it first enables starts within one housekeeping interval, without a
+restart, provided `<secrets>/fleet.key` exists.
+
+The agent's allowlist is the one part the dashboard cannot write: specification
+26.2 makes it the trust boundary, so a compromised router cannot add a command.
+To add a machine:
+
+1. Add the host to the agent's JSON (the panel shows the entry to paste; `ssh`
+   takes a hostname). The agent reloads the file on change.
+2. Publish the router-side records from the Machines panel.
+
+Between the two steps the digests differ and orchestration pauses with
+`fleet_configuration_mismatch`; it resumes once both sides agree. See
 [orchestration.md](orchestration.md) for the design and
 [runbooks.md 22.5](runbooks.md#225-fleet-incidents) for what to do when they do.
 
@@ -808,6 +831,56 @@ quota scope=target:local:m concurrency=4 queued=16 class=interactive
 Queue depth and wait are published as `hypellm_queue_depth` and
 `hypellm_queue_wait_milliseconds`.
 
+### Waiting out an outage
+
+By default a request fails as soon as every target for its alias is
+unreachable. A provider can instead ask for requests to wait for it to come
+back — a machine rebooting, or llama.cpp answering `503` while it loads:
+
+```text
+provider id=spark family=llamacpp scheme=http host=spark.lan port=8000 \
+    egress=private_network recovery_wait_ms=90000
+```
+
+- **When it applies:** nothing has reached the client, at least one target was
+  unreachable (connection refused or timed out, a `5xx` before acceptance, an
+  open breaker, stale fleet state), and nothing failed for a reason time does
+  not cure. A caller over quota, an unknown alias or a `4xx` fails at once.
+- **How long:** the longest `recovery_wait_ms` among the alias's providers, at
+  most 600000, and never past the request deadline (`default_deadline_ms`, or
+  the caller's own). Retries back off from 250 ms to 2 s. A streamed request
+  gets an SSE keepalive each round, and a client that leaves ends the wait.
+- **How many:** at most `settings max_recovery_waiters` (default 256) wait at
+  once. Past that, a request fails at once, because each waiter holds a
+  connection worker.
+- It is set per provider (one machine's endpoint) and editable from the
+  dashboard's Machines panel.
+
+### Metrics for Prometheus
+
+`GET /metrics` serves the Prometheus text exposition. It is unauthenticated on
+the management listener, or on its own address with `settings metrics_listen=`
+(which serves nothing else). A scrape job:
+
+```yaml
+scrape_configs:
+  - job_name: hypellm
+    static_configs: [{ targets: ["router.lan:9464"] }]   # metrics_listen
+```
+
+Throughput and waiting, by model:
+
+| Series | Meaning | Query |
+|---|---|---|
+| `hypellm_model_output_tokens_total{target,alias}` | Output tokens served | `sum by (target) (rate(hypellm_model_output_tokens_total[1m]))` is tokens per second per model |
+| `hypellm_model_input_tokens_total{target,alias}` | Prompt tokens sent | as above |
+| `hypellm_output_tokens_per_second{target}` | Histogram of one request's generation speed, from first byte when streamed | `histogram_quantile(0.5, sum by (le, target) (rate(hypellm_output_tokens_per_second_bucket[5m])))` |
+| `hypellm_pending_requests{alias,reason}` | Requests waiting for a model right now: `capacity` (admission queue), `activation` (a cold model starting), `recovery` (an outage wait) | `sum by (alias) (hypellm_pending_requests)` |
+| `hypellm_recovery_waits_total{alias,outcome}` | Outage waits ended `recovered`, `failed`, `expired`, `client_gone` or `refused` | |
+
+The `alias` label appears only for aliases declared in the configuration; a
+caller-supplied name never becomes a label value.
+
 Provider families: `llamacpp` (or `llama.cpp`), `openai`, `anthropic`,
 `deepseek`, `moonshot` (or `kimi`), and `generic_openai`. The last requires
 `settings allow_generic_adapter=true` — it is refused otherwise
@@ -935,7 +1008,11 @@ Existing records gain optional fields only:
 Slave-hosted providers use `egress=private_network`. That profile — and only that
 profile — also permits cleartext HTTP to a **private** address, because a
 llama.cpp server on a LAN speaks plain HTTP and requiring TLS would mean a
-terminator on every slave. The cost is real and is recorded in
+terminator on every slave. A host may be named rather than numbered
+(`host=spark.lan`): the name is resolved when the router connects, the address
+it resolved to is pinned for that connection, and cleartext is refused unless
+that address is private — so a name that one day resolves publicly gets no
+plaintext prompt. The cost is real and is recorded in
 [current limitations](deferred-issues.md): traffic to an orchestrated slave is
 unencrypted on your own network.
 

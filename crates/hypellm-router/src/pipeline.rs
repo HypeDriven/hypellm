@@ -36,6 +36,7 @@ use hypellm_core::ids::{GroupId, TargetId};
 use hypellm_core::policy::RoutingContext;
 use hypellm_core::target::ProviderFamily;
 use hypellm_core::time::Deadline;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::dispatch::{self, AttemptFailure, AttemptSummary, EventSink};
@@ -79,12 +80,221 @@ pub fn execute(
     permissions: hypellm_core::rbac::PermissionSet,
     sink: &mut dyn EventSink,
 ) -> Outcome {
+    // One snapshot for every round, recovery rounds included: a reload that
+    // lands while a request waits for a machine to come back does not change
+    // the policy that request is decided under.
+    let config = state.config();
+    let first = execute_once(state, &config, request, groups, &permissions, sink);
+    let budget = recovery_budget(&config, request);
+    if budget.is_zero() || !awaits_recovery(&first) {
+        return first;
+    }
+    await_recovery(state, &config, request, groups, &permissions, sink, first, budget)
+}
+
+/// The longest recovery wait any of the alias's targets allows.
+///
+/// Per provider, because a provider is one machine's endpoint: a flaky LAN box
+/// deserves a minute to come back, a hosted API none. The alias's candidates
+/// are known before routing, so the wait does not depend on which of them the
+/// router last tried.
+fn recovery_budget(config: &hypellm_config::ValidatedConfig, request: &CanonicalRequest) -> Duration {
+    let snapshot = &config.snapshot;
+    let Some(alias) = snapshot.aliases.get(&request.requested_model) else {
+        return Duration::ZERO;
+    };
+    let longest = alias
+        .permitted_targets
+        .iter()
+        .filter_map(|id| snapshot.targets.get(id))
+        .filter_map(|target| snapshot.providers.get(&target.provider_id))
+        .map(|provider| provider.recovery_wait_ms)
+        .max()
+        .unwrap_or(0);
+    Duration::from_millis(longest)
+}
+
+/// Whether a failed outcome is "every model is down" rather than a refusal.
+///
+/// Only an outage is worth waiting out: nothing reached the client, at least
+/// one target was unreachable, and nothing failed for a reason time does not
+/// cure. A caller over quota, an unknown alias, or a provider rejecting the
+/// request must hear so at once — waiting would only make the answer slower.
+fn awaits_recovery(outcome: &Outcome) -> bool {
+    use hypellm_core::event::UpstreamErrorClass;
+    if outcome.is_success() || outcome.saw_output {
+        return false;
+    }
+    let unreachable = |reason: ExclusionReason| {
+        matches!(
+            reason,
+            ExclusionReason::CircuitOpen
+                | ExclusionReason::Unhealthy
+                | ExclusionReason::FleetStateStale
+                | ExclusionReason::FleetAgentUnavailable
+        )
+    };
+    let mut any_unreachable = outcome
+        .trace
+        .exclusions
+        .iter()
+        .any(|e| unreachable(e.reason));
+    for attempt in &outcome.trace.attempts {
+        match attempt.outcome {
+            // A 5xx before acceptance counts: llama.cpp answers 503 while it is
+            // still loading weights, which is exactly a machine coming back.
+            AttemptOutcome::FailedBeforeAcceptance(
+                UpstreamErrorClass::Connection
+                | UpstreamErrorClass::Timeout
+                | UpstreamErrorClass::ServerError,
+            ) => any_unreachable = true,
+            _ => return false,
+        }
+    }
+    any_unreachable
+        && !outcome.trace.exclusions.iter().any(|e| {
+            matches!(
+                e.reason,
+                ExclusionReason::CapacityExhausted | ExclusionReason::BudgetExceeded
+            )
+        })
+}
+
+/// Wait, with backoff, for a target to come back, re-running the request.
+///
+/// Bounded three ways: by the providers' `recovery_wait_ms`, by the request's
+/// own deadline, and by `settings max_recovery_waiters` concurrent waiters —
+/// past that, the outage is reported at once, as it was before this existed.
+/// Every round is an ordinary pass through the pipeline, so reservations,
+/// breakers and the no-splice rule apply unchanged: nothing has been sent, so
+/// a later round is a first attempt as far as the client is concerned.
+#[allow(clippy::too_many_arguments)]
+fn await_recovery(
+    state: &RouterState,
+    config: &hypellm_config::ValidatedConfig,
+    request: &CanonicalRequest,
+    groups: &[GroupId],
+    permissions: &hypellm_core::rbac::PermissionSet,
+    sink: &mut dyn EventSink,
+    first: Outcome,
+    budget: Duration,
+) -> Outcome {
+    const FIRST_DELAY: Duration = Duration::from_millis(250);
+    const MAX_DELAY: Duration = Duration::from_secs(2);
+
+    let limit = config.settings.max_recovery_waiters;
+    let admitted = state
+        .recovery_waiters
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < limit).then(|| n + 1))
+        .is_ok();
+    if !admitted {
+        record_recovery(state, request, "refused");
+        return first;
+    }
+
+    let clock = state.clock.as_ref();
+    let until = Deadline::after(clock, budget).min(request.limits.deadline);
+    let pending = PendingGauge::enter(state, request, "recovery");
+    let mut outcome = first;
+    let mut delay = FIRST_DELAY;
+    let result = loop {
+        if until.is_expired(clock) {
+            break "expired";
+        }
+        clock.sleep(delay.min(until.remaining(clock)));
+        // A streamed request gets a keepalive each round, so an idle-timeout
+        // intermediary does not drop it; and a client that left is noticed
+        // here rather than after the next attempt.
+        if sink.keepalive().is_err() {
+            break "client_gone";
+        }
+        outcome = execute_once(state, config, request, groups, permissions, sink);
+        if !awaits_recovery(&outcome) {
+            break if outcome.is_success() { "recovered" } else { "failed" };
+        }
+        delay = delay.saturating_mul(2).min(MAX_DELAY);
+    };
+    pending.leave();
+    state.recovery_waiters.fetch_sub(1, Ordering::SeqCst);
+    record_recovery(state, request, result);
+    outcome
+}
+
+fn record_recovery(state: &RouterState, request: &CanonicalRequest, result: &str) {
+    let mut labels = hypellm_telemetry::Labels::one(hypellm_telemetry::LabelName::Outcome, result);
+    if let Some(alias) = alias_label(state, request) {
+        labels = labels.with(hypellm_telemetry::LabelName::Alias, alias);
+    }
+    state.telemetry.count(
+        hypellm_telemetry::names::RECOVERY_WAITS,
+        "Requests that waited for an unreachable target to recover, by outcome.",
+        &labels,
+    );
+}
+
+/// One request counted in `hypellm_pending_requests` while it waits.
+///
+/// Left explicitly with [`PendingGauge::leave`]; `Drop` covers only an unwind,
+/// so the gauge cannot drift upward if a path forgets.
+struct PendingGauge<'a> {
+    state: &'a RouterState,
+    labels: Option<hypellm_telemetry::Labels>,
+}
+
+impl<'a> PendingGauge<'a> {
+    fn enter(state: &'a RouterState, request: &CanonicalRequest, reason: &str) -> Self {
+        let mut labels = hypellm_telemetry::Labels::one(hypellm_telemetry::LabelName::Reason, reason);
+        if let Some(alias) = alias_label(state, request) {
+            labels = labels.with(hypellm_telemetry::LabelName::Alias, alias);
+        }
+        state.telemetry.metrics.gauge_add(
+            hypellm_telemetry::names::PENDING_REQUESTS,
+            "Requests waiting for a model, by alias and what they wait for.",
+            &labels,
+            1,
+        );
+        Self {
+            state,
+            labels: Some(labels),
+        }
+    }
+
+    fn leave(mut self) {
+        self.release();
+    }
+
+    fn release(&mut self) {
+        if let Some(labels) = self.labels.take() {
+            self.state.telemetry.metrics.gauge_add(
+                hypellm_telemetry::names::PENDING_REQUESTS,
+                "Requests waiting for a model, by alias and what they wait for.",
+                &labels,
+                -1,
+            );
+        }
+    }
+}
+
+impl Drop for PendingGauge<'_> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// One pass through routing and the attempt loop.
+fn execute_once(
+    state: &RouterState,
+    config: &hypellm_config::ValidatedConfig,
+    request: &CanonicalRequest,
+    groups: &[GroupId],
+    permissions: &hypellm_core::rbac::PermissionSet,
+    sink: &mut dyn EventSink,
+) -> Outcome {
     let clock = state.clock.as_ref();
     // Specification 19 budgets the *whole* router overhead at 2 ms p50. The
     // millisecond clock that governs deadlines cannot resolve that, so routing
     // is measured on the microsecond source instead.
     let started_micros = clock.now_micros();
-    let config = state.config();
     let snapshot = &config.snapshot;
 
     let attempted: Vec<TargetId> = Vec::new();
@@ -99,7 +309,7 @@ pub fn execute(
     // Sampled once, before routing, and borrowed for the whole decision. A
     // second sample could classify a target one way for the filter and another
     // for the score.
-    let fleet_view = state.fleet_view(request, &permissions);
+    let fleet_view = state.fleet_view(request, permissions);
     let live = crate::fleet::FleetAwareLiveState::new(state.health.as_ref(), &fleet_view);
     let route = snapshot.route(&context, request, &live);
 
@@ -241,6 +451,7 @@ pub fn execute(
         // "Alias/model" layer limits what the caller asked for, which is the
         // thing they control. A limit attached only to targets would be spread
         // across however many the alias resolves to.
+        let waiting = PendingGauge::enter(state, request, "capacity");
         let reserved = state.admission.reserve_queued_for(
             &request.tenant,
             &request.principal,
@@ -250,6 +461,7 @@ pub fn execute(
             class,
             queue_budget,
         );
+        waiting.leave();
         let reservation = match reserved {
             Ok((reservation, waited_millis)) => {
                 if waited_millis > 0 {
@@ -308,7 +520,10 @@ pub fn execute(
             // loading. This is what turns a burst of ten requests into one
             // activation *and* ten served requests, rather than one activation
             // and nine failovers.
-            if let Err(reason) = wait_for(state, request, candidate, overall) {
+            let waiting = PendingGauge::enter(state, request, "activation");
+            let waited = wait_for(state, request, candidate, overall);
+            waiting.leave();
+            if let Err(reason) = waited {
                 trace.exclusions.push(hypellm_core::decision::Exclusion {
                     target: target.id.clone(),
                     reason,
@@ -319,7 +534,10 @@ pub fn execute(
                 continue;
             }
         } else if candidate.residency.requires_activation() {
-            match activate_for(state, request, &fleet_view, candidate, overall) {
+            let waiting = PendingGauge::enter(state, request, "activation");
+            let activated = activate_for(state, request, &fleet_view, candidate, overall);
+            waiting.leave();
+            match activated {
                 Ok(()) => {}
                 Err(reason) => {
                     trace.exclusions.push(hypellm_core::decision::Exclusion {
@@ -835,6 +1053,7 @@ pub fn record_completion(
                 ),
             summary.usage.total(),
         );
+        record_model_throughput(state, request, outcome, summary);
     }
 
     let event = hypellm_telemetry::Event::new(
@@ -925,6 +1144,79 @@ pub fn record_completion(
 /// intervals, and a wall clock that steps — an NTP correction, a virtual
 /// machine resuming — would move a sample into a slot that has already been
 /// summed, or into one that will never be.
+/// The alias label for a request: the configured alias it named, or nothing.
+///
+/// `requested_model` is caller-supplied, so it is a label only when it names an
+/// alias the administrator declared (specification 17.1: no label may take an
+/// unbounded value from a request).
+pub(crate) fn alias_label<'a>(state: &RouterState, request: &'a CanonicalRequest) -> Option<&'a str> {
+    state
+        .config()
+        .snapshot
+        .aliases
+        .contains_key(&request.requested_model)
+        .then(|| request.requested_model.as_str())
+}
+
+/// Per-model token counters and generation speed.
+///
+/// Counters rather than a precomputed rate, which is the Prometheus idiom:
+/// `rate(hypellm_model_output_tokens_total[1m])` is throughput per model over
+/// whatever window the query asks for. The histogram answers the other
+/// question — how fast one request decodes — which a throughput figure cannot,
+/// because ten slow requests in parallel look like one fast one.
+fn record_model_throughput(
+    state: &RouterState,
+    request: &CanonicalRequest,
+    outcome: &Outcome,
+    summary: &AttemptSummary,
+) {
+    let Some(target) = outcome.trace.chosen.as_ref() else {
+        return;
+    };
+    let mut labels =
+        hypellm_telemetry::Labels::one(hypellm_telemetry::LabelName::Target, target.as_str());
+    if let Some(alias) = alias_label(state, request) {
+        labels = labels.with(hypellm_telemetry::LabelName::Alias, alias);
+    }
+    state.telemetry.metrics.counter_add(
+        hypellm_telemetry::names::MODEL_INPUT_TOKENS,
+        "Input tokens by target and alias.",
+        &labels,
+        summary.usage.input_tokens,
+    );
+    state.telemetry.metrics.counter_add(
+        hypellm_telemetry::names::MODEL_OUTPUT_TOKENS,
+        "Output tokens by target and alias.",
+        &labels,
+        summary.usage.output_tokens,
+    );
+
+    // Decode time: from the first byte to the end when the response streamed,
+    // because time to first byte is prompt processing and queueing, not
+    // generation. Unstreamed, the whole exchange is all there is to divide by.
+    let generating_ms = match summary.first_byte_millis {
+        Some(first) if request.stream.enabled && first < summary.total_millis => {
+            summary.total_millis.saturating_sub(first)
+        }
+        _ => summary.total_millis,
+    };
+    let rate = summary
+        .usage
+        .output_tokens
+        .saturating_mul(1_000)
+        .checked_div(generating_ms);
+    if let Some(rate) = rate.filter(|_| summary.usage.output_tokens > 0) {
+        state.telemetry.metrics.histogram_observe_in(
+            hypellm_telemetry::names::OUTPUT_TOKENS_PER_SECOND,
+            "Output tokens per second of generation, per completed request.",
+            &hypellm_telemetry::Labels::one(hypellm_telemetry::LabelName::Target, target.as_str()),
+            hypellm_telemetry::metrics::RATE_BUCKETS_PER_SECOND,
+            rate,
+        );
+    }
+}
+
 fn record_traffic(
     state: &RouterState,
     request: &CanonicalRequest,

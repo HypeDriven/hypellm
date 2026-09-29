@@ -154,10 +154,13 @@ pub struct FleetRuntime {
     /// The capability verb each deployment's target serves, projected from the
     /// routing snapshot so the planner does not have to hold `Target` records.
     capabilities: RwLock<BTreeMap<DeploymentId, Capability>>,
-    /// One client per configured agent.
-    clients: BTreeMap<AgentId, FleetAgentClient>,
-    /// The open session per agent, re-established on any fatal error.
-    sessions: BTreeMap<AgentId, Mutex<Option<FleetSession>>>,
+    /// One link per configured agent: its client and its open session.
+    ///
+    /// Rebuilt whenever the declared fleet changes, which is what lets a
+    /// published configuration add an agent — and what makes every session
+    /// re-handshake under the new digest. A session authenticated against the
+    /// old digest is agreement about a fleet that no longer exists.
+    links: RwLock<BTreeMap<AgentId, Arc<AgentLink>>>,
     /// The key the handshake is authenticated with.
     ///
     /// Held as bytes rather than as a typed secret because it is passed
@@ -205,6 +208,31 @@ pub struct FleetRuntime {
     store: Arc<Store>,
 }
 
+/// One configured agent: how to reach it and the session currently open.
+#[derive(Debug)]
+struct AgentLink {
+    client: FleetAgentClient,
+    session: Mutex<Option<FleetSession>>,
+}
+
+/// A fresh link per declared agent, with no session open.
+fn agent_links(config: &FleetConfig) -> BTreeMap<AgentId, Arc<AgentLink>> {
+    config
+        .agents
+        .values()
+        .map(|agent| {
+            let link = AgentLink {
+                client: FleetAgentClient::new(
+                    agent.socket.clone(),
+                    Duration::from_millis(agent.request_timeout_ms.max(1_000)),
+                ),
+                session: Mutex::new(None),
+            };
+            (agent.id.clone(), Arc::new(link))
+        })
+        .collect()
+}
+
 impl FleetRuntime {
     /// Build a runtime for a declared fleet.
     ///
@@ -224,18 +252,7 @@ impl FleetRuntime {
         if !config.is_active() {
             return None;
         }
-        let mut clients = BTreeMap::new();
-        let mut sessions = BTreeMap::new();
-        for agent in config.agents.values() {
-            clients.insert(
-                agent.id.clone(),
-                FleetAgentClient::new(
-                    agent.socket.clone(),
-                    Duration::from_millis(agent.request_timeout_ms.max(1_000)),
-                ),
-            );
-            sessions.insert(agent.id.clone(), Mutex::new(None));
-        }
+        let links = agent_links(&config);
 
         let mut snapshot = FleetSnapshot::empty();
         snapshot.config = Arc::clone(&config);
@@ -245,8 +262,7 @@ impl FleetRuntime {
             declared: RwLock::new(config),
             overrides: RwLock::new(BTreeMap::new()),
             capabilities: RwLock::new(BTreeMap::new()),
-            clients,
-            sessions,
+            links: RwLock::new(links),
             key,
             snapshot: RwLock::new(Arc::new(snapshot)),
             demand: DemandTracker::new(),
@@ -424,6 +440,9 @@ impl FleetRuntime {
         if let Ok(mut guard) = self.declared.write() {
             *guard = Arc::clone(&config);
         }
+        if let Ok(mut links) = self.links.write() {
+            *links = agent_links(&config);
+        }
         if let Ok(mut overrides) = self.overrides.write() {
             overrides.retain(|id, _| config.deployments.contains_key(id));
         }
@@ -457,8 +476,8 @@ impl FleetRuntime {
         let mut all_reachable = true;
         let mut all_agree = true;
 
-        for (agent_id, client) in &self.clients {
-            match self.with_session(agent_id, client, &digest, |session| {
+        for (agent_id, link) in self.links() {
+            match self.with_session(&link, &digest, |session| {
                 session.observe(&config)
             }) {
                 Ok(inventory) => {
@@ -474,7 +493,7 @@ impl FleetRuntime {
                     all_reachable = false;
                     if matches!(error, FleetError::DigestMismatch { .. }) {
                         all_agree = false;
-                        self.audit_mismatch(agent_id, &error);
+                        self.audit_mismatch(&agent_id, &error);
                     }
                     self.telemetry.log(
                         &hypellm_telemetry::Event::warn("fleet.observation_failed")
@@ -1555,28 +1574,30 @@ impl FleetRuntime {
         agent: &AgentId,
         f: impl Fn(&mut FleetSession) -> Result<T, FleetError>,
     ) -> Result<T, FleetError> {
-        let Some(client) = self.clients.get(agent) else {
+        let Some(link) = self.links().remove(agent) else {
             return Err(FleetError::Unavailable(std::io::Error::other(
                 "no such fleet agent",
             )));
         };
         let digest = self.config().digest();
-        self.with_session(agent, client, &digest, f)
+        self.with_session(&link, &digest, f)
+    }
+
+    /// The current links, cloned out so no lock is held across agent I/O.
+    fn links(&self) -> BTreeMap<AgentId, Arc<AgentLink>> {
+        self.links
+            .read()
+            .map_or_else(|p| p.into_inner().clone(), |g| g.clone())
     }
 
     fn with_session<T>(
         &self,
-        agent: &AgentId,
-        client: &FleetAgentClient,
+        link: &AgentLink,
         digest: &str,
         f: impl Fn(&mut FleetSession) -> Result<T, FleetError>,
     ) -> Result<T, FleetError> {
-        let Some(slot) = self.sessions.get(agent) else {
-            return Err(FleetError::Unavailable(std::io::Error::other(
-                "no such fleet agent",
-            )));
-        };
-        let mut guard = match slot.lock() {
+        let client = &link.client;
+        let mut guard = match link.session.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };

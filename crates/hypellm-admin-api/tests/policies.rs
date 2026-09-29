@@ -1682,7 +1682,7 @@ fn self_approving_api(admin: &Harness) -> AdminApi {
         break_glass: None,
         next_version: AtomicU64::new(admin.state.next_version.load(Ordering::SeqCst)),
         credentials: admin.state.credentials.clone(),
-        fleet: None,
+        fleet: hypellm_admin_api::FleetSlot::default(),
     });
     AdminApi::new(state)
 }

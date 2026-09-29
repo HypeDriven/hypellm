@@ -362,7 +362,7 @@ impl Resolver {
         let mut refused = Vec::new();
         for candidate in candidates {
             let class = netaddr::classify(candidate.ip());
-            if profile.permits(class) {
+            if profile.permits(class) && cleartext_permitted(endpoint.scheme, class, profile) {
                 return Ok(PinnedDestination::validated(
                     candidate,
                     endpoint.authority(),
@@ -386,6 +386,19 @@ impl Resolver {
             classes: refused,
         })
     }
+}
+
+/// Whether a resolved address may be reached over this scheme.
+///
+/// The configuration applies the same rule to an IP literal at load time; a
+/// name can only be checked here, against the address it actually resolved to.
+/// Cleartext is loopback, or a private address under `private_network` — so a
+/// LAN name that one day answers with a public address is refused rather than
+/// sent a prompt in plaintext across the internet.
+fn cleartext_permitted(scheme: EndpointScheme, class: AddressClass, profile: EgressProfile) -> bool {
+    scheme != EndpointScheme::Http
+        || class == AddressClass::Loopback
+        || (class == AddressClass::Private && profile == EgressProfile::PRIVATE_NETWORK)
 }
 
 /// A connected transport.
@@ -711,6 +724,35 @@ mod tests {
         // The Host header and SNI come from configuration, not from the answer.
         assert_eq!(pinned.authority, "api.example");
         assert_eq!(pinned.sni.as_deref(), Some("api.example"));
+    }
+
+    #[test]
+    fn a_named_lan_host_is_pinned_to_its_private_address_for_cleartext() {
+        let resolver = Resolver::new(Box::new(
+            StaticResolver::new()
+                .with("spark.lan", vec![ip("93.184.216.34"), ip("10.0.0.105")])
+                .with("drifted.lan", vec![ip("93.184.216.34")]),
+        ));
+        let pinned = resolver
+            .resolve(
+                &endpoint(EndpointScheme::Http, "spark.lan", 8000),
+                EgressProfile::PRIVATE_NETWORK,
+            )
+            .expect("a private answer is admitted");
+        assert_eq!(
+            pinned.address,
+            DestinationAddress::Socket("10.0.0.105:8000".parse().unwrap())
+        );
+        assert_eq!(pinned.authority(), "spark.lan:8000");
+
+        // A name whose only answer is public gets no cleartext connection,
+        // under a profile that admits the public class or one that does not.
+        for profile in [EgressProfile::PRIVATE_NETWORK, EgressProfile::REMOTE] {
+            assert!(matches!(
+                resolver.resolve(&endpoint(EndpointScheme::Http, "drifted.lan", 8000), profile),
+                Err(EgressError::AllAddressesRefused { .. })
+            ));
+        }
     }
 
     #[test]

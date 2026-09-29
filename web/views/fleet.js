@@ -33,11 +33,11 @@ import {
   actionButton,
   confirmPrompt,
   emptyState,
-  notAvailable,
   panel,
   toolbar,
 } from '../components/layout.js';
 import { card, grid, pageHeader, render, stat, table } from '../components/table.js';
+import { machinesPanel } from './fleet-machines.js';
 
 /** Screen metadata, read by the shell to build navigation. */
 export const meta = {
@@ -157,16 +157,19 @@ export async function mount(container, ctx) {
   let fleet = await load(ctx.api);
 
   if (!fleet) {
+    // No runtime is not the end of the story: the fleet can be declared from
+    // the Machines panel below and brought up by publishing that draft.
     render(
       container,
       [
         pageHeader(meta.title, meta.lede),
-        notAvailable(
-          'Fleet orchestration',
-          'This router has no fleet configured, or `fleet_enabled` is false in the active ' +
-            'configuration. Declare `fleet_agent`, `host`, `accelerator`, and `deployment` ' +
-            'records and set `fleet_enabled=true` to bring this screen to life.',
+        emptyState(
+          'No fleet is running.',
+          'The active configuration declares no fleet, or fleet_enabled is not true. Declare an ' +
+            'agent, hosts and deployments below — or in the configuration file — and enable ' +
+            'orchestration.',
         ),
+        machinesPanel(ctx, null),
       ],
     );
     return () => {
@@ -188,6 +191,8 @@ export async function mount(container, ctx) {
     toolbar([el('div', { class: 'panel__actions' }, [refresh])], { label: 'Fleet controls' }),
     confirmBox,
     body,
+    // Outside `body`, so a refresh does not discard a half-filled form.
+    machinesPanel(ctx, fleet),
   ]);
   paint();
 
@@ -271,7 +276,7 @@ export async function mount(container, ctx) {
       );
     });
 
-    const rows = (fleet.deployments || []).map((deployment) => {
+    const cells = (fleet.deployments || []).map((deployment) => {
       const controls = [];
       if (mayOperate) {
         controls.push(
@@ -304,6 +309,11 @@ export async function mount(container, ctx) {
       ];
     });
 
+    // `table` takes column objects and row objects; each row here is the list
+    // of cells, so column `i` renders cell `i`.
+    const headings = ['Deployment', 'Target', 'State', 'Memory', 'Resident for', 'Evictable', 'Owner', 'Actions'];
+    const columns = headings.map((label, index) => ({ label, cell: (row) => row[index] }));
+
     render(body, [
       tiles,
       el('div', { class: 'panel__actions' }, [freshness(fleet), pill(`digest ${fleet.digest.slice(0, 12)}`, 'neutral')]),
@@ -317,17 +327,8 @@ export async function mount(container, ctx) {
           'fight the router to keep it.',
         content: table({
           caption: 'Declared deployments',
-          columns: [
-            'Deployment',
-            'Target',
-            'State',
-            'Memory',
-            'Resident for',
-            'Evictable',
-            'Owner',
-            'Actions',
-          ],
-          rows,
+          columns,
+          rows: cells,
           empty: 'No deployments are declared.',
         }),
       }),

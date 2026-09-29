@@ -19,6 +19,9 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import hashlib
+import hmac
+import json
 import os
 import socket
 import subprocess
@@ -467,6 +470,157 @@ class BackgroundBoundsTest(unittest.TestCase):
             )
         )
         self.assertEqual(self.agent.status(activation_id), "OK cancelled cancelled 750")
+
+
+class ReloadTest(unittest.TestCase):
+    """The table on disk is re-read when it changes, and only when it is valid."""
+
+    def setUp(self) -> None:
+        self._dir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._dir.name, "fleet.json")
+        self.write(FLEET)
+        self.agent = agent_module.Agent(
+            agent_module.Fleet(FLEET), b"k" * 32, 5, config_path=self.path
+        )
+        self.parses = 0
+        original = agent_module.Fleet
+
+        def counting(document):  # type: ignore[no-untyped-def]
+            self.parses += 1
+            return original(document)
+
+        self._original_fleet = original
+        agent_module.Fleet = counting  # type: ignore[assignment]
+
+    def tearDown(self) -> None:
+        agent_module.Fleet = self._original_fleet  # type: ignore[assignment]
+        self._dir.cleanup()
+
+    def write(self, document: object, raw: str | None = None) -> None:
+        text = raw if raw is not None else json.dumps(document)
+        with open(self.path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        # A later stamp even on a filesystem with coarse timestamps.
+        stamp = time.time_ns() + 10_000_000_000
+        os.utime(self.path, ns=(stamp, stamp))
+
+    def check(self) -> bool:
+        # The rate limit is a property of wall time, not of what is under test.
+        self.agent._last_check = 0.0
+        return self.agent.maybe_reload()
+
+    def added_host(self) -> dict:
+        document = json.loads(json.dumps(FLEET))
+        document["hosts"].append(
+            {"id": "h3", "arch": "x86_64", "ssh": "hypellm@gpu3.lan"}
+        )
+        return document
+
+    def test_a_valid_change_is_adopted_and_changes_the_digest(self) -> None:
+        before = self.agent.digest
+        self.write(self.added_host())
+        self.assertTrue(self.check())
+        self.assertIn("h3", self.agent.fleet.hosts)
+        self.assertEqual(self.agent.fleet.hosts["h3"].ssh, "hypellm@gpu3.lan")
+        self.assertNotEqual(self.agent.digest, before)
+        self.assertEqual(self.agent.digest, self._original_fleet(self.added_host()).digest())
+        # The handshake reports the table now in force.
+        nonce = "n1"
+        tag = hmac.new(
+            b"k" * 32,
+            (agent_module.PROTOCOL_VERSION + nonce + "x").encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        reply = self.agent.hello(agent_module.PROTOCOL_VERSION, nonce, "x", tag)
+        self.assertTrue(reply.endswith(" " + self.agent.digest), reply)
+
+    def test_an_invalid_change_keeps_the_old_table_and_digest(self) -> None:
+        before_digest = self.agent.digest
+        before_fleet = self.agent.fleet
+        broken = self.added_host()
+        # A deployment on an undeclared host: valid JSON, invalid table.
+        broken["deployments"] = [
+            {"id": "d9", "host": "nowhere", "accelerator": "a", "start": ["x"], "stop": ["y"]}
+        ]
+        for document, raw in [(broken, None), (None, '{"hosts": [')]:
+            self.write(document, raw)
+            self.assertFalse(self.check())
+            self.assertIs(self.agent.fleet, before_fleet)
+            self.assertEqual(self.agent.digest, before_digest)
+        # A rejected version is not re-parsed on every check.
+        parses = self.parses
+        self.assertFalse(self.check())
+        self.assertEqual(self.parses, parses)
+
+    def test_an_unchanged_file_is_not_reparsed(self) -> None:
+        for _ in range(3):
+            self.assertFalse(self.check())
+        self.assertEqual(self.parses, 0)
+
+    def test_checks_are_rate_limited(self) -> None:
+        self.write(self.added_host())
+        self.agent._last_check = time.monotonic()
+        self.assertFalse(self.agent.maybe_reload())
+        self.assertEqual(self.parses, 0)
+
+    def test_a_reload_does_not_reset_a_hosts_activation_window(self) -> None:
+        self.assertTrue(self.agent.limiter.allow("h1", 1))
+        self.write(self.added_host())
+        self.assertTrue(self.check())
+        self.assertFalse(self.agent.limiter.allow("h1", 1))
+
+    def test_a_session_from_before_a_reload_is_closed(self) -> None:
+        # Sessions are long-lived, so a mismatch is only noticed at a new
+        # HELLO. A session authenticated against the old table must end.
+        socket_path = os.path.join(self._dir.name, "agent.sock")
+        server = agent_module.Server(socket_path, agent_module.Handler)
+        server.agent = self.agent  # type: ignore[attr-defined]
+        self.agent.observe = lambda: b"{}"  # type: ignore[method-assign]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(5.0)
+            client.connect(socket_path)
+            reader = client.makefile("rb")
+            nonce = "n2"
+            tag = hmac.new(
+                b"k" * 32,
+                (agent_module.PROTOCOL_VERSION + nonce + "x").encode(),
+                hashlib.sha256,
+            ).hexdigest()
+            client.sendall(f"HELLO {agent_module.PROTOCOL_VERSION} {nonce} x {tag}\n".encode())
+            self.assertTrue(reader.readline().startswith(b"OK "))
+            client.sendall(b"OBSERVE\n")
+            self.assertEqual(reader.readline(), b"OK 2\n")
+            self.assertEqual(reader.read(2), b"{}")
+            self.write(self.added_host())
+            self.agent._last_check = 0.0
+            client.sendall(b"OBSERVE\n")
+            self.assertEqual(reader.readline(), b"ERR fleet_configuration_changed\n")
+            self.assertEqual(reader.readline(), b"", "a stale session stayed open")
+            # A fresh session is served, and its HELLO reports the new digest.
+            fresh = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            fresh.settimeout(5.0)
+            fresh.connect(socket_path)
+            fresh_reader = fresh.makefile("rb")
+            nonce = "n3"
+            tag = hmac.new(
+                b"k" * 32,
+                (agent_module.PROTOCOL_VERSION + nonce + "x").encode(),
+                hashlib.sha256,
+            ).hexdigest()
+            fresh.sendall(f"HELLO {agent_module.PROTOCOL_VERSION} {nonce} x {tag}\n".encode())
+            self.assertTrue(
+                fresh_reader.readline().rstrip().endswith(self.agent.digest.encode())
+            )
+            fresh.sendall(b"OBSERVE\n")
+            self.assertEqual(fresh_reader.readline(), b"OK 2\n")
+            fresh.close()
+            client.close()
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":

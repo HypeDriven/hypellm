@@ -95,6 +95,7 @@ fn provider() -> Provider {
         credential_ref: Some(hypellm_core::ids::CredentialRef::new("cred").unwrap()),
         enabled: true,
         egress_profile: "local".to_owned(),
+        recovery_wait_ms: 0,
     }
 }
 

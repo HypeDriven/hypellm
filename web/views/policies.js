@@ -5,10 +5,13 @@
  * draft diff, validation, simulation, approval, rollback". Validation,
  * simulation and approval are backed by endpoints today — `GET/POST
  * /admin/v1/policies` and the `:validate`, `:simulate`, `:publish` actions of
- * specification 16. The priority matrix, the draft diff and rollback are not:
- * no endpoint returns the active bindings, and a draft's configuration text is
- * never read back. Those panels say so in the shared wording of
- * `notAvailable` rather than showing a plausible-looking approximation, because
+ * specification 16. Routing priority — alias target order and binding
+ * preferences — is read from the records `GET /admin/v1/policies/active`
+ * returns and edited through `POST /admin/v1/policies:edit`, which produces a
+ * draft like any other. The draft diff and rollback are not backed: a draft's
+ * configuration text is never read back. That panel says so in the shared
+ * wording of `notAvailable` rather than showing a plausible-looking
+ * approximation, because
  * the whole value of a management console is that an operator can read it as a
  * statement of what the router said.
  *
@@ -50,6 +53,7 @@ import {
   panel,
 } from '../components/layout.js';
 import { banner, buttonRow, field, pageHeader, render, table } from '../components/table.js';
+import { routingPriority } from './routing-priority.js';
 
 /** Screen metadata, read by the router to build navigation. */
 export const meta = {
@@ -953,11 +957,9 @@ export async function mount(container, ctx) {
     }),
 
     panel({
-      title: 'Priority matrix',
-      content: notAvailable(
-        'The priority matrix by user, group and model',
-        'No endpoint returns the bindings of the active configuration, so this screen cannot show which principal, group or alias prefers which target. Until one exists, a draft simulation above is the way to find out what a binding does, and the decision explorer shows what it did for a real request.',
-      ),
+      title: 'Routing priority',
+      note: 'Reorder an alias\'s targets or a binding\'s preferences. Each change becomes a draft here, to validate and publish like any other.',
+      content: routingPriority(ctx),
     }),
 
     panel({

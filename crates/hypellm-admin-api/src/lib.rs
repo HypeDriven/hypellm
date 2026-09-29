@@ -48,7 +48,7 @@ pub use audit_index::AuditIndex;
 pub use cors::{CorsPolicy, PreflightOutcome, security_headers};
 pub use decisions::DecisionCache;
 pub use drafts::{Draft, DraftStore, PublishRefusal};
-pub use fleet::{DeploymentPatch, FleetControl};
+pub use fleet::{DeploymentPatch, FleetControl, FleetSlot};
 pub use handlers::{
     AdminApi, AdminRequest, AdminState, BreakGlassPolicy, CredentialSink, ProbeOutcome,
 };

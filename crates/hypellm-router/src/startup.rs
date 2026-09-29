@@ -455,6 +455,9 @@ pub struct Router {
     /// Verifies a break-glass token. Carried from `assemble`, where the secret
     /// bundle is consumed, so `serve` does not have to be handed it again.
     break_glass_verifier: Vec<u8>,
+    /// The fleet handshake key, kept so a fleet first enabled by a publication
+    /// can start without a restart. Never logged or rendered.
+    fleet_key: Option<Vec<u8>>,
 }
 
 impl Router {
@@ -921,27 +924,15 @@ impl Router {
             // rather than dividing by a window it has not lived through.
             traffic: Arc::new(hypellm_admin_api::TrafficWindow::new(clock.now_millis())),
             fleet: std::sync::OnceLock::new(),
+            admin_fleet: hypellm_admin_api::FleetSlot::default(),
+            recovery_waiters: std::sync::atomic::AtomicU32::new(0),
         });
 
         // Built after the state so it shares the same store, clock, and
         // telemetry, then published into the `OnceLock` every holder of the
         // `Arc` can see.
-        if let (Some(key), true) = (fleet_key, fleet_enabled) {
-            if let Some(runtime) = crate::fleet::FleetRuntime::new(
-                fleet_config,
-                key,
-                Arc::clone(&state.clock),
-                Arc::clone(&state.telemetry),
-                Arc::clone(&state.store),
-            ) {
-                runtime.adopt_policy(&policy_for_fleet);
-                // Replay leases and flap counters, then take a first
-                // observation. Until one succeeds, every cold orchestrated
-                // target is ineligible — the fail-closed reading of "no
-                // observation has ever succeeded".
-                runtime.recover();
-                let _ = state.fleet.set(Arc::new(runtime));
-            }
+        if let (Some(key), true) = (&fleet_key, fleet_enabled) {
+            start_fleet(&state, fleet_config, &policy_for_fleet, key);
         }
 
         // 4. Listeners, last.
@@ -1011,6 +1002,7 @@ impl Router {
             management,
             metrics,
             break_glass_verifier,
+            fleet_key,
         })
     }
 
@@ -1123,9 +1115,10 @@ impl Router {
         let housekeeping = {
             let state = Arc::clone(&state);
             let stopping = self.inference.shutdown_handle();
+            let fleet_key = self.fleet_key.clone();
             std::thread::Builder::new()
                 .name("hypellm-housekeeping".to_owned())
-                .spawn(move || housekeeping_loop(&state, &stopping))?
+                .spawn(move || housekeeping_loop(&state, &stopping, fleet_key.as_deref()))?
         };
 
         // The job pool. A fixed number of threads, started here and never from
@@ -1231,7 +1224,91 @@ const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(10);
 /// version has no natural emit site: it is a property of the process, not of an
 /// event, so something has to restate it or it disappears from the exposition
 /// after a restart of the collector.
-fn housekeeping_loop(state: &Arc<RouterState>, stopping: &crate::server::ShutdownHandle) {
+/// Build, recover and publish a fleet runtime for `fleet`.
+///
+/// One path for both moments a fleet can start: at boot, and when a published
+/// configuration first enables one.
+fn start_fleet(
+    state: &Arc<RouterState>,
+    fleet: Arc<hypellm_fleet::model::FleetConfig>,
+    policy: &hypellm_core::policy::PolicySnapshot,
+    key: &[u8],
+) {
+    if let Some(runtime) = crate::fleet::FleetRuntime::new(
+        fleet,
+        key.to_vec(),
+        Arc::clone(&state.clock),
+        Arc::clone(&state.telemetry),
+        Arc::clone(&state.store),
+    ) {
+        runtime.adopt_policy(policy);
+        // Replay leases and flap counters, then take a first observation.
+        // Until one succeeds, every cold orchestrated target is ineligible —
+        // the fail-closed reading of "no observation has ever succeeded".
+        runtime.recover();
+        state.install_fleet(Arc::new(runtime));
+    }
+}
+
+/// Start the fleet if the active configuration enables one and none is running.
+///
+/// The router may boot with no fleet and have one published later from the
+/// dashboard; this is what makes that take effect without a restart. With no
+/// `fleet.key` it cannot authenticate to an agent, so it says so once and
+/// leaves orchestration off rather than starting something that can only fail.
+fn start_published_fleet(state: &Arc<RouterState>, fleet_key: Option<&[u8]>, reported: &mut bool) {
+    if state.fleet().is_some() {
+        return;
+    }
+    let config = state.config();
+    if !config.fleet.is_active() {
+        return;
+    }
+    match fleet_key {
+        Some(key) => {
+            start_fleet(state, Arc::clone(&config.fleet), &config.snapshot, key);
+            state
+                .telemetry
+                .log(&hypellm_telemetry::Event::info("fleet.started_after_publication"));
+        }
+        None if !*reported => {
+            *reported = true;
+            state.telemetry.log(
+                &hypellm_telemetry::Event::critical("fleet.key_missing").str_field(
+                    hypellm_telemetry::Field::Detail,
+                    "the active configuration enables a fleet, but this router holds no \
+                     fleet.key; orchestration stays off until it is restarted with one",
+                ),
+            );
+        }
+        None => {}
+    }
+}
+
+/// The observation interval the fleet asks for, or never when there is none.
+fn observation_interval(state: &RouterState, poll: Duration) -> Duration {
+    state
+        .fleet()
+        .map(|fleet| {
+            let config = fleet.config();
+            Duration::from_millis(
+                config
+                    .agents
+                    .values()
+                    .map(|a| a.observation_interval_ms)
+                    .min()
+                    .unwrap_or(5_000)
+                    .max(poll.as_millis().try_into().unwrap_or(200)),
+            )
+        })
+        .unwrap_or(Duration::MAX)
+}
+
+fn housekeeping_loop(
+    state: &Arc<RouterState>,
+    stopping: &crate::server::ShutdownHandle,
+    fleet_key: Option<&[u8]>,
+) {
     // Short poll rather than one long sleep, so shutdown is not delayed by a
     // thread waiting out a full interval (specification 20.1's drain deadline).
     const POLL: Duration = Duration::from_millis(200);
@@ -1245,24 +1322,16 @@ fn housekeeping_loop(state: &Arc<RouterState>, stopping: &crate::server::Shutdow
     // the gate on every fleet decision, and pacing it with the housekeeping
     // interval would mean the router spends most of its time unable to plan.
     let mut since_observation = Duration::ZERO;
-    let observation_interval = state
-        .fleet()
-        .map(|fleet| {
-            let config = fleet.config();
-            Duration::from_millis(
-                config
-                    .agents
-                    .values()
-                    .map(|a| a.observation_interval_ms)
-                    .min()
-                    .unwrap_or(5_000)
-                    .max(POLL.as_millis().try_into().unwrap_or(200)),
-            )
-        })
-        .unwrap_or(Duration::MAX);
+    let mut reported_missing_key = false;
 
     while !stopping.is_shutting_down() {
         std::thread::sleep(POLL);
+
+        // A publication may have enabled a fleet this router booted without.
+        start_published_fleet(state, fleet_key, &mut reported_missing_key);
+        // Recomputed each tick: the agents, and so the interval, can change
+        // with a publication.
+        let observation_interval = observation_interval(state, POLL);
 
         if let Some(fleet) = state.fleet() {
             since_observation = since_observation.saturating_add(POLL);
@@ -2948,6 +3017,59 @@ binding id=b scope=tenant:acme model=* prefer=local:m
         assert!(
             matches!(error, StartupError::MissingSecret("fleet.key")),
             "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_fleet_published_after_boot_starts_without_a_restart() {
+        // The dashboard's "enable the fleet" is a publication, not an edit to
+        // the file the router booted from. Before this, the runtime was built
+        // once at startup, so a published fleet was validated, activated,
+        // reported as live — and never observed or actuated.
+        let dir = hypellm_store::TempDir::new("fleet-late");
+        let path = dir.join("hypellm.conf");
+        let base = format!(
+            "settings state_dir={} inference_listen=127.0.0.1:0 admin_listen=127.0.0.1:0\n\
+             tenant id=acme\n\
+             provider id=local family=llamacpp scheme=http host=127.0.0.1 port=8080 \
+             egress=local\n\
+             target id=local:m provider=local model=m local=true operations=chat \
+             context=1000 max_output=100\n\
+             alias id=a targets=local:m\n\
+             grant scope=tenant:acme allow=true\n\
+             binding id=b scope=tenant:acme prefer=local:m\n",
+            dir.join("state").display()
+        );
+        std::fs::write(&path, &base).expect("write");
+        let secrets = Secrets::generate().expect("entropy");
+        let key = secrets.fleet.clone().expect("a generated bundle has a fleet key");
+        let router = Router::assemble(&path, secrets, Severity::Warn).expect("assembles");
+        assert!(router.state.fleet().is_none());
+
+        let mut reported = false;
+        start_published_fleet(&router.state, Some(&key), &mut reported);
+        assert!(router.state.fleet().is_none(), "no fleet is enabled yet");
+
+        let with_fleet = base.replace(
+            "admin_listen=127.0.0.1:0",
+            "admin_listen=127.0.0.1:0 fleet_enabled=true",
+        ) + "fleet_agent id=local socket=\"/run/hypellm/fleet.sock\"\n\
+             host id=h agent=local arch=x86_64\n\
+             accelerator host=h id=gpu0 kind=cuda memory_bytes=8589934592\n\
+             deployment id=d target=local:m accelerator=gpu0 memory_bytes=1073741824\n";
+        let published = hypellm_config::load(&with_fleet, 2).expect("the fleet validates");
+        router.state.config.activate(published);
+
+        // Without the key it stays off, and says so once.
+        start_published_fleet(&router.state, None, &mut reported);
+        assert!(router.state.fleet().is_none());
+        assert!(reported);
+
+        start_published_fleet(&router.state, Some(&key), &mut reported);
+        assert!(router.state.fleet().is_some(), "the published fleet must start");
+        assert!(
+            router.state.admin_fleet.get().is_some(),
+            "and the management API must see the same runtime"
         );
     }
 

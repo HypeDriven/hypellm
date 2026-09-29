@@ -52,6 +52,14 @@ impl DeploymentPatch {
     }
 }
 
+/// Where the management API finds the live fleet.
+///
+/// Shared with the router rather than filled in at assembly, because a fleet
+/// can start after the router does: a published configuration that first
+/// enables orchestration brings the runtime up without a restart, and the
+/// management surface has to see it when it does.
+pub type FleetSlot = std::sync::Arc<std::sync::OnceLock<Arc<dyn FleetControl>>>;
+
 /// The router's fleet, as the management API may act on it.
 ///
 /// Every method is fallible and returns a stable code rather than prose: the

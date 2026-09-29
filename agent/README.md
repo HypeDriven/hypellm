@@ -78,6 +78,30 @@ gigabytes of weights, and a router that believes otherwise sends the first
 request into a timeout and opens a circuit breaker on a model that was working.
 Probe something that only answers when the model is loaded.
 
+The file is reloaded when it changes. The agent checks its size and
+modification time at most once a second. A new version is adopted only if it
+validates completely, and then the whole table is swapped at once. An invalid
+edit is reported once on stderr and the previous table stays in force.
+Operations already running keep the rows they started with. `ssh` takes a
+hostname as readily as an address (`"ssh": "hypellm@gpu3.lan"`).
+
+A reload that changes the digest ends every session authenticated under the
+old one: the next request gets `ERR fleet_configuration_changed` and the
+connection is closed. The router's next handshake then compares the new digest.
+
+To add a machine:
+
+1. Add its host, accelerators, and deployments to this file. Orchestration
+   pauses at this point with `fleet_configuration_mismatch`, because the
+   router does not know the machine yet. Targets that are already warm keep
+   serving.
+2. Publish the matching router-side `host`, `accelerator`, and `deployment`
+   records, from the dashboard's fleet screen or the configuration file.
+   Orchestration resumes once the two digests agree again.
+
+The router cannot add a row here. The reload reads only this file on disk, so
+§26.2's boundary is unchanged.
+
 ### 2. Confirm both sides agree
 
 ```bash

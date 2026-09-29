@@ -510,6 +510,12 @@ pub struct RouterState {
     /// through `FleetRuntime::adopt_fleet`, so in-flight activations keep the
     /// ledger that authorised them.
     pub fleet: std::sync::OnceLock<Arc<crate::fleet::FleetRuntime>>,
+    /// The same runtime as the management API sees it, filled in together
+    /// with `fleet` by [`RouterState::install_fleet`].
+    pub admin_fleet: hypellm_admin_api::FleetSlot,
+    /// Requests waiting right now for an unreachable provider to recover.
+    /// Bounded by `settings max_recovery_waiters`.
+    pub recovery_waiters: std::sync::atomic::AtomicU32,
     /// Long-running generative work, if `/v1/jobs` is enabled.
     ///
     /// `None` when `settings job_workers` is zero, which is the default: the
@@ -518,6 +524,18 @@ pub struct RouterState {
 }
 
 impl RouterState {
+    /// Publish a fleet runtime to the data path and the management API.
+    ///
+    /// At most once: a second call leaves the first runtime in place, because
+    /// replacing it would discard the lease ledger in-flight activations hold.
+    pub fn install_fleet(&self, runtime: Arc<crate::fleet::FleetRuntime>) {
+        if self.fleet.set(Arc::clone(&runtime)).is_ok() {
+            let control: Arc<dyn hypellm_admin_api::FleetControl> =
+                Arc::new(crate::fleet::FleetControlAdapter::new(runtime));
+            let _ = self.admin_fleet.set(control);
+        }
+    }
+
     /// The fleet runtime, if one was configured.
     #[must_use]
     pub fn fleet(&self) -> Option<&Arc<crate::fleet::FleetRuntime>> {

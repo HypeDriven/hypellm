@@ -118,6 +118,11 @@ pub struct Settings {
     /// "requests past deadline are removed without invoking the provider" hold
     /// for a queued request as well as a dispatched one.
     pub queue_timeout_ms: u64,
+    /// How many requests may wait for an unreachable provider to recover at
+    /// once. Past it, a request fails at once as it did before recovery
+    /// waiting existed: each waiter holds a connection, and an outage must not
+    /// be able to occupy all of them.
+    pub max_recovery_waiters: u32,
     /// The principal a break-glass sign-in authenticates as.
     ///
     /// Specification 22.4 requires a preprovisioned local break-glass method.
@@ -315,6 +320,7 @@ impl Default for Settings {
             // that a caller learns the router is saturated rather than sitting
             // through most of its deadline to find out.
             queue_timeout_ms: 5_000,
+            max_recovery_waiters: 256,
             max_connections: 0,
             quota_partitions: 0,
             connection_stack_kib: 0,
@@ -1377,6 +1383,7 @@ fn build_settings(document: &Document) -> Result<Settings, ConfigError> {
         keepalive_interval_ms: f.u64_field("keepalive_interval_ms", d.keepalive_interval_ms)?,
         slow_client_timeout_ms: f.u64_field("slow_client_timeout_ms", d.slow_client_timeout_ms)?,
         queue_timeout_ms: f.u64_field("queue_timeout_ms", d.queue_timeout_ms)?,
+        max_recovery_waiters: f.u32_field("max_recovery_waiters", d.max_recovery_waiters)?,
         max_connections: f.u64_field("max_connections", d.max_connections)?,
         quota_partitions: f.u32_field("quota_partitions", d.quota_partitions)?,
         connection_stack_kib: f.u64_field("connection_stack_kib", d.connection_stack_kib)?,
@@ -1601,6 +1608,20 @@ fn build_provider(
             credential_ref,
             enabled: f.bool_field("enabled", true)?,
             egress_profile: profile_name.to_owned(),
+            recovery_wait_ms: {
+                // Bounded, because a wait is a held connection: an hour-long
+                // recovery window would let a dead fleet pin every thread the
+                // listener has. Ten minutes covers a machine rebooting.
+                const MAX_RECOVERY_WAIT_MS: u64 = 600_000;
+                let wait = f.u64_field("recovery_wait_ms", 0)?;
+                if wait > MAX_RECOVERY_WAIT_MS {
+                    return Err(f.error(
+                        "invalid_recovery_wait",
+                        format!("recovery_wait_ms must be at most {MAX_RECOVERY_WAIT_MS}"),
+                    ));
+                }
+                wait
+            },
         },
         profile,
         f.position(),
@@ -1616,7 +1637,8 @@ fn build_provider(
 ///   over plaintext HTTP to a non-loopback host is disclosed to the network.
 /// - **An IP literal is classified now.** A DNS name cannot be, so it is
 ///   validated for syntax here and classified at connect time by the egress
-///   guard, which pins the address it validated.
+///   guard, which pins the address it validated — and refuses cleartext to
+///   anything but loopback or, under `private_network`, a private address.
 fn validate_endpoint(
     f: &Fields<'_>,
     scheme: EndpointScheme,
@@ -1700,12 +1722,21 @@ fn validate_endpoint(
                 ),
             ));
         }
-    } else if scheme == EndpointScheme::Http && host != "localhost" {
+    } else if scheme == EndpointScheme::Http
+        && host != "localhost"
+        && profile != EgressProfile::PRIVATE_NETWORK
+    {
+        // A name cannot be classified until it is resolved, so cleartext to one
+        // is admitted only where the profile itself confines the answer: under
+        // `private_network` the egress guard pins a private address or refuses
+        // the connection, which is the same narrow case an IP literal gets
+        // above, decided at connect time instead of load time.
         return Err(f.error(
             "cleartext_not_permitted",
             format!(
                 "endpoint {host}:{port} uses cleartext http to a named host; \
-                 remote cleartext is forbidden"
+                 remote cleartext is forbidden. A name on the local network is \
+                 permitted only under egress=private_network"
             ),
         ));
     }

@@ -50,6 +50,7 @@
 #![cfg_attr(not(test), deny(clippy::indexing_slicing, clippy::as_conversions))]
 
 pub mod build;
+pub mod edit;
 pub mod fleet;
 pub mod parse;
 pub mod schema;
@@ -662,6 +663,27 @@ target id=t provider=p model=m local=true
 alias id=a targets=t
 ";
         assert!(load(text, 1).is_ok());
+    }
+
+    #[test]
+    fn a_named_lan_host_may_speak_cleartext_only_under_private_network() {
+        // A LAN accelerator is reached by name as often as by address. The
+        // name cannot be classified at load time, so the admission rides on
+        // the profile: `private_network` confines the pinned answer to a
+        // private address, and no other non-local profile opens cleartext.
+        let text = |profile: &str| {
+            format!(
+                "provider id=p family=llamacpp scheme=http host=spark.lan port=8000 egress={profile}\n\
+                 target id=t provider=p model=m\nalias id=a targets=t\n"
+            )
+        };
+        assert!(load(&text("private_network"), 1).is_ok());
+        for profile in ["remote", "none"] {
+            assert!(
+                codes(&load_err(&text(profile))).contains(&"cleartext_not_permitted"),
+                "profile {profile} admitted cleartext to a named host"
+            );
+        }
     }
 
     #[test]

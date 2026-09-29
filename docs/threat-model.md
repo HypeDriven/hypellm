@@ -187,7 +187,7 @@ Three layers, none of which is sufficient alone:
 
 | Layer | Control | Where |
 |---|---|---|
-| Load time | Cleartext `http` rejected except to a loopback literal or `localhost`; an IP literal whose class the declared egress profile forbids is rejected; the cloud metadata address is rejected under **every** profile; a relative `unix` path is rejected | `crates/hypellm-config/src/build.rs`, `validate_endpoint` |
+| Load time | Cleartext `http` rejected except to a loopback literal, `localhost`, or — under `private_network` only — a private literal or a name (whose pinned address the egress guard then requires to be private); an IP literal whose class the declared egress profile forbids is rejected; the cloud metadata address is rejected under **every** profile; a relative `unix` path is rejected | `crates/hypellm-config/src/build.rs`, `validate_endpoint` |
 | Classification | IPv4-mapped, IPv4-compatible, and NAT64 IPv6 forms are decoded *before* classification, so `::ffff:169.254.169.254` classifies as `Metadata`; `EgressProfile::permits` refuses `Metadata`, `Multicast`, `Broadcast`, `Unspecified`, `Reserved`, `SharedAddressSpace` under every profile including `LOCAL` | `crates/hypellm-core/src/netaddr.rs` |
 | Connect time | `Dialer::connect` accepts only a `PinnedDestination`; the only production producer is `Resolver::resolve`, which classifies each candidate and pins the first permitted address as a concrete `SocketAddr`, so a second DNS answer has nothing to attach to | `crates/hypellm-net/src/egress.rs` |
 

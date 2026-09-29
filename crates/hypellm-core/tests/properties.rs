@@ -166,6 +166,7 @@ fn snapshot(rng: &mut Rng) -> PolicySnapshot {
                 ),
                 enabled: true,
                 egress_profile: "remote".to_owned(),
+                recovery_wait_ms: 0,
             },
         );
 

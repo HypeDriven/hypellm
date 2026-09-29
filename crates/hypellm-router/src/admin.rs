@@ -100,25 +100,7 @@ impl AdminHandler {
             "/app.js" => ("app.js", "text/javascript; charset=utf-8"),
             "/styles/main.css" => ("styles/main.css", "text/css; charset=utf-8"),
             other => {
-                let allowed = [
-                    "/views/overview.js",
-                    "/views/targets.js",
-                    "/views/fleet.js",
-                    "/views/activations.js",
-                    "/views/policies.js",
-                    "/views/access.js",
-                    "/views/keys.js",
-                    "/views/credentials.js",
-                    "/views/usage.js",
-                    "/views/decisions.js",
-                    "/views/audit.js",
-                    "/views/settings.js",
-                    "/components/dom.js",
-                    "/components/table.js",
-                    "/components/layout.js",
-                    "/api.js",
-                ];
-                if allowed.contains(&other) {
+                if STATIC_MODULES.contains(&other) {
                     (other.trim_start_matches('/'), "text/javascript; charset=utf-8")
                 } else {
                     return write_error(
@@ -429,14 +411,38 @@ pub fn admin_state_from(
         // the whole `/admin/v1/fleet` surface answers "not configured on this
         // router" rather than serving empty rows that read as a healthy idle
         // fleet.
-        fleet: router.fleet().map(|runtime| {
-            let control: Arc<dyn hypellm_admin_api::FleetControl> = Arc::new(
-                crate::fleet::FleetControlAdapter::new(Arc::clone(runtime)),
-            );
-            control
-        }),
+        // `RouterState::install_fleet` fills it when the runtime starts, at
+        // boot or after a publication first enables the fleet.
+        fleet: Arc::clone(&router.admin_fleet),
     }
 }
+
+/// The application's ES modules, by request path.
+///
+/// Enumerated rather than joined onto the static root (see `serve_static`), so
+/// a new module must be listed here or the browser's import of it is a 404 —
+/// which the test `every_web_module_is_served` catches.
+const STATIC_MODULES: &[&str] = &[
+    "/views/overview.js",
+    "/views/targets.js",
+    "/views/fleet.js",
+    "/views/fleet-machines.js",
+    "/views/routing-priority.js",
+    "/views/activations.js",
+    "/views/policies.js",
+    "/views/access.js",
+    "/views/keys.js",
+    "/views/credentials.js",
+    "/views/usage.js",
+    "/views/decisions.js",
+    "/views/audit.js",
+    "/views/settings.js",
+    "/components/dom.js",
+    "/components/table.js",
+    "/components/layout.js",
+    "/components/records.js",
+    "/api.js",
+];
 
 /// Rebuild the draft store from the durable log.
 ///
@@ -567,6 +573,29 @@ fn break_glass_policy(
     reason = "test module: fixtures are indexed directly and failure is a panic"
 )]
 mod tests {
+    #[test]
+    fn every_web_module_is_served() {
+        // A module missing from the allowlist loads as a 404, and an ES import
+        // that fails takes the whole screen with it.
+        let web = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web");
+        let mut pending = vec![web.clone()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read web/") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|e| e == "js") {
+                    let relative = path.strip_prefix(&web).expect("under web/");
+                    let served = format!("/{}", relative.to_string_lossy());
+                    assert!(
+                        served == "/app.js" || STATIC_MODULES.contains(&served.as_str()),
+                        "{served} is not in STATIC_MODULES"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_metrics_listener_serves_the_exposition_and_nothing_else() {
         // Specification 17 puts the exposition on `settings metrics_listen` so

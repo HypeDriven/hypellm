@@ -1145,6 +1145,7 @@ mod tests {
             },
             enabled: true,
             egress_profile: "default".to_owned(),
+            recovery_wait_ms: 0,
         }
     }
 
