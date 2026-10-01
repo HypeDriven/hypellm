@@ -227,8 +227,14 @@ services:
     # the issuer's key set and token endpoint, and it does not need to be
     # reachable from anywhere: the router talks to it over the Unix socket in
     # the shared volume below.
+    #
+    # A fixed address for the same reason as the sidecar's, from the other
+    # side: left to dynamic allocation, a verifier started while the sidecar is
+    # down takes the first free address — 10.89.7.2 — and the sidecar then
+    # fails to start with "Address already in use".
     networks:
-      - hypellm
+      hypellm:
+        ipv4_address: 10.89.7.3
 
     command:
       - python3
