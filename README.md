@@ -113,7 +113,9 @@ Which planes the tailnet can reach is decided by bind address, in `docker/hypell
 
 `10.89.7.2` is the compose bridge address, pinned in `compose.yaml`. A listener bound to it is reachable through the published loopback ports and is not bound on `tailscale0`, so a tailnet peer finds nothing listening. This fails closed and does not depend on a Tailscale ACL or a firewall rule elsewhere. Tailnet reachability is not authentication — inference still requires a router API key.
 
-First run needs the node authenticated: put a key in `run/secrets/tailscale.authkey`, or let `just up` print the login URL. `just tailnet` shows the node's address and its learned routes.
+First run needs the node authenticated: put a key in `run/secrets/tailscale.authkey`, or let `just up` print the login URL — and open it within a minute, because the container gives up after that. `just tailnet` shows the node's address and its learned routes.
+
+Restart the two containers together, with `just restart`, never the sidecar on its own. The router stays in the namespace it joined at start, so a sidecar restarted underneath it leaves both reporting `Up` while every port resets connections. `just status` detects this and says so.
 
 Slaves are reached by their **LAN address**, over a Tailscale subnet route advertised from their network — `--accept-routes` installs it and the RFC 1918 destination is preserved, so `egress=private_network` still describes the connection. Do not point a provider at a slave's `100.64.0.0/10` address: that classifies as `shared_address_space`, which `EgressProfile::permits` refuses under every profile, because carrier-grade NAT space is a well-known SSRF pivot.
 

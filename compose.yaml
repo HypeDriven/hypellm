@@ -54,16 +54,15 @@ services:
       # Nothing here needs a tailnet name — the config addresses slaves by IP.
       TS_ACCEPT_DNS: "false"
 
-      # `--timeout=15m` is what makes an interactive login usable. Without it
-      # `tailscale up` gives up after about a minute, containerboot exits 1,
-      # and the network namespace goes with it — so a person who walks to
-      # another machine to open the URL comes back to a stack that tore itself
-      # down. Fifteen minutes is a human walking away and returning; the flag
-      # bounds the wait rather than removing it.
+      # No `--timeout`: it does not lengthen an interactive login. containerboot
+      # runs `tailscale up` under its own 60-second boot deadline, then
+      # SIGTERMs tailscaled and exits 1 — observed on 1.102.2 with
+      # `--timeout=15m` set, twice, at exactly 60 s. The network namespace goes
+      # with it, so the login URL has to be opened within that minute.
       #
-      # Irrelevant once run/secrets/tailscale.authkey exists: with a key the
-      # node authenticates in seconds and never reaches this path.
-      TS_EXTRA_ARGS: --accept-routes --timeout=15m
+      # That is why run/secrets/tailscale.authkey is the dependable path: with
+      # a key the node authenticates in seconds and never reaches this one.
+      TS_EXTRA_ARGS: --accept-routes
 
     volumes:
       - ./run/tailscale:/var/lib/tailscale

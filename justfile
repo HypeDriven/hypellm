@@ -421,7 +421,7 @@ down:
             # lock behind, because the lock is removed on `Drop`.
             for _ in $(seq 1 60); do
                 [ -z "$({{compose}} ps -q router 2>/dev/null)" ] && break
-                state=$(docker inspect -f '{{{{.State.Status}}}}' hypellm-router 2>/dev/null || echo gone)
+                state=$(docker inspect -f '{{{{.State.Status}}' hypellm-router 2>/dev/null || echo gone)
                 [ "$state" != "running" ] && break
                 sleep 0.5
             done
@@ -680,15 +680,31 @@ _upstreams:
 # The router has no network namespace of its own. If the sidecar is gone and
 # the router is not, the router is reachable by nothing while still reporting
 # `Up` — a state worth naming rather than leaving someone to discover.
+#
+# The sidecar being *up* is not enough either. The router joins the namespace
+# the sidecar had when the router started, and keeps it: a sidecar restarted
+# since then — `docker restart`, Docker Desktop's start button, a second login
+# attempt — runs in a new namespace that the published ports lead into and the
+# router is not in. Both containers read `Up (healthy)`, the ports accept and
+# immediately reset, and the router is left holding a namespace with nothing
+# but `lo` in it. Start order is the evidence, so compare start times.
 _stranded:
     #!/usr/bin/env bash
     set -euo pipefail
     router=$({{compose}} ps -q router 2>/dev/null || true)
     sidecar=$({{compose}} ps -q tailscale 2>/dev/null || true)
-    if [ -n "$router" ] && [ -z "$sidecar" ]; then
+    [ -n "$router" ] || exit 0
+    if [ -z "$sidecar" ]; then
         printf '\n\033[1;31m  %s\033[0m\n' "The router is running without its network namespace."
         printf '  %s\n' "The tailscale sidecar owns it and has exited, so the router reaches"
         printf '  %s\n' "nothing and nothing reaches it. Run \`just restart\`."
+        exit 0
+    fi
+    started() { date -u -d "$(docker inspect -f '{{{{.State.StartedAt}}' "$1")" +%s%N; }
+    if [ "$(started "$sidecar")" -gt "$(started "$router")" ]; then
+        printf '\n\033[1;31m  %s\033[0m\n' "The router is running in a network namespace that no longer exists."
+        printf '  %s\n' "The tailscale sidecar restarted after the router did, so its ports lead"
+        printf '  %s\n' "somewhere the router is not. Run \`just restart\`."
     fi
 
 # The node's tailnet address, or a word saying why there is not one. Used by
@@ -775,10 +791,19 @@ _lanroutes:
 # Without a key in run/secrets/tailscale.authkey the node prints a login URL
 # and waits, which is unhelpful if nobody is reading the log — so pull it out
 # and put it in front of the operator as soon as it appears.
+#
+# Recreated, not restarted, for the reason `up` recreates the router, and here
+# the cost of not doing so is the node's identity: a sidecar that outlived a
+# Docker Desktop or WSL restart comes back with run/tailscale mounted as an
+# empty directory, finds no state, and asks for a fresh login — as a new node,
+# while the real state sits untouched on the host. Recreating also gives it an
+# empty log, so the URL found below is this boot's rather than a stale one.
+# `up` recreates the router straight after, so the namespace it is about to
+# lose is replaced before anything could notice.
 _tailnet_up:
     #!/usr/bin/env bash
     set -euo pipefail
-    {{compose}} up -d tailscale >/dev/null
+    {{compose}} up -d --force-recreate tailscale >/dev/null
     shown=0
     for _ in $(seq 1 240); do
         if {{compose}} exec -T tailscale tailscale status --peers=false >/dev/null 2>&1; then
@@ -800,7 +825,7 @@ _tailnet_up:
                 printf '\n\033[1;33m  This node is not on the tailnet yet.\033[0m\n'
                 printf '  Authenticate it now: \033[4m%s\033[0m\n' "$url"
                 printf '  \033[2m%s\033[0m\n' "the router starts once this completes — it runs inside this node's namespace"
-                printf '  \033[2m%s\033[0m\n' "you have 15 minutes; this waits 4 and can be re-run with just up"
+                printf '  \033[2m%s\033[0m\n' "you have about a minute before the node gives up; just up starts it again"
                 printf '  \033[2m%s\033[0m\n\n' "to skip this next time, put a key in run/secrets/tailscale.authkey"
                 shown=1
             fi
