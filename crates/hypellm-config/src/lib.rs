@@ -209,6 +209,14 @@ quota scope=alias:code operation=not_an_operation concurrency=2\n";
     }
 
     #[test]
+    fn default_target_queued_defaults_to_32_and_is_settable() {
+        let config = load("settings state_dir=/tmp/x\n", 1).expect("load");
+        assert_eq!(config.settings.default_target_queued, 32);
+        let config = load("settings state_dir=/tmp/x default_target_queued=0\n", 1).expect("load");
+        assert_eq!(config.settings.default_target_queued, 0);
+    }
+
+    #[test]
     fn quota_partitions_divide_every_limit_so_the_deployment_honours_the_figure() {
         // `DI-029`: running N routers behind a load balancer multiplies every
         // tenant limit by N, because each counts alone. Specification 12

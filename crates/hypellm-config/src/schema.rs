@@ -61,6 +61,7 @@ pub const SCHEMAS: &[Schema] = &[
             "keepalive_interval_ms",
             "slow_client_timeout_ms",
             "queue_timeout_ms",
+            "default_target_queued",
             "max_connections",
             "max_requests_per_connection",
             "read_timeout_ms",

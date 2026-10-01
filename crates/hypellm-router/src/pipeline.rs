@@ -1195,17 +1195,17 @@ fn record_model_throughput(
     // Decode time: from the first byte to the end when the response streamed,
     // because time to first byte is prompt processing and queueing, not
     // generation. Unstreamed, the whole exchange is all there is to divide by.
-    let generating_ms = match summary.first_byte_millis {
-        Some(first) if request.stream.enabled && first < summary.total_millis => {
-            summary.total_millis.saturating_sub(first)
+    let generating_micros = match summary.first_byte_micros {
+        Some(first) if request.stream.enabled && first < summary.total_micros => {
+            summary.total_micros.saturating_sub(first)
         }
-        _ => summary.total_millis,
+        _ => summary.total_micros,
     };
     let rate = summary
         .usage
         .output_tokens
-        .saturating_mul(1_000)
-        .checked_div(generating_ms);
+        .saturating_mul(1_000_000)
+        .checked_div(generating_micros);
     if let Some(rate) = rate.filter(|_| summary.usage.output_tokens > 0) {
         state.telemetry.metrics.histogram_observe_in(
             hypellm_telemetry::names::OUTPUT_TOKENS_PER_SECOND,

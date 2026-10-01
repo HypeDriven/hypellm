@@ -214,6 +214,11 @@ pub struct AttemptSummary {
     pub first_byte_millis: Option<u64>,
     /// Milliseconds for the whole attempt.
     pub total_millis: u64,
+    /// `first_byte_millis` and `total_millis` in microseconds, for rates: a local
+    /// upstream answers inside one millisecond.
+    pub first_byte_micros: Option<u64>,
+    /// See `first_byte_micros`.
+    pub total_micros: u64,
     /// Whether semantic output reached the sink.
     pub saw_output: bool,
     /// The provider's native model, when reported.
@@ -264,6 +269,7 @@ pub fn attempt_with(
 ) -> Result<AttemptSummary, AttemptFailure> {
     let clock = state.clock.as_ref();
     let started = clock.now_millis();
+    let started_micros = clock.now_micros();
     let mut saw_output = false;
 
     let Some(endpoint) = provider.endpoints.get(target.endpoint_index) else {
@@ -437,6 +443,7 @@ pub fn attempt_with(
     };
 
     let first_byte_millis = clock.now_millis().saturating_sub(started);
+    let first_byte_micros = clock.now_micros().saturating_sub(started_micros);
     let mut decoder = BodyDecoder::new(head.body, HttpLimits::UPSTREAM);
 
     // -- Error responses ---------------------------------------------------
@@ -570,6 +577,8 @@ pub fn attempt_with(
         usage,
         first_byte_millis: Some(first_byte_millis),
         total_millis: clock.now_millis().saturating_sub(started),
+        first_byte_micros: Some(first_byte_micros),
+        total_micros: clock.now_micros().saturating_sub(started_micros),
         saw_output,
         native_model,
     })

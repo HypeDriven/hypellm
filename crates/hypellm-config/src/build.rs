@@ -118,6 +118,9 @@ pub struct Settings {
     /// "requests past deadline are removed without invoking the provider" hold
     /// for a queued request as well as a dispatched one.
     pub queue_timeout_ms: u64,
+    /// Admission-queue length for a target with a declared concurrency and no
+    /// `quota` of its own. A target `quota` overrides it; zero disables the queue.
+    pub default_target_queued: u32,
     /// How many requests may wait for an unreachable provider to recover at
     /// once. Past it, a request fails at once as it did before recovery
     /// waiting existed: each waiter holds a connection, and an outage must not
@@ -320,6 +323,7 @@ impl Default for Settings {
             // that a caller learns the router is saturated rather than sitting
             // through most of its deadline to find out.
             queue_timeout_ms: 5_000,
+            default_target_queued: 32,
             max_recovery_waiters: 256,
             max_connections: 0,
             quota_partitions: 0,
@@ -1383,6 +1387,7 @@ fn build_settings(document: &Document) -> Result<Settings, ConfigError> {
         keepalive_interval_ms: f.u64_field("keepalive_interval_ms", d.keepalive_interval_ms)?,
         slow_client_timeout_ms: f.u64_field("slow_client_timeout_ms", d.slow_client_timeout_ms)?,
         queue_timeout_ms: f.u64_field("queue_timeout_ms", d.queue_timeout_ms)?,
+        default_target_queued: f.u32_field("default_target_queued", d.default_target_queued)?,
         max_recovery_waiters: f.u32_field("max_recovery_waiters", d.max_recovery_waiters)?,
         max_connections: f.u64_field("max_connections", d.max_connections)?,
         quota_partitions: f.u32_field("quota_partitions", d.quota_partitions)?,

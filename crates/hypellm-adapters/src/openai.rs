@@ -265,6 +265,12 @@ impl Adapter for OpenAiAdapter {
                     body.push_opt("response_format", encode_response_format(format)?);
                 }
                 push_chat_sampling(&mut body, request, declared_output_limit(meta));
+                // llama.cpp and SGLang read it; OpenAI proper rejects the field.
+                if let (ProviderFamily::LlamaCpp, Some(thinking)) = (self.family, request.sampling.enable_thinking) {
+                    let mut kwargs = Object::new();
+                    kwargs.push("enable_thinking", Value::from(thinking));
+                    body.push("chat_template_kwargs", Value::Object(kwargs));
+                }
             }
         }
 
@@ -1521,6 +1527,27 @@ mod tests {
     }
 
     #[test]
+    fn enable_thinking_reaches_llamacpp_family_servers_only() {
+        let mut request = request_fixture();
+        request.sampling.enable_thinking = Some(false);
+        let target = target_fixture();
+        let endpoint = target_fixture_endpoint();
+        let meta = meta_fixture(&target, &endpoint, false);
+        let encode = |family, request: &CanonicalRequest| {
+            let bytes = OpenAiAdapter::new(family).encode_request(request, &meta).expect("encodes");
+            parse(&bytes, &Limits::DEFAULT).expect("valid JSON")
+        };
+
+        let llamacpp = encode(ProviderFamily::LlamaCpp, &request);
+        let kwargs = llamacpp.get("chat_template_kwargs").expect("forwarded");
+        assert_eq!(kwargs.opt_field_bool("enable_thinking").unwrap(), Some(false));
+        assert!(encode(ProviderFamily::OpenAi, &request).get("chat_template_kwargs").is_none());
+
+        request.sampling.enable_thinking = None;
+        assert!(encode(ProviderFamily::LlamaCpp, &request).get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
     fn a_zero_sampling_value_is_sent() {
         let mut request = request_fixture();
         request.sampling = Sampling {
@@ -2333,6 +2360,7 @@ mod tests {
             presence_penalty: Some(1.0),
             stop: vec!["END".to_owned()],
             top_k: None,
+            enable_thinking: Some(false),
         };
         let body = encoded(&request);
 
@@ -2341,7 +2369,7 @@ mod tests {
         assert_eq!(body.opt_field_f64("top_p").unwrap(), Some(0.5));
         // These have no counterpart in this dialect. Sending them is a 400, and
         // there is nothing to translate them into.
-        for field in ["seed", "frequency_penalty", "presence_penalty", "stop"] {
+        for field in ["seed", "frequency_penalty", "presence_penalty", "stop", "chat_template_kwargs"] {
             assert!(body.get(field).is_none(), "{field} has no Responses spelling");
         }
     }

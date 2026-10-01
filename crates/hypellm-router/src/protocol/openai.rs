@@ -426,6 +426,7 @@ fn parse_sampling(value: &Value) -> Result<Sampling, RouterError> {
         frequency_penalty: value.opt_field_f64("frequency_penalty").map_err(type_error)?,
         presence_penalty: value.opt_field_f64("presence_penalty").map_err(type_error)?,
         stop: parse_stop(value)?,
+        enable_thinking: parse_enable_thinking(value)?,
     };
     if let Err(param) = sampling.validate() {
         return Err(
@@ -433,6 +434,15 @@ fn parse_sampling(value: &Value) -> Result<Sampling, RouterError> {
         );
     }
     Ok(sampling)
+}
+
+fn parse_enable_thinking(value: &Value) -> Result<Option<bool>, RouterError> {
+    match value.get_present("chat_template_kwargs") {
+        None => Ok(None),
+        Some(kwargs @ Value::Object(_)) => kwargs.opt_field_bool("enable_thinking").map_err(type_error),
+        Some(_) => Err(RouterError::invalid_request("'chat_template_kwargs' must be an object")
+            .with_param("chat_template_kwargs")),
+    }
 }
 
 fn parse_stop(value: &Value) -> Result<Vec<String>, RouterError> {
@@ -2317,6 +2327,22 @@ mod tests {
         assert_eq!(request.sampling.top_p, Some(0.0));
         assert_eq!(request.sampling.seed, Some(0));
         assert!(!request.sampling.is_unset());
+    }
+
+    #[test]
+    fn enable_thinking_is_read_from_chat_template_kwargs() {
+        let request = parse_chat(
+            r#"{"model":"m","messages":[{"role":"user","content":"x"}],"chat_template_kwargs":{"enable_thinking":false,"other":1}}"#,
+        )
+        .expect("parses");
+        assert_eq!(request.sampling.enable_thinking, Some(false));
+        assert!(!request.sampling.is_unset());
+
+        for bad in [r#""chat_template_kwargs":"yes""#, r#""chat_template_kwargs":{"enable_thinking":"no"}"#] {
+            let body = format!(r#"{{"model":"m","messages":[{{"role":"user","content":"x"}}],{bad}}}"#);
+            let error = parse_chat(&body).expect_err("must fail");
+            assert_eq!(error.code, ErrorCode::InvalidRequest);
+        }
     }
 
     #[test]

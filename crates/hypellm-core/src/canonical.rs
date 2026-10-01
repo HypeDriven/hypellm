@@ -602,6 +602,9 @@ pub struct Sampling {
     pub presence_penalty: Option<f64>,
     /// Stop sequences.
     pub stop: Vec<String>,
+    /// `chat_template_kwargs.enable_thinking`: whether the chat template opens a
+    /// thinking block. Only llama.cpp-family servers receive it.
+    pub enable_thinking: Option<bool>,
 }
 
 impl Sampling {
@@ -615,6 +618,7 @@ impl Sampling {
             && self.frequency_penalty.is_none()
             && self.presence_penalty.is_none()
             && self.stop.is_empty()
+            && self.enable_thinking.is_none()
     }
 
     /// Validate ranges, returning the name of the first out-of-range field.

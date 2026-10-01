@@ -781,14 +781,7 @@ impl Router {
             health.set_capacity(id, target.max_concurrency);
             // Keep the routing filter and the admission queue in agreement: a
             // target that will queue must stay eligible while it can queue.
-            health.set_queue_allowance(
-                id,
-                config
-                    .quotas
-                    .iter()
-                    .find(|q| q.scope == hypellm_config::QuotaScope::Target(id.clone()))
-                    .map_or(0, |q| q.limits.max_queued),
-            );
+            health.set_queue_allowance(id, target_queue_allowance(&config, id, target));
         }
 
         let admission = build_admission(&config, Arc::clone(&clock));
@@ -1790,6 +1783,23 @@ fn resume_activation(
     })
 }
 
+/// The queue `build_admission` gives a target, so routing keeps it eligible while it can queue.
+fn target_queue_allowance(
+    config: &ValidatedConfig,
+    id: &hypellm_core::TargetId,
+    target: &hypellm_core::Target,
+) -> u32 {
+    match config
+        .quotas
+        .iter()
+        .find(|q| q.scope == hypellm_config::QuotaScope::Target(id.clone()))
+    {
+        Some(q) => q.limits.max_queued,
+        None if target.max_concurrency > 0 => config.settings.default_target_queued,
+        None => 0,
+    }
+}
+
 fn build_admission(config: &ValidatedConfig, clock: Arc<dyn Clock>) -> AdmissionController {
     let global = config
         .quotas
@@ -1849,6 +1859,7 @@ fn build_admission(config: &ValidatedConfig, clock: Arc<dyn Clock>) -> Admission
                 id,
                 ScopeLimits {
                     max_concurrency: target.max_concurrency,
+                    max_queued: config.settings.default_target_queued,
                     requests_per_second: target.max_requests_per_second,
                     request_burst: target.max_requests_per_second,
                     ..ScopeLimits::UNLIMITED

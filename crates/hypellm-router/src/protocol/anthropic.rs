@@ -126,6 +126,7 @@ pub fn parse_messages_request(
                     .collect()
             })
             .unwrap_or_default(),
+        enable_thinking: None,
     };
     if let Err(param) = sampling.validate() {
         return Err(

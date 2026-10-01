@@ -826,7 +826,9 @@ quota scope=target:local:m concurrency=4 queued=16 class=interactive
   mandatory.
 - **Only concurrency queues.** A rate-limit rejection has nothing to wake on, so
   it is reported rather than waited out.
-- Without `queued=`, behaviour is unchanged: the scope refuses immediately.
+- A target with a `concurrency` and no `quota` of its own queues up to
+  `settings default_target_queued` (default 32); set it to 0 to refuse
+  immediately. Other scopes without `queued=` refuse immediately.
 
 Queue depth and wait are published as `hypellm_queue_depth` and
 `hypellm_queue_wait_milliseconds`.
