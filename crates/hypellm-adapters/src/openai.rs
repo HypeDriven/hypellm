@@ -271,6 +271,12 @@ impl Adapter for OpenAiAdapter {
                     kwargs.push("enable_thinking", Value::from(thinking));
                     body.push("chat_template_kwargs", Value::Object(kwargs));
                 }
+                // Set by the alias, not the client (`LlamaCppSampling`); configuration
+                // already refuses them on an alias that can reach another family.
+                if self.family == ProviderFamily::LlamaCpp {
+                    body.push_opt("dry_multiplier", request.sampling.dry_multiplier.map(Value::from));
+                    body.push_opt("repeat_penalty", request.sampling.repeat_penalty.map(Value::from));
+                }
             }
         }
 
@@ -1548,6 +1554,32 @@ mod tests {
     }
 
     #[test]
+    fn alias_sampler_settings_reach_llamacpp_family_servers_only() {
+        let mut request = request_fixture();
+        request.sampling.dry_multiplier = Some(0.0);
+        request.sampling.repeat_penalty = Some(1.0);
+        let target = target_fixture();
+        let endpoint = target_fixture_endpoint();
+        let meta = meta_fixture(&target, &endpoint, false);
+        let encode = |family, request: &CanonicalRequest| {
+            let bytes = OpenAiAdapter::new(family).encode_request(request, &meta).expect("encodes");
+            parse(&bytes, &Limits::DEFAULT).expect("valid JSON")
+        };
+
+        let llamacpp = encode(ProviderFamily::LlamaCpp, &request);
+        // Zero is a value here: it is what turns DRY off.
+        assert_eq!(llamacpp.opt_field_f64("dry_multiplier").unwrap(), Some(0.0));
+        assert_eq!(llamacpp.opt_field_f64("repeat_penalty").unwrap(), Some(1.0));
+        let openai = encode(ProviderFamily::OpenAi, &request);
+        assert!(openai.get("dry_multiplier").is_none() && openai.get("repeat_penalty").is_none());
+
+        request.sampling.dry_multiplier = None;
+        request.sampling.repeat_penalty = None;
+        let unset = encode(ProviderFamily::LlamaCpp, &request);
+        assert!(unset.get("dry_multiplier").is_none() && unset.get("repeat_penalty").is_none());
+    }
+
+    #[test]
     fn a_zero_sampling_value_is_sent() {
         let mut request = request_fixture();
         request.sampling = Sampling {
@@ -2361,6 +2393,8 @@ mod tests {
             stop: vec!["END".to_owned()],
             top_k: None,
             enable_thinking: Some(false),
+            dry_multiplier: Some(0.0),
+            repeat_penalty: Some(1.0),
         };
         let body = encoded(&request);
 

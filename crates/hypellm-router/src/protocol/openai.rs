@@ -427,6 +427,10 @@ fn parse_sampling(value: &Value) -> Result<Sampling, RouterError> {
         presence_penalty: value.opt_field_f64("presence_penalty").map_err(type_error)?,
         stop: parse_stop(value)?,
         enable_thinking: parse_enable_thinking(value)?,
+        // Alias configuration, never the client's: a request that spells them
+        // gets nothing for it (`LlamaCppSampling`).
+        dry_multiplier: None,
+        repeat_penalty: None,
     };
     if let Err(param) = sampling.validate() {
         return Err(

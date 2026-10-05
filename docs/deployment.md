@@ -756,6 +756,31 @@ The figure appears as `estimated_cost` on usage rows from `GET
 The tokenizer half of specification 25's cost question — pre-flight token
 *counting* — is not implemented; see [current limitations](deferred-issues.md#conservative-token-estimation).
 
+### Alias sampler settings (llama.cpp)
+
+A llama.cpp server's sampler flags apply to every client, and a default that suits one workload
+breaks another. DRY (`--dry-multiplier`) keeps a chat model from looping, but it also stops an agent
+from copying an identifier out of a tool result, because a verbatim copy is the repetition DRY
+penalises. With `--dry-multiplier 0.8 --dry-allowed-length 2`, a model asked to repeat
+`ds_5a8c1f0e2b7d4e93a61c` returns `ds_5a8c1e2b7d4a61c`.
+
+An alias can fix two of these for every request it routes, without changing the server:
+
+```text
+alias id=agent targets=spark-q8kp:qwen38 dry_multiplier=0 repeat_penalty=1 capability=chat \
+      description="tool-using agents: DRY off so identifiers survive"
+```
+
+| Field | Range | Meaning |
+|---|---|---|
+| `dry_multiplier` | 0–5 | llama.cpp `dry_multiplier`; `0` turns DRY off |
+| `repeat_penalty` | 0–2 | llama.cpp `repeat_penalty`; `1` turns it off |
+
+These are operator settings: no client protocol can set or clear them, and a request that spells
+them gets nothing for it. Only llama.cpp-family providers receive them, and configuration refuses
+(`sampling_family_mismatch`) an alias that sets them and lists a target on any other family. Remember
+to add the alias to the target's own `aliases=` list.
+
 ### Alias quotas
 
 Specification 12's admission hierarchy has five layers. A `quota` may scope to
@@ -1004,7 +1029,7 @@ Existing records gain optional fields only:
 |---|---|
 | `settings` | `fleet_enabled`, `max_documents_per_request`, `max_document_bytes`, `max_inline_document_bytes`, `default_document_token_estimate`, `activation_effort_headroom_ms` |
 | `tenant` | `min_quality` |
-| `alias` | `capability` |
+| `alias` | `capability`, `dry_multiplier`, `repeat_penalty` (llama.cpp only; see [Alias sampler settings](#alias-sampler-settings-llamacpp)) |
 | `target` | `capabilities`, `quality_class`, `reasoning_efforts`, `effort_multipliers`, `document_token_estimate`, `bytes_per_token`, and `document` among `modalities` |
 
 Slave-hosted providers use `egress=private_network`. That profile — and only that

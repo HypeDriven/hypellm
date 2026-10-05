@@ -127,6 +127,9 @@ pub fn parse_messages_request(
             })
             .unwrap_or_default(),
         enable_thinking: None,
+        // Alias configuration, never the client's (`LlamaCppSampling`).
+        dry_multiplier: None,
+        repeat_penalty: None,
     };
     if let Err(param) = sampling.validate() {
         return Err(

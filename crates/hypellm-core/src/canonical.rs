@@ -605,6 +605,12 @@ pub struct Sampling {
     /// `chat_template_kwargs.enable_thinking`: whether the chat template opens a
     /// thinking block. Only llama.cpp-family servers receive it.
     pub enable_thinking: Option<bool>,
+    /// llama.cpp `dry_multiplier`. Set from the resolved alias's
+    /// [`crate::target::LlamaCppSampling`], never from the client; only
+    /// llama.cpp-family servers receive it.
+    pub dry_multiplier: Option<f64>,
+    /// llama.cpp `repeat_penalty`. As `dry_multiplier`.
+    pub repeat_penalty: Option<f64>,
 }
 
 impl Sampling {

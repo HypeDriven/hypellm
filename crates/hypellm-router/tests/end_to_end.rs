@@ -979,6 +979,31 @@ fn the_upstream_receives_the_native_model_not_the_alias() {
 }
 
 #[test]
+fn an_alias_turns_llamacpp_sampling_off_for_its_requests_and_only_its_requests() {
+    // An agent must copy identifiers verbatim from tool results; a llama.cpp
+    // server started with DRY penalises exactly that. The `agent` alias turns
+    // DRY off for its own requests; `test-alias` keeps the server's defaults.
+    let upstream = FakeUpstream::start(chat_completion_response());
+    let config = default_config_text(upstream.address.port())
+        .replace("family=openai", "family=llamacpp")
+        .replace("alias id=test-alias", "alias id=agent targets=local:model dry_multiplier=0 repeat_penalty=1\nalias id=test-alias");
+    let harness = Harness::start(upstream, router_with_config_text(&config));
+
+    let agent = r#"{"model":"agent","messages":[{"role":"user","content":"Copy ds_5a8c1f0e2b7d4e93a61c."}]}"#;
+    assert_eq!(harness.request("POST", "/v1/chat/completions", agent, true).status, 200);
+    let sent = parse_str(&harness.upstream.last_body().expect("a body"), &Limits::DEFAULT).expect("JSON");
+    assert_eq!(sent.opt_field_f64("dry_multiplier").unwrap(), Some(0.0));
+    assert_eq!(sent.opt_field_f64("repeat_penalty").unwrap(), Some(1.0));
+
+    // The other alias sends neither, and a client cannot set them itself.
+    let plain = r#"{"model":"test-alias","dry_multiplier":5,"repeat_penalty":2,"messages":[{"role":"user","content":"x"}]}"#;
+    let response = harness.request("POST", "/v1/chat/completions", plain, true);
+    assert_eq!(response.status, 200, "{}", response.body);
+    let sent = parse_str(&harness.upstream.last_body().expect("a body"), &Limits::DEFAULT).expect("JSON");
+    assert!(sent.get("dry_multiplier").is_none() && sent.get("repeat_penalty").is_none());
+}
+
+#[test]
 fn the_credential_never_appears_in_a_log_line() {
     let harness = Harness::default(chat_completion_response());
     harness.request("POST", "/v1/chat/completions", CHAT_BODY, true);

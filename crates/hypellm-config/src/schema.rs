@@ -156,7 +156,7 @@ pub const SCHEMAS: &[Schema] = &[
     Schema {
         kind: "alias",
         required: &["id", "targets"],
-        optional: &["family_failover", "description", "capability"],
+        optional: &["family_failover", "description", "capability", "dry_multiplier", "repeat_penalty"],
         singleton: false,
     },
     Schema {

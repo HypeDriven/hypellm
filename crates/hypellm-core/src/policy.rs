@@ -1213,6 +1213,7 @@ mod tests {
                     tid("deepseek:coder"),
                 ],
                 allow_family_failover: true,
+                llamacpp_sampling: Default::default(),
                 description: None,
             },
         );
@@ -2284,6 +2285,7 @@ mod tests {
                 permitted_targets: vec![tid("local:qwen")],
                 capability: None,
                 allow_family_failover: false,
+                llamacpp_sampling: Default::default(),
                 description: None,
             },
         );

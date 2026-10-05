@@ -28,7 +28,7 @@ use hypellm_core::policy::{
 use hypellm_core::rbac::Role;
 use hypellm_core::target::{
     AdminState, Alias, Capabilities, Capability, EffortMultipliers, Endpoint, EndpointScheme,
-    Provider, ProviderFamily, Target,
+    LlamaCppSampling, Provider, ProviderFamily, Target,
 };
 use hypellm_crypto::Digest;
 use std::collections::{BTreeMap, BTreeSet};
@@ -857,11 +857,29 @@ pub fn build(document: &Document, version: u64) -> Result<ValidatedConfig, Vec<C
             continue;
         }
         for target_id in &alias.permitted_targets {
-            if !targets.contains_key(target_id) {
+            let Some(target) = targets.get(target_id) else {
                 errors.push(ConfigError::new(
                     "unresolved_reference",
                     format!(
                         "alias '{}' names target '{target_id}', which is not defined",
+                        alias.id
+                    ),
+                    position,
+                ));
+                continue;
+            };
+            // Sampler settings only llama.cpp understands: another family would
+            // reject the request, or worse, silently ignore what the operator
+            // relied on. Refused here rather than dropped at dispatch.
+            let llamacpp = providers
+                .get(&target.provider_id)
+                .is_some_and(|p| p.family == ProviderFamily::LlamaCpp);
+            if !alias.llamacpp_sampling.is_unset() && !llamacpp {
+                errors.push(ConfigError::new(
+                    "sampling_family_mismatch",
+                    format!(
+                        "alias '{}' sets dry_multiplier or repeat_penalty, which only llama.cpp \
+                         providers accept, and may route to target '{target_id}', which is not on one",
                         alias.id
                     ),
                     position,
@@ -2020,6 +2038,22 @@ fn build_alias(f: &Fields<'_>) -> Result<(Alias, Position), ConfigError> {
         })?),
     };
 
+    let bounded = |range: core::ops::RangeInclusive<f64>| {
+        move |raw: &str| raw.parse::<f64>().ok().filter(|v| v.is_finite() && range.contains(v))
+    };
+    let llamacpp_sampling = LlamaCppSampling {
+        dry_multiplier: f.opt_parsed(
+            "dry_multiplier",
+            "invalid_sampling",
+            bounded(LlamaCppSampling::DRY_MULTIPLIER_RANGE),
+        )?,
+        repeat_penalty: f.opt_parsed(
+            "repeat_penalty",
+            "invalid_sampling",
+            bounded(LlamaCppSampling::REPEAT_PENALTY_RANGE),
+        )?,
+    };
+
     Ok((
         Alias {
             id,
@@ -2027,6 +2061,7 @@ fn build_alias(f: &Fields<'_>) -> Result<(Alias, Position), ConfigError> {
             permitted_targets,
             allow_family_failover: f.bool_field("family_failover", false)?,
             description: f.opt_str("description").map(str::to_owned),
+            llamacpp_sampling,
         },
         f.position(),
     ))

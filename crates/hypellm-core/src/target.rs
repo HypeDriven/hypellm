@@ -672,6 +672,40 @@ pub struct Alias {
     pub allow_family_failover: bool,
     /// A description surfaced by the models endpoint.
     pub description: Option<String>,
+    /// Sampler settings the operator fixes for every request through this alias.
+    pub llamacpp_sampling: LlamaCppSampling,
+}
+
+/// llama.cpp sampler settings an alias applies to every request it routes.
+///
+/// Operator configuration, never client input: the client protocols have no
+/// spelling for these, so a caller can neither set nor clear them. They exist
+/// because a llama.cpp server's command-line defaults apply to every client,
+/// and a default that suits one workload breaks another — DRY (`--dry-multiplier`)
+/// stops a chat model looping, and also stops an agent copying an identifier
+/// from a tool result, because a verbatim copy is exactly the repetition DRY
+/// penalises. An alias for agentic work can turn it off without changing the
+/// server for everyone else. Only llama.cpp-family targets receive them;
+/// configuration refuses an alias that sets them and could route elsewhere.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LlamaCppSampling {
+    /// llama.cpp `dry_multiplier`: 0 disables DRY.
+    pub dry_multiplier: Option<f64>,
+    /// llama.cpp `repeat_penalty`: 1 disables it.
+    pub repeat_penalty: Option<f64>,
+}
+
+impl LlamaCppSampling {
+    /// Accepted `dry_multiplier` values.
+    pub const DRY_MULTIPLIER_RANGE: core::ops::RangeInclusive<f64> = 0.0..=5.0;
+    /// Accepted `repeat_penalty` values.
+    pub const REPEAT_PENALTY_RANGE: core::ops::RangeInclusive<f64> = 0.0..=2.0;
+
+    /// True when the alias overrides nothing.
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        self.dry_multiplier.is_none() && self.repeat_penalty.is_none()
+    }
 }
 
 #[cfg(test)]

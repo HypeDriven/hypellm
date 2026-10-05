@@ -84,12 +84,39 @@ pub fn execute(
     // lands while a request waits for a machine to come back does not change
     // the policy that request is decided under.
     let config = state.config();
+    // The alias's operator-fixed sampler settings, applied once so every round —
+    // recovery rounds included — sends the same request.
+    let with_alias_sampling = alias_sampling(&config, request);
+    let request = with_alias_sampling.as_ref().unwrap_or(request);
     let first = execute_once(state, &config, request, groups, &permissions, sink);
     let budget = recovery_budget(&config, request);
     if budget.is_zero() || !awaits_recovery(&first) {
         return first;
     }
     await_recovery(state, &config, request, groups, &permissions, sink, first, budget)
+}
+
+/// The request with its alias's llama.cpp sampler settings applied, or `None`
+/// when the alias sets none (the common case, which costs no copy).
+///
+/// The fields are operator configuration: no client protocol can set them, so
+/// whatever the request carries is replaced, never merged.
+fn alias_sampling(
+    config: &hypellm_config::ValidatedConfig,
+    request: &CanonicalRequest,
+) -> Option<CanonicalRequest> {
+    let fixed = config
+        .snapshot
+        .aliases
+        .get(&request.requested_model)?
+        .llamacpp_sampling;
+    if fixed.is_unset() {
+        return None;
+    }
+    let mut request = request.clone();
+    request.sampling.dry_multiplier = fixed.dry_multiplier;
+    request.sampling.repeat_penalty = fixed.repeat_penalty;
+    Some(request)
 }
 
 /// The longest recovery wait any of the alias's targets allows.
@@ -1511,6 +1538,7 @@ mod tests {
                 capability: None,
                 permitted_targets: vec![TargetId::new("t").unwrap()],
                 allow_family_failover: false,
+                llamacpp_sampling: Default::default(),
                 description: None,
             },
         );
@@ -1536,6 +1564,7 @@ mod tests {
                 capability: None,
                 permitted_targets: vec![TargetId::new("t").unwrap()],
                 allow_family_failover: false,
+                llamacpp_sampling: Default::default(),
                 description: None,
             },
         );
@@ -1559,6 +1588,7 @@ mod tests {
                 capability: None,
                 permitted_targets: vec![TargetId::new("t").unwrap()],
                 allow_family_failover: false,
+                llamacpp_sampling: Default::default(),
                 description: None,
             },
         );

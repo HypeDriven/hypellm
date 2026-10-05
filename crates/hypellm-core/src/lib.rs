@@ -119,7 +119,7 @@ pub use rbac::{Permission, PermissionSet, Role as ManagementRole};
 pub use sensitive::{Capped, Sensitive};
 pub use target::{
     AdminState, Alias, Capabilities, Capability, EffortMultipliers, Endpoint, EndpointScheme,
-    Provider, ProviderFamily, Target,
+    LlamaCppSampling, Provider, ProviderFamily, Target,
 };
 pub use time::{Clock, Deadline, SystemClock};
 
@@ -193,6 +193,7 @@ mod invariant_tests {
                 permitted_targets: vec![tid("local:qwen")],
                 capability: None,
                 allow_family_failover: false,
+                llamacpp_sampling: Default::default(),
                 description: None,
             },
         );

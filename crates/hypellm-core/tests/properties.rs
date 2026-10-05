@@ -202,6 +202,7 @@ fn snapshot(rng: &mut Rng) -> PolicySnapshot {
             permitted_targets: TARGET_NAMES.iter().map(|n| tid(n)).collect(),
             capability: None,
             allow_family_failover: true,
+            llamacpp_sampling: Default::default(),
             description: None,
         },
     );

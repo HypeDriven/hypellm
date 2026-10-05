@@ -146,6 +146,7 @@ fn snapshot(targets: Vec<Target>) -> PolicySnapshot {
             capability: Some(Capability::Chat),
             permitted_targets: ids.clone(),
             allow_family_failover: true,
+            llamacpp_sampling: Default::default(),
             description: None,
         },
     );

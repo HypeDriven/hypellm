@@ -208,6 +208,41 @@ quota scope=alias:code operation=not_an_operation concurrency=2\n";
         );
     }
 
+    const SAMPLING_FLEET: &str = "settings state_dir=/tmp/x\n\
+provider id=local family=llamacpp scheme=http host=127.0.0.1 port=8080 egress=local\n\
+provider id=hosted family=openai scheme=https host=api.openai.com port=443 egress=remote credential=k\n\
+credential id=k\n\
+target id=local:m provider=local model=m local=true operations=chat aliases=agent,mixed\n\
+target id=hosted:m provider=hosted model=m operations=chat aliases=mixed\n";
+
+    #[test]
+    fn an_alias_carries_llamacpp_sampler_settings() {
+        let config = load(&format!("{SAMPLING_FLEET}alias id=agent targets=local:m dry_multiplier=0 repeat_penalty=1.0\nalias id=mixed targets=local:m,hosted:m\n"), 1)
+            .expect("load");
+        let alias = &config.snapshot.aliases[&hypellm_core::ids::AliasId::new("agent").unwrap()];
+        assert_eq!(alias.llamacpp_sampling.dry_multiplier, Some(0.0));
+        assert_eq!(alias.llamacpp_sampling.repeat_penalty, Some(1.0));
+
+        let plain = load(&format!("{SAMPLING_FLEET}alias id=agent targets=local:m\nalias id=mixed targets=local:m,hosted:m\n"), 1).expect("load");
+        assert!(plain.snapshot.aliases[&hypellm_core::ids::AliasId::new("agent").unwrap()].llamacpp_sampling.is_unset());
+    }
+
+    #[test]
+    fn llamacpp_sampler_settings_are_refused_where_another_family_could_serve() {
+        let errors = load(&format!("{SAMPLING_FLEET}alias id=mixed targets=local:m,hosted:m dry_multiplier=0\n"), 1)
+            .expect_err("an OpenAI target cannot take dry_multiplier");
+        assert!(errors.iter().any(|e| e.code == "sampling_family_mismatch"), "{errors:?}");
+    }
+
+    #[test]
+    fn llamacpp_sampler_settings_are_range_checked() {
+        for bad in ["dry_multiplier=-1", "dry_multiplier=9", "repeat_penalty=3", "repeat_penalty=nan", "dry_multiplier=abc"] {
+            let errors = load(&format!("{SAMPLING_FLEET}alias id=agent targets=local:m {bad}\nalias id=mixed targets=local:m,hosted:m\n"), 1)
+                .expect_err(bad);
+            assert!(errors.iter().any(|e| e.code == "invalid_sampling"), "{bad}: {errors:?}");
+        }
+    }
+
     #[test]
     fn default_target_queued_defaults_to_32_and_is_settable() {
         let config = load("settings state_dir=/tmp/x\n", 1).expect("load");
