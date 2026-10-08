@@ -108,10 +108,12 @@ Which planes the tailnet can reach is decided by bind address, in `docker/hypell
 | Listener | Bound to | Tailnet | This host |
 |---|---|---|---|
 | Inference | `0.0.0.0:18000` | yes | yes |
-| Management + SPA | `10.89.7.2:18001` | no | yes |
+| Management + SPA | `10.89.7.2:18001` | via HTTPS proxy only | yes |
 | Metrics | `10.89.7.2:18002` | no | yes |
 
 `10.89.7.2` is the compose bridge address, pinned in `compose.yaml`. A listener bound to it is reachable through the published loopback ports and is not bound on `tailscale0`, so a tailnet peer finds nothing listening. This fails closed and does not depend on a Tailscale ACL or a firewall rule elsewhere. Tailnet reachability is not authentication — inference still requires a router API key.
+
+The admin dashboard is the one deliberate exception: the sidecar serves it at **`https://hypellm-router.<tailnet>.ts.net/`** with `tailscale serve` (`docker/tailscale-serve.json`), terminating TLS with a certificate for the MagicDNS name and proxying to the bridge address. It has to be HTTPS — the session cookie is `__Host-`, so a browser drops it over plain http on any name but `localhost`. The proxy withholds `/metrics`. Signing in still needs a `local_user` password or break-glass, and the URL must be listed in `cors_origins` or every sign-in fails with `origin_not_permitted`. The tailnet needs MagicDNS and HTTPS certificates enabled.
 
 First run needs the node authenticated: put a key in `run/secrets/tailscale.authkey`, or let `just up` print the login URL — and open it within a minute, because the container gives up after that. `just tailnet` shows the node's address and its learned routes.
 

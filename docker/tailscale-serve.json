@@ -1,0 +1,13 @@
+{
+  "TCP": {
+    "443": { "HTTPS": true }
+  },
+  "Web": {
+    "${TS_CERT_DOMAIN}:443": {
+      "Handlers": {
+        "/": { "Proxy": "http://10.89.7.2:18001" },
+        "/metrics": { "Text": "metrics are not served on the tailnet\n" }
+      }
+    }
+  }
+}

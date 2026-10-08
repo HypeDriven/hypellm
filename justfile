@@ -474,6 +474,11 @@ endpoints:
         *)       tailnet="" ;;
     esac
     admin="http://127.0.0.1:{{admin_port}}"
+    ts_name=$(just _ts_name)
+    case "$ts_name" in
+        *.ts.net) admin_tailnet="https://${ts_name}/" ;;
+        *)        admin_tailnet="" ;;
+    esac
     metrics="http://127.0.0.1:{{metrics_port}}"
 
     rule() { printf '\033[2m%s\033[0m\n' "────────────────────────────────────────────────────────────────"; }
@@ -500,7 +505,7 @@ endpoints:
     printf '  \033[2m%s\033[0m\n' "also on http://127.0.0.1:{{inference_port}} from this host"
     printf '  \033[2m%s\033[0m\n' "a router API key is required; tailnet reachability is not authentication"
 
-    head "Management — this host only" "$admin — session cookie + CSRF"
+    head "Management" "$admin — session cookie + CSRF"
     row GET  "/"                     "admin SPA"
     row POST "/admin/v1/auth/password"    "sign in as a local_user"
     row POST "/admin/v1/auth/break-glass" "sign in (no OIDC configured)"
@@ -509,7 +514,11 @@ endpoints:
     row GET  "/admin/v1/policies"    "drafts, simulate, activate"
     row GET  "/admin/v1/usage"       "usage and cost estimates"
     row GET  "/admin/v1/audit"       "audit chain (export at /audit/export)"
-    printf '  \033[2m%s\033[0m\n' "bound {{admin_bind}}, so no tailnet peer can reach it"
+    if [ -n "$admin_tailnet" ]; then
+        printf '  \033[2m%s\033[0m\n' "on the tailnet as $admin_tailnet (HTTPS, proxied by the sidecar; /metrics withheld)"
+    else
+        printf '  \033[2m%s\033[0m\n' "not logged in to the tailnet; this host only for now"
+    fi
 
     head "Metrics — this host only" "$metrics"
     row GET  "/metrics"              "also on $admin/metrics"
@@ -544,7 +553,8 @@ tailnet:
     echo
     echo "reachable on the tailnet"
     echo "  inference   :{{inference_port}}   (bound 0.0.0.0)"
-    echo "  management  no          (bound {{admin_bind}}, host loopback only)"
+    name=$(ts status --peers=false --json | jq -r '.Self.DNSName // "" | rtrimstr(".")')
+    echo "  management  https://${name:-<node name>}/   (sidecar HTTPS proxy; :{{admin_port}} itself is bound {{admin_bind}})"
     echo "  metrics     no          (bound {{admin_bind}}, host loopback only)"
     echo
     echo "learned subnet routes — the only path to a LAN slave"

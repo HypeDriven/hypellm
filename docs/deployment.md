@@ -120,6 +120,18 @@ metrics planes are not, while all three stay reachable at the namespace's other
 addresses. Reaching a listener is not authenticating to it: inference still
 requires a router API key, and being on the tailnet grants nothing by itself.
 
+A plane bound off the overlay can still be published on it deliberately, by a
+proxy that runs in the same namespace. The worked example below serves the
+admin SPA this way: `tailscale serve` terminates TLS for the node's MagicDNS
+name and proxies to the bridge-bound management listener, so the listener stays
+unbound on the overlay and the exposure is one reviewable file
+([`docker/tailscale-serve.json`](../docker/tailscale-serve.json)). Two
+constraints shape it. It must be HTTPS, because the session cookie is
+`__Host-`-prefixed and a browser discards a `Secure` cookie over plain http on
+any host but `localhost`. And the proxy answers `/metrics` itself instead of
+forwarding it, because the management listener serves metrics unauthenticated.
+The served origin has to be added to `cors_origins` as well.
+
 `compose.yaml` and [`docker/hypellm.conf`](../docker/hypellm.conf) in this
 repository are a worked example, using a `tailscale/tailscale` sidecar that owns
 the namespace the router runs in. That arrangement also sidesteps a Docker

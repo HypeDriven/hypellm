@@ -64,8 +64,25 @@ services:
       # a key the node authenticates in seconds and never reaches this one.
       TS_EXTRA_ARGS: --accept-routes
 
+      # The admin SPA on the tailnet, as https://hypellm-router.<tailnet>.ts.net/.
+      # tailscaled terminates TLS with a Let's Encrypt certificate for the
+      # MagicDNS name and proxies to the management listener on the bridge
+      # address, which stays unbound on `tailscale0`. HTTPS rather than the
+      # listener's own port because the session cookie is `__Host-` and
+      # therefore `Secure`: over plain http on any name but localhost the
+      # browser drops it and every sign-in silently fails.
+      #
+      # `/metrics` is answered by tailscaled and never proxied: the management
+      # listener serves it unauthenticated, which is fine for this host's
+      # loopback and not for every device on the tailnet.
+      #
+      # Needs MagicDNS and HTTPS certificates enabled for the tailnet; the
+      # first request after a fresh node waits ~40s for the certificate.
+      TS_SERVE_CONFIG: /etc/tailscale/serve.json
+
     volumes:
       - ./run/tailscale:/var/lib/tailscale
+      - ./docker/tailscale-serve.json:/etc/tailscale/serve.json:ro
 
     devices:
       - /dev/net/tun:/dev/net/tun
@@ -74,12 +91,12 @@ services:
       - NET_RAW
 
     # A fixed bridge address, because the router binds its management and
-    # metrics listeners to it by name in docker/hypellm.conf. That is the whole
-    # mechanism keeping those two planes off the tailnet: a listener bound to
-    # 10.89.7.2 is reachable through the published ports below and is not
+    # metrics listeners to it by name in docker/hypellm.conf. A listener bound
+    # to 10.89.7.2 is reachable through the published ports below and is not
     # bound on `tailscale0`, so a tailnet peer connecting to this node's
-    # 100.64.x.x finds nothing listening. Fail-closed, and it does not depend
-    # on an ACL being written correctly somewhere else.
+    # 100.64.x.x:18001 or :18002 finds nothing listening. The one tailnet path
+    # to the management plane is the HTTPS proxy in TS_SERVE_CONFIG above;
+    # metrics have none.
     networks:
       hypellm:
         ipv4_address: 10.89.7.2
@@ -89,7 +106,7 @@ services:
     # the management plane.
     ports:
       - "127.0.0.1:18000:18000"   # inference  (also on the tailnet, see below)
-      - "127.0.0.1:18001:18001"   # management + admin SPA  (this host only)
+      - "127.0.0.1:18001:18001"   # management + admin SPA  (tailnet via HTTPS only)
       - "127.0.0.1:18002:18002"   # metrics                 (this host only)
 
     # True only once the node is logged in and has an address, which is
