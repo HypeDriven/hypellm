@@ -1,0 +1,15 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: hypellm
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: hypellm
+resources:
+  - hypellm.yaml
+  - publish.yaml
+# Rolled on change through the name hash, so `just up` after editing either file restarts the pod.
+configMapGenerator:
+  - name: hypellm-config
+    files:
+      - hypellm.conf=../docker/hypellm.conf
+      - serve.json=../docker/tailscale-serve.json

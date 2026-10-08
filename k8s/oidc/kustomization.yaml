@@ -1,0 +1,9 @@
+# The identity verifier (verifier/README.md). Applied by `just oidc`, not by `just up`.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: hypellm
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: hypellm
+resources:
+  - verifier.yaml

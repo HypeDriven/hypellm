@@ -51,8 +51,8 @@ RUN --mount=type=cache,target=/src/target,sharing=locked \
 FROM debian:trixie-slim AS runtime
 
 # A fixed system uid so the bind-mounted state and secret directories have a
-# predictable owner. `compose.yaml` overrides it with the invoking user's uid
-# so that a developer can read what the router wrote; in any other context this
+# predictable owner. `k8s/hypellm.yaml` overrides it with uid 1000 so that a
+# developer can read what the router wrote; in any other context this
 # is the account the router runs as, and it owns nothing it does not write.
 RUN useradd --system --uid 10001 --user-group --no-create-home --shell /usr/sbin/nologin hypellm
 
@@ -60,9 +60,9 @@ COPY --from=build /usr/local/bin/hypellm-router /usr/local/bin/hypellm-router
 COPY web /srv/hypellm/web
 COPY --chmod=0755 supervisor/hypellm-init /usr/local/bin/hypellm-init
 
-# A default configuration so the image is runnable on its own. `compose.yaml`
-# bind-mounts the same file read-only, so editing `docker/hypellm.conf` and
-# restarting is enough — there is no need to rebuild to change policy.
+# A default configuration so the image is runnable on its own. `k8s/` mounts
+# the same file from a ConfigMap, so editing `docker/hypellm.conf` and running
+# `just up` is enough — there is no need to rebuild to change policy.
 COPY docker/hypellm.conf /etc/hypellm/hypellm.conf
 
 # Owned by the router account and writable, because `--generate-secrets` and
@@ -74,8 +74,8 @@ RUN mkdir -p /etc/hypellm/secrets /var/lib/hypellm \
 USER hypellm
 
 # 8000 inference · 8001 management and the admin SPA · 8002 metrics.
-# Documentation only: `compose.yaml` decides what is published, and publishes
-# each to loopback on the host.
+# Documentation only: `docker/hypellm.conf` decides the ports, and
+# `k8s/publish.yaml` publishes each to loopback on the host.
 EXPOSE 8000 8001 8002
 
 # The init runs the router as its child and forwards nothing but the shutdown.

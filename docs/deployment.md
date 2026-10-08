@@ -132,13 +132,12 @@ any host but `localhost`. And the proxy answers `/metrics` itself instead of
 forwarding it, because the management listener serves metrics unauthenticated.
 The served origin has to be added to `cors_origins` as well.
 
-`compose.yaml` and [`docker/hypellm.conf`](../docker/hypellm.conf) in this
-repository are a worked example, using a `tailscale/tailscale` sidecar that owns
-the namespace the router runs in. That arrangement also sidesteps a Docker
-Desktop limitation worth knowing about: it accepts `-p 100.64.x.y:port:port`
-and binds nothing, because its daemon runs in a VM that has no overlay
-interface, and a container on a bridge network has no route to the tailnet
-either. Making the container itself a node avoids both.
+[`k8s/`](../k8s/) and [`docker/hypellm.conf`](../docker/hypellm.conf) in this
+repository are a worked example: a pod in which a `tailscale/tailscale`
+container and the router share one network namespace. Making the pod itself a
+tailnet node means nothing has to bind a host's overlay address, which Docker
+Desktop could not do at all (it accepted `-p 100.64.x.y:port:port` and bound
+nothing, because its daemon runs in a VM with no overlay interface).
 
 ### Single secure node
 

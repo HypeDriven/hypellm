@@ -1,0 +1,33 @@
+# Host ports. k8s Service ports are iptables-only and WSL forwards only real sockets to Windows,
+# so each published port is a socat listener on the node. Loopback only, as under Compose.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: publish
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: publish
+  template:
+    metadata:
+      labels:
+        app: publish
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: desktop-oin3g16
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      automountServiceAccountToken: false
+      containers:
+        - name: inference
+          image: alpine/socat:1.8.0.3
+          args: ["TCP-LISTEN:18000,bind=127.0.0.1,fork,reuseaddr", "TCP:hypellm:18000"]
+        - name: management
+          image: alpine/socat:1.8.0.3
+          args: ["TCP-LISTEN:18001,bind=127.0.0.1,fork,reuseaddr", "TCP:hypellm:18001"]
+        - name: metrics
+          image: alpine/socat:1.8.0.3
+          args: ["TCP-LISTEN:18002,bind=127.0.0.1,fork,reuseaddr", "TCP:hypellm:18002"]

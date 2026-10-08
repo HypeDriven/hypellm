@@ -1,0 +1,54 @@
+# Talks to the router only over the Unix socket in run/verify; needs outbound HTTPS to the issuer.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: verifier
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: verifier
+  template:
+    metadata:
+      labels:
+        app: verifier
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: desktop-oin3g16
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      containers:
+        - name: verifier
+          image: python:3.13-slim
+          command:
+            - python3
+            - /opt/hypellm-verifier/hypellm-verifier
+            - --config
+            - /etc/hypellm/verifier/verifier.json
+            - --socket
+            - /run/hypellm/verify.sock
+            - --log
+            - info
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+            seccompProfile: {type: RuntimeDefault}
+          volumeMounts:
+            - {name: script, mountPath: /opt/hypellm-verifier, readOnly: true}
+            - {name: verifier, mountPath: /etc/hypellm/verifier, readOnly: true}
+            - {name: verify, mountPath: /run/hypellm}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: script
+          hostPath: {path: "${PROJECT_DIR}/verifier", type: Directory}
+        - name: verifier
+          hostPath: {path: "${PROJECT_DIR}/run/verifier", type: Directory}
+        - name: verify
+          hostPath: {path: "${PROJECT_DIR}/run/verify", type: Directory}
+        - name: tmp
+          emptyDir: {medium: Memory}

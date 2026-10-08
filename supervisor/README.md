@@ -59,8 +59,11 @@ change that.
 ## What it deliberately is not
 
 **Not a supervisor.** One child, one shutdown, one exit status. It does not
-restart the router: `compose.yaml` sets `restart: "no"` because a router that
-exited cleanly after a drain must not be started again.
+restart the router. Under Compose that was `restart: "no"`, because a router
+that exited cleanly after a drain must not be started again. The Kubernetes
+Deployment in `k8s/` restarts any exit, so `just down` deletes the pod rather
+than asking the router to exit; a `--shutdown` sent by hand is followed by a
+restart.
 
 **Not a decision maker.** It reads nothing from the network, from a file, or
 from the router. Its whole input is its own argv.
@@ -87,8 +90,9 @@ already there.
 1. The inference listener's `drain_timeout` — 30 s (`ServerConfig::inference`).
 2. `HYPELLM_DRAIN_DEADLINE` — 40 s, longer than (1), or this kills the router
    part-way through the drain it just asked for.
-3. The supervisor's grace period — `stop_grace_period: 45s` in `compose.yaml`,
-   longer than (2), or the supervisor kills *this* part-way through.
+3. The supervisor's grace period — `terminationGracePeriodSeconds: 45` in
+   `k8s/hypellm.yaml`, longer than (2), or the supervisor kills *this*
+   part-way through.
 
 Each has to exceed the one before it. Getting the order wrong reintroduces
 exactly the dropped streams the whole chain exists to prevent, and it does so

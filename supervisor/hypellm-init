@@ -36,9 +36,9 @@
 # ----------------
 #
 # It is not a supervisor. It starts one child, forwards one shutdown, and exits
-# with the child's status. It does not restart the router — `compose.yaml` sets
-# `restart: "no"` deliberately, because a router that exited cleanly after a
-# drain must not be started again — and it makes no decision of its own.
+# with the child's status. It does not restart the router — a router that
+# exited cleanly after a drain must not be started again by this — and it makes
+# no decision of its own.
 #
 # The rules it keeps
 # ------------------
@@ -61,8 +61,8 @@ ROUTER="${HYPELLM_ROUTER_BIN:-/usr/local/bin/hypellm-router}"
 # How long the router is given to finish its own drain after `--shutdown` is
 # accepted. Must exceed the inference listener's `drain_timeout` (30 s in
 # `ServerConfig::inference`), or this cuts off the drain it just asked for --
-# the same ordering `compose.yaml`'s `stop_grace_period` has to respect, and for
-# the same reason. The supervisor's grace period must in turn exceed this.
+# the same ordering the pod's `terminationGracePeriodSeconds` (k8s/hypellm.yaml)
+# has to respect, and for the same reason. The supervisor's grace period must in turn exceed this.
 DRAIN_DEADLINE="${HYPELLM_DRAIN_DEADLINE:-40}"
 
 # Exit codes, distinct from the router's own (2 configuration, 3 state, 4

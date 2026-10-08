@@ -1,0 +1,125 @@
+# The router and its tailnet node in one pod: the pod's network namespace is the one the
+# Compose sidecar used to own, and it outlives a restart of either container.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hypellm
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: hypellm
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hypellm
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: hypellm
+  template:
+    metadata:
+      labels:
+        app: hypellm
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: desktop-oin3g16
+      hostname: hypellm-router
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      # hypellm-init drains over the control socket on SIGTERM; the inference drain deadline is 30 s.
+      terminationGracePeriodSeconds: 45
+      initContainers:
+        # docker/hypellm.conf binds management and metrics to 10.89.7.2, the Compose bridge address.
+        # Here that becomes the pod IP: reachable from the node's publisher, not bound on tailscale0.
+        - name: render-config
+          image: hypellm-router:local
+          imagePullPolicy: Never
+          command:
+            - /bin/sh
+            - -c
+            - |
+              sed "s/10\.89\.7\.2/$POD_IP/g" /src/hypellm.conf > /out/hypellm.conf
+              sed "s/10\.89\.7\.2/$POD_IP/g" /src/serve.json > /out/serve.json
+          env:
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: config-src, mountPath: /src, readOnly: true}
+            - {name: config, mountPath: /out}
+      containers:
+        - name: tailscale
+          image: tailscale/tailscale:stable
+          env:
+            - {name: TS_HOSTNAME, value: hypellm-router}
+            - {name: TS_USERSPACE, value: "false"}
+            - {name: TS_STATE_DIR, value: /var/lib/tailscale}
+            # State lives in run/tailscale, not in a Kubernetes Secret.
+            - {name: TS_KUBE_SECRET, value: ""}
+            - {name: TS_ACCEPT_DNS, value: "false"}
+            - {name: TS_EXTRA_ARGS, value: --accept-routes}
+            - {name: TS_SERVE_CONFIG, value: /etc/tailscale/serve.json}
+            - name: TS_AUTHKEY
+              valueFrom: {secretKeyRef: {name: tailscale-authkey, key: authkey, optional: true}}
+          securityContext:
+            # Kernel networking needs /dev/net/tun, which an unprivileged container cannot open.
+            privileged: true
+          readinessProbe:
+            exec: {command: [tailscale, status, --peers=false]}
+            periodSeconds: 3
+            timeoutSeconds: 3
+          volumeMounts:
+            - {name: tailscale-state, mountPath: /var/lib/tailscale}
+            - {name: config, mountPath: /etc/tailscale/serve.json, subPath: serve.json, readOnly: true}
+        - name: router
+          image: hypellm-router:local
+          imagePullPolicy: Never
+          # Docker's soft core limit is 0 and the router's hardening check expects it.
+          command: [/bin/sh, -c, 'ulimit -c 0 && exec /usr/local/bin/hypellm-init "$@"', hypellm-init]
+          args:
+            - --config
+            - /etc/hypellm/hypellm.conf
+            - --secrets
+            - /etc/hypellm/secrets
+            - --static
+            - /srv/hypellm/web
+            - --log
+            - info
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+            seccompProfile: {type: RuntimeDefault}
+          readinessProbe:
+            httpGet: {path: /health/live, port: 18000}
+            periodSeconds: 3
+          volumeMounts:
+            - {name: config, mountPath: /etc/hypellm/hypellm.conf, subPath: hypellm.conf, readOnly: true}
+            - {name: secrets, mountPath: /etc/hypellm/secrets}
+            - {name: state, mountPath: /var/lib/hypellm}
+            - {name: verify, mountPath: /run/hypellm}
+      volumes:
+        - name: config-src
+          configMap: {name: hypellm-config}
+        - name: config
+          emptyDir: {}
+        - name: tailscale-state
+          hostPath: {path: "${PROJECT_DIR}/run/tailscale", type: Directory}
+        - name: secrets
+          hostPath: {path: "${PROJECT_DIR}/run/secrets", type: Directory}
+        - name: state
+          hostPath: {path: "${PROJECT_DIR}/run/state", type: Directory}
+        - name: verify
+          hostPath: {path: "${PROJECT_DIR}/run/verify", type: Directory}

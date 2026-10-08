@@ -1,34 +1,34 @@
-# HypeLLM Router — local container workflow.
+# HypeLLM Router — local workflow on the fleet k3s cluster (namespace hypellm).
 #
 #   just bootstrap  first run: secrets, router, and a key to call it with
 #   just up         build the image, start the router, print its endpoints
 #   just key        mint another API key
-#   just down       graceful shutdown over the control socket, then remove
+#   just down       delete the namespace; the router drains on SIGTERM
 #   just logs       follow the router's structured log
 #   just status     is it up, and what is it serving
 #   just tailnet    the tailnet node: address, routes, who can reach it
 #   just oidc       write the OAuth secret from .env, start the verifier
 #
-# `just --list` prints the rest.
+# `just --list` prints the rest. The manifests are in k8s/; kstack and the
+# cluster conventions are described in ~/system/docs/k3s.md.
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 set dotenv-load := false
 
 config := justfile_directory() / "docker" / "hypellm.conf"
 
+ns      := "hypellm"
+image   := "hypellm-router:local"
+kubectl := "kubectl --context " + env("KUBE_CONTEXT", "fleet") + " -n " + ns
+
 # Everything printed and probed below is read back out of that file rather than
 # restated here. Two copies of a port number drift, and this is the copy every
 # health check and printed URL uses — a stale one sends the reader to an
-# address nothing is listening on. compose.yaml publishes each listener to the
-# same port on 127.0.0.1, so the configured ports are also the host's.
+# address nothing is listening on. k8s/publish.yaml publishes each listener to
+# the same port on 127.0.0.1, so the configured ports are also the host's.
 inference_port := `sed -n 's/.*inference_listen=[^:]*:\([0-9]*\).*/\1/p' docker/hypellm.conf | head -1`
 admin_port     := `sed -n 's/.*admin_listen=[^:]*:\([0-9]*\).*/\1/p' docker/hypellm.conf | head -1`
 metrics_port   := `sed -n 's/.*metrics_listen=[^:]*:\([0-9]*\).*/\1/p' docker/hypellm.conf | head -1`
-
-# The bind address of the management and metrics listeners: the compose bridge
-# address, not loopback and not the tailnet. Read back for the same reason the
-# ports are — so the printed URLs cannot disagree with what is bound.
-admin_bind := `sed -n 's/.*admin_listen=\([^: ]*\):.*/\1/p' docker/hypellm.conf | head -1`
 
 # Bind-mount roots. Covered by .gitignore's /run rule; nothing here is
 # committable, and run/secrets is the router's root of trust.
@@ -36,49 +36,35 @@ state_dir     := justfile_directory() / "run" / "state"
 secrets_dir   := justfile_directory() / "run" / "secrets"
 tailscale_dir := justfile_directory() / "run" / "tailscale"
 
-# The identity verifier's two directories, created empty and used only under
-# the `oidc` compose profile (see verifier/README.md). `verify` is the socket
-# the router reaches it on and is shared with the router container; `verifier`
-# holds verifier.json and the OAuth client secret, so it is 0700 and never
-# committed.
+# The identity verifier's two directories, created empty and used only by the
+# verifier `just oidc` starts (see verifier/README.md). `verify` is the socket
+# the router reaches it on and is mounted into both pods; `verifier` holds
+# verifier.json and the OAuth client secret, so it is 0700 and never committed.
 verify_dir    := justfile_directory() / "run" / "verify"
 verifier_dir  := justfile_directory() / "run" / "verifier"
 
-# Tailscale authenticates once and persists its node identity in
-# run/tailscale. A key is needed only for that first login; after it, the file
-# can be deleted. Absent, the node prints a login URL instead and `just up`
-# surfaces it — which is the better path for a machine someone is sitting at.
-#
-# Read from a file rather than taken from the ambient environment so it cannot
-# arrive by accident, and so `just` is the only thing that puts it in the
-# container's environment.
-export HYPELLM_TS_AUTHKEY := \
-    if path_exists(justfile_directory() / "run" / "secrets" / "tailscale.authkey") == "true" \
-    { trim(`cat run/secrets/tailscale.authkey 2>/dev/null || true`) } else { "" }
-
-# The container runs as the invoking user so the bind mounts stay readable
-# from the host without sudo.
-export HYPELLM_UID := `id -u`
-export HYPELLM_GID := `id -g`
-
-compose := "docker compose"
+# The one-shot tools below (`check`, `password`, `shell`, secret generation)
+# run as the invoking user so the bind-mounted files stay readable from the
+# host without sudo. The pod runs as uid/gid 1000 for the same reason.
+uid := `id -u`
+gid := `id -g`
 
 _default:
     @just --list --unsorted
 
 # Build the image, start the router, and print where it is listening.
 #
-# `--force-recreate` rather than a plain `up -d`: compose restarts an existing
-# container when nothing in its definition changed, and a container that
-# outlived a Docker Desktop or WSL restart comes back with its bind mounts
-# pointing at nothing. The paths still read correctly in `docker inspect` and
-# the directories are simply empty inside — so the router starts against an
-# empty run/secrets and run/state instead of failing on a missing mount.
-# Recreating makes that state unreachable. The cost is that `just up` on an
-# already-running router bounces it; the container holds no state that the two
-# bind mounts do not, so that is a restart and not a loss.
-up: _ports _dirs build _secrets _lanroutes _tailnet_up
-    @{{compose}} up -d --no-build --force-recreate router
+# The router and its tailnet node are two containers in one pod, so the
+# network namespace belongs to the pod and survives a restart of either. The
+# Compose-era failure where a restarted sidecar stranded the router in a dead
+# namespace cannot happen here.
+[doc('Build the image, start the router, and print where it is listening')]
+up: _ports _dirs build _secrets _authkey
+    kstack load {{image}}
+    kstack apply {{ns}}
+    kstack roll {{ns}} {{image}}
+    @just _tailnet_up
+    kstack wait {{ns}} --timeout 120
     @just _wait
     @just endpoints
 
@@ -131,9 +117,9 @@ bootstrap principal="agent":
     # is not read here leaves a break-glass path nothing can satisfy — which is
     # the state this recipe exists to avoid.
     generated=$(docker run --rm --network none \
-        -u "$HYPELLM_UID:$HYPELLM_GID" \
+        -u "{{uid}}:{{gid}}" \
         -v "{{secrets_dir}}:/etc/hypellm/secrets" \
-        hypellm-router:local --generate-secrets /etc/hypellm/secrets)
+        {{image}} --generate-secrets /etc/hypellm/secrets)
     token=$(sed -n 's/^break-glass token: //p' <<<"$generated" | head -1)
     if [ -z "$token" ]; then
         printf '%s\n' "$generated" >&2
@@ -311,7 +297,7 @@ _session reason:
 
 # Build the image. Runs depscan and the release build inside the container.
 build:
-    @{{compose}} build router
+    docker build -f docker/Dockerfile -t {{image}} .
 
 # Validate docker/hypellm.conf without starting anything. Prints the
 # configuration digest, and the fleet digest when a fleet is declared.
@@ -319,7 +305,7 @@ build:
 check: build
     @docker run --rm --network none \
         -v "{{config}}:/etc/hypellm/hypellm.conf:ro" \
-        hypellm-router:local --check --config /etc/hypellm/hypellm.conf
+        {{image}} --check --config /etc/hypellm/hypellm.conf
 
 # The identity verifier's two test layers.
 #
@@ -346,8 +332,8 @@ password:
     read -rs value
     printf '\n' >&2
     [ -n "$value" ] || { echo "empty password" >&2; exit 1; }
-    printf '%s' "$value" | {{compose}} run --rm --no-deps -T \
-        --entrypoint /usr/local/bin/hypellm-router router --hash-password
+    printf '%s' "$value" | docker run --rm -i --network none \
+        --entrypoint /usr/local/bin/hypellm-router {{image}} --hash-password
 
 [doc('Run the identity verifier self-test and end-to-end acceptance')]
 verifier-acceptance:
@@ -381,22 +367,24 @@ oidc: _dirs _verifier_secret
         echo "  on the OAuth client. See verifier/README.md." >&2
         exit 1
     fi
-    {{compose}} --profile oidc run --rm --no-deps verifier \
-        python3 /opt/hypellm-verifier/hypellm-verifier \
+    # A one-shot container with the verifier pod's mounts, as the same user.
+    docker run --rm --network none -u "{{uid}}:{{gid}}" \
+        -v "{{justfile_directory()}}/verifier:/opt/hypellm-verifier:ro" \
+        -v "{{verifier_dir}}:/etc/hypellm/verifier:ro" \
+        python:3.13-slim python3 /opt/hypellm-verifier/hypellm-verifier \
         --config /etc/hypellm/verifier/verifier.json --check
-    # Recreated, not restarted, for the reason `up` is — and the verifier is
-    # the service that shows it, because its own script arrives over a bind
-    # mount: a stale container fails with "can't open file
-    # /opt/hypellm-verifier/hypellm-verifier" and exits 2.
-    {{compose}} --profile oidc up -d --force-recreate verifier
+    # Restarted after the apply, not just applied: its script arrives over a
+    # hostPath, so an unchanged manifest would leave the old process running
+    # the old script.
+    kstack apply {{ns}} --dir k8s/oidc
+    {{kubectl}} rollout restart deploy/verifier >/dev/null
 
-    # It has no health check and `up -d` returns as soon as the process is
-    # started, so without this an immediate exit is silent and the next thing
-    # the operator sees is a sign-in that says the verifier is not configured.
-    sleep 1
-    if [ -z "$(docker ps -q --filter name=hypellm-verifier --filter status=running)" ]; then
-        echo "hypellm: the verifier exited immediately; its log follows" >&2
-        {{compose}} --profile oidc logs --tail 20 verifier >&2
+    # It has no health check, so without this an immediate exit is silent and
+    # the next thing the operator sees is a sign-in that says the verifier is
+    # not configured.
+    if ! {{kubectl}} rollout status deploy/verifier --timeout=60s; then
+        echo "hypellm: the verifier did not start; its log follows" >&2
+        {{kubectl}} logs deploy/verifier --tail 20 >&2 || true
         exit 1
     fi
     echo
@@ -404,51 +392,38 @@ oidc: _dirs _verifier_secret
     echo "  oidc_verifier_socket is set in {{config}}; add the oidc_* settings"
     echo "  there and \`just restart\` if you have not already."
 
-# Stop the router the way it is meant to be stopped: `shutdown` over the
-# authenticated control socket, which stops admission and drains in-flight
-# requests. Falls back to compose's SIGTERM/SIGKILL if the socket is gone.
-[doc('Drain over the control socket, then remove the container')]
+# Delete the namespace. The pod gets SIGTERM, which supervisor/hypellm-init
+# turns into `shutdown` over the authenticated control socket: admission stops
+# and in-flight requests drain. terminationGracePeriodSeconds is 45 s, above
+# the inference listener's 30 s drain deadline, so the drain is never cut off
+# by SIGKILL. run/ is a hostPath and is untouched.
+[doc('Delete the namespace; the router drains on SIGTERM')]
 down:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [ -n "$({{compose}} ps -q router 2>/dev/null)" ]; then
-        echo "→ draining (control socket)"
-        if {{compose}} exec -T router /usr/local/bin/hypellm-router --shutdown \
-                --config /etc/hypellm/hypellm.conf --secrets /etc/hypellm/secrets; then
-            # Wait for the process to exit on its own. Tearing the container
-            # down here instead would SIGKILL the router mid-drain, which drops
-            # the streams the drain exists to finish — and leaves the state
-            # lock behind, because the lock is removed on `Drop`.
-            for _ in $(seq 1 60); do
-                [ -z "$({{compose}} ps -q router 2>/dev/null)" ] && break
-                state=$(docker inspect -f '{{{{.State.Status}}' hypellm-router 2>/dev/null || echo gone)
-                [ "$state" != "running" ] && break
-                sleep 0.5
-            done
-        else
-            echo "  control socket unavailable; compose will signal instead"
-        fi
-    fi
-    {{compose}} down --remove-orphans
+    kstack down {{ns}}
 
 # Graceful stop and start, picking up an edited docker/hypellm.conf.
 restart: down up
 
 # The router's log is line-delimited JSON; pipe through jq to read it:
-# `just logs | jq -c`. `just logs tailscale` follows the sidecar instead, which
-# is where a login URL or a routing problem shows up.
-[doc("Follow a service's log: router (default) or tailscale")]
+# `just logs | jq -c`. `just logs tailscale` follows the tailnet node instead,
+# which is where a login URL or a routing problem shows up; `just logs
+# verifier` follows the identity verifier.
+[doc("Follow a container's log: router (default), tailscale or verifier")]
 logs service="router":
-    @{{compose}} logs -f {{service}}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{service}}" in
+        verifier) exec {{kubectl}} logs -f deploy/verifier ;;
+        *)        exec {{kubectl}} logs -f deploy/hypellm -c "{{service}}" ;;
+    esac
 
 # Is it running, and does it answer?
 status:
-    @{{compose}} ps
+    @kstack status {{ns}}
     @echo
     @printf 'live:   '; curl -fsS --max-time 2 http://127.0.0.1:{{inference_port}}/health/live  && echo || echo 'unreachable'
     @printf 'ready:  '; curl -fsS --max-time 2 http://127.0.0.1:{{inference_port}}/health/ready && echo || echo 'unreachable'
     @printf 'tailnet: '; just _ts_addr
-    @just _stranded
 
 # The current metrics exposition.
 metrics:
@@ -459,10 +434,10 @@ metrics:
 [doc('Open a shell in a throwaway container from the same image')]
 shell:
     @docker run --rm -it --entrypoint /bin/bash \
-        -u "$HYPELLM_UID:$HYPELLM_GID" \
+        -u "{{uid}}:{{gid}}" \
         -v "{{state_dir}}:/var/lib/hypellm:ro" \
-        -v "{{justfile_directory()}}/docker/hypellm.conf:/etc/hypellm/hypellm.conf:ro" \
-        hypellm-router:local
+        -v "{{config}}:/etc/hypellm/hypellm.conf:ro" \
+        {{image}}
 
 # Print the endpoint map for a running router.
 endpoints:
@@ -529,7 +504,7 @@ endpoints:
     printf '  \033[2m%s\033[0m\n' "a LAN slave needs a subnet route on the tailnet — just tailnet"
 
     echo
-    printf '  \033[2m%s\033[0m\n' "config  docker/hypellm.conf   ·   state  run/state   ·   secrets  run/secrets"
+    printf '  \033[2m%s\033[0m\n' "config  docker/hypellm.conf   ·   state  run/state   ·   secrets  run/secrets   ·   k8s/"
     printf '  \033[2m%s\033[0m\n' "just key · just keys · just logs · just status · just tailnet · just down"
     echo
 
@@ -540,11 +515,11 @@ endpoints:
 tailnet:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ -z "$({{compose}} ps -q tailscale 2>/dev/null)" ]; then
-        echo "the tailscale sidecar is not running — try \`just up\`" >&2
+    if ! {{kubectl}} get deploy/hypellm >/dev/null 2>&1; then
+        echo "the router pod is not running — try \`just up\`" >&2
         exit 1
     fi
-    ts() { {{compose}} exec -T tailscale tailscale "$@" 2>/dev/null; }
+    ts() { {{kubectl}} exec deploy/hypellm -c tailscale -- tailscale "$@" 2>/dev/null; }
     echo "node"
     ts status --peers=false --json | jq -r '
         "  name    \(.Self.DNSName // "(not logged in)" | rtrimstr("."))",
@@ -554,8 +529,8 @@ tailnet:
     echo "reachable on the tailnet"
     echo "  inference   :{{inference_port}}   (bound 0.0.0.0)"
     name=$(ts status --peers=false --json | jq -r '.Self.DNSName // "" | rtrimstr(".")')
-    echo "  management  https://${name:-<node name>}/   (sidecar HTTPS proxy; :{{admin_port}} itself is bound {{admin_bind}})"
-    echo "  metrics     no          (bound {{admin_bind}}, host loopback only)"
+    echo "  management  https://${name:-<node name>}/   (sidecar HTTPS proxy; :{{admin_port}} itself is bound to the pod IP)"
+    echo "  metrics     no          (bound to the pod IP; 127.0.0.1 on this host only)"
     echo
     echo "learned subnet routes — the only path to a LAN slave"
     routes=$(ts debug prefs 2>/dev/null | jq -r '.RouteAll // false')
@@ -569,13 +544,13 @@ tailnet:
 
 # --- internals -------------------------------------------------------------
 
-# A port already published on this host makes `docker compose up` fail with a
-# message about the port and nothing about which listener wanted it. Say both,
-# and say where to change it.
+# A port already taken on this host leaves the publisher pod crash-looping on
+# its bind with nothing saying which listener wanted it. Say both, and say
+# where to change it.
 _ports:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ -n "$({{compose}} ps -q router 2>/dev/null)" ]; then exit 0; fi
+    if [ -n "$({{kubectl}} get pods -l app=publish -o name 2>/dev/null)" ]; then exit 0; fi
     clash=0
     for entry in "inference:{{inference_port}}" "management:{{admin_port}}" "metrics:{{metrics_port}}"; do
         name=${entry%%:*}; port=${entry##*:}
@@ -587,13 +562,13 @@ _ports:
     if [ "$clash" = 1 ]; then
         echo >&2
         echo "Change the listen addresses in {{config}} and the matching" >&2
-        echo "\`ports:\` entries in compose.yaml; just reads the ports back from" >&2
+        echo "listeners in k8s/publish.yaml; just reads the ports back from" >&2
         echo "the configuration, so those two files are the only ones to edit." >&2
         exit 1
     fi
 
-# Bind-mount targets have to exist and be owned by the invoking user before
-# Docker creates them itself as root.
+# hostPath volumes are declared `type: Directory`, so they have to exist, owned
+# by the invoking user, before the pod starts.
 _dirs:
     @mkdir -p "{{state_dir}}" "{{secrets_dir}}" "{{tailscale_dir}}" "{{verify_dir}}" "{{verifier_dir}}"
     @chmod 0700 "{{secrets_dir}}" "{{tailscale_dir}}" "{{verifier_dir}}"
@@ -606,26 +581,44 @@ _secrets:
     set -euo pipefail
     if [ -f "{{secrets_dir}}/store_mac.key" ]; then exit 0; fi
     echo "→ generating the secret bundle in run/secrets"
-    # Plain `docker run`, not `compose run`: the router service shares the
-    # sidecar's network namespace, so compose would start a tailnet node just
-    # to write eight files. `--network none` because this needs no network at
-    # all — the keys come from the OS entropy source.
+    # A throwaway container, not the pod: `--network none` because this needs
+    # no network at all — the keys come from the OS entropy source.
     docker run --rm --network none \
-        -u "$HYPELLM_UID:$HYPELLM_GID" \
+        -u "{{uid}}:{{gid}}" \
         -v "{{secrets_dir}}:/etc/hypellm/secrets" \
-        hypellm-router:local --generate-secrets /etc/hypellm/secrets
+        {{image}} --generate-secrets /etc/hypellm/secrets
     echo
     echo "  The break-glass token above is printed once and stored nowhere."
     echo "  Save it now: with no OIDC configured it is the only way into the"
     echo "  management plane, and therefore the only way to mint the API key"
     echo "  that inference requires. See docs/using-the-router.md."
 
+# Tailscale authenticates once and persists its node identity in
+# run/tailscale. A key is needed only for that first login; after it, the file
+# can be deleted. Absent, the node prints a login URL instead and `just up`
+# surfaces it — which is the better path for a machine someone is sitting at.
+#
+# Read from a file rather than taken from the ambient environment so it cannot
+# arrive by accident. It reaches the tailscale container as TS_AUTHKEY through
+# the `tailscale-authkey` Secret, which exists only while the file does.
+_authkey:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    key_file="{{secrets_dir}}/tailscale.authkey"
+    {{kubectl}} create namespace {{ns}} --dry-run=client -o yaml | {{kubectl}} apply -f - >/dev/null
+    if [ -f "$key_file" ]; then
+        {{kubectl}} create secret generic tailscale-authkey --from-file=authkey="$key_file" \
+            --dry-run=client -o yaml | {{kubectl}} apply -f - >/dev/null
+    else
+        {{kubectl}} delete secret tailscale-authkey --ignore-not-found >/dev/null
+    fi
+
 # Materialise the OAuth client secret from `.env` into the one file the verifier
 # reads, and nowhere else.
 #
-# Why a file when `.env` is right there and compose would happily pass it as an
-# environment variable: `docker inspect hypellm-verifier` prints a container's
-# whole environment to anyone in the `docker` group, and `/proc/<pid>/environ`
+# Why a file when `.env` is right there and a Secret would happily pass it as an
+# environment variable: `kubectl get pod -o yaml` prints a container's whole
+# environment to anyone who can read the namespace, and `/proc/<pid>/environ`
 # does the same for the process uid. A 0600 file is readable by the verifier's
 # user alone. So `dotenv-load` stays false at the top of this file and nothing
 # here exports anything — `.env` is a host-side convenience for typing the
@@ -687,163 +680,70 @@ _upstreams:
         if(h!="") printf "  \033[36m%-6s\033[0m %-26s \033[2m%s\033[0m\n", "", id, "http://" h ":" p "  (" f ")"
     }' docker/hypellm.conf
 
-# The router has no network namespace of its own. If the sidecar is gone and
-# the router is not, the router is reachable by nothing while still reporting
-# `Up` — a state worth naming rather than leaving someone to discover.
-#
-# The sidecar being *up* is not enough either. The router joins the namespace
-# the sidecar had when the router started, and keeps it: a sidecar restarted
-# since then — `docker restart`, Docker Desktop's start button, a second login
-# attempt — runs in a new namespace that the published ports lead into and the
-# router is not in. Both containers read `Up (healthy)`, the ports accept and
-# immediately reset, and the router is left holding a namespace with nothing
-# but `lo` in it. Start order is the evidence, so compare start times.
-_stranded:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    router=$({{compose}} ps -q router 2>/dev/null || true)
-    sidecar=$({{compose}} ps -q tailscale 2>/dev/null || true)
-    [ -n "$router" ] || exit 0
-    if [ -z "$sidecar" ]; then
-        printf '\n\033[1;31m  %s\033[0m\n' "The router is running without its network namespace."
-        printf '  %s\n' "The tailscale sidecar owns it and has exited, so the router reaches"
-        printf '  %s\n' "nothing and nothing reaches it. Run \`just restart\`."
-        exit 0
-    fi
-    started() { date -u -d "$(docker inspect -f '{{{{.State.StartedAt}}' "$1")" +%s%N; }
-    if [ "$(started "$sidecar")" -gt "$(started "$router")" ]; then
-        printf '\n\033[1;31m  %s\033[0m\n' "The router is running in a network namespace that no longer exists."
-        printf '  %s\n' "The tailscale sidecar restarted after the router did, so its ports lead"
-        printf '  %s\n' "somewhere the router is not. Run \`just restart\`."
-    fi
-
 # The node's tailnet address, or a word saying why there is not one. Used by
 # `status` and by the endpoint map, both of which must not fail when the node
 # has not logged in yet.
 _ts_addr:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ -z "$({{compose}} ps -q tailscale 2>/dev/null)" ]; then echo "sidecar not running"; exit 0; fi
-    addr=$({{compose}} exec -T tailscale tailscale ip -4 2>/dev/null | tr -d '\r' | head -1 || true)
+    if ! {{kubectl}} get deploy/hypellm >/dev/null 2>&1; then echo "pod not running"; exit 0; fi
+    addr=$({{kubectl}} exec deploy/hypellm -c tailscale -- tailscale ip -4 2>/dev/null | tr -d '\r' | head -1 || true)
     if [ -n "${addr:-}" ]; then echo "$addr"; else echo "not logged in"; fi
 
 # The node's MagicDNS name, when it has one.
 _ts_name:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ -z "$({{compose}} ps -q tailscale 2>/dev/null)" ]; then echo "sidecar not running"; exit 0; fi
-    {{compose}} exec -T tailscale tailscale status --peers=false --json 2>/dev/null \
+    if ! {{kubectl}} get deploy/hypellm >/dev/null 2>&1; then echo "pod not running"; exit 0; fi
+    {{kubectl}} exec deploy/hypellm -c tailscale -- tailscale status --peers=false --json 2>/dev/null \
         | jq -r '.Self.DNSName // "" | rtrimstr(".")' | grep . || echo "no MagicDNS name"
 
-# Make the configured provider addresses reachable from inside a container.
+# Can the pod reach every configured provider address?
 #
-# Docker allocates bridge subnets from a built-in pool that ends with
-# 192.168.0.0/16 in /20 chunks, and it reaches that fallback once 172.17-172.31
-# are used up — which a machine with a dozen compose projects manages easily.
-# On this host that produced a network on 192.168.0.0/20, which *contains* the
-# Sparks' 192.168.8.0/24, so the Docker VM routes every packet for a slave onto
-# a local bridge instead of out to the LAN:
-#
-#     ip route get 192.168.8.105
-#     192.168.8.105 dev br-814c33bb4ef9  src 192.168.0.1
-#
-# The host itself is unaffected, which is what makes it easy to miss: `curl`
-# from a terminal works and the identical `curl` in a container times out.
-#
-# This adds a /32 for each configured provider via the VM's real gateway, which
-# is more specific than the bridge route and wins. It is a workaround, not a
-# fix — the fix is to stop the other project occupying that range — and it is
-# re-applied here because the VM's routing table does not survive a Docker
-# Desktop restart, so without it the router silently loses its upstreams and
-# reports `deadline_exceeded` with no hint why.
-#
-# It does nothing when the addresses are already reachable, which is the normal
-# case on a machine without the collision.
-[doc('Ensure the provider addresses are reachable from inside a container')]
-lanroutes: _lanroutes
-
-_lanroutes:
+# Under Docker Desktop this repaired a routing collision: a compose network on
+# 192.168.0.0/20 contains the Sparks' 192.168.8.0/24 and swallowed their
+# packets. Pods are on 10.42.0.0/16, which collides with nothing on the LAN, so
+# there is nothing to repair; what is left is the check, run from inside the
+# router's namespace, which is the vantage point that matters.
+[doc('Check the provider addresses are reachable from the router pod')]
+lanroutes:
     #!/usr/bin/env bash
     set -uo pipefail
-    hosts=$(awk '/^provider /{for(i=1;i<=NF;i++) if($i~/^host=/) print substr($i,6)}' {{config}} \
-            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u | tr '\n' ' ')
-    if [ -z "${hosts// /}" ]; then exit 0; fi
+    awk '/^provider /{h="";p=""; for(i=1;i<=NF;i++){ if($i~/^host=/) h=substr($i,6); if($i~/^port=/) p=substr($i,6) } if(h!="") print h, p}' {{config}} \
+        | sort -u | while read -r host port; do
+            if {{kubectl}} exec deploy/hypellm -c tailscale -- nc -z -w 3 "$host" "$port" >/dev/null 2>&1; then
+                echo "  reachable    $host:$port"
+            else
+                echo "  UNREACHABLE  $host:$port" >&2
+            fi
+        done
 
-    for ip in $hosts; do
-        # Can a container reach it? That is the question that matters; the
-        # host's own answer is different and is checked separately below.
-        if docker run --rm --network bridge busybox:1.37 \
-               nc -z -w 3 "$ip" 8000 >/dev/null 2>&1; then
-            continue
-        fi
-        if ! curl -sS -o /dev/null -m 4 "http://$ip:8000/health" >/dev/null 2>&1; then
-            echo "  $ip is unreachable from this host too — not a routing collision," >&2
-            echo "  so check the slave itself rather than Docker." >&2
-            continue
-        fi
-        # Reachable from the host, not from a container: something local is
-        # claiming the address. Name it, because the fix is to stop it doing so.
-        docker network ls -q | xargs -r docker network inspect 2>/dev/null | HYPELLM_IP="$ip" python3 -c "import ipaddress,json,os,sys; a=ipaddress.ip_address(os.environ['HYPELLM_IP']); [print('  %s is inside docker network %r (%s) — that is why a container cannot reach it' % (a, n['Name'], c['Subnet'])) for n in json.load(sys.stdin) for c in ((n.get('IPAM') or {}).get('Config') or []) if c.get('Subnet') and a in ipaddress.ip_network(c['Subnet'])]" 2>/dev/null || true
-        if docker run --rm --network host --cap-add NET_ADMIN busybox:1.37 \
-               ip route replace "$ip/32" via 192.168.65.1 dev eth0 >/dev/null 2>&1; then
-            echo "  added a /32 route for $ip via the Docker VM gateway"
-        else
-            echo "  could not add a route for $ip — containers will not reach it" >&2
-        fi
-    done
-
-# Bring the tailnet node up and wait until it is logged in, because the router
-# runs inside its network namespace and must not attach to one that is about to
-# disappear. containerboot exits when an interactive login is not completed
-# inside its own deadline; if the router had already attached, it would keep
-# running with a dead namespace, reachable by nothing and still reported `Up`.
-#
-# Without a key in run/secrets/tailscale.authkey the node prints a login URL
-# and waits, which is unhelpful if nobody is reading the log — so pull it out
-# and put it in front of the operator as soon as it appears.
-#
-# Recreated, not restarted, for the reason `up` recreates the router, and here
-# the cost of not doing so is the node's identity: a sidecar that outlived a
-# Docker Desktop or WSL restart comes back with run/tailscale mounted as an
-# empty directory, finds no state, and asks for a fresh login — as a new node,
-# while the real state sits untouched on the host. Recreating also gives it an
-# empty log, so the URL found below is this boot's rather than a stale one.
-# `up` recreates the router straight after, so the namespace it is about to
-# lose is replaced before anything could notice.
+# Wait until the tailnet node is logged in, surfacing the login URL when there
+# is no key. containerboot gives up on an interactive login after about a
+# minute and the container restarts with a fresh URL, so the URL shown is
+# always the newest one.
 _tailnet_up:
     #!/usr/bin/env bash
     set -euo pipefail
-    {{compose}} up -d --force-recreate tailscale >/dev/null
-    shown=0
+    shown=""
     for _ in $(seq 1 240); do
-        if {{compose}} exec -T tailscale tailscale status --peers=false >/dev/null 2>&1; then
-            [ "$shown" = 1 ] && printf '\033[1;32m  authenticated\033[0m\n'
+        if {{kubectl}} exec deploy/hypellm -c tailscale -- tailscale status --peers=false >/dev/null 2>&1; then
+            [ -n "$shown" ] && printf '\033[1;32m  authenticated\033[0m\n'
             exit 0
         fi
-        if [ -z "$({{compose}} ps -q tailscale 2>/dev/null)" ]; then
-            printf '\n\033[1;31m  The tailnet node exited before authenticating.\033[0m\n' >&2
-            printf '  %s\n' "It gives up on an interactive login after about a minute." >&2
-            printf '  %s\n' "Put a key in run/secrets/tailscale.authkey and run just up again," >&2
-            printf '  %s\n\n' "or re-run just up and open the URL promptly." >&2
-            {{compose}} logs --tail 15 tailscale >&2
-            exit 1
-        fi
-        if [ "$shown" = 0 ]; then
-            url=$({{compose}} logs tailscale 2>/dev/null \
-                  | grep -oE 'https://login\.tailscale\.com/a/[0-9a-f]+' | tail -1 || true)
-            if [ -n "${url:-}" ]; then
-                printf '\n\033[1;33m  This node is not on the tailnet yet.\033[0m\n'
-                printf '  Authenticate it now: \033[4m%s\033[0m\n' "$url"
-                printf '  \033[2m%s\033[0m\n' "the router starts once this completes — it runs inside this node's namespace"
-                printf '  \033[2m%s\033[0m\n' "you have about a minute before the node gives up; just up starts it again"
-                printf '  \033[2m%s\033[0m\n\n' "to skip this next time, put a key in run/secrets/tailscale.authkey"
-                shown=1
-            fi
+        url=$({{kubectl}} logs deploy/hypellm -c tailscale 2>/dev/null \
+              | grep -oE 'https://login\.tailscale\.com/a/[0-9a-f]+' | tail -1 || true)
+        if [ -n "${url:-}" ] && [ "$url" != "$shown" ]; then
+            printf '\n\033[1;33m  This node is not on the tailnet yet.\033[0m\n'
+            printf '  Authenticate it now: \033[4m%s\033[0m\n' "$url"
+            printf '  \033[2m%s\033[0m\n' "the pod is not ready until this completes; the URL changes about once a minute"
+            printf '  \033[2m%s\033[0m\n\n' "to skip this next time, put a key in run/secrets/tailscale.authkey"
+            shown=$url
         fi
         sleep 1
     done
     printf '\n\033[1;31m  %s\033[0m\n' "The tailnet node did not authenticate within four minutes." >&2
-    {{compose}} logs --tail 15 tailscale >&2
+    {{kubectl}} logs deploy/hypellm -c tailscale --tail 15 >&2 || true
     exit 1
 
 # Poll liveness until the router answers or the deadline passes. The image
@@ -855,13 +755,8 @@ _wait:
         if curl -fsS --max-time 1 "http://127.0.0.1:{{inference_port}}/health/live" >/dev/null 2>&1; then
             exit 0
         fi
-        if [ -z "$({{compose}} ps -q router 2>/dev/null)" ]; then
-            echo "the router container exited during startup:" >&2
-            {{compose}} logs --tail 40 router >&2
-            exit 1
-        fi
         sleep 0.5
     done
     echo "the router did not answer /health/live within 30s:" >&2
-    {{compose}} logs --tail 40 router >&2
+    {{kubectl}} logs deploy/hypellm -c router --tail 40 >&2 || true
     exit 1

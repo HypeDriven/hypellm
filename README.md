@@ -85,39 +85,39 @@ Inference requests require a router API key created through the management API. 
 
 ## Run it in a container
 
-A [`justfile`](justfile) and [`compose.yaml`](compose.yaml) build the router and start it locally. Requirements: Docker and [`just`](https://github.com/casey/just).
+A [`justfile`](justfile) and the manifests in [`k8s/`](k8s/) build the router and run it on the fleet's k3s cluster, namespace `hypellm`, kubectl context `fleet`. Requirements: Docker (to build the image), `kubectl`, [`just`](https://github.com/casey/just), and `kstack`, the cluster helper every fleet project's justfile calls (`~/system/k3s/bin/kstack` on the cluster host).
 
 ```bash
 just bootstrap  # first run: secrets, router, and a key to call it with
 just status     # is it running, and does it answer
 just logs       # follow the structured log
 just key        # mint another API key
-just down       # drain over the control socket, then remove the container
+just down       # delete the namespace; the router drains on SIGTERM
 ```
 
 `just bootstrap` is `just up` plus the two steps that otherwise happen by hand. It captures the break-glass token from `--generate-secrets` — printed once, stored nowhere — spends it minting the first API key, and prints the token at the end to be stored offline. Without a key the router answers `/health` and refuses everything else, and break-glass is the only credential that carries `manage_keys` where no identity provider is configured — the shipped `admin` password account can reach every other screen but not this one.
 
-`just up` prints the inference, management and metrics endpoints when the router answers `/health/live`. The image build runs `depscan` and the release build offline; the router container gets no capabilities, a read-only root filesystem, and the invoking user's uid. Configuration is [`docker/hypellm.conf`](docker/hypellm.conf); state and secrets are bind-mounted under `run/`.
+`just up` prints the inference, management and metrics endpoints when the router answers `/health/live`. The image build runs `depscan` and the release build offline; the router container gets no capabilities, `no_new_privs`, the runtime's seccomp filter, a read-only root filesystem, and uid 1000. Configuration is [`docker/hypellm.conf`](docker/hypellm.conf), delivered as a ConfigMap, so `just up` after an edit restarts the pod; state and secrets are hostPath mounts under `run/`.
 
 ### Reaching it over Tailscale
 
-The stack is two containers: a `tailscale/tailscale` node and the router running inside its network namespace. The router therefore *is* a tailnet node — `hypellm-router.<tailnet>.ts.net` — rather than a port published on the host, which also avoids Docker Desktop's inability to bind a host's Tailscale address.
+The pod has two containers: a `tailscale/tailscale` node and the router, sharing the pod's network namespace. The router therefore *is* a tailnet node — `hypellm-router.<tailnet>.ts.net` — rather than a port published on the host. The node's identity lives in `run/tailscale`, so it keeps its name and address across restarts.
 
 Which planes the tailnet can reach is decided by bind address, in `docker/hypellm.conf`:
 
 | Listener | Bound to | Tailnet | This host |
 |---|---|---|---|
 | Inference | `0.0.0.0:18000` | yes | yes |
-| Management + SPA | `10.89.7.2:18001` | via HTTPS proxy only | yes |
-| Metrics | `10.89.7.2:18002` | no | yes |
+| Management + SPA | pod IP `:18001` | via HTTPS proxy only | yes |
+| Metrics | pod IP `:18002` | no | yes |
 
-`10.89.7.2` is the compose bridge address, pinned in `compose.yaml`. A listener bound to it is reachable through the published loopback ports and is not bound on `tailscale0`, so a tailnet peer finds nothing listening. This fails closed and does not depend on a Tailscale ACL or a firewall rule elsewhere. Tailnet reachability is not authentication — inference still requires a router API key.
+The configuration names `10.89.7.2`, which the pod's `render-config` init container replaces with the pod's own address before the router starts. A listener bound to it is reachable through the published loopback ports (socat listeners on the node, `k8s/publish.yaml`) and is not bound on `tailscale0`, so a tailnet peer finds nothing listening. This fails closed and does not depend on a Tailscale ACL or a firewall rule elsewhere. Tailnet reachability is not authentication — inference still requires a router API key.
 
-The admin dashboard is the one deliberate exception: the sidecar serves it at **`https://hypellm-router.<tailnet>.ts.net/`** with `tailscale serve` (`docker/tailscale-serve.json`), terminating TLS with a certificate for the MagicDNS name and proxying to the bridge address. It has to be HTTPS — the session cookie is `__Host-`, so a browser drops it over plain http on any name but `localhost`. The proxy withholds `/metrics`. Signing in still needs a `local_user` password or break-glass, and the URL must be listed in `cors_origins` or every sign-in fails with `origin_not_permitted`. The tailnet needs MagicDNS and HTTPS certificates enabled.
+The admin dashboard is the one deliberate exception: the sidecar serves it at **`https://hypellm-router.<tailnet>.ts.net/`** with `tailscale serve` (`docker/tailscale-serve.json`), terminating TLS with a certificate for the MagicDNS name and proxying to the pod address. It has to be HTTPS — the session cookie is `__Host-`, so a browser drops it over plain http on any name but `localhost`. The proxy withholds `/metrics`. Signing in still needs a `local_user` password or break-glass, and the URL must be listed in `cors_origins` or every sign-in fails with `origin_not_permitted`. The tailnet needs MagicDNS and HTTPS certificates enabled.
 
-First run needs the node authenticated: put a key in `run/secrets/tailscale.authkey`, or let `just up` print the login URL — and open it within a minute, because the container gives up after that. `just tailnet` shows the node's address and its learned routes.
+First run needs the node authenticated: put a key in `run/secrets/tailscale.authkey`, or let `just up` print the login URL — and open it within a minute, because the container gives up after that and restarts with a new one. `just tailnet` shows the node's address and its learned routes.
 
-Restart the two containers together, with `just restart`, never the sidecar on its own. The router stays in the namespace it joined at start, so a sidecar restarted underneath it leaves both reporting `Up` while every port resets connections. `just status` detects this and says so.
+The network namespace belongs to the pod, not to either container, so a restart of the tailscale container no longer strands the router in a dead namespace.
 
 Slaves are reached by their **LAN address**, over a Tailscale subnet route advertised from their network — `--accept-routes` installs it and the RFC 1918 destination is preserved, so `egress=private_network` still describes the connection. Do not point a provider at a slave's `100.64.0.0/10` address: that classifies as `shared_address_space`, which `EgressProfile::permits` refuses under every profile, because carrier-grade NAT space is a well-known SSRF pivot.
 

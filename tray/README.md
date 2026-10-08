@@ -51,7 +51,7 @@ monitor says so in Options.
 Mint one on the router's Keys screen or with `just key monitor management:read`
 after adding `role_binding subject=principal:monitor role=operator` to the
 configuration, then in **Options** paste the management listener's address
-(`http://127.0.0.1:18001` for the shipped compose file, or the `https://`
+(`http://127.0.0.1:18001` for the shipped `k8s/` deployment, or the `https://`
 address of the TLS edge in front of it) and the key. The key is stored in
 Windows Credential Manager, never in the registry or a file, and is sent only
 as a bearer header to the address you typed: the monitor uses no proxy,
