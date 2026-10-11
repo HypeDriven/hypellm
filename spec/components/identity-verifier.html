@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: Identity verifier.">
+  <title>Identity verifier · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="../assets/wiki.css">
+  <script defer src="../assets/search-index.js"></script>
+  <script defer src="../assets/wiki.js"></script>
+</head>
+<body data-wiki-root="../" data-page-title="Identity verifier" data-page-group="Components">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="../index.html">Wiki home</a></li>
+<li><a href="../overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="../router-specification.html">Router specification</a></li>
+<li><a href="../threat-model.html">Threat model</a></li>
+<li><a href="../orchestration.html">Fleet orchestration</a></li>
+<li><a href="../deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="../using-the-router.html">Using the router</a></li>
+<li><a href="../deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="../runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="fleet-agent.html">Fleet agent</a></li>
+<li><a href="identity-verifier.html" aria-current="page">Identity verifier</a></li>
+<li><a href="container-init.html">Container init</a></li>
+<li><a href="tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="../modules/hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="../modules/hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="../modules/hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="../modules/hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="../modules/hypellm-config.html">hypellm-config</a></li>
+<li><a href="../modules/hypellm-core.html">hypellm-core</a></li>
+<li><a href="../modules/hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="../modules/hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="../modules/hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="../modules/hypellm-net.html">hypellm-net</a></li>
+<li><a href="../modules/hypellm-router.html">hypellm-router</a></li>
+<li><a href="../modules/hypellm-store.html">hypellm-store</a></li>
+<li><a href="../modules/hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="../modules/hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="../modules/wire-http1.html">wire-http1</a></li>
+<li><a href="../modules/wire-json.html">wire-json</a></li>
+<li><a href="../modules/wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="../index.html">Wiki</a><span aria-hidden="true">/</span>Components</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="the-hypellm-identity-verifier">The HypeLLM identity verifier</h1>
+<p>This directory holds the reference <strong>identity verifier</strong>: the process that
+checks OpenID Connect identity token signatures and redeems authorization
+codes.</p>
+<p>It is deliberately outside the Rust workspace. It is not a workspace member, not
+built by <code>cargo build --workspace</code>, and not scanned by <code>depscan</code> as router
+source — the same arrangement as <code>agent/</code>, for the same reason.</p>
+<h2 id="why-it-is-a-separate-process">Why it is a separate process</h2>
+<p>Specification 4 and 9.1 draw the line:</p>
+<blockquote>
+<p><strong>OIDC dependency boundary:</strong> JWT signature verification and HTTPS are
+cryptographic security functions. Strict profile delegates them to an approved
+local identity/TLS verifier service over a narrow authenticated local
+interface. … Never write novel signature or TLS code merely to satisfy &quot;no
+dependencies.&quot;</p>
+</blockquote>
+<p>The router therefore ships a <em>client</em> — <code>crates/hypellm-net/src/helper.rs</code> — and
+no verifier. Without one, <code>settings oidc_verifier_socket</code> points at nothing,
+<code>oidc_callback</code> answers <code>the identity verifier is not configured</code>, and Google
+sign-in cannot complete. This is that service.</p>
+<p><strong>This is an honest cost, not a free win.</strong> The verifier holds the OAuth client
+secret and decides which tokens are authentic. It is in the trusted computing
+base and should be reviewed as such.</p>
+<h2 id="what-it-does-and-what-it-deliberately-does-not">What it does, and what it deliberately does not</h2>
+<p>It performs <strong>no cryptography of its own</strong>:</p>
+<ul>
+<li>The RSA signature check is <code>openssl dgst -verify</code>, invoked with an argument
+vector. OpenSSL is the platform's audited implementation.</li>
+<li>HTTPS to the key set and the token endpoint is the standard library's <code>ssl</code>
+module against the system trust store, with verification asserted rather than
+assumed.</li>
+</ul>
+<p>What remains here is the JOSE envelope — splitting the token, pinning the
+algorithm, selecting the key by <code>kid</code>, and encoding a public key into a form
+OpenSSL will read. That is structure, not cryptography, but it is also where JWT
+verifiers historically fail, so each decision is stated in the file and each has
+a case in <code>--selftest</code>.</p>
+<p>It also <strong>does not validate claims</strong>. <code>iss</code>, <code>aud</code>, <code>azp</code>, <code>exp</code>, <code>iat</code>,
+<code>nonce</code>, <code>email_verified</code> and <code>hd</code> are checked by
+<code>hypellm_auth::oidc::validate_claims</code>, in exactly one place, so a check cannot
+be skipped on one of two paths. An expired token verifies here and is refused by
+the router — <code>--selftest</code> asserts exactly that, because a verifier that helpfully
+checked <code>exp</code> too would create the second path this design exists to avoid.</p>
+<h2 id="what-the-router-may-tell-it">What the router may tell it</h2>
+<p>Two verbs, framed as <code>VERB &lt;length&gt;\n&lt;payload&gt;</code>:</p>
+<pre><code class="language-text">→ VERIFY &lt;length&gt;\n&lt;id token&gt;
+← OK &lt;length&gt;\n&lt;claims JSON&gt;
+← ERR &lt;code&gt;\n
+
+→ EXCHANGE &lt;length&gt;\n{&quot;code&quot;:…,&quot;code_verifier&quot;:…,&quot;redirect_uri&quot;:…,&quot;client_id&quot;:…,&quot;token_endpoint&quot;:…}
+← OK &lt;length&gt;\n&lt;claims JSON&gt;
+← ERR &lt;code&gt;\n
+</code></pre>
+<p><code>EXCHANGE</code> carries a <code>token_endpoint</code>, a <code>client_id</code> and a <code>redirect_uri</code>, and
+<strong>none of them is used as given</strong>. Each is compared against this verifier's own
+configuration and a mismatch is refused with <code>endpoint_mismatch</code>. A fully
+compromised router can ask this process to redeem a code against the endpoint it
+was configured with, and nowhere else — it cannot make it spend the client secret
+at an attacker's host. Same rule as the fleet agent's, same reason.</p>
+<h2 id="obligations">Obligations</h2>
+<p>These are normative. A verifier that does not keep them is not this verifier.</p>
+<ul>
+<li><strong>Runs as its own unprivileged user</strong>, separate from the router. The process
+refuses to start as root.</li>
+<li><strong>Holds the OAuth client secret; the router never sees one.</strong> It is read from
+a file, never from a command-line argument, and never logged.</li>
+<li><strong>Pins the algorithm before selecting a key.</strong> <code>none</code> and every MAC algorithm
+are refused, so a caller cannot present a token signed with the public key the
+verifier is about to look up.</li>
+<li><strong>Never treats a router-supplied value as a destination.</strong></li>
+<li><strong>Caches issuer keys for a bounded lifetime, and rate-limits the refetch an
+unknown <code>kid</code> triggers.</strong> Otherwise an unauthenticated caller decides how often
+this process talks to the issuer.</li>
+<li><strong>Bounds everything</strong>: token size, key-set size, response size, and every
+timeout.</li>
+<li><strong>Logs no token, no claim, no email address, and no secret.</strong></li>
+</ul>
+<h2 id="setting-it-up">Setting it up</h2>
+<h3 id="1-an-oauth-client">1. An OAuth client</h3>
+<p>In the Google Cloud console, create an <strong>OAuth 2.0 Client ID</strong> of type <em>Web
+application</em>. Add the router's callback as an authorized redirect URI:</p>
+<pre><code class="language-text">https://admin.example/admin/v1/auth/google/callback
+</code></pre>
+<p>It must match <code>oidc_redirect_uri</code> in the router's configuration and
+<code>redirect_uri</code> here, byte for byte. Google compares it exactly.</p>
+<h3 id="2-configure-the-verifier">2. Configure the verifier</h3>
+<pre><code class="language-bash">cp verifier/verifier.example.json /etc/hypellm/verifier/verifier.json
+$EDITOR /etc/hypellm/verifier/verifier.json
+printf '%s' 'the-client-secret' &gt; /etc/hypellm/verifier/client_secret
+chmod 600 /etc/hypellm/verifier/client_secret
+verifier/hypellm-verifier --config /etc/hypellm/verifier/verifier.json --check
+</code></pre>
+<p>An unknown field is an error rather than a warning, for the reason the router's
+own grammar takes that position (specification 11.1): a misspelled
+<code>client_secret_file</code> would otherwise deploy a verifier with no secret.</p>
+<p>In the <code>k8s/</code> deployment the paths are <code>run/verifier/</code> on the host, and <code>just oidc</code> does the last three lines for you — it writes <code>client_secret</code> from
+<code>HYPELLM_OIDC_CLIENT_SECRET</code> in a git-ignored <code>.env</code> (see <code>.env.example</code>), runs
+<code>--check</code>, and applies <code>k8s/oidc/</code>, which runs the verifier as its own pod:</p>
+<pre><code class="language-bash">cp .env.example .env                 # then put the client secret in it
+cp verifier/verifier.example.json run/verifier/verifier.json
+$EDITOR run/verifier/verifier.json   # client_id and redirect_uri
+just oidc
+</code></pre>
+<p><code>.env</code> is read by <code>just</code> on the host and is never loaded into a container
+environment — <code>kubectl get pod -o yaml</code> (or <code>docker inspect</code>) prints a container's
+environment to anyone who can read it, whereas the 0600 file is readable by the
+verifier's user alone.
+<code>verifier.json</code> is still edited by hand: <code>client_id</code> and <code>redirect_uri</code> have to
+agree with the router's configuration and the Google console byte for byte, and
+generating them here would add a third place for them to disagree.</p>
+<h3 id="3-run-it">3. Run it</h3>
+<pre><code class="language-bash">verifier/hypellm-verifier \
+    --config /etc/hypellm/verifier/verifier.json \
+    --socket /run/hypellm/verify.sock
+</code></pre>
+<p>The socket is created <code>0660</code>. The router's user needs a group in common with the
+verifier's, and the containing directory's permissions are the real access
+control — anything that can open this socket can ask it to verify tokens. The
+router does not set either; that is the deployment's job.</p>
+<h3 id="4-point-the-router-at-it">4. Point the router at it</h3>
+<pre><code class="language-text">settings oidc_issuer=https://accounts.google.com \
+         oidc_client_id=REPLACE.apps.googleusercontent.com \
+         oidc_authorization_endpoint=https://accounts.google.com/o/oauth2/v2/auth \
+         oidc_token_endpoint=https://oauth2.googleapis.com/token \
+         oidc_redirect_uri=https://admin.example/admin/v1/auth/google/callback \
+         oidc_verifier_socket=/run/hypellm/verify.sock \
+         oidc_hosted_domains=example.com
+</code></pre>
+<p><code>GET /admin/v1/settings</code> then reports <code>oidc.configured</code> and
+<code>oidc.verifier_configured</code>, and the admin application's Settings screen shows
+both. Both must be true before a sign-in can complete.</p>
+<h2 id="checking-it-works">Checking it works</h2>
+<pre><code class="language-bash">just verifier-acceptance     # both layers
+</code></pre>
+<p><strong><code>--selftest</code></strong> — thirty cases, most over the JOSE logic in-process:
+algorithm confusion in its three usual shapes, key selection, tampering after
+signing, token shape, bounds, the <code>EXCHANGE</code> pinning rules, and the cap on
+concurrent connections (at most <code>MAX_CONCURRENT_CONNECTIONS</code> handler threads;
+a connection past it is answered <code>ERR busy</code> and closed). It needs
+<code>openssl</code> and <strong>no network</strong>, and the last case asserts that — because the
+first draft of this file refetched the key set on every unknown <code>kid</code> and so
+silently reached Google's live endpoint.</p>
+<p><strong><code>verifier/acceptance</code></strong> — the wire. It stands this process up behind a local
+TLS key-set server whose certificate it is told to trust, then drives it twice:
+once over a re-derived copy of the router's framing (a deliberate second
+implementation, so it disagrees if the framing is wrong), and once through the
+router's own <code>VerifierClient</code>. That second layer lives in
+<code>crates/hypellm-net/tests/verifier_acceptance.rs</code> and is <code>#[ignore]</code>d, because
+starting a process is exactly what specification 4.1 forbids the router from
+doing — the harness starts it and the tests only connect. <code>cargo test --workspace</code> therefore stays hermetic and needs neither Python nor a socket.</p>
+<p>Add <code>--no-cargo</code> to run the wire layer alone on a machine without Rust.</p>
+<p>The router's side of the boundary is covered separately by
+<code>crates/hypellm-net/tests/fuzz.rs</code>, which asserts that no reply from a process
+like this one — buggy, replaced, or mid-upgrade — can make the router invent an
+identity.</p>
+<h2 id="enrolling-the-first-administrator">Enrolling the first administrator</h2>
+<p>A router with OIDC configured and no <code>identity</code> records has nobody who can sign
+in. That fails closed correctly and is discovered at the worst moment, so do it
+deliberately:</p>
+<ol>
+<li>
+<p><strong>Sign in once and be refused.</strong> The refusal names the <code>(iss, sub)</code> pair your
+account presented:</p>
+<pre><code class="language-json">{&quot;error&quot;:{&quot;code&quot;:&quot;forbidden&quot;,&quot;message&quot;:&quot;this identity is not bound to a principal in this deployment&quot;,
+  &quot;details&quot;:[{&quot;code&quot;:&quot;unknown_identity&quot;,&quot;location&quot;:&quot;identity&quot;,
+    &quot;message&quot;:&quot;no identity record matches issuer=https://accounts.google.com subject=104729183746152938471&quot;}]}}
+</code></pre>
+<p>The subject is the stable identity, not the email address: specification 9.1
+makes <code>(iss, sub)</code> the key because an email can be reassigned to a different
+person.</p>
+</li>
+<li>
+<p><strong>Open a break-glass session</strong> — the sign-in screen's <em>Use break-glass
+access</em>, or <code>POST /admin/v1/auth/break-glass</code>.</p>
+</li>
+<li>
+<p><strong>Draft the records and publish them</strong>, on the Routing policies screen or
+through <code>POST /admin/v1/policies</code>:</p>
+<pre><code class="language-text">identity issuer=https://accounts.google.com subject=104729183746152938471 \
+         principal=user:alice tenant=acme description=&quot;first administrator&quot;
+role_binding subject=principal:user:alice role=operator
+</code></pre>
+<p>Pick the narrowest role that does the job. <code>break_glass_admin</code> carries every
+permission the model defines and is not a general-purpose administrator role.</p>
+</li>
+<li>
+<p><strong>Sign out of break-glass and sign in with Google.</strong> The closing audit record
+is what gives a review the window rather than only its start.</p>
+</li>
+</ol>
+<h2 id="when-it-stops-working">When it stops working</h2>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Cause</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>the identity verifier is not configured</code></td>
+<td><code>oidc_verifier_socket</code> is unset in the router's configuration.</td>
+</tr>
+<tr>
+<td>Sign-in fails, verifier logs nothing</td>
+<td>The router cannot open the socket. Check the group and the directory's permissions.</td>
+</tr>
+<tr>
+<td><code>ERR unknown_kid</code> for every token</td>
+<td>The key set fetch is failing, or <code>jwks_uri</code> is wrong. Run with <code>--log debug</code>.</td>
+</tr>
+<tr>
+<td><code>ERR endpoint_mismatch</code></td>
+<td>The router's <code>oidc_token_endpoint</code>, <code>oidc_client_id</code> or <code>oidc_redirect_uri</code> disagrees with this verifier's configuration. They are compared exactly.</td>
+</tr>
+<tr>
+<td><code>ERR exchange_refused</code></td>
+<td>Google refused the code — usually a redirect URI that does not match the OAuth client, or a reused code.</td>
+</tr>
+<tr>
+<td><code>this identity is not bound to a principal</code></td>
+<td>Sign-in worked. There is no <code>identity</code> record. See above.</td>
+</tr>
+</tbody>
+</table></div>
+<p>An identity outage does not lock you out: break-glass is preprovisioned exactly
+for this, and <code>spec/runbooks.html</code> §22.4 is the procedure.</p>
+
+      </article>
+      <footer class="page-footer"><a href="../index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#why-it-is-a-separate-process">Why it is a separate process</a></li>
+<li class="toc-level-2"><a href="#what-it-does-and-what-it-deliberately-does-not">What it does, and what it deliberately does not</a></li>
+<li class="toc-level-2"><a href="#what-the-router-may-tell-it">What the router may tell it</a></li>
+<li class="toc-level-2"><a href="#obligations">Obligations</a></li>
+<li class="toc-level-2"><a href="#setting-it-up">Setting it up</a></li>
+<li class="toc-level-3"><a href="#1-an-oauth-client">1. An OAuth client</a></li>
+<li class="toc-level-3"><a href="#2-configure-the-verifier">2. Configure the verifier</a></li>
+<li class="toc-level-3"><a href="#3-run-it">3. Run it</a></li>
+<li class="toc-level-3"><a href="#4-point-the-router-at-it">4. Point the router at it</a></li>
+<li class="toc-level-2"><a href="#checking-it-works">Checking it works</a></li>
+<li class="toc-level-2"><a href="#enrolling-the-first-administrator">Enrolling the first administrator</a></li>
+<li class="toc-level-2"><a href="#when-it-stops-working">When it stops working</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

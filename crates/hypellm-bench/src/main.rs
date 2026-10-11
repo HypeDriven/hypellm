@@ -1,7 +1,7 @@
 //! `hypellm-bench`: run the router benchmark scenarios and print a report.
 //!
 //! Specification 21 (`Performance`) and 2.3 (`Release acceptance`). See
-//! `MODULE.md` for what the numbers do and do not mean.
+//! `spec/modules/hypellm-bench.html` for what the numbers do and do not mean.
 //!
 //! ```text
 //! cargo run --release -p hypellm-bench --offline

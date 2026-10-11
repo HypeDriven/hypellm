@@ -899,6 +899,36 @@ tenant id=other
         assert!(codes(&load_err("tenant id=acme max_cost=42")).contains(&"invalid_cost_class"));
     }
 
+    #[test]
+    fn tenant_payment_instructions_are_validated_at_load() {
+        // Specification 12.2: "a bounded plain-text message and an absolute
+        // HTTPS payment_url". The value is repeated to callers in an error
+        // body, so a bad one is a configuration error rather than something a
+        // client discovers.
+        let c = load_ok(
+            "tenant id=acme payment_message=\"Top up in the portal.\" \
+             payment_url=\"https://billing.example/tokens\"\ntenant id=other\n",
+        );
+        let acme = c.tenants.get(&TenantId::new("acme").unwrap()).expect("acme");
+        let payment = acme.payment.as_ref().expect("payment instructions");
+        assert_eq!(payment.message(), Some("Top up in the portal."));
+        assert_eq!(payment.payment_url(), Some("https://billing.example/tokens"));
+        let other = c.tenants.get(&TenantId::new("other").unwrap()).expect("other");
+        assert_eq!(other.payment, None);
+
+        for bad in [
+            "tenant id=acme payment_url=\"http://billing.example/tokens\"",
+            "tenant id=acme payment_url=\"https://user:pw@billing.example/\"",
+            "tenant id=acme payment_url=/tokens",
+            "tenant id=acme payment_message=\"line one\\nline two\"",
+        ] {
+            assert!(
+                codes(&load_err(bad)).contains(&"invalid_payment_instructions"),
+                "accepted: {bad}"
+            );
+        }
+    }
+
     // -- Identity binding ----------------------------------------------------
 
     #[test]

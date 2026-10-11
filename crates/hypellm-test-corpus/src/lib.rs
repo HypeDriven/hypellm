@@ -38,7 +38,7 @@
 //!
 //! # Honest gaps
 //!
-//! These are stated here as well as in `MODULE.md` because a reader who trusts
+//! These are stated here as well as in `spec/modules/hypellm-test-corpus.html` because a reader who trusts
 //! this corpus needs them before they trust a passing suite:
 //!
 //! - **Nothing was recorded from a live provider.** Every golden fixture is
@@ -51,7 +51,7 @@
 //!   measurements of any named tool.
 //! - **No fuzz target exists anywhere in the repository.** This crate is their
 //!   declared corpus home; the seven targets specification 21 requires are
-//!   listed in `MODULE.md` and none is implemented.
+//!   listed in `spec/modules/hypellm-test-corpus.html` and none is implemented.
 //! - **The parser crates still carry their own inline copies** of most of these
 //!   vectors. They are deliberately left in place — deleting working coverage
 //!   in exchange for a refactor is not an improvement — so migrating those

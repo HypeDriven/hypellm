@@ -502,7 +502,7 @@ export async function mount(container, ctx) {
 
     return panel({
       title: 'Anonymous access',
-      note: 'Whether a request that presents no API key is served. A deviation from specification 9.2, recorded in docs/deferred-issues.md.',
+      note: 'Whether a request that presents no API key is served. A deviation from specification 9.2, recorded in spec/deferred-issues.html.',
       content: [
         enabled
           ? banner(

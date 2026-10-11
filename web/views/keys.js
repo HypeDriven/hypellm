@@ -244,12 +244,40 @@ export async function mount(container, ctx) {
     replace(tableRegion, [
       table({
         caption: `API keys — ${caption}`,
-        columns: columns(askRevoke),
+        columns: columns(askRevoke, ctx.can('manage_key_budgets') ? askBudget : null),
         rows,
         empty: emptyMessage(state),
       }),
       morePager(state.envelope, loadMore),
     ]);
+  }
+
+  /**
+   * Open the budget editor for a key.
+   *
+   * @param {object} row
+   * @param {HTMLElement} trigger The button that opened the editor.
+   */
+  function askBudget(row, trigger) {
+    const close = () => {
+      replace(confirmRegion, []);
+      if (trigger.isConnected) {
+        trigger.focus();
+      }
+    };
+    replace(
+      confirmRegion,
+      budgetEditor(ctx, row, {
+        onClose: close,
+        onChanged: async () => {
+          if (state.disposed) {
+            return;
+          }
+          replace(confirmRegion, []);
+          await refresh();
+        },
+      }),
+    );
   }
 
   /**
@@ -345,12 +373,254 @@ function adopt(state, envelope, fresh) {
 // ------------------------------------------------------------------- table -
 
 /**
+ * A token count for display. Counts are integers; grouping makes a million
+ * distinguishable from ten million at a glance.
+ *
+ * @param {unknown} value
+ * @returns {string}
+ */
+function tokens(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value.toLocaleString('en-US') : '—';
+}
+
+/**
+ * A key's token budget, as the router reports it.
+ *
+ * @param {object|undefined} budget
+ * @returns {HTMLElement|string}
+ */
+function budgetCell(budget) {
+  if (!budget || typeof budget !== 'object') {
+    return '—';
+  }
+  const used = `${tokens(budget.consumed_tokens)} used`;
+  if (budget.token_limit === null || budget.token_limit === undefined) {
+    return el('span', {}, [pill('Unlimited'), ` ${used}`]);
+  }
+  const remaining = budget.remaining_tokens;
+  return el('span', {}, [
+    pill(`${tokens(remaining)} left`, remaining === 0 ? 'danger' : 'neutral'),
+    ` of ${tokens(budget.token_limit)}, ${used}`,
+  ]);
+}
+
+/**
+ * The budget editor: the absolute limit and payment instructions, and — for a
+ * finite budget — a one-off credit.
+ *
+ * Both actions carry the budget's ETag, so an edit made against a limit that
+ * somebody else has since changed is refused rather than applied on top of it.
+ * Consumption does not move that tag, so a key in use can still be edited.
+ *
+ * @param {object} ctx
+ * @param {object} row
+ * @param {{onClose: () => void, onChanged: () => Promise<void>}} handlers
+ * @returns {HTMLElement}
+ */
+function budgetEditor(ctx, row, { onClose, onChanged }) {
+  const budget = row.budget && typeof row.budget === 'object' ? row.budget : {};
+  const finite = typeof budget.token_limit === 'number';
+  const path = `/keys/${encodeURIComponent(row.id)}/budget`;
+  const override = budget.payment_override ? budget.payment_required || {} : {};
+
+  const limit = el('input', {
+    type: 'text',
+    inputmode: 'numeric',
+    autocomplete: 'off',
+    value: finite ? String(budget.token_limit) : '',
+  });
+  const message = el('input', {
+    type: 'text',
+    autocomplete: 'off',
+    maxlength: '512',
+    value: typeof override.message === 'string' ? override.message : '',
+  });
+  const url = el('input', {
+    type: 'url',
+    autocomplete: 'off',
+    maxlength: '512',
+    value: typeof override.payment_url === 'string' ? override.payment_url : '',
+  });
+  const amount = el('input', { type: 'text', inputmode: 'numeric', autocomplete: 'off' });
+  const reference = el('input', {
+    type: 'text',
+    autocomplete: 'off',
+    spellcheck: 'false',
+    maxlength: '128',
+    // A fresh reference per editor, so pressing Credit twice — or retrying
+    // after a timeout — is one credit. An operator recording a real payment
+    // replaces it with that payment's own identifier.
+    value: `console-${crypto.randomUUID()}`,
+  });
+  const reason = el('input', { type: 'text', autocomplete: 'off', maxlength: '256' });
+  const status = el('p', { class: 'field__hint', role: 'status', 'aria-live': 'polite' });
+
+  /** @param {string} raw @returns {number|null} A whole token count, or null. */
+  const whole = (raw) => (/^\d{1,15}$/.test(raw) ? Number(raw) : null);
+
+  /** @param {unknown} error @param {string} what */
+  const explain = (error, what) => {
+    if (error instanceof ApiError && error.status === 412) {
+      status.textContent = `The budget changed while this editor was open, so ${what} was not applied. Close it and reopen from the refreshed list.`;
+      return;
+    }
+    if (error instanceof ApiError && (error.status === 400 || error.status === 409)) {
+      status.textContent = `${error.message} Nothing was changed.`;
+      return;
+    }
+    throw error;
+  };
+
+  const save = actionButton(
+    'Save budget',
+    async () => {
+      const raw = limit.value.trim();
+      const parsed = raw === '' ? null : whole(raw);
+      if (raw !== '' && parsed === null) {
+        status.textContent = 'The limit is a whole number of tokens, or empty for no limit.';
+        limit.focus();
+        return;
+      }
+      const body = { token_limit: parsed, payment_required: null };
+      const messageValue = message.value.trim();
+      const urlValue = url.value.trim();
+      if (messageValue !== '' || urlValue !== '') {
+        body.payment_required = {};
+        if (messageValue !== '') {
+          body.payment_required.message = messageValue;
+        }
+        if (urlValue !== '') {
+          body.payment_required.payment_url = urlValue;
+        }
+      }
+      try {
+        await ctx.api.put(path, body, budget.etag);
+      } catch (error) {
+        explain(error, 'the new limit');
+        return;
+      }
+      ctx.notify('ok', `Budget for key ${row.id} saved.`);
+      await onChanged();
+    },
+    { busyLabel: 'Saving…' },
+  );
+
+  const credit = actionButton(
+    'Credit tokens',
+    async () => {
+      const parsed = whole(amount.value.trim());
+      if (parsed === null || parsed === 0) {
+        status.textContent = 'A credit is a positive whole number of tokens.';
+        amount.focus();
+        return;
+      }
+      const referenceValue = reference.value.trim();
+      if (!/^[\x21-\x7e]{1,128}$/.test(referenceValue)) {
+        status.textContent =
+          'The reference is 1 to 128 printable characters with no spaces: the payment or ticket this credit records.';
+        reference.focus();
+        return;
+      }
+      const body = { tokens: parsed };
+      if (reason.value.trim() !== '') {
+        body.reason = reason.value.trim();
+      }
+      let outcome;
+      try {
+        outcome = await ctx.api.postOnce(`${path}:credit`, body, budget.etag, referenceValue);
+      } catch (error) {
+        explain(error, 'the credit');
+        return;
+      }
+      ctx.notify(
+        'ok',
+        outcome.data && outcome.data.replayed
+          ? `That reference was already credited to key ${row.id}; nothing was added.`
+          : `${tokens(parsed)} tokens credited to key ${row.id}.`,
+      );
+      await onChanged();
+    },
+    { busyLabel: 'Crediting…' },
+  );
+
+  const inherited =
+    !budget.payment_override && budget.payment_required
+      ? ' The tenant default currently applies.'
+      : '';
+
+  return panel({
+    title: `Token budget — key ${row.id}`,
+    note: 'A budget is a cumulative allowance that does not refill. When a request cannot be funded the key gets HTTP 402 and the provider is not called.',
+    actions: [actionButton('Close', onClose, { tone: 'quiet' })],
+    content: [
+      definitionList([
+        ['Limit', finite ? tokens(budget.token_limit) : 'Unlimited'],
+        ['Consumed', tokens(budget.consumed_tokens)],
+        ['Held by requests in flight', tokens(budget.reserved_tokens)],
+        ['Remaining', finite ? tokens(budget.remaining_tokens) : 'Unlimited'],
+      ]),
+      field({
+        id: 'budget-limit',
+        label: 'Token limit',
+        hint: 'The total the key may ever consume, input plus output. Empty means no limit; zero permits nothing. Changing it never resets what has been consumed.',
+        control: limit,
+      }),
+      field({
+        id: 'budget-message',
+        label: 'Payment message (optional)',
+        hint: `Plain text returned with the 402. Leave both payment fields empty to inherit the tenant default.${inherited}`,
+        control: message,
+      }),
+      field({
+        id: 'budget-url',
+        label: 'Payment URL (optional)',
+        hint: 'An absolute HTTPS address. The router returns it as data and never calls or redirects to it.',
+        control: url,
+      }),
+      buttonRow([save]),
+      ...(finite
+        ? [
+            field({
+              id: 'budget-credit',
+              label: 'Credit tokens',
+              hint: 'Added to the limit once. Use the limit above to set an absolute allowance instead.',
+              control: amount,
+            }),
+            field({
+              id: 'budget-reference',
+              label: 'Reference',
+              hint: 'Identifies this credit. Submitting the same reference again adds nothing, so a retry is safe.',
+              control: reference,
+            }),
+            field({
+              id: 'budget-reason',
+              label: 'Reason (optional)',
+              hint: 'Recorded in the audit log with the credit.',
+              control: reason,
+            }),
+            buttonRow([credit]),
+          ]
+        : [
+            el('p', {
+              class: 'field__hint',
+              text: 'An unlimited budget cannot be credited. Set a limit first.',
+            }),
+          ]),
+      status,
+    ],
+  });
+}
+
+/**
  * The columns of the key table.
  *
  * @param {(row: object, trigger: HTMLElement) => void} onRevoke
+ * @param {((row: object, trigger: HTMLElement) => void)|null} onBudget Null
+ *   when the session may not manage budgets, in which case the column still
+ *   shows them and offers no editor.
  * @returns {object[]}
  */
-function columns(onRevoke) {
+function columns(onRevoke, onBudget) {
   return [
     {
       label: 'Key id',
@@ -376,6 +646,7 @@ function columns(onRevoke) {
       },
     },
     { label: 'Status', cell: (row) => statusPill(row) },
+    { label: 'Token budget', cell: (row) => budgetCell(row.budget) },
     { label: 'Created', cell: (row) => formatTime(row.created_at) },
     {
       label: 'Expires',
@@ -397,7 +668,17 @@ function columns(onRevoke) {
           },
           { tone: 'danger', title: `Revoke key ${row.id}` },
         );
-        return button;
+        if (!onBudget) {
+          return button;
+        }
+        const budget = actionButton(
+          'Budget',
+          () => {
+            onBudget(row, budget);
+          },
+          { tone: 'quiet', title: `Edit the token budget of key ${row.id}` },
+        );
+        return buttonRow([budget, button]);
       },
     },
   ];

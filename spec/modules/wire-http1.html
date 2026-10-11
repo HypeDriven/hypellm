@@ -1,0 +1,480 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: wire-http1.">
+  <title>wire-http1 · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="../assets/wiki.css">
+  <script defer src="../assets/search-index.js"></script>
+  <script defer src="../assets/wiki.js"></script>
+</head>
+<body data-wiki-root="../" data-page-title="wire-http1" data-page-group="Module contracts">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="../index.html">Wiki home</a></li>
+<li><a href="../overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="../router-specification.html">Router specification</a></li>
+<li><a href="../threat-model.html">Threat model</a></li>
+<li><a href="../orchestration.html">Fleet orchestration</a></li>
+<li><a href="../deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="../using-the-router.html">Using the router</a></li>
+<li><a href="../deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="../runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="../components/fleet-agent.html">Fleet agent</a></li>
+<li><a href="../components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="../components/container-init.html">Container init</a></li>
+<li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="hypellm-config.html">hypellm-config</a></li>
+<li><a href="hypellm-core.html">hypellm-core</a></li>
+<li><a href="hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="hypellm-net.html">hypellm-net</a></li>
+<li><a href="hypellm-router.html">hypellm-router</a></li>
+<li><a href="hypellm-store.html">hypellm-store</a></li>
+<li><a href="hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="wire-http1.html" aria-current="page">wire-http1</a></li>
+<li><a href="wire-json.html">wire-json</a></li>
+<li><a href="wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="../index.html">Wiki</a><span aria-hidden="true">/</span>Module contracts</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="module-wire-http1">Module: wire-http1</h1>
+<p>Specification 4.1 requires every in-repository module to declare an owner, threat
+notes, public API, unsafe-code declaration, fuzz targets, and maximum
+input/resource limits.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Owner</td>
+<td>Security (primary), Platform (secondary)</td>
+</tr>
+<tr>
+<td>Unsafe code</td>
+<td>None. <code>#![forbid(unsafe_code)]</code> declared in <code>lib.rs</code> and inherited from the workspace lint table.</td>
+</tr>
+<tr>
+<td>External dependencies</td>
+<td>None. Rust standard library only; no path dependencies on other workspace crates.</td>
+</tr>
+<tr>
+<td>Fuzz targets</td>
+<td><code>tests/fuzz.rs</code> — 7 targets over the head parser and framing, driven by <code>hypellm-test-corpus::fuzz</code>. See <a href="#fuzz-targets">Fuzz targets</a>.</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="scope-and-the-no-normalization-rule">Scope and the &quot;no normalization&quot; rule</h2>
+<p>Specification 18.1 assigns this crate &quot;strict bounded HTTP/1.1 server/client
+state machines where platform edge does not supply normalized transport&quot;, and
+specification 25 fixes the version envelope: &quot;HTTP/1.1 inside normalized
+boundary for v1; edge provides HTTP/2/3.&quot;</p>
+<p>What this module implements is the byte-level framing layer in both directions:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>Reference</th>
+<th>Why the router needs it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Request head parsing</td>
+<td>RFC 9112 §2–§6</td>
+<td>The router's outermost trust boundary; produces <code>RequestHead</code></td>
+</tr>
+<tr>
+<td>Response head parsing</td>
+<td>RFC 9112 §4</td>
+<td>A provider is untrusted (spec 8.2 <code>upstream_invalid_response</code>)</td>
+</tr>
+<tr>
+<td>Body framing</td>
+<td>RFC 9112 §6</td>
+<td>Fixed-length, <code>chunked</code>, and close-delimited decoding for streams</td>
+</tr>
+<tr>
+<td>Request encoding</td>
+<td>spec 7</td>
+<td>Adapter-side serialization to a configured authority</td>
+</tr>
+<tr>
+<td>Response encoding</td>
+<td>spec 8.2</td>
+<td>Status line, headers, and framing the router itself chose</td>
+</tr>
+<tr>
+<td>Error → status mapping</td>
+<td>spec 8.2</td>
+<td>Stable codes with no echo of the offending bytes</td>
+</tr>
+</tbody>
+</table></div>
+<p>The distinguishing design choice is that the parser <strong>refuses ambiguity rather
+than resolving it</strong>. Specification 10.1 requires a &quot;single strict parser [that
+rejects] TE/CL ambiguity and invalid duplicate headers&quot;, and every smuggling
+technique is a <em>disagreement</em> between two parsers about where a message ends.
+Anything a conforming implementation could read two ways is an error, not a
+normalization.</p>
+<p>What this module deliberately does <strong>not</strong> do:</p>
+<ul>
+<li><strong>No I/O, no sockets, no timeouts, no connection lifetime.</strong> Every entry point
+is a pure function or a state machine over a caller-supplied buffer that
+returns <code>ParseStatus::Incomplete</code> instead of blocking. Deadlines, cancellation,
+backpressure, and the specification 3.2 per-stream 256 KiB buffered-data
+watermark belong to <code>hypellm-net</code> and are <strong>not enforced here</strong>.</li>
+<li><strong>No URI normalization or percent-decoding.</strong> <code>RequestHead::target</code> is kept
+exactly as received. <code>/v1/..%2f..%2fadmin/v1/keys</code> stays encoded, because
+decoding before the router compares a path is how a traversal becomes a route
+match. Splitting on the first <code>?</code> into <code>path</code> and <code>query</code> is the only
+transformation applied.</li>
+<li><strong>No routing, policy, or authorization decisions.</strong> Unrecognized methods are
+carried as <code>Method::Other</code> for the listener to answer 405; the parser bounds
+and validates, it does not decide.</li>
+<li><strong>No content coding.</strong> A <code>Transfer-Encoding</code> list such as <code>gzip, chunked</code> is
+rejected outright rather than decompressed, because decompressing
+attacker-controlled bytes before authentication is unbounded work by
+definition. <code>Content-Encoding</code> is carried through untouched.</li>
+<li><strong>No proxy behaviour.</strong> Absolute-form, authority-form, and <code>//</code>-prefixed
+targets are rejected (<code>NonOriginFormTarget</code>). Specification 2.2 makes general
+reverse proxying a non-goal and specification 10 forbids any client-controlled
+value selecting a destination; accepting a proxy-form target is the first half
+of exactly that.</li>
+<li><strong>No HTTP/2, HTTP/3, HTTP/0.9, or upgrade handling.</strong> <code>Version::parse</code> accepts
+the two exact byte strings <code>HTTP/1.1</code> and <code>HTTP/1.0</code> and nothing else.</li>
+</ul>
+<h2 id="threat-notes">Threat notes</h2>
+<ul>
+<li><strong>Request smuggling is the primary threat, and the control is refusal.</strong>
+<code>Content-Length</code> with <code>Transfer-Encoding</code> (<code>ConflictingFraming</code>), any repeat of
+a <code>header::SINGLE_VALUED</code> field (<code>DuplicateHeader</code>), whitespace before a colon
+(<code>WhitespaceBeforeColon</code>), obsolete line folding (<code>ObsoleteLineFolding</code>), bare
+CR or bare LF anywhere in a head (<code>MalformedRequestLine</code> /
+<code>MalformedStatusLine</code>), a <code>Transfer-Encoding</code> that is not exactly <code>chunked</code>,
+and a non-decimal <code>Content-Length</code> are all hard errors. The published
+techniques are held as a corpus in <code>lib.rs::smuggling_tests</code>.</li>
+<li><strong>A rejection must close the connection.</strong> Once framing is in doubt, the bytes
+still buffered on that connection cannot be attributed to any request, and
+reusing it is how a smuggled prefix becomes the next caller's request line.
+<code>HttpErrorKind::must_close()</code> returns true for every kind except
+<code>UnsupportedVersion</code>. <strong>This is a declaration, not an enforcement</strong>: the value
+is advisory and the listener in <code>hypellm-net</code> is responsible for honouring it.
+A listener that ignores <code>must_close()</code> reintroduces the whole threat class.</li>
+<li><strong>Upstream responses are as dangerous as client requests.</strong> Provider
+connections are pooled and reused, so a response whose end is ambiguous puts a
+prefix on the <em>next</em> tenant's response. <code>parse_response_head</code> therefore applies
+the same duplicate, folding, bare-LF, and TE/CL rules to an upstream as
+<code>parse_request_head</code> applies to a client.</li>
+<li><strong>Internal parser differential.</strong> The single most likely way this crate fails
+is by disagreeing with <em>itself</em>. <code>request::split_crlf</code> and
+<code>client::split_crlf_strict</code>, and <code>request::parse_header_line</code> and
+<code>client::parse_header_line</code>, are near-identical duplicates, and
+<code>client::RequestBuilder::new</code> carries a third copy of the target/host charset
+rules from <code>request::parse_target</code> and <code>request::validate_host</code> — one which
+does <strong>not</strong> apply <code>Limits::max_target_bytes</code>. Any edit to one copy that is not
+mirrored in the others creates precisely the disagreement this crate exists to
+prevent. Treat these as a single reviewed unit.</li>
+<li><strong>Case-sensitivity footgun in header lookup.</strong> <code>Headers</code> lowercases on insert
+and <code>Headers::get</code> guards its argument with a <code>debug_assert!</code> only. In a
+release build, <code>get(&quot;Content-Length&quot;)</code> returns <code>None</code> silently. Every framing
+and security lookup in this crate uses a lowercase literal today; a future
+lookup that does not would not fail a test build, it would simply stop seeing
+the header.</li>
+<li><strong>The outbound builders are laxer than the inbound parsers.</strong>
+<code>RequestBuilder::header</code> and <code>ResponseBuilder::header</code> use
+<code>Headers::append_unchecked</code>, which skips the <code>SINGLE_VALUED</code> duplicate check,
+and neither builder bounds header count or total head size. Two calls with the
+same name emit two fields — a message this crate's own parser would reject.
+Adapters and the admin API must not pass a caller-derived header <em>name</em> to
+these builders. CR/LF/NUL in a <em>value</em> is still rejected by <code>is_field_value</code>,
+which is what stops response splitting; <code>ResponseBuilder::header_lossy</code> drops
+such a value silently by design and must be used only for optional diagnostics.</li>
+<li><strong>Quadratic rescan under slow delivery.</strong> <code>find_head_end</code> runs
+<code>buf.windows(4).position(..)</code> from offset zero on every call, and the request
+parser additionally runs <code>scan_for_bare_terminators</code> over the whole partial
+buffer. A client that delivers a head one byte per packet costs O(n²) byte
+comparisons — bounded by <code>max_head_bytes</code>, so roughly 5·10⁸ window comparisons
+per connection at the 32 KiB default. Bounded, but a real slowloris
+amplification factor; the mitigation is the head cap plus the read deadline in
+<code>hypellm-net</code>, not anything in this crate.</li>
+<li><strong>Close-delimited bodies are bounded in total, contrary to the note in
+<code>limits.rs</code>.</strong> <code>BodyDecoder::emit</code> accumulates <code>decoded</code> for <em>every</em> framing
+including <code>BodyFraming::UntilClose</code>, and the counter is never reset when the
+caller drains <code>out</code>. A <code>text/event-stream</code> response therefore fails with
+<code>BodyTooLarge</code> once its cumulative payload passes <code>Limits::UPSTREAM</code>'s 64 MiB,
+even though the doc comment on that constant states streaming responses are
+&quot;bounded per event by <code>wire_sse</code> rather than in total&quot;. The code is the
+conservative behaviour; the comment is wrong and long streams will terminate.</li>
+<li><strong>Truncation is an error, not a short answer.</strong> <code>BodyDecoder::finish</code> returns
+<code>UnexpectedEof</code> for any state other than <code>Done</code> or <code>UntilClose</code>. A caller that
+treated a truncated upstream body as a complete one would hand a silently
+clipped completion to the client.</li>
+<li><strong>Errors must not echo input.</strong> <code>HttpError</code> carries only a <code>kind</code>; <code>Display</code>
+renders a fixed phrase with no CR, LF, or caller bytes, and <code>code()</code> values are
+stable and distinct. This is what keeps a transport failure — which happens
+before authentication and before routing — from becoming an oracle.</li>
+<li><strong>Trailers cannot re-open a decided question.</strong> <code>header::FORBIDDEN_TRAILERS</code>
+rejects <code>transfer-encoding</code>, <code>content-length</code>, <code>host</code>, <code>authorization</code>,
+<code>proxy-authorization</code>, <code>trailer</code>, <code>te</code>, <code>expect</code>, <code>cookie</code>, <code>set-cookie</code>, and
+<code>content-encoding</code> in a chunked trailer section: framing and authentication
+were settled from the head, and a trailer that redeclares them is a smuggling
+attempt.</li>
+<li><strong>Integer handling.</strong> Chunk sizes accumulate through <code>checked_mul</code>/<code>checked_add</code>
+and fail with <code>InvalidChunkSize</code> on overflow; <code>emit</code> uses <code>saturating_add</code>
+before comparing against the body bound. <code>Content-Length</code> is capped at 19
+characters before <code>u64::from_str</code>, so the parse cannot be the overflow site.</li>
+</ul>
+<h2 id="limits">Limits</h2>
+<p>Bounds are supplied per call as a <code>Limits</code> value; the three profiles are
+<code>Limits::DEFAULT</code> (inference listener), <code>Limits::ADMIN</code> (management listener),
+and <code>Limits::UPSTREAM</code> (provider responses). Values below are <code>DEFAULT</code>.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Input</th>
+<th>Limit</th>
+<th>Enforced by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Message head bytes</td>
+<td>32 KiB default, 64 KiB hard ceiling (spec 3.2)</td>
+<td><code>Limits::max_head_bytes</code>, floored through <code>Limits::clamped()</code> against <code>HARD_MAX_HEAD_BYTES</code> on entry to both head parsers; checked both on a complete head and on an over-long incomplete one</td>
+</tr>
+<tr>
+<td>Header field count</td>
+<td>100 (<code>ADMIN</code> 64)</td>
+<td><code>Limits::max_header_count</code>, checked against the CRLF line count before any header is allocated</td>
+</tr>
+<tr>
+<td>Request target bytes</td>
+<td>8 KiB (<code>ADMIN</code> 2 KiB)</td>
+<td><code>Limits::max_target_bytes</code> in <code>request::parse_target</code></td>
+</tr>
+<tr>
+<td>Method token bytes</td>
+<td>32 (<code>ADMIN</code> 16)</td>
+<td><code>Limits::max_method_bytes</code> in <code>request::parse_request_line</code></td>
+</tr>
+<tr>
+<td>Body bytes</td>
+<td>16 MiB (<code>ADMIN</code> 1 MiB, <code>UPSTREAM</code> 64 MiB); spec 3.2 default is 16 MiB</td>
+<td><code>Limits::max_body_bytes</code>, checked twice — against the declared <code>Content-Length</code> in <code>request_body_framing</code>/<code>response_body_framing</code>, and against bytes actually produced in <code>BodyDecoder::emit</code></td>
+</tr>
+<tr>
+<td>Chunk-size line bytes</td>
+<td>256 (<code>ADMIN</code> 128)</td>
+<td><code>Limits::max_chunk_line_bytes</code> via <code>BodyDecoder::take_line</code>; the internal <code>line_buf</code> may reach <code>max + 2</code> bytes before the error fires</td>
+</tr>
+<tr>
+<td>Trailer section bytes</td>
+<td>4 KiB (<code>ADMIN</code> 1 KiB)</td>
+<td><code>Limits::max_trailer_bytes</code>, applied per line in <code>take_line</code> and cumulatively via <code>BodyDecoder::trailer_bytes</code>; the cumulative check runs after the line is counted, so the section may overshoot by one line</td>
+</tr>
+<tr>
+<td><code>Content-Length</code> digits</td>
+<td>19 characters, ASCII digits only</td>
+<td><code>request::parse_content_length</code></td>
+</tr>
+<tr>
+<td>Chunk-size hex digits</td>
+<td>16, plus checked accumulation</td>
+<td><code>body::parse_chunk_size</code></td>
+</tr>
+<tr>
+<td><code>Host</code> value</td>
+<td>255 bytes, <code>[A-Za-z0-9.\-:\[\]_]</code> only</td>
+<td><code>request::validate_host</code> — a hardcoded constant, <strong>not</strong> a <code>Limits</code> field</td>
+</tr>
+<tr>
+<td>Status code</td>
+<td>three ASCII digits in 100–599</td>
+<td><code>client::parse_status_line</code></td>
+</tr>
+<tr>
+<td>Target charset</td>
+<td>visible ASCII <code>0x21..=0x7E</code>, origin form, no <code>//</code> prefix</td>
+<td><code>request::parse_target</code></td>
+</tr>
+<tr>
+<td>Header name / value charset</td>
+<td>RFC 9110 <code>tchar</code> / VCHAR+SP+HTAB+<code>obs-text</code>, values must be UTF-8</td>
+<td><code>header::is_token</code>, <code>header::is_field_value</code>, <code>Headers::append</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>Known gaps, stated rather than papered over:</p>
+<ul>
+<li><code>Limits::clamped()</code> clamps <strong>only</strong> <code>max_head_bytes</code>. A misconfigured
+<code>max_body_bytes</code>, <code>max_header_count</code>, or <code>max_trailer_bytes</code> is accepted as
+written; there is no hard ceiling on those.</li>
+<li><strong>Neither builder is bounded.</strong> <code>RequestBuilder</code> and <code>ResponseBuilder</code> take no
+<code>Limits</code> and apply no cap on header count, target length, or serialized head
+size. Outbound head size is the caller's responsibility.</li>
+<li>The specification 3.2 per-stream 256 KiB buffered-data watermark is <strong>not</strong>
+implemented here. <code>BodyDecoder::decode</code> appends to a caller-owned <code>Vec</code> and
+bounds only cumulative decoded length.</li>
+<li>Transient allocation during head parsing is bounded but amplifying:
+<code>split_crlf</code> materializes a <code>Vec</code> of one slice descriptor per CRLF line, so a
+head of empty lines at the 64 KiB ceiling costs roughly 512 KiB of transient
+descriptors. Bounded by <code>max_head_bytes</code>, not separately capped.</li>
+</ul>
+<h2 id="fuzz-targets">Fuzz targets</h2>
+<p>Specification 21 requires a fuzz layer covering &quot;HTTP, JSON, SSE, configuration,
+provider events, management API, state recovery&quot;, and 21.1 requires that a known
+attack corpus &quot;produces bounded work and stable error responses&quot;.</p>
+<p><code>tests/fuzz.rs</code> — seven targets, run by <code>cargo test -p wire-http1</code>, driven by
+the seeded mutation engine in <code>hypellm-test-corpus::fuzz</code>. There is no <code>fuzz/</code>
+directory and no libFuzzer harness, because specification 4 admits no such
+dependency; a failing case is reproducible by seed number.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Target</th>
+<th>Property asserted</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>no_mutation_of_the_corpus_panics_the_head_parser</code></td>
+<td>Termination and no panic over mutations of the attack corpus</td>
+</tr>
+<tr>
+<td><code>an_accepted_head_never_declares_two_framings</code></td>
+<td>The smuggling invariant: <code>Content-Length</code> and <code>Transfer-Encoding</code> are never both accepted</td>
+</tr>
+<tr>
+<td><code>an_accepted_head_carries_no_control_bytes_in_its_fields</code></td>
+<td>No CR, LF, or NUL survives into a parsed field</td>
+</tr>
+<tr>
+<td><code>the_head_size_limit_holds_on_mutated_input</code></td>
+<td><code>max_head_bytes</code> is exact, not approximate</td>
+</tr>
+<tr>
+<td><code>an_incomplete_head_is_never_reported_as_complete</code></td>
+<td>Truncation is never mistaken for a whole message</td>
+</tr>
+<tr>
+<td><code>random_bytes_are_rejected_without_panicking</code></td>
+<td>Unstructured input</td>
+</tr>
+<tr>
+<td><code>a_head_of_many_short_headers_is_bounded_by_the_count_limit</code></td>
+<td>The many-small-headers shape</td>
+</tr>
+</tbody>
+</table></div>
+<p>The corpus these mutate is <code>hypellm-test-corpus::http1</code> plus the inline <code>#[test]</code>
+vectors in <code>lib.rs::smuggling_tests</code>. Still outstanding:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Target</th>
+<th>Property to assert</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Request and response heads</td>
+<td>Mutated corpus heads terminate with bounded allocations and stable outcomes</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Chunked bodies</td>
+<td>Mutated chunk framing never exceeds body limits or reports consumption past input</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Split delivery</td>
+<td>Fragmented and whole delivery produce equivalent parser outcomes</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Framing safety</td>
+<td>Smuggling mutations never turn ambiguous framing into accepted pipelined requests</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Builders</td>
+<td>Emitted messages reparse under the corresponding wire profile</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>Until these land, the smuggling corpus in <code>lib.rs</code> and the byte-at-a-time and
+split-read tests in <code>request.rs</code>, <code>client.rs</code>, and <code>body.rs</code> are the only
+coverage of these properties.</p>
+<h2 id="public-api">Public API</h2>
+<p>See <code>lib.rs</code>. Re-exported surface: <code>parse_request_head</code>, <code>parse_response_head</code>,
+<code>ParseStatus</code>, <code>RequestHead</code>, <code>ResponseHead</code>, <code>RequestBuilder</code>,
+<code>ResponseBuilder</code>, <code>BodyDecoder</code>, <code>encode_chunk</code>, <code>encode_last_chunk</code>,
+<code>continue_response</code>, <code>reason_phrase</code>, <code>Headers</code>, <code>trim_ows</code>, <code>Limits</code>, <code>Method</code>,
+<code>Version</code>, <code>BodyFraming</code>, <code>HttpError</code>, <code>HttpErrorKind</code>.</p>
+<p>Parsing is a pure function over a buffer, so the same code serves a blocking
+socket, a recorded golden fixture, and a fuzz driver. There is no configurable
+leniency, no normalization mode, no upgrade path, and no way to raise
+<code>max_head_bytes</code> past the specification's hard ceiling.</p>
+<p>Specification 21 requires two-person review for parser changes. Because the
+duplicated line-splitting and header-parsing routines in <code>request.rs</code> and
+<code>client.rs</code> must stay in lockstep, review any edit to one against the other.</p>
+
+      </article>
+      <footer class="page-footer"><a href="../index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#scope-and-the-no-normalization-rule">Scope and the &quot;no normalization&quot; rule</a></li>
+<li class="toc-level-2"><a href="#threat-notes">Threat notes</a></li>
+<li class="toc-level-2"><a href="#limits">Limits</a></li>
+<li class="toc-level-2"><a href="#fuzz-targets">Fuzz targets</a></li>
+<li class="toc-level-2"><a href="#public-api">Public API</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

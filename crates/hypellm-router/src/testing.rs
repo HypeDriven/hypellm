@@ -483,7 +483,13 @@ pub fn router_with_config(_upstream: &FakeUpstream, config_text: &str) -> TestRo
     });
 
     let dir = TempDir::new("router");
-    let (store, _) = Store::open(dir.path(), b"test-store-mac-key", 0).expect("open store");
+    let (store, recovery) = Store::open(dir.path(), b"test-store-mac-key", 0).expect("open store");
+    let store = Arc::new(store);
+    let (budgets, _) = hypellm_admin_api::budget::restore(
+        &store,
+        &recovery,
+        config.settings.budget_draw_tokens,
+    );
 
     let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
     let logs = Arc::new(MemorySink::new());
@@ -585,13 +591,14 @@ pub fn router_with_config(_upstream: &FakeUpstream, config_text: &str) -> TestRo
         anonymous_access: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         config: Arc::new(Activatable::new(config)),
         keys: Arc::new(keys),
+        budgets,
         sessions: Arc::new(SessionStore::new(b"test-session-key", SessionPolicy::DEFAULT)),
         credentials: Arc::new(credentials),
         health,
         admission: Arc::new(admission),
         egress,
         telemetry: Arc::new(telemetry),
-        store: Arc::new(store),
+        store,
         clock,
         trusted_edge: TrustedEdge::none(),
         decisions: Arc::new(hypellm_admin_api::DecisionCache::default()),

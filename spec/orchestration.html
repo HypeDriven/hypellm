@@ -1,0 +1,1506 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: Fleet orchestration.">
+  <title>Fleet orchestration · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="./assets/wiki.css">
+  <script defer src="./assets/search-index.js"></script>
+  <script defer src="./assets/wiki.js"></script>
+</head>
+<body data-wiki-root="./" data-page-title="Fleet orchestration" data-page-group="Design &amp; security">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="index.html">Wiki home</a></li>
+<li><a href="overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="router-specification.html">Router specification</a></li>
+<li><a href="threat-model.html">Threat model</a></li>
+<li><a href="orchestration.html" aria-current="page">Fleet orchestration</a></li>
+<li><a href="deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="using-the-router.html">Using the router</a></li>
+<li><a href="deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="components/fleet-agent.html">Fleet agent</a></li>
+<li><a href="components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="components/container-init.html">Container init</a></li>
+<li><a href="components/tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="modules/hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="modules/hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="modules/hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="modules/hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="modules/hypellm-config.html">hypellm-config</a></li>
+<li><a href="modules/hypellm-core.html">hypellm-core</a></li>
+<li><a href="modules/hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="modules/hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="modules/hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="modules/hypellm-net.html">hypellm-net</a></li>
+<li><a href="modules/hypellm-router.html">hypellm-router</a></li>
+<li><a href="modules/hypellm-store.html">hypellm-store</a></li>
+<li><a href="modules/hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="modules/hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="modules/wire-http1.html">wire-http1</a></li>
+<li><a href="modules/wire-json.html">wire-json</a></li>
+<li><a href="modules/wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="index.html">Wiki</a><span aria-hidden="true">/</span>Design &amp; security</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="capability-orchestration-across-a-managed-fleet">Capability orchestration across a managed fleet</h1>
+<p><strong>Status: built, with four stated exceptions.</strong> Phases 5 through 8 are implemented: the capability contract, the fleet domain model and agent protocol, observation, planning, activation with leases and rollback, anti-thrash governance, the management surface, and the SPA screens. <code>crates/hypellm-fleet</code> is the planner, <code>crates/hypellm-net/src/fleet.rs</code> the socket, <code>crates/hypellm-router/src/fleet.rs</code> the runtime, and <code>agent/</code> the reference agent that reaches the slaves.</p>
+<p>One thing described here is <strong>not</strong> implemented, and is recorded in <a href="deferred-issues.html">current limitations</a> rather than approximated: Windows-host actuation. <code>POST /v1/jobs</code> is built, with its job records in memory rather than durable — see <a href="deferred-issues.html#jobs-are-in-memory-and-a-restart-loses-them">current limitations</a>. Two implemented details deviate from the design below and are marked <strong>[as built]</strong> where they occur — the <code>HELLO</code> line carries the fleet digest, and the activation budget is a sliding window rather than a token bucket. Both changes were forced by building it, and both are explained at the point they appear.</p>
+<p>This document remains written in the specification's normative voice. <code>spec/router-specification.html</code> §26 now carries the normative summary; this is the reasoning behind it.</p>
+<p><strong>Reference convention.</strong> <code>spec §N</code> refers to <code>spec/router-specification.html</code>. A bare <code>§N</code> refers to a section of this document.</p>
+<p><strong>Specification relationship.</strong> This extends spec §5, §5.1, §6, §11.1, §12, §13, §16, §17, §21 and §24. It does not amend spec §4, §4.1, §10, §15 or §18.2, and every design decision below is constrained by them. Where the specification must change, the change is stated explicitly rather than implied.</p>
+<hr />
+<h2 id="1-what-this-adds">1. What this adds</h2>
+<p>HypeLLM Router today routes a request to a target that is <em>already running</em>, chosen from an alias's permitted set. Every target is assumed permanently available; the only variability is health, capacity and policy.</p>
+<p>Two assumptions break at once when the fleet is real.</p>
+<p><strong>The first is availability.</strong> A single accelerator host has finite memory, and the models an operator wants to offer do not fit simultaneously. On the DGX Spark, MiniMax-H3, MiniMax-Music3 and the Qwen3.8 27B chat service can be resident together only by leaving roughly 4 GiB of headroom, which is not enough to run any of them at length. Offering all three as routable targets means accepting that a request for one may have to stop another.</p>
+<p><strong>The second is expressiveness.</strong> A request carries more intent than &quot;alias plus operation&quot;. A caller wanting a 27B model at Q5 to read a PDF with medium reasoning effort is stating four separate requirements — a model tier, a document modality, a reasoning budget, and implicitly a latency tolerance. The canonical request models none of the last three. Routing them correctly is not a provider passthrough problem: reasoning effort changes token counts and therefore admission reservations, and document input changes which targets are eligible at all. On this fleet that distinction is concrete — the Spark's Qwen3.8 deliberately runs <strong>without</strong> the vision projector to preserve memory headroom, so it cannot serve a document request no matter how much VRAM is free.</p>
+<p>This feature addresses both, because they are the same problem seen from two ends: deciding what the fleet must become in order to satisfy what a request actually asked for.</p>
+<ul>
+<li>A request is matched against a <strong>capability contract</strong> with four axes — verb, modality, feature, tier (§3) — rather than a single label.</li>
+<li>The router models every <strong>host</strong>, its <strong>accelerators</strong>, and which <strong>deployments</strong> are resident (§5).</li>
+<li>When the best way to satisfy a contract is to start a cold deployment, the router produces an explicit <strong>plan</strong>: what to stop, what to start, and what that costs in time. The plan is a pure function of a snapshot, so it can be simulated without touching the fleet (§8).</li>
+<li>Plans are subject to <strong>anti-thrash governance</strong> — dwell floors, hysteresis margins, activation budgets, demand batching, cooldowns — so oscillating demand converges instead of destroying throughput (§9).</li>
+<li>If an artifact is present on no host it may be <strong>acquired</strong>, under explicit permission and budget, verified by digest, onto an architecture-compatible host with sufficient disk (§12).</li>
+</ul>
+<h3 id="11-non-goals">1.1 Non-goals</h3>
+<p>This is not a container orchestrator and must not become one. Out of scope: general workload scheduling, replica abstractions, service discovery for non-inference services, image building, host autoscaling, cluster networking, and any control over containers not declared as inference deployments in HypeLLM's own configuration. The router observes and toggles a <strong>closed, administrator-declared set</strong> and nothing else.</p>
+<p>It is also not a distributed scheduler. Placement decisions are made by one router process against its own snapshot. Multi-node coordination inherits the constraint already recorded in <a href="deferred-issues.html">current limitations</a>: independent nodes are not a cluster. Two routers must not manage one host (§10.4).</p>
+<p>It does not parse or interpret user content. Adding a document modality (§3.3) explicitly does <strong>not</strong> add a PDF parser to the data plane.</p>
+<h3 id="12-the-fleet-this-is-designed-against">1.2 The fleet this is designed against</h3>
+<p>Validated against a real five-host fleet. Hosts are named by their configured
+identifier throughout — an address is a deployment detail, and the design turns
+on what each machine <em>is</em>:</p>
+<blockquote>
+<p>This table is the design's provenance, not the current configuration.
+<a href="examples/fleet.conf"><code>examples/fleet.conf</code></a> now declares the two Sparks and
+nothing else. The heterogeneous cases below — two accelerators of different
+capability on one host, unified memory that is not VRAM, a GPU carrying
+unrelated production work — are why the model is shaped as it is, and they
+remain the cases it must keep handling.</p>
+</blockquote>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Host</th>
+<th>Accelerator</th>
+<th>Memory</th>
+<th>Constraint that matters</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>rtx4090</code></td>
+<td>RTX 4090 Laptop</td>
+<td>16 GB VRAM</td>
+<td>Four services at once; MOSS-SoundEffect v2 is on-disk, un-containerised, and consumes nearly the whole GPU.</td>
+</tr>
+<tr>
+<td><code>node0</code></td>
+<td>GT 1030 (idx 0) + GTX 1080 Ti (idx 1)</td>
+<td>4 GB + 11 GB</td>
+<td><strong>Two accelerators of very different capability.</strong> Placement must select <code>device=1</code>, not merely &quot;the host&quot;. Hosts the fleet's only vision model.</td>
+</tr>
+<tr>
+<td><code>cache</code></td>
+<td>GT 1030</td>
+<td>2 GB</td>
+<td>CPU/RAM/disk host (Threadripper, 101 GB, 5.9 TB free). Not an inference target; the natural artifact cache.</td>
+</tr>
+<tr>
+<td><code>rtx5090</code></td>
+<td>RTX 5090</td>
+<td>32 GB VRAM</td>
+<td>Best discrete GPU; also runs unrelated production services that must never be evicted.</td>
+</tr>
+<tr>
+<td><code>spark</code></td>
+<td>NVIDIA GB10</td>
+<td>~140 GB <strong>unified</strong></td>
+<td><strong>ARM64.</strong> Unified memory is shared with the host, so a VRAM-only model is wrong. Three large models contend. Serves images; documents are not declared.</td>
+</tr>
+</tbody>
+</table></div>
+<p>Four consequences are load-bearing below: accelerators are addressed individually (§5.2); memory is a per-pool quantity with a host reservation, because unified memory is not VRAM (§5.2); artifacts are architecture-scoped, because an x86-64 image will never run on the Spark (§12); and <strong>the same weights can back two targets with different capability declarations</strong> — Qwen3.8 with and without the vision projector are different memory footprints and different eligibility (§1.3).</p>
+<h3 id="13-model-alias-target-deployment-artifact">1.3 Model, alias, target, deployment, artifact</h3>
+<p>Five distinct things. Conflating any two of them produces a design that cannot express this fleet, so they are defined before anything else.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What it is</th>
+<th>Client-visible?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Model</strong></td>
+<td>A set of weights. Not a router concept. Has no identifier in configuration.</td>
+<td>No</td>
+</tr>
+<tr>
+<td><strong>Artifact</strong></td>
+<td>The distributable form of a model or image — digest, size, architecture. What gets fetched.</td>
+<td>No</td>
+</tr>
+<tr>
+<td><strong>Target</strong></td>
+<td>A model <em>as served by one provider endpoint</em>, with a full capability declaration and limits. <code>spark:qwen38-q5</code>.</td>
+<td>Only if an alias exposes it</td>
+</tr>
+<tr>
+<td><strong>Deployment</strong></td>
+<td>A target's <em>lifecycle on one accelerator</em> — memory cost, start/stop times, dwell rules. New in this design.</td>
+<td>No</td>
+</tr>
+<tr>
+<td><strong>Alias</strong></td>
+<td>The client-visible name. Resolves to a permitted set of targets. <code>requested_model</code> is typed <code>AliasId</code>.</td>
+<td><strong>Yes — this is what the client sends</strong></td>
+</tr>
+</tbody>
+</table></div>
+<p>The router does not map a request to a model. It maps an alias to a <em>set</em> of targets and ranks them. This is deliberate: spec Appendix B requires that no client-controlled value influence an upstream destination, and an alias is the indirection that makes that true.</p>
+<p><strong>The practical guidance, which is not currently written down anywhere and should be: name aliases after models.</strong> Nothing prevents</p>
+<pre><code class="language-text">alias id=qwen3.8-27b-q5 capability=chat targets=spark:qwen38-q5,rtx5090:qwen38-q5
+</code></pre>
+<p>A client then sends <code>&quot;model&quot;: &quot;qwen3.8-27b-q5&quot;</code> — model-centric, works unmodified with any OpenAI harness — while the router chooses between two hosts under administrator policy. The caller experiences direct model selection; the operator retains destination control. Host selection is therefore <strong>not a new routing dimension</strong>: it falls out of the existing alias→target ranking, now informed by residency (§7).</p>
+<p>Three corollaries worth stating because each one has bitten someone:</p>
+<ul>
+<li><strong>Quantization is target identity, not a request parameter.</strong> Q5 and Q4 of one model are two targets with different memory, quality and cost. Your fleet already has exactly this pair. Expose the choice by declaring two aliases, or one alias with both targets and a quality tier (§3.5).</li>
+<li><strong>The same weights may back two targets.</strong> Qwen3.8 with the vision projector loaded is a different capability declaration and a different <code>memory_bytes</code> than the same weights without it. Two targets, two deployments, one artifact.</li>
+<li><strong>A target belongs to exactly one host.</strong> A model runnable in two places is two targets sharing an alias. <code>Target</code> is unchanged by this design.</li>
+</ul>
+<hr />
+<h2 id="2-what-does-not-change">2. What does not change</h2>
+<p>Stated first because the temptation to violate each is real.</p>
+<ol>
+<li><strong>The router does not execute processes.</strong> spec §4.1 forbids shell execution and depscan's <code>forbidden-api</code> rule fails the build on <code>process::Command</code>. The router will never invoke <code>ssh</code>, <code>docker</code> or <code>powershell.exe</code>. Actuation happens in a separate out-of-process <strong>fleet agent</strong> across a narrow authenticated local socket (§4).</li>
+<li><strong>The router does not parse user content.</strong> Adding a document modality does not add a document parser. Document bytes are opaque, bounded, and forwarded (§3.3).</li>
+<li><strong>Security, residency and capability constraints remain eligibility filters, never score penalties</strong> (spec §6.2, §6.3, Appendix B). Warmness is a preference; authorization is not.</li>
+<li><strong>The spec §6.3 score term list is closed and its bound is proven.</strong> No new score term. Warmness and client hints share the existing <code>affinity_term</code> under a split budget (§7.2).</li>
+<li><strong>Priority rank still dominates.</strong> <code>ScoreTerms::RANK_UNIT</code> (1,000,000) exceeds <code>MAX_NON_RANK_MAGNITUDE</code> (400,999), so a cold rank-0 target outranks a warm rank-1 target and the swap happens. An operator's explicit preference is not silently overturned by what happens to be loaded — which is also why warmth must not become a filter.</li>
+<li><strong>Client hints never create eligibility.</strong> A permitted hint may reorder targets that are already eligible. It may not make an ineligible target eligible, and it may not outrank a priority binding (§3.6).</li>
+<li><strong>Prompts are inert data.</strong> No prompt, tool argument, message or document may name a host, deployment, container, image, artifact or accelerator, or influence a plan by any path other than the resolved alias and the declared capability contract.</li>
+<li><strong>Everything is bounded.</strong> Activation queues, plan sizes, eviction sets, inventory payloads, document counts, fetch sizes, retries and leases carry finite maxima. A request may not create an unbounded amount of <em>fleet work</em> any more than an unbounded buffer.</li>
+<li><strong>Targets without a deployment record behave exactly as they do today.</strong> A deployment-free configuration produces byte-identical routing behaviour.</li>
+</ol>
+<hr />
+<h2 id="3-the-capability-contract">3. The capability contract</h2>
+<p>The current model asks one question of a target: does it serve this operation, with these modalities, tools, context and residency? That is enough to route chat between two chat models. It is not enough to decide that a document request cannot go to a projector-less deployment, or that a high-effort request needs four times the token reservation.</p>
+<p>A <strong>capability contract</strong> is what a request requires and what a target declares, across four independent axes. Every axis is an eligibility filter (spec §6.2), never a score term.</p>
+<h3 id="31-the-four-axes">3.1 The four axes</h3>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Axis</th>
+<th>Question</th>
+<th>Request source</th>
+<th>Target declaration</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Verb</strong></td>
+<td>What kind of work is this?</td>
+<td>Alias's declared capability</td>
+<td><code>capabilities</code></td>
+</tr>
+<tr>
+<td><strong>Modality</strong></td>
+<td>What inputs does it carry?</td>
+<td>Derived from content parts</td>
+<td><code>modalities</code></td>
+</tr>
+<tr>
+<td><strong>Feature</strong></td>
+<td>What behaviours must work?</td>
+<td>Tools, structured output, streaming, reasoning</td>
+<td><code>Capabilities</code> booleans</td>
+</tr>
+<tr>
+<td><strong>Tier</strong></td>
+<td>How large, how good, how hard?</td>
+<td>Context, output, quality floor, cost ceiling, effort</td>
+<td><code>max_context_tokens</code>, <code>quality_class</code>, <code>cost_class</code>, <code>reasoning_efforts</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>Verb and feature exist in some form today. Modality exists but is incomplete. Tier is partial — context and cost are modelled, quality and effort are not. The three additions below complete it.</p>
+<h3 id="32-capability-verbs">3.2 Capability verbs</h3>
+<p>A closed vocabulary — never a client-supplied string, both because spec §10 forbids client-controlled routing inputs and because spec §17 forbids unbounded metric labels:</p>
+<p><code>chat</code>, <code>vision</code>, <code>document</code>, <code>embeddings</code>, <code>rerank</code>, <code>text-to-speech</code>, <code>text-to-music</code>, <code>text-to-sfx</code>, <code>text-to-image</code>, <code>text-to-video</code>, <code>image-to-video</code>, <code>audio-to-video</code>, <code>lipsync</code>.</p>
+<p><code>Capability</code> is distinct from <code>Operation</code>. <code>Operation</code> is the wire shape the client used; <code>Capability</code> is the work the model does. A music model and a TTS model both take text and emit audio, and no combination of modalities distinguishes them — which is why the verb axis cannot be derived and must be declared.</p>
+<p><code>alias</code> gains <code>capability</code>; <code>target</code> gains a <code>capabilities</code> list. A target not declaring the alias's verb is excluded with <code>capability_unsupported</code>.</p>
+<h3 id="33-modalities-including-documents">3.3 Modalities, including documents</h3>
+<p><code>Modality</code> is extended from <code>Text | Image | Audio</code> to include <strong><code>Document</code></strong>, and <code>ContentPart</code> gains:</p>
+<pre><code class="language-rust">Document {
+    /// Declared media type, from a closed allowlist (`application/pdf`, …).
+    media_type: DocumentType,
+    /// Inline base64, or a URL the router forwards and never fetches.
+    source: DocumentSource,
+}
+</code></pre>
+<p><code>DocumentSource</code> mirrors the existing <code>ImageSource</code> exactly, including the rule its own comment already states: <strong>a URL is forwarded to the provider and never fetched by the router</strong>, because fetching a caller-named URL would make the router an SSRF proxy (spec §10). The provider retrieves it under its own egress policy, and only when the target declares the modality. Reusing this shape rather than inventing an upload endpoint means documents inherit a boundary that is already reasoned about and tested.</p>
+<p><strong>The router must never parse the document.</strong> No page counting, no text extraction, no rendering, no format validation beyond the declared media type against a closed allowlist. A document is opaque bounded bytes forwarded to a target that declared the modality. Adding a PDF parser to the data plane would put a notoriously hostile format in front of untrusted input, in a codebase whose entire parser strategy is small, strict, in-repository and fuzzed. It is not a close call.</p>
+<p>Two consequences follow, and both are the reason this is a design decision rather than an enum variant:</p>
+<p><strong>Token estimation cannot be byte-derived.</strong> spec §12 requires &quot;a conservative byte-based upper bound&quot; when no tokenizer is available; the implementation currently uses <code>ceil(bytes / 2)</code> in <code>hypellm_core::canonical::estimated_input_tokens</code>. That is conservative for text and meaningless for documents: a scanned PDF is megabytes and few tokens, a dense text PDF is the reverse, and a page rendered as an image costs a fixed model-dependent amount. Since the router cannot count pages without parsing, it must use a <strong>configured conservative constant per document part</strong> — <code>document_token_estimate</code>, declared per target with a global default, erring high — added to the byte-based estimate for the remaining content. An operator tuning this is choosing between rejecting large documents and admitting them past a quota, and should be told so.</p>
+<p><strong>Bounds are mandatory, and inline documents are bounded by the body limit they live inside.</strong> <code>max_body_bytes</code> defaults to 16 MiB, and base64 inflates payloads by roughly 4/3, so an inline document budget must be set against the encoded size, not the decoded one:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Bound</th>
+<th>Default</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>max_documents_per_request</code></td>
+<td>4</td>
+<td>Caps reservation and provider cost per request.</td>
+</tr>
+<tr>
+<td><code>max_document_bytes</code></td>
+<td>4 MiB decoded</td>
+<td>Per inline part.</td>
+</tr>
+<tr>
+<td><code>max_inline_document_bytes</code></td>
+<td>8 MiB decoded</td>
+<td>Aggregate. At ~10.7 MiB encoded this leaves headroom inside the 16 MiB body.</td>
+</tr>
+</tbody>
+</table></div>
+<p>Configuration validation rejects a set of limits whose encoded aggregate cannot fit <code>max_body_bytes</code>, so raising one forces raising the other deliberately rather than producing requests that parse and then fail.</p>
+<p>URL-form documents consume no body budget — and the router cannot know their size at all, since it never fetches them. That makes the conservative token constant below load-bearing rather than a convenience.</p>
+<p>Eligibility needs no new exclusion reason: <code>modality_unsupported</code> already exists and already does the right thing. On this fleet it does something specifically useful — a document request against the Spark's projector-less Qwen3.8 is excluded and routed to <code>ai-qwen35-9b-vision</code> on <code>node0</code>, or refused with a reason. It does <strong>not</strong> start a container and discover the problem at the provider.</p>
+<h3 id="34-reasoning-effort">3.4 Reasoning effort</h3>
+<p>Absent from the canonical request today. <code>Capabilities.reasoning</code> is a boolean meaning &quot;exposes reasoning content&quot; — a different question, and it stays as it is.</p>
+<pre><code class="language-rust">pub enum ReasoningEffort { Unset, Minimal, Low, Medium, High }
+</code></pre>
+<p><code>Unset</code> is distinct from <code>Minimal</code>, per spec §5.1's existing rule that sampling parameters carry an explicit unset distinct from zero. A target declares <code>reasoning_efforts</code> — the tiers it supports, a list rather than a boolean. A request naming a tier no eligible target supports is excluded with <code>reasoning_effort_unsupported</code>.</p>
+<p>Effort is a <strong>routing input, not a provider passthrough</strong>, for three reasons that each touch a different subsystem:</p>
+<p><strong>Admission.</strong> Effort multiplies expected output tokens. Each tier carries an administrator-declared <code>output_multiplier</code> per target (default 1 / 2 / 4 / 8 for minimal / low / medium / high). The multiplier is applied <em>at reservation</em>, and reconciled against provider-reported usage on completion through the existing <code>Reservation::commit(actual_tokens)</code> path. Reserving unmultiplied would let a high-effort request consume several times what it was held to — a quota bypass that requires no malformed input at all, just a JSON field.</p>
+<p><strong>Deadlines.</strong> Effort raises expected time to completion, so the cold-start feasibility check (§7.3) must compare against effort-adjusted duration, not the base estimate. A high-effort request behind a 3-minute model load is a different proposition from a minimal-effort one.</p>
+<p><strong>Adapters.</strong> Each family maps the tier to its own parameter — OpenAI <code>reasoning.effort</code>, Anthropic a thinking-token budget, llama.cpp <code>--reasoning</code> or a no-op. This is exactly the typed conversion spec §7.1 assigns to adapters, and nothing more: adapters still make no routing decisions.</p>
+<h3 id="35-quality-tiers-and-quantization">3.5 Quality tiers and quantization</h3>
+<p>Your fleet runs Q5_K_P with Q4_K_P downloaded as a fallback. Both serve the same alias; one is better. Nothing in the current model expresses &quot;better&quot;.</p>
+<p><code>cost_class</code> cannot serve this. It is orderable, but cost and quality are not the same axis — a local Q5 may be cheaper <em>and</em> better than a remote Q4, and conflating them makes that target either unreachable or mispriced.</p>
+<p>So <code>target</code> gains <code>quality_class</code>, an ordered class exactly symmetric with the existing <code>cost_class</code>, and <code>RequestLimits</code> gains <code>min_quality</code> as a <strong>floor</strong>, symmetric with the existing <code>max_cost</code> ceiling. Exclusion: <code>quality_floor_not_met</code>. No new mechanism — the same shape, the other direction.</p>
+<p>Quantization itself remains unmodelled, and deliberately. What the router needs is memory, context, quality and cost; Q5 versus Q4 differs in precisely those four, all of which are already declared. &quot;Q5&quot; is the operator's label in a target id, not a concept the router reasons about.</p>
+<h3 id="36-client-hints">3.6 Client hints</h3>
+<p><code>RoutingHints.prefer_target</code> is parsed from <code>hypellm_routing.prefer_target</code>, validated as a target id, permission-gated behind <code>hints_permitted</code>, and read by <code>PolicySnapshot::score</code> as a bounded slice of the affinity term.</p>
+<p><strong>The permission gate was less covered than it looked, and that had to be repaired first.</strong> The fuzz target <code>a_hint_is_ignored_unless_the_principal_may_supply_one</code> planted its hints under the key <code>&quot;hypellm&quot;</code>, while <code>parse_hints</code> looks up <code>&quot;hypellm_routing&quot;</code>. Since the key lookup is the <em>first</em> early return and the permission gate the <em>second</em>, control never reached the gate: the function returned a default for a reason unrelated to permissions, and all three of that target's cases asserted vacuously. The test would have passed with the gate deleted. It now derives the key from <code>openai::HINTS_KEY</code> and asserts the other half of the property — the same body <em>with</em> the permission must produce the hint — so a parser that dropped every hint unconditionally fails it.</p>
+<p>The wiring keeps the semantics that make a client hint admissible at all:</p>
+<ul>
+<li>A hint <strong>reorders</strong> targets that are already eligible. It never creates eligibility.</li>
+<li>It draws from a bounded slice of <code>affinity_term</code> (§7.2), so it can break a tie between comparable targets and can never beat a warmer target, a higher-ranked target, or a policy binding.</li>
+<li>It remains permission-gated and silently dropped otherwise, unchanged.</li>
+<li>An unknown or ineligible <code>prefer_target</code> is ignored, not an error — a harness that always sends one must keep working.</li>
+</ul>
+<p>A hint that could outrank policy would be a client-controlled destination by a longer route, which spec Appendix B forbids. Bounding it inside affinity is what makes it admissible at all.</p>
+<h3 id="37-what-this-costs-at-admission">3.7 What this costs at admission</h3>
+<p>Three of these axes change the reservation, so they are computed <strong>before</strong> capacity is reserved, not after:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Input</th>
+<th>Effect on the estimate</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Reasoning effort</td>
+<td>Multiplies reserved output tokens by the tier's <code>output_multiplier</code>.</td>
+</tr>
+<tr>
+<td>Documents</td>
+<td>Adds <code>document_token_estimate</code> per part, not <code>bytes / 2</code>.</td>
+</tr>
+<tr>
+<td>Quality floor / cost ceiling</td>
+<td>Filters candidates; no estimate effect.</td>
+</tr>
+</tbody>
+</table></div>
+<p>Over-estimation is the correct failure direction and matches the existing posture: the current estimator deliberately errs toward over-counting, and <a href="deferred-issues.html">current limitations</a> already records that this rejects some near-limit requests. These additions make it more conservative, not less.</p>
+<hr />
+<h2 id="4-trust-boundary-the-fleet-agent">4. Trust boundary: the fleet agent</h2>
+<h3 id="41-why-it-is-a-separate-process">4.1 Why it is a separate process</h3>
+<p>Starting a container on <code>spark</code> means running <code>ssh</code> and <code>docker compose</code>. The router cannot do this and must not be changed so that it can — the prohibition on subprocess execution is load-bearing, and a router that can spawn a shell is a different security proposition.</p>
+<p>The specification already solves this shape twice. spec §4 delegates outbound TLS to &quot;a platform-provided audited TLS helper/sidecar with a narrow CONNECT-like API and destination allowlist&quot;; spec §9.1 delegates JWT verification to &quot;an approved local identity/TLS verifier service over a narrow authenticated local interface&quot;. <code>crates/hypellm-net/src/helper.rs</code> implements both clients over a deliberately tiny line protocol on a Unix socket.</p>
+<p>The fleet agent is the third member of that family and follows the same rules.</p>
+<p><strong>The fleet agent is not a workspace crate.</strong> It is platform-supplied, like the TLS helper and the OIDC verifier, and it joins them in the trusted computing base. The repository ships:</p>
+<ul>
+<li>the wire protocol (§4.3) as normative text;</li>
+<li>a <strong>conformance corpus</strong> in <code>hypellm-test-corpus</code> — recorded exchanges, malformed replies, protocol violations, required state transitions;</li>
+<li>a <strong>simulated agent</strong> used by every test, with a deterministic clock and scriptable latencies and failures, so <code>cargo test --workspace --offline</code> exercises the full activation path without SSH, Docker or a network.</li>
+</ul>
+<p>A reference agent may live in this repository <em>outside the strict-profile build boundary</em> — not a workspace member, not built by <code>cargo build --workspace</code>, not scanned as router source. Admitting it into the workspace would require the spec §4 security-decision-record process, and there is no reason to seek that.</p>
+<p>This is an honest cost, not a free win: the agent holds SSH keys to five machines and can start and stop containers on all of them. §15 treats it as a first-class attacker target.</p>
+<h3 id="42-what-the-agent-may-be-told">4.2 What the agent may be told</h3>
+<p>The router sends <strong>identifiers, never commands.</strong> The socket carries no image name, host address, file path, container name, Docker flag, shell fragment or URL — only opaque <code>deployment-id</code> and <code>artifact-id</code> tokens both sides hold from configuration, plus bounded integers.</p>
+<p>The agent maintains <strong>its own</strong> allowlist mapping each identifier to a host, SSH destination, Compose project and service. The router cannot extend it. The goal is specific: <strong>a fully compromised router cannot cause arbitrary code to run on a slave.</strong> It can reorder declared deployments; it cannot introduce one.</p>
+<p>An unrecognised identifier is refused with <code>ERR unknown_deployment</code> and audited on both sides. A fleet-digest mismatch fails closed rather than warning: the router issues no mutating verb, and every orchestrated target is excluded with <code>fleet_configuration_mismatch</code> until the digests agree (§4.3).</p>
+<h3 id="43-wire-protocol">4.3 Wire protocol</h3>
+<p>The same line-oriented shape as <code>helper.rs</code>, over an owner-only Unix socket, authenticated with <code>&lt;secrets&gt;/fleet.key</code> via <code>hypellm_crypto::hmac::hmac_sha256_parts</code> and verified with <code>hypellm_crypto::ct::eq</code>. <code>HELLO</code> carries <code>HMAC-SHA-256(fleet.key, protocol-version ‖ nonce ‖ fleet-digest)</code>, so the handshake binds both the protocol version and the fleet configuration each side claims, and the agent rejects a nonce it has already accepted.</p>
+<p>This is deliberately <strong>stronger than the control socket's <code>control.key</code>, and does not reuse it.</strong> That pattern sends the hex-encoded key itself as a bearer line and constant-time-compares it (<code>startup.rs::authenticated_control_command</code>); it carries no keyed digest and binds no message. A bearer line is adequate for a local stop command and inadequate for verbs that stop production models, so the fleet socket does not inherit it. Every reply bounded; every request deadlined.</p>
+<p><strong>[as built]</strong> <code>HELLO</code> carries the router's digest as well as covering it with
+the tag. The design's original form — a nonce and a tag computed over the
+router's own digest — does not work: an agent whose fleet file differs computes
+a <em>different</em> tag, so the handshake fails as <code>unauthenticated</code>, and the two
+failures an operator most needs to tell apart — a wrong key, and a stale fleet
+file on one slave — arrive as the same error. Sending the digest and covering it
+with the tag keeps both properties: the tag still binds the claim, so a captured
+<code>HELLO</code> cannot be edited to assert a different fleet, and the agent can compare
+a digest it has actually received.</p>
+<pre><code class="language-text">→ HELLO 1 &lt;nonce&gt; &lt;fleet-digest&gt; &lt;hmac&gt;\n
+← OK &lt;agent-version&gt; &lt;fleet-digest&gt;\n | ERR &lt;code&gt;\n
+
+→ OBSERVE\n
+← OK &lt;length&gt;\n&lt;inventory JSON, at most 256 KiB&gt;
+
+→ ACTIVATE &lt;deployment-id&gt; &lt;lease-id&gt; &lt;deadline-ms&gt;\n
+← ACCEPTED &lt;activation-id&gt;\n | ERR &lt;code&gt;\n
+
+→ DEACTIVATE &lt;deployment-id&gt; &lt;lease-id&gt; &lt;drain-ms&gt;\n
+← ACCEPTED &lt;activation-id&gt;\n | ERR &lt;code&gt;\n
+
+→ FETCH &lt;artifact-id&gt; &lt;host-id&gt; &lt;deadline-ms&gt;\n
+← ACCEPTED &lt;activation-id&gt;\n | ERR &lt;code&gt;\n
+
+→ STATUS &lt;activation-id&gt;\n
+← OK &lt;state&gt; &lt;detail-code&gt; &lt;progress-permille&gt;\n
+
+→ CANCEL &lt;activation-id&gt;\n
+← OK\n | ERR &lt;code&gt;\n
+</code></pre>
+<p><code>&lt;fleet-digest&gt;</code> is the SHA-256 of the canonical fleet configuration both sides derive independently. On mismatch the router issues no mutating verb, marks every orchestrated target ineligible with <code>fleet_configuration_mismatch</code>, and audits it. A router and an agent that disagree about what an identifier means must not act on that disagreement.</p>
+<p><code>ACTIVATE</code>, <code>DEACTIVATE</code> and <code>FETCH</code> are <strong>asynchronous and idempotent per <code>lease-id</code></strong>; re-sending returns the same <code>activation-id</code>. This is what makes restart recovery tractable (§10.4).</p>
+<p>States are a closed vocabulary: <code>pending</code>, <code>draining</code>, <code>stopping</code>, <code>fetching</code>, <code>starting</code>, <code>probing</code>, <code>ready</code>, <code>failed</code>, <code>stopped</code>, <code>cancelled</code>.</p>
+<p>Inventory JSON is parsed by <code>wire-json</code> under explicit <code>Limits</code>. <strong>The agent's report is untrusted input.</strong> Unknown identifiers are dropped and counted, never adopted; numeric fields are range-checked; a reply violating a bound fails the whole observation rather than partially updating belief.</p>
+<h3 id="44-agent-obligations">4.4 Agent obligations</h3>
+<p>Normative, and testable against the conformance corpus:</p>
+<ul>
+<li>Runs as its own unprivileged user, separate from the router.</li>
+<li>Per-host SSH keys restricted by a forced <code>command=</code> in the slave's <code>authorized_keys</code>, with <code>no-pty</code>, <code>no-port-forwarding</code>, <code>no-agent-forwarding</code>, <code>no-X11-forwarding</code>. The agent's key must not grant an interactive shell.</li>
+<li>Never interpolates a router-supplied value into a command line. Router input selects a row in the agent's own table; it never becomes an argument.</li>
+<li>Applies its own independent per-host activation rate limit. A router bug must not be able to exhaust the fleet through the agent.</li>
+<li>Verifies artifact digests before an artifact becomes activatable, and refuses activation of an unverified artifact.</li>
+<li>Reports memory as observed from the accelerator, not as configured, so the router can detect drift (§6.3).</li>
+<li>Bounds and truncates every reported field.</li>
+</ul>
+<hr />
+<h2 id="5-fleet-domain-model">5. Fleet domain model</h2>
+<p>Four entities join spec §5. All administrator-configured; none nameable or influenceable by a client request.</p>
+<h3 id="51-host">5.1 Host</h3>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>id</code></td>
+<td>Stable identifier; a bounded metric label.</td>
+</tr>
+<tr>
+<td><code>agent</code></td>
+<td>Which configured fleet-agent socket manages it.</td>
+</tr>
+<tr>
+<td><code>arch</code></td>
+<td><code>x86_64</code> or <code>aarch64</code>. Filters artifact eligibility.</td>
+</tr>
+<tr>
+<td><code>status</code></td>
+<td><code>enabled</code>, <code>drain</code>, <code>maintenance</code>, <code>disabled</code>. Mirrors <code>AdminState</code> semantics.</td>
+</tr>
+<tr>
+<td><code>reserved_memory_bytes</code></td>
+<td>Never offered to deployments. On a unified-memory host this is the OS's and other services' share, and must be set generously.</td>
+</tr>
+<tr>
+<td><code>max_concurrent_activations</code></td>
+<td>Bound on in-flight fleet work per host. Default 1.</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="52-accelerator">5.2 Accelerator</h3>
+<p>A host has one or more. Placement targets an accelerator, because <code>node0</code> has a GT 1030 and a GTX 1080 Ti and only one is useful.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>host</code></td>
+<td>Owning host.</td>
+</tr>
+<tr>
+<td><code>id</code></td>
+<td>Local index or name as the agent addresses it (<code>device=1</code>).</td>
+</tr>
+<tr>
+<td><code>kind</code></td>
+<td><code>cuda</code>, <code>unified</code>, <code>cpu</code>.</td>
+</tr>
+<tr>
+<td><code>memory_bytes</code></td>
+<td>Total.</td>
+</tr>
+<tr>
+<td><code>pool</code></td>
+<td>Optional. Accelerators sharing a pool draw from one budget. <strong>Unified memory is modelled by giving accelerator and host the same pool</strong>, so a resident model correctly reduces host RAM availability.</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="53-deployment">5.3 Deployment</h3>
+<p>The placement of a routable target onto an accelerator, plus lifecycle costs. <strong>At most one deployment per target</strong> (§1.3).</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>id</code></td>
+<td>The only token that crosses the agent socket.</td>
+</tr>
+<tr>
+<td><code>target</code></td>
+<td>The <code>target</code> record served.</td>
+</tr>
+<tr>
+<td><code>accelerator</code></td>
+<td>Where it runs.</td>
+</tr>
+<tr>
+<td><code>artifact</code></td>
+<td>Weights/image required (§12).</td>
+</tr>
+<tr>
+<td><code>memory_bytes</code></td>
+<td>Conservative administrator-declared reservation.</td>
+</tr>
+<tr>
+<td><code>start_ms</code>, <code>stop_ms</code>, <code>drain_ms</code>, <code>probe_ms</code></td>
+<td>Declared lifecycle costs; refined by observation (§8.2).</td>
+</tr>
+<tr>
+<td><code>readiness</code></td>
+<td>How readiness is confirmed. A TCP connect is not readiness (spec §13).</td>
+</tr>
+<tr>
+<td><code>min_resident_ms</code></td>
+<td>Dwell floor. <strong>The primary anti-thrash control</strong> (§9.1).</td>
+</tr>
+<tr>
+<td><code>evictable</code>, <code>pinned</code></td>
+<td>Operator anchors (§9.7).</td>
+</tr>
+<tr>
+<td><code>autostart</code></td>
+<td>Whether routing demand may start it, or only an operator.</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>start_ms</code> is not a formality: a 20 GB Q5 GGUF with a speculative-decoding sidecar takes minutes to become ready, and every decision below is dominated by that number.</p>
+<h3 id="54-artifact">5.4 Artifact</h3>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>id</code>, <code>kind</code></td>
+<td><code>image</code> or <code>weights</code>.</td>
+</tr>
+<tr>
+<td><code>digest</code>, <code>size_bytes</code></td>
+<td>SHA-256, content-addressed. Verified before use.</td>
+</tr>
+<tr>
+<td><code>arch</code></td>
+<td>Must match the host. The Spark is <code>aarch64</code>.</td>
+</tr>
+<tr>
+<td><code>source</code></td>
+<td>Administrator-configured registry or mirror. Never client-supplied.</td>
+</tr>
+</tbody>
+</table></div>
+<p>One artifact may back several deployments — the vision and non-vision Qwen3.8 targets share weights and differ only in projector loading and declared capability (§1.3).</p>
+<hr />
+<h2 id="6-fleet-state-observation-belief-and-intent">6. Fleet state: observation, belief and intent</h2>
+<p>Four distinct things, never conflated. Conflating them is how orchestrators come to fight their operators.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th></th>
+<th>Source</th>
+<th>Trust</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Configuration</strong></td>
+<td>The activated policy snapshot</td>
+<td>Authoritative for what <em>may</em> exist</td>
+</tr>
+<tr>
+<td><strong>Observation</strong></td>
+<td>The agent's <code>OBSERVE</code> reply</td>
+<td>Untrusted input; the only source of what <em>is</em></td>
+</tr>
+<tr>
+<td><strong>Intent</strong></td>
+<td>The router's own leases in durable state</td>
+<td>Authoritative for what the router <em>asked for</em></td>
+</tr>
+<tr>
+<td><strong>Belief</strong></td>
+<td>Last valid observation plus its age</td>
+<td>Advisory, and expires</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="61-belief-expires">6.1 Belief expires</h3>
+<p>Observation runs on a bounded interval (default 5 s) and immediately after any activation reaches a terminal state. If the newest valid observation is older than <code>observation_max_age_ms</code> (default 30 s), the router <strong>fails closed</strong>: cold orchestrated targets become ineligible with <code>fleet_state_stale</code> and no plan may execute. Warm targets already serving traffic continue under spec §13 as usual.</p>
+<p>Acting on stale belief is how a scheduler stops a container something else already restarted, or starts one twice. A stale-state swap is worse than a rejected request, because it costs minutes of fleet time and can cascade.</p>
+<h3 id="62-divergence-is-audited-not-silently-corrected">6.2 Divergence is audited, not silently corrected</h3>
+<p>When observation disagrees with intent the router records <code>fleet.divergence</code> with deployment, expected state, observed state and observation age, then re-plans <strong>from observation</strong>. It does not re-assert intent. An operator who stopped a container by hand should not have to fight the router to keep it stopped; the correct response is to route elsewhere and say so.</p>
+<p>A deployment observed running that the router did not start is <strong>adopted as resident</strong> for routing but is <strong>not router-owned</strong>: never placed in an eviction set unless <code>adopt_unmanaged=true</code>. The default is that the router will use what it finds and will not take it away.</p>
+<h3 id="63-memory-drift">6.3 Memory drift</h3>
+<p>If observed accelerator usage exceeds the declared sum for resident deployments by more than <code>memory_drift_tolerance</code> (default 10%), the planner <strong>uses the observed figure</strong>, records <code>fleet.memory_drift</code>, and continues. Declared figures may be optimistic; observed figures are what will actually run out. Planning against a declaration the hardware disagrees with produces an activation that OOMs after two minutes of load — the most expensive possible failure.</p>
+<hr />
+<h2 id="7-routing-integration">7. Routing integration</h2>
+<h3 id="71-residency-classification">7.1 Residency classification</h3>
+<p>Each orchestrated surviving-eligibility target is classified against the fleet snapshot into exactly one state:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Class</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Resident</code></td>
+<td>Ready now.</td>
+</tr>
+<tr>
+<td><code>Activating</code></td>
+<td>Already coming up under an existing lease; ETA known.</td>
+</tr>
+<tr>
+<td><code>ColdFits</code></td>
+<td>Not resident; free pool memory suffices.</td>
+</tr>
+<tr>
+<td><code>ColdRequiresEviction</code></td>
+<td>Not resident; requires stopping a computed set.</td>
+</tr>
+<tr>
+<td><code>ColdRequiresFetch</code></td>
+<td>Artifact absent from the host; acquisition first.</td>
+</tr>
+<tr>
+<td><code>Infeasible(reason)</code></td>
+<td>Cannot be made ready.</td>
+</tr>
+</tbody>
+</table></div>
+<p>Only <code>Infeasible</code> produces an exclusion. The other five remain candidates, ranked by §7.2. This is the central decision and easy to get wrong: <strong>if &quot;not currently running&quot; excluded a target, no target would ever start.</strong></p>
+<p>New <code>ExclusionReason</code> variants, in two groups.</p>
+<p><em>Capability contract (§3), independent of the fleet:</em></p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Cause</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>capability_unsupported</code></td>
+<td>Target does not declare the alias's verb.</td>
+</tr>
+<tr>
+<td><code>reasoning_effort_unsupported</code></td>
+<td>Target does not support the requested tier.</td>
+</tr>
+<tr>
+<td><code>quality_floor_not_met</code></td>
+<td>Target's <code>quality_class</code> is below the request's floor.</td>
+</tr>
+</tbody>
+</table></div>
+<p><em>Fleet:</em></p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Cause</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>activation_exceeds_deadline</code></td>
+<td>Effort-adjusted time-to-ready exceeds remaining deadline (§7.3).</td>
+</tr>
+<tr>
+<td><code>activation_budget_exhausted</code></td>
+<td>Host activation bucket empty (§9.5).</td>
+</tr>
+<tr>
+<td><code>activation_not_permitted</code></td>
+<td>Principal lacks <code>fleet.activate</code>, or deployment is not <code>autostart</code>.</td>
+</tr>
+<tr>
+<td><code>artifact_unavailable</code></td>
+<td>Absent and fetch not permitted, budgeted or feasible.</td>
+</tr>
+<tr>
+<td><code>host_capacity_insufficient</code></td>
+<td>No admissible eviction set frees enough memory.</td>
+</tr>
+<tr>
+<td><code>fleet_state_stale</code></td>
+<td>Belief older than <code>observation_max_age_ms</code>.</td>
+</tr>
+<tr>
+<td><code>fleet_agent_unavailable</code></td>
+<td>Agent socket unreachable.</td>
+</tr>
+<tr>
+<td><code>fleet_configuration_mismatch</code></td>
+<td>Router and agent digests disagree.</td>
+</tr>
+<tr>
+<td><code>deployment_in_dwell</code></td>
+<td>Would require evicting inside a dwell window (§9.1).</td>
+</tr>
+<tr>
+<td><code>eviction_value_insufficient</code></td>
+<td>An admissible eviction set exists, but incoming demand does not exceed its summed <code>retention_value</code> by <code>eviction_margin</code> (§9.2).</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>modality_unsupported</code> is reused unchanged for documents (§3.3). Every reason appears in the decision trace with no prompt content and is visible in the decision explorer.</p>
+<h3 id="72-the-affinity-budget">7.2 The affinity budget</h3>
+<p>spec §6.3 defines <code>affinity_term</code> as &quot;short-lived cache/model warmness or conversation affinity&quot;, range <code>(0, 50_000)</code>. That is precisely what warmness needs, and the specification anticipated it. No new score term, no change to <code>MAX_NON_RANK_MAGNITUDE</code>, and the proven rank-dominance bound is untouched.</p>
+<p>Two things now share the term, so the range is <strong>split</strong> rather than contended:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Contributor</th>
+<th>Slice</th>
+<th>Values</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Warmness</strong></td>
+<td>0 – 40,000</td>
+<td><code>Resident</code> idle 40,000 · <code>Resident</code> loaded 32,000 · <code>Activating</code> 24,000 · <code>ColdFits</code> 16,000 · <code>ColdRequiresEviction</code> 8,000 · <code>ColdRequiresFetch</code> 0</td>
+</tr>
+<tr>
+<td><strong>Client hint</strong> (§3.6)</td>
+<td>0 – 6,000</td>
+<td><code>prefer_target</code> match 6,000, otherwise 0</td>
+</tr>
+<tr>
+<td><strong>Conversation affinity</strong></td>
+<td>0 – 4,000</td>
+<td>Reserved; not implemented</td>
+</tr>
+</tbody>
+</table></div>
+<p>The precedence this produces is the intended one, and each step matters:</p>
+<ul>
+<li>A warm target beats a cold one at equal rank.</li>
+<li>A <strong>hint cannot beat warmth.</strong> The ladder is spaced so every adjacent gap is 8,000, which exceeds the 6,000 hint slice; the spacing is chosen for exactly this reason and a property test asserts it. A client asking for a cold target when a warm equivalent exists gets the warm one.</li>
+<li>A hint <strong>can</strong> break a tie between two equally-warm eligible targets, which is its entire legitimate purpose.</li>
+<li><strong>Nothing here beats rank.</strong> A cold rank-0 pin still outranks a warm rank-1 target, and the router performs the swap. An operator wanting warmth to dominate expresses that by ranking, not by hoping the arithmetic works out.</li>
+</ul>
+<h3 id="73-deadlines-make-cold-targets-honest">7.3 Deadlines make cold targets honest</h3>
+<p>Estimated time-to-ready, adjusted for reasoning effort (§3.4), is compared against the request's remaining deadline before a cold target is offered. A 90-second model load cannot serve a 30-second deadline, and pretending otherwise converts a fast failure into a slow one.</p>
+<p>This is the strongest argument for the asynchronous job API (§11): a request <em>allowed</em> to wait ten minutes makes a cold, evicting, even fetching target legitimately eligible, and lets the fleet do work that synchronous semantics can only reject.</p>
+<h3 id="74-ordering-within-the-request-pipeline">7.4 Ordering within the request pipeline</h3>
+<p>The spec §3.1 lifecycle gains one step, placed deliberately:</p>
+<p>1–3. Unchanged (normalize, authenticate, parse — now including document parts, effort and quality floor).
+4. Compute eligible targets — now the full four-axis contract (§3) plus residency classification.
+5. Rank deterministically, <strong>reserve admission capacity</strong> using the effort- and document-adjusted estimate (§3.7). Unchanged in ordering: spec Appendix B requires the reservation before outbound I/O.
+6. <strong>New — if the chosen candidate is not <code>Resident</code>: acquire the host activation lease, execute the plan, await readiness or fail over.</strong>
+7–9. Unchanged (adapter, stream, normalize, meter, release <em>all</em> reservations and leases exactly once).</p>
+<p>Admission is reserved <strong>before</strong> the activation lease, and both release on every path. Evicting a running model and <em>then</em> discovering the tenant is over quota is exactly the unforced error Appendix B's ordering exists to prevent.</p>
+<p>Activation failure occurs strictly before upstream acceptance, so spec §6.5 failover applies unchanged. No new failover rule is required, and the prohibition on splicing after semantic output is untouched.</p>
+<hr />
+<h2 id="8-the-planner">8. The planner</h2>
+<h3 id="81-shape">8.1 Shape</h3>
+<p>A pure function in a new <code>hypellm-fleet</code> crate, subject to the same rule as <code>hypellm-core</code>: no I/O, no secrets, no clock of its own.</p>
+<pre><code class="language-rust">FleetPolicy::plan(
+    &amp;FleetSnapshot,      // observation + intent + age, immutable
+    &amp;DemandSnapshot,     // EWMA demand and queue depth per capability
+    &amp;Target,             // what we want ready
+    &amp;PlanContext,        // deadline, effort, principal class, permissions, now_ms
+) -&gt; PlanOutcome         // Plan { steps, eta_ms, trace } | Infeasible(reason)
+</code></pre>
+<p>Purity buys three operationally significant things: plans are deterministic and property-testable; identical snapshots produce identical plans, which is what Appendix B's determinism invariant requires once fleet state is live state; and <code>POST /admin/v1/fleet:simulate</code> can answer &quot;what would you do, and why&quot; with no side effects. Being able to ask a scheduler what it is about to do, before it does it, is the difference between an operable system and a haunted one.</p>
+<p>Fleet state reaches routing through the existing <code>LiveState</code> trait, extended with <strong>defaulted</strong> methods (<code>residency_class</code>, <code>activation_eta_ms</code>, <code>fleet_observation_age_ms</code>) so every current implementor compiles unchanged — the pattern <code>admin_override</code> and <code>failure_percent</code> already use. The snapshot is sampled once per decision and never re-read mid-scoring.</p>
+<h3 id="82-cost-model">8.2 Cost model</h3>
+<p>Integer milliseconds, saturating, no floating point.</p>
+<pre><code class="language-text">time_to_ready = Σ(drain_ms + stop_ms over the eviction set)
+              + fetch_ms (if the artifact is absent)
+              + start_ms + probe_ms
+</code></pre>
+<p>Declared values start it; each is refined by an EWMA over observed durations, clamped to <code>[declared / 4, declared × 4]</code> so one anomalous observation cannot make the planner believe a model loads instantly. Observation improves the estimate; it does not overrule the administrator by an order of magnitude.</p>
+<h3 id="83-eviction-set-selection">8.3 Eviction set selection</h3>
+<p>Bounded, deterministic, no combinatorial search.</p>
+<ol>
+<li><code>required_bytes = deployment.memory_bytes − free_bytes_in_pool</code>. If <code>≤ 0</code> the class is <code>ColdFits</code>; no eviction.</li>
+<li>Take resident deployments in the pool and <strong>exclude outright</strong>: <code>pinned</code>, <code>evictable=false</code>, not router-owned (§6.2), inside <code>min_resident_ms</code>, holding in-flight work above <code>max_drainable_inflight</code>, or currently activating.</li>
+<li>Sort the remainder by <code>retention_value</code> ascending, tie-broken by deployment id ascending so the order is total and independent of map iteration (Appendix B).</li>
+<li>Take the smallest prefix summing to <code>required_bytes</code>. If the whole list is insufficient return <code>host_capacity_insufficient</code>; if the shortfall is caused <em>only</em> by dwell exclusions return <code>deployment_in_dwell</code> instead — operationally different, and an operator must be able to tell them apart.</li>
+<li>Apply the hysteresis margin (§9.2). On failure return <code>eviction_value_insufficient</code>, with the incoming demand value, the set's summed <code>retention_value</code> and the configured margin in the trace. The set was evictable and large enough; it was simply not worth displacing, and the operator's lever is demand or <code>eviction_margin</code> rather than waiting for a dwell window to elapse.</li>
+</ol>
+<p>The set is capped at <code>max_eviction_set</code> (default 2). A plan that stops four models to start one is nearly always a misconfigured fleet rather than a good idea, and the cap turns that into a visible rejection instead of a five-minute outage.</p>
+<h3 id="84-retention-value">8.4 Retention value</h3>
+<p>What a resident deployment is worth keeping. Integer, saturating, closed inputs, ranges documented in the style of spec §6.3's score terms so the two read as one system:</p>
+<pre><code class="language-text">retention_value = demand_term      // EWMA of requests per minute for its capability
+                + queue_term       // requests currently waiting for it
+                + recency_term     // decayed time since last served request
+                + restore_term     // its own start_ms × its demand — the cost of being wrong
+                + operator_term    // administrator weight, plus tenant priority class
+                − staleness_term   // long-idle deployments become cheap to evict
+</code></pre>
+<p><code>restore_term</code> prevents the obvious failure. Without it the planner happily evicts the model about to be needed again, because it is momentarily idle, then pays its full load cost thirty seconds later. Weighting the <em>cost of restoring</em> something by <em>how likely it is to be wanted</em> is what makes the planner conservative in the right places.</p>
+<hr />
+<h2 id="9-anti-thrash-governance">9. Anti-thrash governance</h2>
+<p>The requirement is that the fleet must not swap models continuously. Eight mechanisms, layered, each sufficient against a different failure mode, listed in the order they take effect.</p>
+<h3 id="91-dwell-time--min_resident_ms">9.1 Dwell time — <code>min_resident_ms</code></h3>
+<p>Once <code>ready</code>, a deployment may not be evicted by the planner for <code>min_resident_ms</code> (default 300,000 ms). Operators may override; the planner may not.</p>
+<p>This is the primary control and the only hard floor. Every other mechanism is an economic argument that adversarial demand can talk into a swap. Dwell time cannot. It alone bounds the worst case: at five minutes, a host swaps at most twelve times an hour whatever demand does. It directly prevents A-evicts-B-evicts-A ping-pong.</p>
+<h3 id="92-hysteresis-margin">9.2 Hysteresis margin</h3>
+<p>Eviction is permitted only when incoming demand value <strong>exceeds</strong> the evicted set's summed <code>retention_value</code> by <code>eviction_margin</code> (default 25%), not merely equals it. Two capabilities of near-identical value must not trade places on noise. Without a margin a scheduler at equilibrium oscillates by construction.</p>
+<h3 id="93-demand-batching">9.3 Demand batching</h3>
+<p>Requests for a cold capability are held in a bounded per-capability queue rather than each triggering its own evaluation. A swap starts when accumulated demand reaches <code>activation_min_demand</code>, or the oldest queued request has waited <code>activation_max_wait_ms</code> — whichever comes first, and always before any request's deadline. All queued requests are then served by the one activation.</p>
+<p>This converts thrash into throughput. Ten music requests over two minutes should cost one swap, not ten. The queue is bounded, deadline-aware, and shares the spec §12 admission machinery rather than being a new unbounded structure.</p>
+<h3 id="94-cooldown-and-flap-backoff">9.4 Cooldown and flap backoff</h3>
+<p>After eviction, a deployment may not be re-activated on that accelerator for <code>reactivation_cooldown_ms</code> (default 120,000 ms). Repeated activate/evict cycles within <code>flap_window_ms</code> accrue an exponentially increasing cooldown capped at <code>max_flap_cooldown_ms</code> (default 1 hour), decaying after a quiet period.</p>
+<p>Backoff on repeated failure is the reflex spec §13's circuit breaker already applies to unhealthy targets. A flapping deployment is unhealthy in the same operational sense and deserves the same treatment.</p>
+<h3 id="95-activation-budget">9.5 Activation budget</h3>
+<p>A <strong>sliding window</strong> per host on activations per hour (<code>max_activations_per_hour</code>, default 12, matching the dwell floor). When exhausted, cold targets on that host become ineligible with <code>activation_budget_exhausted</code> rather than queueing indefinitely.</p>
+<p><strong>[as built]</strong> The design said token bucket, and that is wrong for the claim this mechanism makes. A bucket of twelve tokens refilling at twelve an hour permits <em>twenty-four</em> activations in the first hour, because it starts full. §15 promises &quot;twelve swaps per host per hour regardless of the attacker's rate&quot;, and only a window that counts actual activations in the trailing hour delivers that. The cost is a bounded ring of at most <code>max_activations_per_hour</code> timestamps per host, which is one more reason the ceiling is a small number.</p>
+<p>This is the hard ceiling that makes the feature safe to enable. Whatever defeats the economic arguments above, the bucket is arithmetic, and the failure mode when it engages is a clean, explained rejection.</p>
+<h3 id="96-prefer-no-swap-at-all">9.6 Prefer no swap at all</h3>
+<p>Placement prefers, strictly: <code>Resident</code>, then <code>Activating</code>, then <code>ColdFits</code> on any eligible accelerator, then <code>ColdRequiresEviction</code>. Given an alias with targets on two hosts, the planner takes the host with free memory over the one requiring an eviction, even when the latter has the better accelerator. The cheapest swap is the one that does not happen.</p>
+<h3 id="97-operator-anchors">9.7 Operator anchors</h3>
+<p><code>pinned=true</code> and <code>evictable=false</code> remove a deployment from automatic eviction. The Qwen3.8 chat service every coding harness depends on, and the unrelated production services on <code>rtx5090</code>, are configured this way. The planner is not asked to be clever about things the operator has already decided.</p>
+<h3 id="98-predictive-pre-warm--implemented-off-by-default">9.8 Predictive pre-warm — implemented, off by default</h3>
+<p>Starting a model before it is asked for is genuinely valuable and genuinely capable of doubling the swap rate if the prediction is poor. <strong>[as built]</strong> It ships disabled — <code>fleet_policy … prewarm_min_rate_per_minute=0</code> is the default — and is gated by the same activation budget so a bad predictor cannot exceed the ceiling.</p>
+<p>Two constraints beyond the budget, both because the budget alone bounds the <em>rate</em> of damage rather than its <em>kind</em>: a pre-warm plan that would evict is abandoned rather than executed, and one that would fetch is too. Prediction that displaces running work is the failure this section warns about, and refusing those two plan shapes is what makes the feature safe to enable on a fleet that is already busy.</p>
+<h3 id="99-making-the-goal-falsifiable">9.9 Making the goal falsifiable</h3>
+<p><code>hypellm_fleet_thrash_ratio</code> — activations divided by requests served from activated deployments — decides whether any of this works. A healthy fleet trends toward zero as batching amortises each swap. A ratio near 1 means every request costs a swap and the configuration is wrong. Publishing it turns &quot;relatively intelligent about it&quot; from an aspiration into something an operator can check.</p>
+<hr />
+<h2 id="10-activation-lifecycle">10. Activation lifecycle</h2>
+<h3 id="101-state-machine">10.1 State machine</h3>
+<p>Exhaustive enum; invalid transitions return an internal fault and close safely (spec §18.2):</p>
+<pre><code class="language-text">Planned → LeaseHeld → Draining → Stopping → [Fetching] → Starting → Probing → Ready
+                          ↓          ↓           ↓           ↓          ↓
+                       Failed ←──────┴───────────┴───────────┴──────────┘
+                          ↓
+                   RollbackPending → RollbackDone | RollbackFailed
+</code></pre>
+<p>Every transition is deadline-bounded. Every terminal state releases the lease exactly once.</p>
+<h3 id="102-draining-is-not-optional">10.2 Draining is not optional</h3>
+<p>A deployment being evicted is quiesced — the router stops selecting it — then drained: in-flight requests finish within <code>drain_ms</code>. Only if the drain deadline expires <em>and</em> <code>force_stop=true</code> is configured is it stopped with work in flight, emitting <code>fleet.forced_stop</code> naming the affected request count.</p>
+<p>Stopping a container mid-stream to serve someone else's request is a decision an operator must opt into explicitly and be able to find afterwards.</p>
+<h3 id="103-rollback">10.3 Rollback</h3>
+<p>If activation fails after eviction succeeded, the fleet is worse off than it started: one model stopped, none started. The plan carries a bounded best-effort rollback re-activating the evicted set, subject to the same budgets so a rollback storm cannot itself become the outage. The outcome is audited either way; a failed rollback quarantines the deployment for operator attention.</p>
+<h3 id="104-leases-and-crash-recovery">10.4 Leases and crash recovery</h3>
+<p>An activation lease is a durable record in the <code>hypellm-store</code> append-only log, written <strong>before</strong> the mutating verb is sent, carrying deployment, operation, expiry and the requesting decision id.</p>
+<p>On restart the router replays leases, queries <code>STATUS</code> for each, and reconciles. Because agent verbs are idempotent per lease, re-issuing is safe. Expired leases whose activation cannot be found are released and audited.</p>
+<p>Only one router may hold a lease on a host, enforced agent-side: the agent refuses a verb for a deployment leased to a different router instance. This is the conservative posture <code>ProcessLock</code> already takes in the store — not distributed consensus, and not claimed as such, but it prevents two routers fighting over one accelerator.</p>
+<h3 id="105-every-lease-is-released-exactly-once">10.5 Every lease is released exactly once</h3>
+<p>The obligation Appendix B places on admission reservations, for the same reason: <code>Drop</code> alone is not trusted for accounting. Release happens on success, activation failure, cancellation, client disconnect, deadline expiry, plan abandonment and shutdown. A leaked lease pins a host out of service until expiry — a slow, confusing outage. This gets a conservation property test (§16).</p>
+<hr />
+<h2 id="11-long-running-generative-work">11. Long-running generative work</h2>
+<p>Music, video and audio-to-video generation take minutes. One bounded worker thread per connection across 4,096 connections makes holding a socket for six minutes an expensive way to wait, and a cold-start swap in front of it makes it worse.</p>
+<p><strong>New first-party endpoint: <code>POST /v1/jobs</code></strong> — not OpenAI-compatible, because no OpenAI-compatible shape fits, and announced as first-party rather than dressed up as compatibility.</p>
+<pre><code class="language-text">POST   /v1/jobs             → 202 { job_id, state, eta_ms }
+GET    /v1/jobs/{id}        → state, progress, eta, error
+GET    /v1/jobs/{id}/events → bounded SSE progress stream (wire-sse), resumable
+GET    /v1/jobs/{id}/result → streamed artifact bytes, bounded, expiring
+DELETE /v1/jobs/{id}        → cancel; releases reservations and any activation lease
+</code></pre>
+<p>Where a standard shape exists it is used unchanged: <code>/v1/audio/speech</code> and <code>/v1/images/generations</code> keep their OpenAI-compatible forms and simply gain orchestrated targets behind them.</p>
+<p>Jobs carry <code>patience_ms</code> far exceeding an interactive deadline, which is what makes an eviction- or fetch-requiring target legitimately eligible (§7.3). Job records are bounded per tenant and in retention. Results stream through with bounded buffers and are <strong>not</strong> stored beyond a bounded time-limited spool — the router is not becoming a blob store, and spec §2.2's non-goals are not being quietly widened.</p>
+<hr />
+<h2 id="12-artifact-acquisition">12. Artifact acquisition</h2>
+<p>&quot;If a model is on no machine, it should be retrieved.&quot; This is the highest-risk path in the feature: the one place a request causes the fleet to consume tens or hundreds of gigabytes of disk and hours of bandwidth.</p>
+<p>A client cannot name an artifact, a source, or a digest. Controls, all mandatory:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Control</th>
+<th>Rule</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Permission</td>
+<td><code>fleet.fetch</code>, distinct from <code>fleet.activate</code>. Not granted by default.</td>
+</tr>
+<tr>
+<td>Budget</td>
+<td>Per-tenant bytes-per-period, enforced through the spec §12 admission machinery.</td>
+</tr>
+<tr>
+<td>Precondition</td>
+<td>Free disk must exceed <code>size_bytes</code> plus <code>fetch_disk_headroom_bytes</code> before starting.</td>
+</tr>
+<tr>
+<td>Architecture</td>
+<td><code>artifact.arch</code> must match <code>host.arch</code>. The Spark is <code>aarch64</code>; an x86-64 image will never run there.</td>
+</tr>
+<tr>
+<td>Verification</td>
+<td>The agent verifies digest and size before the artifact is usable; unverified artifacts cannot be activated.</td>
+</tr>
+<tr>
+<td>Concurrency</td>
+<td>One fetch per host; <code>max_concurrent_fetches</code> fleet-wide.</td>
+</tr>
+<tr>
+<td>Resumability</td>
+<td>Fetches resume rather than restart. A 40 GB download that restarts on every transient failure never completes.</td>
+</tr>
+<tr>
+<td>Cancellation</td>
+<td>A cancelled job cancels its fetch.</td>
+</tr>
+</tbody>
+</table></div>
+<p>Placement chooses among architecture-compatible hosts by free disk, accelerator fit, and whether the artifact is already partially present. <code>cache</code>, with ~5.9 TB free and no serious accelerator, is the natural artifact cache, and the model should let an operator say so.</p>
+<hr />
+<h2 id="13-configuration-grammar-additions">13. Configuration grammar additions</h2>
+<p>The spec §11.1 line-oriented grammar is extended with new record types and new fields on existing ones. No new syntax: same <code>type key=value</code> records, JSON-style quoted strings, <code>#</code> comments, unknown fields still errors, still no includes, environment expansion or templates.</p>
+<pre><code class="language-text">fleet_agent id=local socket=&quot;/run/hypellm/fleet.sock&quot; \
+    observation_interval_ms=5000 observation_max_age_ms=30000
+
+host id=spark agent=local arch=aarch64 status=enabled \
+    reserved_memory_bytes=17179869184 max_concurrent_activations=1
+
+accelerator host=spark id=gb10 kind=unified pool=spark-unified \
+    memory_bytes=140384485376
+
+deployment id=spark-music3 target=spark:minimax-music3 accelerator=gb10 \
+    artifact=minimax-music3-arm64 memory_bytes=64424509440 \
+    start_ms=180000 stop_ms=15000 drain_ms=30000 probe_ms=10000 \
+    min_resident_ms=600000 evictable=true pinned=false autostart=true \
+    readiness=http_ok
+
+artifact id=minimax-music3-arm64 kind=image arch=aarch64 \
+    size_bytes=21474836480 digest=&quot;sha256:…&quot; source=mirror-local
+
+capability id=text-to-music operations=jobs modalities=text
+
+fleet_policy scope=host:spark max_activations_per_hour=12 \
+    eviction_margin_permille=250 max_eviction_set=2 \
+    activation_min_demand=1 activation_max_wait_ms=20000 \
+    reactivation_cooldown_ms=120000 allow_fetch=false
+</code></pre>
+<p>Existing records gain <strong>optional fields only</strong>, so every current configuration stays valid:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Record</th>
+<th>New optional fields</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>alias</code></td>
+<td><code>capability</code></td>
+</tr>
+<tr>
+<td><code>target</code></td>
+<td><code>capabilities</code>, <code>quality_class</code>, <code>reasoning_efforts</code>, <code>effort_multipliers</code>, <code>document_token_estimate</code></td>
+</tr>
+<tr>
+<td><code>settings</code></td>
+<td><code>fleet_enabled</code> (default false), <code>max_documents_per_request</code>, <code>max_document_bytes</code>, <code>max_inline_document_bytes</code>, <code>default_document_token_estimate</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>Slave-hosted providers use <code>egress=private_network</code>, which <code>hypellm-core::netaddr::EgressProfile</code> already supports and <code>hypellm-net::egress</code> already enforces — private destinations are permitted only where an administrator declared the profile, and remain pinned and revalidated.</p>
+<p>Validation is off-path and fails closed on: a deployment whose <code>memory_bytes</code> exceeds its accelerator's pool; an artifact whose <code>arch</code> mismatches its host; a dangling reference; a <code>fleet_policy</code> whose budget underflows to zero; two deployments for one target; a capability required by an alias and declared by no target; an <code>effort_multipliers</code> entry for a tier absent from <code>reasoning_efforts</code>; a document limit set whose base64-encoded aggregate exceeds <code>max_body_bytes</code>.</p>
+<hr />
+<h2 id="14-durable-state">14. Durable state</h2>
+<p>New record types in the <code>hypellm-store</code> append-only framed log, replayed at startup under existing integrity rules:</p>
+<ul>
+<li><strong>Activation leases</strong> (§10.4) — written before the mutating verb; the basis of crash recovery.</li>
+<li><strong>Activation history</strong> — bounded ring per deployment: outcome, duration, reason, decision id. Feeds the EWMA cost model (§8.2) and the &quot;why was this evicted&quot; view.</li>
+<li><strong>Flap counters</strong> (§9.4) — survive restart, so a router bounce does not reset accrued backoff and permit a fresh burst of thrash.</li>
+<li><strong>Fetch progress</strong> — resumable across restart.</li>
+</ul>
+<p>Demand EWMAs are advisory and are <strong>not</strong> persisted; they rebuild from traffic. Persisting an advisory statistic so it survives a restart is how a scheduler ends up acting confidently on data from before an outage.</p>
+<hr />
+<h2 id="15-security-analysis">15. Security analysis</h2>
+<p>Extending spec §10.1. The fleet agent is a genuine expansion of the trusted computing base and is treated as one.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Threat</th>
+<th>Control</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Prompt or tool argument steers the fleet</td>
+<td>Deployments, hosts, artifacts and capabilities are administrator-configured identifiers. Only the resolved alias and its capability contract reach the planner. Prompt and document bytes never do.</td>
+</tr>
+<tr>
+<td>Malicious document input</td>
+<td>The router never parses documents (§3.3). Bytes are opaque, bounded, count-limited, and forwarded to a target that declared the modality. No parser is added to the data plane.</td>
+</tr>
+<tr>
+<td>Document URL as SSRF vector</td>
+<td>A URL-form document is forwarded and <strong>never fetched by the router</strong>, following the rule <code>ImageSource</code> already establishes. The provider retrieves it under its own egress policy (spec §10).</td>
+</tr>
+<tr>
+<td>Reasoning effort as quota bypass</td>
+<td>The tier's <code>output_multiplier</code> is applied <strong>at reservation</strong>, not after (§3.4). Reserving unmultiplied would let a single JSON field consume several times the held allowance.</td>
+</tr>
+<tr>
+<td>Reservation starvation via high effort</td>
+<td>Reservations are per-principal and refunded on completion through the existing <code>commit</code> path; a caller can only starve their own scope.</td>
+</tr>
+<tr>
+<td>Client hint as destination control</td>
+<td>A hint reorders eligible targets within a 6,000-point affinity slice; it cannot create eligibility, beat warmth, or outrank a binding (§3.6, §7.2).</td>
+</tr>
+<tr>
+<td>Thrash as denial of service</td>
+<td>Dwell floor, hysteresis margin, per-host activation bucket, per-principal activation quota, <code>fleet.activate</code> permission, and a clean eligibility rejection when exhausted (§9).</td>
+</tr>
+<tr>
+<td>Storage exhaustion via fetch</td>
+<td><code>fleet.fetch</code> permission, per-tenant byte budget, free-disk precondition, size ceiling, digest verification, one fetch per host (§12).</td>
+</tr>
+<tr>
+<td>Compromised router escalates to slaves</td>
+<td>The agent holds its own allowlist. The socket carries opaque identifiers and integers only. A compromised router can reorder declared deployments; it cannot introduce one (§4.2).</td>
+</tr>
+<tr>
+<td>Compromised agent</td>
+<td>The agent is TCB and is stated to be. Own unprivileged user; per-host keys with forced <code>command=</code>, no pty, no forwarding; independent rate limits; bounded reports (§4.4).</td>
+</tr>
+<tr>
+<td>Forged or malicious observation</td>
+<td>HMAC-authenticated handshake binding version and fleet digest, <code>wire-json</code> under explicit limits, unknown identifiers dropped and counted, numeric fields range-checked, partial updates rejected (§4.3).</td>
+</tr>
+<tr>
+<td>Replayed fleet verb</td>
+<td>The <code>HELLO</code> HMAC covers a nonce the agent will not accept twice, so a captured handshake cannot be replayed. Note this is defence in depth: reaching the socket at all already requires the owner's privileges (§4.3).</td>
+</tr>
+<tr>
+<td>Artifact substitution</td>
+<td>Content-addressed digest verified by the agent before use; source administrator-configured; unverified artifacts cannot be activated (§12).</td>
+</tr>
+<tr>
+<td>Eviction as cross-tenant attack</td>
+<td>Tenant priority class enters <code>retention_value</code>; a deployment with in-flight work above <code>max_drainable_inflight</code> is not evictable; <code>force_stop</code> is opt-in and audited (§8.3, §10.2).</td>
+</tr>
+<tr>
+<td>Capability enumeration across tenants</td>
+<td>Capability and deployment visibility is tenant-scoped. A cold-but-declared capability is not revealed to an unauthorized principal, and <code>GET /v1/models</code> still reveals only authorized aliases (Appendix B).</td>
+</tr>
+<tr>
+<td>Fleet topology leakage</td>
+<td>Host identifiers, memory figures and residency are management-plane data. Data-plane errors say &quot;capability unavailable&quot;; they never name hosts, accelerators, or what else is loaded.</td>
+</tr>
+<tr>
+<td>Split-brain between routers</td>
+<td>Agent-side lease ownership refuses verbs for a deployment leased elsewhere (§10.4).</td>
+</tr>
+</tbody>
+</table></div>
+<p>Two abuse cases deserve naming because they are cheap to run and expensive to suffer:</p>
+<ol>
+<li><strong>Alternating-capability request storm.</strong> A low-privilege principal alternates two capabilities that cannot coexist on one host. Defence is layered: batching absorbs the first burst, the dwell floor caps swap frequency absolutely, and the activation bucket terminates the pattern with an explained rejection. Worst case with defaults is twelve swaps per host per hour regardless of the attacker's rate.</li>
+<li><strong>Fetch amplification.</strong> A principal requests capabilities whose artifacts are absent everywhere, each triggering a large download. Defence: fetch is off by default, separately permissioned, byte-budgeted per tenant, disk-gated per host, and limited to one concurrent fetch per host.</li>
+</ol>
+<p>Changes to the agent protocol, the agent client, lease accounting, the eviction path, and the admission estimate for effort and documents require two-person review under the existing rule.</p>
+<hr />
+<h2 id="16-testing">16. Testing</h2>
+<p>The bar in <code>CLAUDE.md</code> applies: assert the property, make the fixture adversarial, verify the test fails without the fix.</p>
+<p><strong>Capability contract properties</strong> in <code>hypellm-core</code>:</p>
+<ul>
+<li><code>a_document_request_is_excluded_from_a_target_without_the_document_modality</code></li>
+<li><code>a_document_url_is_never_dereferenced_by_the_router</code> — asserted against an egress recorder, not by inspection</li>
+<li><code>inline_document_limits_cannot_be_configured_to_exceed_the_body_limit</code></li>
+<li><code>a_reasoning_effort_reserves_its_multiplied_output_budget</code></li>
+<li><code>an_unsupported_effort_tier_excludes_rather_than_downgrades</code></li>
+<li><code>a_quality_floor_excludes_a_lower_tier_target_even_when_it_is_cheaper</code></li>
+<li><code>a_client_hint_never_makes_an_ineligible_target_eligible</code></li>
+<li><code>a_client_hint_never_outranks_a_warmer_target_or_a_binding</code></li>
+<li><code>the_warmth_ladder_spacing_exceeds_the_maximum_hint_bonus</code> — the arithmetic the previous property depends on</li>
+</ul>
+<p><strong>Fleet properties</strong> in <code>hypellm-fleet</code>, seeded, in the style of the 14 existing properties in <code>hypellm-core/tests/properties.rs</code>:</p>
+<ul>
+<li><code>an_activation_never_evicts_a_deployment_inside_its_dwell_window</code></li>
+<li><code>a_plan_that_evicts_frees_at_least_the_required_memory</code></li>
+<li><code>equal_fleet_and_demand_snapshots_produce_equal_plans</code></li>
+<li><code>no_eviction_occurs_without_the_configured_hysteresis_margin</code></li>
+<li><code>a_pinned_deployment_never_appears_in_an_eviction_set</code></li>
+<li><code>the_planner_prefers_a_free_memory_host_over_an_eviction_host</code></li>
+<li><code>oscillating_demand_converges_below_the_activation_budget</code> — the anti-thrash property, over many rounds of adversarial alternating demand</li>
+<li><code>every_activation_lease_is_released_exactly_once</code> — the fleet analogue of reservation conservation</li>
+<li><code>a_cold_target_beyond_the_effort_adjusted_deadline_is_excluded_not_activated</code></li>
+<li><code>an_unfetchable_artifact_never_produces_a_plan_that_evicts</code></li>
+</ul>
+<p>Fixtures must be adversarial to be worth anything: the pin must not also be the cheapest option, the dwell-protected deployment must be the one the planner most wants to evict, and the quality-floor test's high-tier target must be the <em>expensive</em> one.</p>
+<p><strong>Fuzz targets</strong> using the seeded deterministic mutator in <code>hypellm-test-corpus::fuzz</code> — no <code>fuzz/</code> directory and no libFuzzer, per spec §4. Each asserts a property, not absence of panic:</p>
+<ul>
+<li>Agent inventory JSON — no unknown identifier is ever adopted; no numeric field escapes its range.</li>
+<li>Agent protocol replies — no malformed reply advances the activation state machine.</li>
+<li>Fleet configuration records — no accepted configuration permits a deployment exceeding its pool.</li>
+<li>Document content parts — no document part is ever parsed, and none escapes the count or byte bound.</li>
+<li>Plan execution — no interleaving of failures leaks a lease.</li>
+</ul>
+<p><strong>Integration</strong> against the simulated agent (§4.1): full eviction-and-start sequences, drain expiry, rollback, stale observation, divergence adoption, crash-and-recover with outstanding leases. Deterministic clock, no network — <code>cargo test --workspace --offline</code> stays honest.</p>
+<p><strong>Security tests</strong>: a prompt or document naming a deployment changes no plan; a principal without <code>fleet.activate</code> cannot cause activation by any request path; a principal without <code>fleet.fetch</code> cannot cause a byte to be downloaded; agent replies naming unknown deployments are dropped; data-plane errors leak no host identifier; a high-effort request cannot exceed its reserved token budget.</p>
+<p><strong>Resilience</strong>: agent unavailable mid-activation, agent restart mid-activation, host reboot during drain, disk full during fetch, clock skew across lease expiry, two routers contending for one host.</p>
+<hr />
+<h2 id="17-management-api-and-spa">17. Management API and SPA</h2>
+<p>New endpoints under <code>/admin/v1</code>, following existing conventions — explicit JSON schemas, ETags, <code>If-Match</code> on mutation, cursor pagination, stable error codes:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Method/path</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET /admin/v1/fleet</code></td>
+<td>Hosts, accelerators, deployments, residency, leases, budget remaining, observation age.</td>
+</tr>
+<tr>
+<td><code>PATCH /admin/v1/fleet/deployments/{id}</code></td>
+<td>Pin, unpin, set evictable, maintenance. ETag-guarded.</td>
+</tr>
+<tr>
+<td><code>POST /admin/v1/fleet/deployments/{id}:activate</code></td>
+<td>Operator-initiated, audited; bypasses demand thresholds but not dwell or budget.</td>
+</tr>
+<tr>
+<td><code>POST /admin/v1/fleet/deployments/{id}:deactivate</code></td>
+<td>Operator-initiated, with drain.</td>
+</tr>
+<tr>
+<td><code>POST /admin/v1/fleet:simulate</code></td>
+<td>Pure planner over a sanitized request descriptor. No side effects.</td>
+</tr>
+<tr>
+<td><code>POST /admin/v1/fleet/artifacts/{id}:fetch</code></td>
+<td>Operator-initiated acquisition.</td>
+</tr>
+<tr>
+<td><code>GET /admin/v1/fleet/activations</code></td>
+<td>History with outcome and reason — the &quot;why was this evicted&quot; view.</td>
+</tr>
+</tbody>
+</table></div>
+<p>SPA screens, first-party only, no <code>vendor/</code>, no inline handlers, DOM construction not HTML strings (spec §15):</p>
+<ul>
+<li><strong>Fleet</strong> — host cards with memory bars, resident sets, activation budget remaining, observation age, drift warnings.</li>
+<li><strong>Activations</strong> — a timeline of starts and stops, each with its reason code and the decision that caused it.</li>
+<li><strong>Decision explorer</strong> — extended with the capability contract (which axis excluded each candidate) and the plan (residency class, eviction set, estimated time-to-ready).</li>
+</ul>
+<p>Per the honesty rule: when <code>fleet_enabled=false</code> or no agent is configured, these screens render an explicit &quot;not available&quot; state. They must never render plausible-looking empty rows that read as a healthy idle fleet.</p>
+<hr />
+<h2 id="18-telemetry">18. Telemetry</h2>
+<p>Closed label vocabularies only. <code>host_id</code>, <code>deployment_id</code>, <code>capability</code> and <code>effort</code> are administrator-configured or closed enums and are therefore bounded, so they are admissible labels — unlike user id, request id or prompt, which remain forbidden (spec §17).</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>hypellm_fleet_activations_total{host,outcome}</code></td>
+<td>Swap volume and success rate.</td>
+</tr>
+<tr>
+<td><code>hypellm_fleet_evictions_total{host,reason}</code></td>
+<td>What is being displaced and why.</td>
+</tr>
+<tr>
+<td><code>hypellm_fleet_time_to_ready_ms{deployment}</code></td>
+<td>Histogram. Distribution, not average (spec §19.1).</td>
+</tr>
+<tr>
+<td><code>hypellm_fleet_resident_bytes{accelerator}</code></td>
+<td>Memory pressure.</td>
+</tr>
+<tr>
+<td><code>hypellm_fleet_activation_budget_remaining{host}</code></td>
+<td>How close the ceiling is.</td>
+</tr>
+<tr>
+<td><code>hypellm_fleet_queue_wait_ms{capability}</code></td>
+<td>The cost of batching, as experienced.</td>
+</tr>
+<tr>
+<td><code>hypellm_fleet_observation_age_ms{agent}</code></td>
+<td>Staleness, which gates everything.</td>
+</tr>
+<tr>
+<td><code>hypellm_fleet_thrash_ratio{host}</code></td>
+<td><strong>The KPI</strong> (§9.9).</td>
+</tr>
+<tr>
+<td><code>hypellm_requests_by_effort_total{effort,outcome}</code></td>
+<td>Whether effort tiers are used as expected.</td>
+</tr>
+<tr>
+<td><code>hypellm_token_estimate_error{source}</code></td>
+<td>Reserved versus reconciled tokens; validates the effort multipliers and document constants.</td>
+</tr>
+</tbody>
+</table></div>
+<p>Audit events: <code>fleet.activate</code>, <code>fleet.deactivate</code>, <code>fleet.evict</code>, <code>fleet.forced_stop</code>, <code>fleet.rollback</code>, <code>fleet.fetch</code>, <code>fleet.divergence</code>, <code>fleet.memory_drift</code>, <code>fleet.lease_expired</code>, <code>fleet.configuration_mismatch</code>. Each names the actor — an operator, or the decision id that caused it — so every model that stops is traceable to a cause.</p>
+<hr />
+<h2 id="19-performance-and-bounds">19. Performance and bounds</h2>
+<p>The spec §19 targets are unchanged and must stay so: warm router overhead p50 &lt; 2 ms, p99 &lt; 10 ms. Contract evaluation and planning run on the request path and are budgeted.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Quantity</th>
+<th>Bound</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Contract evaluation per candidate</td>
+<td>O(axes), no allocation.</td>
+</tr>
+<tr>
+<td>Planning per decision</td>
+<td>&lt; 500 µs at p99. Bounded search, no allocation in the common path.</td>
+</tr>
+<tr>
+<td>Fleet snapshot</td>
+<td>Immutable, sampled once per decision, shared by <code>Arc</code>. Never re-read mid-scoring.</td>
+</tr>
+<tr>
+<td>Observation payload</td>
+<td>256 KiB; 64 hosts; 256 accelerators; 512 deployments.</td>
+</tr>
+<tr>
+<td>Documents per request</td>
+<td><code>max_documents_per_request</code>, default 4.</td>
+</tr>
+<tr>
+<td>Inline document bytes</td>
+<td>4 MiB per part, 8 MiB aggregate decoded; encoded aggregate must fit <code>max_body_bytes</code> (16 MiB default).</td>
+</tr>
+<tr>
+<td>Eviction set</td>
+<td><code>max_eviction_set</code>, default 2.</td>
+</tr>
+<tr>
+<td>Plan steps</td>
+<td>8.</td>
+</tr>
+<tr>
+<td>Concurrent activations</td>
+<td>1 per host by default; fleet-wide cap.</td>
+</tr>
+<tr>
+<td>Activation queue</td>
+<td>Per capability, bounded, deadline-ordered, on the spec §12 admission machinery.</td>
+</tr>
+<tr>
+<td>Activation history</td>
+<td>Bounded ring per deployment.</td>
+</tr>
+</tbody>
+</table></div>
+<p>A cold start is not router overhead and must not be reported as one. Benchmarks report activation latency as its own distribution; the spec §19 figures continue to measure the warm path only.</p>
+<hr />
+<h2 id="20-phased-plan">20. Phased plan</h2>
+<p>Extending spec §24. Phase 5 has <strong>no fleet dependency at all</strong> and ships value alone; the rest are observation-before-mutation.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>Scope</th>
+<th>Exit</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>5 — Request expressiveness</strong></td>
+<td>Document modality, reasoning effort with multiplied reservation, quality tiers, <code>prefer_target</code> wiring, new exclusion reasons, adapter mappings. No fleet code.</td>
+<td>A document request routes to the vision target and is refused by the projector-less one; effort multiplies reservations and reconciles; hints reorder but never elevate; the mis-keyed hint fuzz target is repaired and demonstrably fails when the permission gate is removed.</td>
+</tr>
+<tr>
+<td><strong>6 — Fleet observation</strong></td>
+<td>Agent protocol and client, inventory model, <code>hypellm-fleet</code> types, residency classification, warmness into <code>affinity_term</code>, Fleet screen, metrics. <strong>No mutation.</strong></td>
+<td>Observation matches the real five-host fleet across restarts and manual operator changes; routing is unchanged for warm targets.</td>
+</tr>
+<tr>
+<td><strong>7 — Single-host orchestration</strong></td>
+<td>Activation and deactivation, leases, drain, rollback, dwell, hysteresis, budgets, cooldown, durable state, audit. One host — the Spark, where the contention is.</td>
+<td>Music3 ↔ Qwen3.8 swaps under real demand with a measured thrash ratio below target and no leaked leases across induced failures.</td>
+</tr>
+<tr>
+<td><strong>8 — Fleet-wide placement</strong></td>
+<td>Multi-host and multi-accelerator placement, capability routing, batching, <code>/v1/jobs</code>, simulation endpoint, decision-explorer integration.</td>
+<td>Correct <code>device=1</code> selection on <code>node0</code>; correct ARM64/x86-64 separation; job semantics under cancellation and disconnect.</td>
+</tr>
+<tr>
+<td><strong>9 — Acquisition and prediction</strong></td>
+<td>Artifact fetch with digest verification and budgets; predictive pre-warm, shipped disabled.</td>
+<td>Fetch drills including disk-full and interruption; pre-warm demonstrated not to raise the thrash ratio.</td>
+</tr>
+</tbody>
+</table></div>
+<p>Phases 5 through 8 are built, and so is phase 9: <code>FETCH</code> is permissioned, budgeted, disk-gated and digest-verified, and the reference agent retries it within the router's deadline, one fetch per host, resuming at layer granularity; predictive pre-warm is implemented and ships disabled. <code>POST /v1/jobs</code>, listed under phase 8, is built and ships disabled; its job records are process state rather than durable, which is recorded in <a href="deferred-issues.html#jobs-are-in-memory-and-a-restart-loses-them">current limitations</a>.</p>
+<p>Phases 5 and 6 are each worth doing alone. Phase 5 fixes a request model that is currently unable to express what callers ask for, with no new trust boundary. Phase 6 gives an accurate read-only picture of what is loaded where, improving routing immediately, with none of the risk of actuation.</p>
+<hr />
+<h2 id="21-open-decisions">21. Open decisions</h2>
+<p>Extending spec §25. Each has a recommended default; none should be settled by implementation accident.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Decision</th>
+<th>Recommended default</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Agent transport</td>
+<td>Unix socket on the router host; the agent reaches slaves over SSH. Do not put an agent on each slave in v1 — one TCB component is easier to review than five.</td>
+</tr>
+<tr>
+<td>Effort tier vocabulary</td>
+<td>Four tiers plus <code>Unset</code>. Do not accept provider-specific effort strings; map in the adapter.</td>
+</tr>
+<tr>
+<td>Document handling</td>
+<td>Opaque bytes with a configured token constant. Do not extract text in the router, now or later.</td>
+</tr>
+<tr>
+<td>Quality class semantics</td>
+<td>An ordered class, administrator-assigned, exactly like <code>cost_class</code>. Do not derive it from quantization strings or model names.</td>
+</tr>
+<tr>
+<td>Memory model fidelity</td>
+<td>Declared reservation refined by observed high-water. Do not attempt per-layer VRAM prediction.</td>
+</tr>
+<tr>
+<td>Demand signal</td>
+<td>EWMA of requests per minute per capability plus queue depth. Never prompt content.</td>
+</tr>
+<tr>
+<td>Multi-router coordination</td>
+<td>Forbid it: one router per host, enforced agent-side. Revisit only with the wider cluster question.</td>
+</tr>
+<tr>
+<td>Job result storage</td>
+<td>Stream through with a bounded expiring spool. Do not become a blob store.</td>
+</tr>
+<tr>
+<td>Capability vocabulary</td>
+<td>Closed enum in the router. Adding one is a code change and a review, not a configuration string.</td>
+</tr>
+<tr>
+<td>Un-containerised models (MOSS-SoundEffect)</td>
+<td>Out of scope for Phases 5–8. Either containerise, or model as a target with no deployment record and manage residency manually.</td>
+</tr>
+<tr>
+<td>Windows-host actuation</td>
+<td>Entirely the agent's concern. The router must never learn that some hosts need <code>powershell.exe</code> interop.</td>
+</tr>
+</tbody>
+</table></div>
+<hr />
+<h2 id="22-worked-examples">22. Worked examples</h2>
+<h3 id="221-capability-refusal-and-rerouting">22.1 Capability refusal and rerouting</h3>
+<p>The request that motivated this rework: <em>Qwen 3.8 at Q5, medium effort, reading a PDF.</em></p>
+<p><strong>Configuration.</strong> <code>alias id=qwen3.8-27b-q5 capability=chat targets=spark:qwen38-q5,rtx5090:qwen38-q5</code>. The Spark target declares <code>modalities=text,image</code> — the vision projector is loaded, so it reads images — but <strong>not</strong> <code>document</code>: a document is forwarded opaquely and llama.cpp has no PDF path. <code>node0:qwen35-9b-vision</code> is the only target declaring <code>modalities=text,image,document</code>.</p>
+<p><strong>Request.</strong> <code>POST /v1/chat/completions</code>, <code>&quot;model&quot;: &quot;qwen3.8-27b-q5&quot;</code>, one text part and one <code>Document</code> part, <code>reasoning_effort: &quot;medium&quot;</code>.</p>
+<p><strong>Contract evaluation.</strong> Verb <code>chat</code>: both targets pass. Modality: the request requires <code>Document</code>; neither Qwen3.8 target declares it — declaring <code>image</code> does not imply it. Both are excluded with <code>modality_unsupported</code>. <strong>No container starts.</strong> The caller receives a 4xx naming the unsupported modality — not a 5xx after a three-minute model load, and not a provider error after admission and metering.</p>
+<p>This is the design working. The alternative — starting a model because the caller named it, then failing at the provider — is the failure mode the capability contract exists to prevent.</p>
+<p><strong>If instead the caller had sent <code>&quot;model&quot;: &quot;vision-standard&quot;</code>:</strong> verb, modality and effort all pass against <code>node0:qwen35-9b-vision</code>. Effort <code>medium</code> carries <code>output_multiplier=4</code>, so admission reserves four times the base output estimate; the document part contributes <code>document_token_estimate</code> rather than <code>bytes / 2</code>. The reservation is reconciled against provider-reported usage on completion. If that target were cold, its effort-adjusted time-to-ready would be checked against the request deadline before it was offered as a candidate at all.</p>
+<p>The operator lesson is worth writing into the runbook: <strong>if you want one alias to serve both, list both targets under it.</strong> <code>alias id=qwen-any capability=chat targets=spark:qwen38-q5,node0:qwen35-9b-vision</code> routes text to the big model and documents to the vision model automatically, because modality is a filter and the caller never has to know.</p>
+<h3 id="222-eviction-under-memory-pressure">22.2 Eviction under memory pressure</h3>
+<p>The fleet-orchestration path, on real numbers.</p>
+<p><strong>State.</strong> <code>spark</code> (~140 GB unified, 17 GB reserved for the host) has <code>spark-qwen38</code> (chat, declared 26 GB, resident 40 minutes, dwell satisfied, steady harness demand) and <code>spark-h3</code> (audio-to-video, declared 48 GB, resident 6 minutes, idle 5 minutes). <code>spark-music3</code> (text-to-music, declared 64 GB) is cold; its artifact is present. Declared figures are the conservative reservations of §5.3 and exceed observed usage, which is why the three do not co-reside under the router's model even though a hand-tuned operator can squeeze them in.</p>
+<p><strong>Request.</strong> A principal with <code>fleet.activate</code> submits <code>POST /v1/jobs</code>, alias <code>music-standard</code>, capability <code>text-to-music</code>, <code>patience_ms=900000</code>.</p>
+<p><strong>Route.</strong> One target, <code>spark:minimax-music3</code>. Free pool memory ~49 GB against 64 GB required, so the class is <code>ColdRequiresEviction</code>. Time-to-ready is 30 s drain + 15 s stop + 180 s start + 10 s probe = 235 s, comfortably inside <code>patience_ms</code>. Affinity 8,000; it is the only candidate.</p>
+<p><strong>Admission.</strong> Tenant and principal reservations succeed and are held.</p>
+<p><strong>Plan.</strong> <code>spark-qwen38</code> is excluded — <code>pinned</code>, and independently holding in-flight work. <code>spark-h3</code> is still inside its dwell window, 6 minutes resident against a 10-minute <code>min_resident_ms</code>, so it is excluded too. No admissible eviction set remains; the plan returns <code>deployment_in_dwell</code>.</p>
+<p>That is the correct answer at that moment and worth dwelling on: the job is queued with an explicit reason and an ETA rather than the fleet tearing down a model that has been up for six minutes. Four minutes later the queued demand is re-evaluated. <code>spark-h3</code> is now past dwell, idle, with a low <code>retention_value</code> — no demand, no queue, poor recency — that the incoming demand exceeds by more than the 25% margin.</p>
+<p><strong>Execute.</strong> Lease written durably. <code>DEACTIVATE spark-h3</code> with a 30 s drain; no in-flight work, stops in 8 s. Observation confirms ~97 GB free. <code>ACTIVATE spark-music3</code>; <code>starting</code> → <code>probing</code> → <code>ready</code> in 174 s. The <code>host:spark</code> bucket goes 12 → 11; <code>spark-h3</code> enters a 120 s cooldown; <code>spark-music3</code> starts a 10-minute dwell.</p>
+<p><strong>Serve.</strong> The job dispatches to the now-warm target. Other music jobs queued during those 174 s are served by the same activation — one swap, several jobs.</p>
+<p><strong>Afterwards.</strong> The audit chain holds <code>fleet.evict</code> naming <code>spark-h3</code>, its retention value, the margin, and the displacing decision id. <code>hypellm_fleet_time_to_ready_ms</code> records 174,000. If an H3 request arrives 30 seconds later it does <strong>not</strong> swap back: music3 is inside its dwell window and H3 inside its cooldown. It waits, or fails with a reason an operator can read.</p>
+<hr />
+<h2 id="23-invariants">23. Invariants</h2>
+<p>Extending spec Appendix B. The review checklist for any change to this subsystem.</p>
+<p><strong>Capability contract</strong></p>
+<ul>
+<li>Every axis of the contract is an eligibility filter; none is a score term.</li>
+<li>The router never parses a document, never fetches a document URL, and document bytes never influence routing.</li>
+<li>Inline document limits fit within the endpoint body limit once base64 inflation is applied.</li>
+<li>A reasoning tier's output multiplier is applied at reservation, before outbound I/O.</li>
+<li>A client hint never creates eligibility, never beats warmth, and never outranks a binding. The warmth ladder's minimum adjacent gap exceeds the maximum hint bonus, and the affinity slices sum to no more than the term's range.</li>
+<li>A quality floor and a cost ceiling are independent; neither is derived from the other.</li>
+</ul>
+<p><strong>Fleet</strong></p>
+<ul>
+<li>The router never executes a process, and no identifier crossing the agent socket originates from a client.</li>
+<li>Warmness is a preference; capability, authorization and residency remain filters. Priority rank still dominates every warmness consideration.</li>
+<li>A deployment inside its dwell window is never evicted by the planner.</li>
+<li>A pinned or non-evictable deployment never appears in an eviction set.</li>
+<li>No eviction occurs without exceeding the configured hysteresis margin.</li>
+<li>An eviction set frees at least the required memory, or the plan is refused.</li>
+<li>Equal fleet, demand and policy snapshots produce equal plans.</li>
+<li>Admission is reserved before an activation lease is acquired; both are released exactly once on every path.</li>
+<li>No plan executes on an observation older than <code>observation_max_age_ms</code>.</li>
+<li>Activation failure occurs before upstream acceptance; the no-splice-after-semantic-output rule is untouched.</li>
+<li>The activation budget is a hard ceiling. When exhausted, requests are refused with a reason, never queued indefinitely.</li>
+<li>No artifact is activated before its digest is verified.</li>
+<li>The agent handshake binds the protocol version and the fleet digest, and no nonce is accepted twice.</li>
+<li>Management visibility of fleet topology never exceeds the caller's tenant and permissions, and data-plane errors reveal no host, accelerator or co-resident deployment.</li>
+</ul>
+
+      </article>
+      <footer class="page-footer"><a href="index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#1-what-this-adds">1. What this adds</a></li>
+<li class="toc-level-3"><a href="#11-non-goals">1.1 Non-goals</a></li>
+<li class="toc-level-3"><a href="#12-the-fleet-this-is-designed-against">1.2 The fleet this is designed against</a></li>
+<li class="toc-level-3"><a href="#13-model-alias-target-deployment-artifact">1.3 Model, alias, target, deployment, artifact</a></li>
+<li class="toc-level-2"><a href="#2-what-does-not-change">2. What does not change</a></li>
+<li class="toc-level-2"><a href="#3-the-capability-contract">3. The capability contract</a></li>
+<li class="toc-level-3"><a href="#31-the-four-axes">3.1 The four axes</a></li>
+<li class="toc-level-3"><a href="#32-capability-verbs">3.2 Capability verbs</a></li>
+<li class="toc-level-3"><a href="#33-modalities-including-documents">3.3 Modalities, including documents</a></li>
+<li class="toc-level-3"><a href="#34-reasoning-effort">3.4 Reasoning effort</a></li>
+<li class="toc-level-3"><a href="#35-quality-tiers-and-quantization">3.5 Quality tiers and quantization</a></li>
+<li class="toc-level-3"><a href="#36-client-hints">3.6 Client hints</a></li>
+<li class="toc-level-3"><a href="#37-what-this-costs-at-admission">3.7 What this costs at admission</a></li>
+<li class="toc-level-2"><a href="#4-trust-boundary-the-fleet-agent">4. Trust boundary: the fleet agent</a></li>
+<li class="toc-level-3"><a href="#41-why-it-is-a-separate-process">4.1 Why it is a separate process</a></li>
+<li class="toc-level-3"><a href="#42-what-the-agent-may-be-told">4.2 What the agent may be told</a></li>
+<li class="toc-level-3"><a href="#43-wire-protocol">4.3 Wire protocol</a></li>
+<li class="toc-level-3"><a href="#44-agent-obligations">4.4 Agent obligations</a></li>
+<li class="toc-level-2"><a href="#5-fleet-domain-model">5. Fleet domain model</a></li>
+<li class="toc-level-3"><a href="#51-host">5.1 Host</a></li>
+<li class="toc-level-3"><a href="#52-accelerator">5.2 Accelerator</a></li>
+<li class="toc-level-3"><a href="#53-deployment">5.3 Deployment</a></li>
+<li class="toc-level-3"><a href="#54-artifact">5.4 Artifact</a></li>
+<li class="toc-level-2"><a href="#6-fleet-state-observation-belief-and-intent">6. Fleet state: observation, belief and intent</a></li>
+<li class="toc-level-3"><a href="#61-belief-expires">6.1 Belief expires</a></li>
+<li class="toc-level-3"><a href="#62-divergence-is-audited-not-silently-corrected">6.2 Divergence is audited, not silently corrected</a></li>
+<li class="toc-level-3"><a href="#63-memory-drift">6.3 Memory drift</a></li>
+<li class="toc-level-2"><a href="#7-routing-integration">7. Routing integration</a></li>
+<li class="toc-level-3"><a href="#71-residency-classification">7.1 Residency classification</a></li>
+<li class="toc-level-3"><a href="#72-the-affinity-budget">7.2 The affinity budget</a></li>
+<li class="toc-level-3"><a href="#73-deadlines-make-cold-targets-honest">7.3 Deadlines make cold targets honest</a></li>
+<li class="toc-level-3"><a href="#74-ordering-within-the-request-pipeline">7.4 Ordering within the request pipeline</a></li>
+<li class="toc-level-2"><a href="#8-the-planner">8. The planner</a></li>
+<li class="toc-level-3"><a href="#81-shape">8.1 Shape</a></li>
+<li class="toc-level-3"><a href="#82-cost-model">8.2 Cost model</a></li>
+<li class="toc-level-3"><a href="#83-eviction-set-selection">8.3 Eviction set selection</a></li>
+<li class="toc-level-3"><a href="#84-retention-value">8.4 Retention value</a></li>
+<li class="toc-level-2"><a href="#9-anti-thrash-governance">9. Anti-thrash governance</a></li>
+<li class="toc-level-3"><a href="#91-dwell-time--min_resident_ms">9.1 Dwell time — min_resident_ms</a></li>
+<li class="toc-level-3"><a href="#92-hysteresis-margin">9.2 Hysteresis margin</a></li>
+<li class="toc-level-3"><a href="#93-demand-batching">9.3 Demand batching</a></li>
+<li class="toc-level-3"><a href="#94-cooldown-and-flap-backoff">9.4 Cooldown and flap backoff</a></li>
+<li class="toc-level-3"><a href="#95-activation-budget">9.5 Activation budget</a></li>
+<li class="toc-level-3"><a href="#96-prefer-no-swap-at-all">9.6 Prefer no swap at all</a></li>
+<li class="toc-level-3"><a href="#97-operator-anchors">9.7 Operator anchors</a></li>
+<li class="toc-level-3"><a href="#98-predictive-pre-warm--implemented-off-by-default">9.8 Predictive pre-warm — implemented, off by default</a></li>
+<li class="toc-level-3"><a href="#99-making-the-goal-falsifiable">9.9 Making the goal falsifiable</a></li>
+<li class="toc-level-2"><a href="#10-activation-lifecycle">10. Activation lifecycle</a></li>
+<li class="toc-level-3"><a href="#101-state-machine">10.1 State machine</a></li>
+<li class="toc-level-3"><a href="#102-draining-is-not-optional">10.2 Draining is not optional</a></li>
+<li class="toc-level-3"><a href="#103-rollback">10.3 Rollback</a></li>
+<li class="toc-level-3"><a href="#104-leases-and-crash-recovery">10.4 Leases and crash recovery</a></li>
+<li class="toc-level-3"><a href="#105-every-lease-is-released-exactly-once">10.5 Every lease is released exactly once</a></li>
+<li class="toc-level-2"><a href="#11-long-running-generative-work">11. Long-running generative work</a></li>
+<li class="toc-level-2"><a href="#12-artifact-acquisition">12. Artifact acquisition</a></li>
+<li class="toc-level-2"><a href="#13-configuration-grammar-additions">13. Configuration grammar additions</a></li>
+<li class="toc-level-2"><a href="#14-durable-state">14. Durable state</a></li>
+<li class="toc-level-2"><a href="#15-security-analysis">15. Security analysis</a></li>
+<li class="toc-level-2"><a href="#16-testing">16. Testing</a></li>
+<li class="toc-level-2"><a href="#17-management-api-and-spa">17. Management API and SPA</a></li>
+<li class="toc-level-2"><a href="#18-telemetry">18. Telemetry</a></li>
+<li class="toc-level-2"><a href="#19-performance-and-bounds">19. Performance and bounds</a></li>
+<li class="toc-level-2"><a href="#20-phased-plan">20. Phased plan</a></li>
+<li class="toc-level-2"><a href="#21-open-decisions">21. Open decisions</a></li>
+<li class="toc-level-2"><a href="#22-worked-examples">22. Worked examples</a></li>
+<li class="toc-level-3"><a href="#221-capability-refusal-and-rerouting">22.1 Capability refusal and rerouting</a></li>
+<li class="toc-level-3"><a href="#222-eviction-under-memory-pressure">22.2 Eviction under memory pressure</a></li>
+<li class="toc-level-2"><a href="#23-invariants">23. Invariants</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

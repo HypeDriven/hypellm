@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: hypellm-store.">
+  <title>hypellm-store · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="../assets/wiki.css">
+  <script defer src="../assets/search-index.js"></script>
+  <script defer src="../assets/wiki.js"></script>
+</head>
+<body data-wiki-root="../" data-page-title="hypellm-store" data-page-group="Module contracts">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="../index.html">Wiki home</a></li>
+<li><a href="../overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="../router-specification.html">Router specification</a></li>
+<li><a href="../threat-model.html">Threat model</a></li>
+<li><a href="../orchestration.html">Fleet orchestration</a></li>
+<li><a href="../deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="../using-the-router.html">Using the router</a></li>
+<li><a href="../deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="../runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="../components/fleet-agent.html">Fleet agent</a></li>
+<li><a href="../components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="../components/container-init.html">Container init</a></li>
+<li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="hypellm-config.html">hypellm-config</a></li>
+<li><a href="hypellm-core.html">hypellm-core</a></li>
+<li><a href="hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="hypellm-net.html">hypellm-net</a></li>
+<li><a href="hypellm-router.html">hypellm-router</a></li>
+<li><a href="hypellm-store.html" aria-current="page">hypellm-store</a></li>
+<li><a href="hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="wire-http1.html">wire-http1</a></li>
+<li><a href="wire-json.html">wire-json</a></li>
+<li><a href="wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="../index.html">Wiki</a><span aria-hidden="true">/</span>Module contracts</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="module-hypellm-store">Module: hypellm-store</h1>
+<p>Specification 4.1 requires every in-repository module to declare an owner, threat
+notes, public API, unsafe-code declaration, fuzz targets, and maximum
+input/resource limits.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Owner</td>
+<td>Security (primary), Platform (secondary)</td>
+</tr>
+<tr>
+<td>Unsafe code</td>
+<td>None. <code>#![forbid(unsafe_code)]</code> declared in <code>lib.rs</code> and inherited from the workspace lint table.</td>
+</tr>
+<tr>
+<td>External dependencies</td>
+<td>None third-party. Workspace path dependencies only: <code>hypellm-core</code>, <code>hypellm-crypto</code>, <code>wire-json</code>.</td>
+</tr>
+<tr>
+<td>Fuzz targets</td>
+<td>None implemented. Required targets are listed under <a href="#fuzz-targets">Fuzz targets</a>.</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="scope">Scope</h2>
+<p>This module owns durable state on a single node: the append-only framed log, the
+periodic snapshot, the process lock, atomic file replacement, the audit hash
+chain with signed checkpoints, and the pointer swap that activates a validated
+configuration (specification 11, 11.2, 18.1).</p>
+<p>The boundary matters as much as the contents. This module does <strong>not</strong>:</p>
+<ul>
+<li><strong>Interpret payloads.</strong> <code>Frame::payload</code> is opaque bytes. Only <code>audit.rs</code>
+imposes a payload shape, and only on its own two record kinds. The store never
+parses a configuration document, a key record, or a usage aggregate — it
+stores and returns them. Validation belongs to the module that owns the type.</li>
+<li><strong>Hold or derive the MAC key.</strong> <code>Store::open</code> takes <code>mac_key: &amp;[u8]</code> from the
+platform secret facility (specification 10). The store never generates it,
+never persists it, and has no rotation path: re-keying invalidates every
+protected frame already on disk, so it is an offline re-write, not a runtime
+operation.</li>
+<li><strong>Invent cryptography.</strong> Every digest, MAC, and constant-time comparison comes
+from <code>hypellm-crypto</code>. There is no signature scheme here, and the &quot;signed
+checkpoint&quot; of specification 11.2 is an HMAC under the router's own key, not
+an asymmetric signature.</li>
+<li><strong>Export anything.</strong> Specification 11.2 requires checkpoints to be &quot;exported
+to immutable storage&quot;. This module <em>produces</em> checkpoints and a point-in-time
+backup (<code>Store::backup_to</code>); shipping either off the node is the caller's job.</li>
+<li><strong>Distribute state.</strong> Specification 11.2 defers multi-node to an external
+consensus/config distributor. There is no replication, no leader election, and
+no distributed lock here — only <code>ProcessLock</code>, which is single-node by
+construction.</li>
+<li><strong>Decide policy.</strong> <code>Activatable&lt;T&gt;</code> is generic and holds no routing knowledge;
+it is a pointer with bounded history.</li>
+</ul>
+<h3 id="fleet-records">Fleet records</h3>
+<p>Three kinds join the log for fleet orchestration (specification 26.6):
+<code>FleetLease</code>, <code>FleetActivation</code> and <code>FleetFlap</code>. Two of them are <strong>protected</strong>,
+and the reason is worth stating: a lease authorises stopping a production model,
+so an unprotected one could be forged on disk between a crash and a restart and
+the router would reconcile against it — re-issuing a verb nobody asked for. Flap
+counters are protected for the same reason inverted: clearing one on disk would
+grant a fresh burst of exactly the thrash the backoff exists to stop.</p>
+<p><code>FleetActivation</code> is an outcome record, recomputable from the audit trail and
+high-volume, so it is unprotected — the same judgement <code>UsageAggregate</code> already
+carries.</p>
+<p>The payload codec is <code>hypellm_fleet::durable</code>, not this crate: a record that
+fails any range check on the way back in is <strong>skipped rather than adopted</strong>,
+because a corrupt lease the router acted on would send a verb nobody asked for
+while a skipped one merely expires and is audited.</p>
+<p><strong>Key budgets.</strong> <code>KeyBudget</code> (specification 12.1) carries one API key's token
+limit, payment override, revision and durable high-water mark, together with
+the receipt of the credit that produced the record when a credit did — so a
+credit and its receipt are one frame and cannot disagree. Last frame per key
+wins on replay; receipts accumulate. It is <strong>protected</strong>: an unprotected record
+could be rewritten on disk to raise a purchased limit or forget consumption.
+The codec is <code>hypellm_admin_api::budget</code>, and it rejects a record whose limit or
+mark is present but malformed rather than reading it as "unlimited" or "nothing
+spent". Because the kind is protected, a binary that predates it refuses to
+start on a log that contains one, instead of running the keys without their
+budgets.</p>
+<h2 id="threat-notes">Threat notes</h2>
+<p><strong>Two integrity mechanisms for two different adversaries.</strong> CRC-32 covers header
+and payload and detects a torn write, a short read, or bit rot; it is not a
+security control. HMAC-SHA-256 covers header, payload, and CRC on <em>protected</em>
+kinds (<code>RecordKind::is_protected</code>) — the ones that decide authorization or carry
+accountability. The distinction drives recovery: <code>FrameError::is_recoverable_tail</code>
+(incomplete, checksum) truncates and the router starts; <code>is_integrity_violation</code>
+(MAC mismatch, missing MAC, unexpected MAC) fails startup closed. Getting this
+backwards in either direction is a bug — turning every power loss into an outage,
+or booting on an edited audit history.</p>
+<p><strong>Forgery with a recomputed checksum.</strong> The realistic attacker holds write access
+to the state directory, knows the frame format, and can fix up the CRC. The MAC
+covers the sequence number, the record kind, and the protected flag, so
+renumbering, retyping, and flag-stripping are all rejected
+(<code>FrameError::MissingMac</code> / <code>UnexpectedMac</code> / <code>MacMismatch</code>). Reordering or
+deleting whole frames that each verify is caught separately, by the strictly
+increasing sequence check in <code>Log::replay</code>
+(<code>LogError::NonMonotonicSequence</code>).</p>
+<p><strong>The audit chain alone is not tamper-evident.</strong> <code>link_of</code> is unkeyed SHA-256, so
+an attacker who can rewrite the entire log can recompute a self-consistent chain
+from genesis. What actually resists that is the per-frame HMAC and the
+checkpoint MAC, both keyed with material the attacker does not hold. Treat the
+chain as <em>ordering and continuity</em> evidence and the checkpoint as the trust
+anchor; a chain verified without a checkpoint proves very little.</p>
+<p><strong>Snapshot metadata is MACed on write and verified on read.</strong> <code>encode_meta</code>
+appends an HMAC over the magic, sequence, audit head, audit count, and a SHA-256
+of the payload; <code>read_snapshot</code> recomputes that MAC and rejects a mismatch as
+<code>SnapshotIntegrity</code>, using a constant-time compare. Editing the metadata to
+rewind the sequence number or substitute an audit head therefore fails startup
+rather than being accepted.</p>
+<p><strong>The snapshot is one file.</strong> The metadata leads <code>snapshot.bin</code> and the payload
+follows it, so <code>Store::compact</code> replaces both with a single atomic rename; a
+crash cannot pair a new payload with old metadata. The metadata still carries a
+digest of the payload, so a substituted body is <code>SnapshotIntegrity</code>. A
+<code>snapshot.meta</code> left by the earlier two-file format is removed on the next
+compaction, and a <code>snapshot.bin</code> in that format fails closed as
+<code>CorruptSnapshotMetadata</code>. The log reset happens last; if it does not happen,
+startup and every later read skip frames at or below the snapshot's sequence,
+so no record is applied twice.</p>
+<p><strong>A failed append leaves nothing behind.</strong> <code>Log::append</code> cuts the file back to
+its last known-good length and syncs it when a write or <code>fsync</code> fails, so a
+frame the caller was told failed is not on disk and the next frame does not
+land behind partial bytes. If the cut itself fails, the log is poisoned and
+refuses every later append until the store is reopened. <code>append_audit</code>'s chain
+rollback depends on this.</p>
+<p><strong>Recovery verifies integrity and continuity.</strong> <code>Store::open</code> authenticates
+protected frames, checks monotonic sequence numbers, decodes every audit record
+under the same field bounds used by the writer, and verifies each chain link.
+A torn final frame is recoverable; corruption before the tail, an unreadable
+protected record or a broken chain refuses startup rather than discarding later
+history.</p>
+<p><strong>Replay is window-bounded.</strong> Log replay streams through a bounded window rather
+than materialising the complete log. Snapshot payload size is validated before
+allocation. Compaction remains an operator-controlled lifecycle action, so disk
+capacity still needs monitoring.</p>
+<p><strong>Diagnostic output redacts the MAC key.</strong> <code>Store</code> has a hand-written <code>Debug</code>
+implementation that never renders key bytes.</p>
+<p><strong>The process lock is advisory and racy.</strong> <code>ProcessLock</code> is a lock <em>file</em>, not an
+OS lock — <code>flock</code> would need <code>unsafe</code> FFI, which the workspace forbids. It
+records a <code>ProcessIdentity</code>: the boot id, the pid, and the process start time
+from <code>/proc/&lt;pid&gt;/stat</code>, so a pid that has been reused, a pid 1 in a fresh
+container, and a pid from before a reboot are each recognised as <em>not</em> the
+holder and the lock is reclaimed. The reclaim runs inside its own <code>O_EXCL</code> critical section (<code>lock.claim</code>) and
+re-reads the lock under it, so two starters that both observe the same stale
+lock cannot both proceed; a claim left by a starter that died mid-reclaim
+carries an identity of its own and is swept, so it cannot wedge the directory.
+<code>Drop</code> removes the lock file only if the identity on disk is still this
+process's. A lock (or claim) is written to a staging file and hard-linked into
+place, so it never appears without its identity; an empty lock — which only an
+older build, or a filesystem without hard links, can produce — is treated as
+held for <code>EMPTY_LOCK_GRACE</code> and reclaimable after it.</p>
+<p>What remains: where <code>/proc</code> is absent or will not answer, the liveness check
+degrades to pid existence — which never steals a live lock but can refuse a
+start after a crash. <strong>On a shared or network volume the lock provides no
+protection at all</strong>; <code>O_EXCL</code> and the identity are both local facts.</p>
+<p><strong>Backup validates its boundary.</strong> <code>Store::backup_to</code> refuses a log shorter than
+the tracked durable boundary and copies only complete validated bytes.</p>
+<p><strong>Forward compatibility is one-directional.</strong> An unknown <code>RecordKind</code> is
+preserved as <code>Unknown(v)</code> so a newer writer's records survive a rollback, but
+<code>Unknown</code> reports <code>is_protected() == false</code>. A <em>protected</em> record kind added in a
+later version therefore arrives at an older reader with the protected flag set,
+is classified <code>UnexpectedMac</code>, and fails startup closed. Adding an
+authorization-relevant record kind is a format-version change, not an additive
+one.</p>
+<p><strong>Sequence gaps are legal.</strong> <code>Store::append_locked</code> consumes a sequence number
+before the write; a failed append leaves a hole. Replay requires strictly
+increasing, not contiguous, sequence numbers, so gaps are accepted by design and
+cannot be used to detect deletion — that is the chain's job.</p>
+<h2 id="limits">Limits</h2>
+<p>Enforced:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Input / resource</th>
+<th>Limit</th>
+<th>Enforced by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Declared frame payload length</td>
+<td>64 MiB</td>
+<td><code>frame::MAX_PAYLOAD_LEN</code>, checked in <code>frame::decode</code> <strong>before</strong> any allocation, and in <code>frame::encode</code> so an unreadable frame is never written</td>
+</tr>
+<tr>
+<td>Frame header / CRC / MAC</td>
+<td>24 / 4 / 32 bytes, fixed</td>
+<td><code>frame::HEADER_LEN</code>, <code>CRC_LEN</code>, <code>MAC_LEN</code></td>
+</tr>
+<tr>
+<td>Frame format version</td>
+<td>Exactly <code>1</code></td>
+<td><code>frame::FORMAT_VERSION</code>; anything else is <code>UnsupportedVersion</code></td>
+</tr>
+<tr>
+<td>Audit record JSON</td>
+<td>depth 32, 64 KiB per string, 1 MiB total, 10 000 array items, 2 000 object entries, duplicate keys rejected</td>
+<td><code>wire_json::Limits::SMALL</code> in <code>AuditRecord::from_payload</code></td>
+</tr>
+<tr>
+<td>Audit reason text</td>
+<td>512 bytes, truncated on a char boundary</td>
+<td><code>Capped::new(reason, 512)</code> in <code>AuditEvent::with_reason</code> and <code>from_json</code></td>
+</tr>
+<tr>
+<td>Audit checkpoint payload</td>
+<td>Exactly 80 bytes</td>
+<td><code>AuditCheckpoint::from_payload</code></td>
+</tr>
+<tr>
+<td>Snapshot metadata</td>
+<td>The first 116 bytes (<code>META_LEN</code>) of <code>snapshot.bin</code>, with <code>HYMT</code> magic</td>
+<td><code>read_snapshot</code></td>
+</tr>
+<tr>
+<td>Retained activation history</td>
+<td>8 versions by default, caller-chosen via <code>Activatable::with_history</code>; 0 disables rollback</td>
+<td><code>history_limit</code> plus <code>Vec::truncate</code> in <code>activate</code></td>
+</tr>
+<tr>
+<td>Audit checkpoint cadence</td>
+<td>Caller-supplied record interval; <code>0</code> disables automatic checkpoints</td>
+<td><code>Store::checkpoint_interval</code></td>
+</tr>
+<tr>
+<td>Sequence ordering</td>
+<td>Strictly increasing across the log</td>
+<td><code>Log::replay</code> → <code>LogError::NonMonotonicSequence</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>Not enforced — stated so the gap is visible rather than assumed:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Input / resource</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Total log file size</td>
+<td>Not bounded on write. Compaction is caller-driven; replay refuses a log over <code>log::MAX_LOG_BYTES</code> rather than reading it.</td>
+</tr>
+<tr>
+<td>Snapshot payload size</td>
+<td>Unbounded on both write (<code>Store::compact</code>) and read (<code>read_optional</code>).</td>
+</tr>
+<tr>
+<td>Frames materialised by one replay</td>
+<td>Unbounded; <code>Replay::frames</code> grows with the log.</td>
+</tr>
+<tr>
+<td><code>AuditEvent</code> actor / tenant / object / request_id / source</td>
+<td>Unbounded on write; only the read path is bounded, which is the asymmetry noted above.</td>
+</tr>
+<tr>
+<td>Reserved header field (bytes 10..12)</td>
+<td>Not validated on decode. Covered by CRC and MAC, so it cannot be edited in place, but a non-zero value decodes successfully.</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="fuzz-targets">Fuzz targets</h2>
+<p><code>tests/fuzz.rs</code> — seven targets over specification 21's &quot;state recovery&quot; row,
+run by <code>cargo test -p hypellm-store</code>, driven by the seeded mutation engine in
+<code>hypellm-test-corpus::fuzz</code>. There is no <code>fuzz/</code> directory and no libFuzzer
+harness, because specification 4 admits no such dependency.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Target</th>
+<th>Property asserted</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>truncating_the_log_at_any_offset_recovers_a_prefix_and_never_panics</code></td>
+<td>A torn tail is a prefix, not a crash</td>
+</tr>
+<tr>
+<td><code>truncation_never_discards_a_frame_that_precedes_the_damage</code></td>
+<td>Recovery keeps everything before the damage</td>
+</tr>
+<tr>
+<td><code>a_corrupted_byte_anywhere_is_detected_or_confined</code></td>
+<td>A flipped bit is caught or cannot cross a frame</td>
+</tr>
+<tr>
+<td><code>a_forged_protected_frame_does_not_authenticate</code></td>
+<td>The MAC is load-bearing</td>
+</tr>
+<tr>
+<td><code>random_bytes_are_not_mistaken_for_a_log</code></td>
+<td>No accidental recognition</td>
+</tr>
+<tr>
+<td><code>a_log_written_under_another_key_is_refused</code></td>
+<td>Key confusion is refused</td>
+</tr>
+<tr>
+<td><code>recovery_is_repeatable</code></td>
+<td>Two recoveries of one directory agree</td>
+</tr>
+</tbody>
+</table></div>
+<p>Offsets are sampled rather than exhaustive (96 exhaustive, then a prime stride,
+then the last 48 bytes) to keep the run under a few seconds; a bug living only
+at an unsampled interior offset would be missed.</p>
+<p>Still outstanding:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Target</th>
+<th>Property under test</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Frame decode</td>
+<td>Mutated bytes terminate without panic or oversized allocation</td>
+</tr>
+<tr>
+<td>Log replay</td>
+<td>Mutated logs produce a validated frame prefix or a classified integrity failure</td>
+</tr>
+<tr>
+<td>Recovery</td>
+<td>Structured truncation and corruption preserve the torn-tail versus mid-file-damage distinction</td>
+</tr>
+<tr>
+<td>Audit payloads</td>
+<td>Mutated records and checkpoints cannot fabricate authenticated history</td>
+</tr>
+<tr>
+<td>Snapshot metadata</td>
+<td>Mutated metadata and payload pairs are bounded and integrity-checked</td>
+</tr>
+</tbody>
+</table></div>
+<p>Differential and property coverage that fuzzing should back: encode/decode round
+trip for every <code>RecordKind</code>, and &quot;every proper prefix of a frame reports
+<code>Incomplete</code>&quot; — both currently exist only as unit tests in <code>frame.rs</code>.</p>
+<h2 id="public-api">Public API</h2>
+<p>See <code>lib.rs</code>. <code>Store</code> is the intended entry point: <code>open</code>, <code>append</code>,
+<code>append_audit</code>, <code>checkpoint_audit</code>, <code>compact</code>, <code>snapshot</code>, <code>backup_to</code>, <code>sync</code>.
+The lower layers (<code>frame</code>, <code>log</code>, <code>durable</code>, <code>audit</code>, <code>activation</code>) are public
+because the router startup path, the admin API, and the recovery tooling each
+need one of them directly, not because the layering is optional — in particular,
+the documented lock order inside <code>Store</code> is <strong>log, then audit</strong>, and any caller
+reaching past <code>Store</code> to <code>Log</code> forfeits that guarantee.</p>
+<p><code>tempdir::TempDir</code> is a test utility shipped in the library rather than under
+<code>#[cfg(test)]</code> so that other crates' integration tests can use it; the dependency
+policy (specification 4) admits no <code>tempfile</code> crate. It panics on failure and
+must not appear on any production path.</p>
+
+      </article>
+      <footer class="page-footer"><a href="../index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#scope">Scope</a></li>
+<li class="toc-level-3"><a href="#fleet-records">Fleet records</a></li>
+<li class="toc-level-2"><a href="#threat-notes">Threat notes</a></li>
+<li class="toc-level-2"><a href="#limits">Limits</a></li>
+<li class="toc-level-2"><a href="#fuzz-targets">Fuzz targets</a></li>
+<li class="toc-level-2"><a href="#public-api">Public API</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

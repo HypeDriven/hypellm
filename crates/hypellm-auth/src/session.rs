@@ -58,7 +58,7 @@ pub enum AuthMethod {
     /// A local username and password.
     ///
     /// Not one of specification 9.2's four methods — see `LocalUser` in
-    /// `hypellm-config` and `docs/deferred-issues.md` for why it exists anyway.
+    /// `hypellm-config` and `spec/deferred-issues.html` for why it exists anyway.
     /// It is recorded distinctly because an investigation's first question is
     /// how a principal authenticated, and a password session answered as
     /// `oidc` would say the identity provider vouched for someone it has never
@@ -87,7 +87,7 @@ pub enum AuthMethod {
     /// that field exists to prevent.
     ///
     /// This is a deviation from specification 9.2, recorded in
-    /// `docs/deferred-issues.md`. It is off unless configured.
+    /// `spec/deferred-issues.html`. It is off unless configured.
     Anonymous,
 }
 

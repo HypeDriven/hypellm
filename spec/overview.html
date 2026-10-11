@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: Project overview.">
+  <title>Project overview · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="./assets/wiki.css">
+  <script defer src="./assets/search-index.js"></script>
+  <script defer src="./assets/wiki.js"></script>
+</head>
+<body data-wiki-root="./" data-page-title="Project overview" data-page-group="Start here">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="index.html">Wiki home</a></li>
+<li><a href="overview.html" aria-current="page">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="router-specification.html">Router specification</a></li>
+<li><a href="threat-model.html">Threat model</a></li>
+<li><a href="orchestration.html">Fleet orchestration</a></li>
+<li><a href="deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="using-the-router.html">Using the router</a></li>
+<li><a href="deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="components/fleet-agent.html">Fleet agent</a></li>
+<li><a href="components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="components/container-init.html">Container init</a></li>
+<li><a href="components/tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="modules/hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="modules/hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="modules/hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="modules/hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="modules/hypellm-config.html">hypellm-config</a></li>
+<li><a href="modules/hypellm-core.html">hypellm-core</a></li>
+<li><a href="modules/hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="modules/hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="modules/hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="modules/hypellm-net.html">hypellm-net</a></li>
+<li><a href="modules/hypellm-router.html">hypellm-router</a></li>
+<li><a href="modules/hypellm-store.html">hypellm-store</a></li>
+<li><a href="modules/hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="modules/hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="modules/wire-http1.html">wire-http1</a></li>
+<li><a href="modules/wire-json.html">wire-json</a></li>
+<li><a href="modules/wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="index.html">Wiki</a><span aria-hidden="true">/</span>Start here</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="hypellm-router">HypeLLM Router</h1>
+<p>HypeLLM Router is a self-hosted gateway for routing LLM requests across local and hosted providers. It presents OpenAI- and Anthropic-compatible APIs to coding tools, applies tenant policy and capacity controls, selects an eligible target, and streams the provider response back to the client.</p>
+<p>The project is a Rust workspace with a dependency-free static administration UI. It is designed for operators who need one controlled entry point for several model providers without allowing request content to choose destinations or credentials.</p>
+<h2 id="what-it-provides">What it provides</h2>
+<ul>
+<li><strong>Compatible inference APIs</strong> for OpenAI chat, responses, embeddings and Anthropic messages workflows.</li>
+<li><strong>Policy-based routing</strong> through client-facing model aliases, grants, denies, preferences, hard pins, residency requirements and capability filters.</li>
+<li><strong>Capability-contract requests</strong>: a caller states a verb, the modalities they are sending (including opaque documents), a reasoning tier and a quality floor, and each is an eligibility filter rather than a hint.</li>
+<li><strong>Fleet orchestration.</strong> The router models the accelerator hosts behind its targets and starts and stops declared containers to serve demand — under dwell floors, hysteresis margins, per-host activation budgets and durable leases, through a separate out-of-process agent. It never executes a process itself.</li>
+<li><strong>Provider support</strong> for llama.cpp, OpenAI, Anthropic, DeepSeek and Moonshot/Kimi, plus an explicitly enabled generic OpenAI-compatible adapter and SemIf, a local decision scorer reached through <code>POST /v1/rerank</code>.</li>
+<li><strong>Bounded admission</strong> with concurrency, queue, request-rate, token-rate, byte-rate and spend controls.</li>
+<li><strong>Streaming and failover</strong> with backpressure, deadlines, circuit breakers and deterministic candidate ordering.</li>
+<li><strong>Separate management plane</strong> with Google OIDC, RBAC, CSRF protection, policy drafts, two-person publication, audit export, usage views and emergency break-glass access.</li>
+<li><strong>Security-focused operation</strong> including strict parsers, destination pinning, credential isolation, durable policy activation and an authenticated audit chain.</li>
+<li><strong>No third-party runtime or web dependencies.</strong> The workspace builds offline and the admin UI uses first-party static assets only.</li>
+</ul>
+<h2 id="architecture-at-a-glance">Architecture at a glance</h2>
+<pre><code class="language-text">Coding tools ──OpenAI/Anthropic API──▶ inference listener
+                                           │
+                                  authenticate and admit
+                                           │
+                                  policy and target ranking
+                                           │
+                         llama.cpp / OpenAI / Anthropic /
+                           DeepSeek / Moonshot providers
+
+Operators ─────────HTTPS edge────────▶ management listener
+                                           │
+                              admin API and static web UI
+
+                     ┌──── owner-only Unix socket, identifiers only
+                     ▼
+              fleet agent ──ssh──▶ accelerator hosts
+</code></pre>
+<p>Inference and management use separate listeners, handlers, authentication methods and resource limits. Starting and stopping containers happens in a separate agent process, because the router must not execute a subprocess: the socket between them carries opaque identifiers and bounded integers, and the agent resolves each against its own allowlist. The router speaks HTTP/1.1 internally. Production deployments place a platform TLS edge in front of inbound listeners and use local platform helpers for outbound TLS and OIDC token verification; the router does not implement TLS or asymmetric signature verification itself. A reference identity verifier ships in <code>verifier/</code>, out of the workspace like the agent, and performs no cryptography of its own.</p>
+<h2 id="build-and-verify">Build and verify</h2>
+<p>Requirements: Rust 1.85 or newer on Linux. All commands run offline.</p>
+<pre><code class="language-bash">cargo build --workspace --offline
+cargo test --workspace --offline
+cargo clippy --workspace --all-targets --offline
+cargo run -q -p hypellm-devtools --bin depscan --offline -- --root .
+</code></pre>
+<p><code>depscan</code> enforces the repository's supply-chain policy: no registry dependencies, build scripts, procedural macros, dynamic loading, unsafe Rust, remote web assets or vendored browser code.</p>
+<h2 id="quick-start-with-llamacpp">Quick start with llama.cpp</h2>
+<p>Create <code>hypellm.conf</code>:</p>
+<pre><code class="language-text">settings state_dir=./state inference_listen=127.0.0.1:8000 \
+         admin_listen=127.0.0.1:8001 control_socket=./run/control.sock
+tenant id=local
+provider id=local family=llamacpp scheme=http host=127.0.0.1 port=8080 egress=local
+target id=local:model provider=local model=model local=true operations=chat,embeddings \
+       streaming=true context=32768 max_output=4096 concurrency=4
+alias id=default targets=local:model
+grant scope=tenant:local model=* allow=true
+binding id=prefer-local scope=tenant:local model=* prefer=local:model
+</code></pre>
+<p>Then generate the secret bundle, validate the configuration and start the router:</p>
+<pre><code class="language-bash">mkdir -p ./run ./state
+cargo run -p hypellm-router -- --generate-secrets ./secrets
+cargo run -p hypellm-router -- --check --config ./hypellm.conf
+cargo run -p hypellm-router -- \
+  --config ./hypellm.conf --secrets ./secrets --static ./web
+</code></pre>
+<p><code>--generate-secrets</code> prints the break-glass token once and stores only its verifier. Save it offline: it cannot be recovered, and it is the only credential that carries <code>manage_keys</code> on a deployment with no identity provider — and therefore the only way to mint the API key inference requires. The container profile also ships a <code>local_user</code> account (<code>admin</code>/<code>admin</code>) for the admin application; it is a default credential and the first thing to change.</p>
+<p>Inference requests require a router API key created through the management API. <a href="using-the-router.html">Using the router</a> is the client-side guide — how to mint that key and point a project at the endpoint. See the <a href="deployment.html">deployment guide</a> for HTTPS/OIDC setup, credentials, configuration and service hardening.</p>
+<h2 id="run-it-in-a-container">Run it in a container</h2>
+<p>A <a href="../justfile"><code>justfile</code></a> and the manifests in <a href="../k8s"><code>k8s/</code></a> build the router and run it on the fleet's k3s cluster, namespace <code>hypellm</code>, kubectl context <code>fleet</code>. Requirements: Docker (to build the image), <code>kubectl</code>, <a href="https://github.com/casey/just"><code>just</code></a>, and <code>kstack</code>, the cluster helper every fleet project's justfile calls (<code>~/system/k3s/bin/kstack</code> on the cluster host).</p>
+<pre><code class="language-bash">just bootstrap  # first run: secrets, router, and a key to call it with
+just status     # is it running, and does it answer
+just logs       # follow the structured log
+just key        # mint another API key
+just down       # delete the namespace; the router drains on SIGTERM
+</code></pre>
+<p><code>just bootstrap</code> is <code>just up</code> plus the two steps that otherwise happen by hand. It captures the break-glass token from <code>--generate-secrets</code> — printed once, stored nowhere — spends it minting the first API key, and prints the token at the end to be stored offline. Without a key the router answers <code>/health</code> and refuses everything else, and break-glass is the only credential that carries <code>manage_keys</code> where no identity provider is configured — the shipped <code>admin</code> password account can reach every other screen but not this one.</p>
+<p><code>just up</code> prints the inference, management and metrics endpoints when the router answers <code>/health/live</code>. The image build runs <code>depscan</code> and the release build offline; the router container gets no capabilities, <code>no_new_privs</code>, the runtime's seccomp filter, a read-only root filesystem, and uid 1000. Configuration is <a href="../docker/hypellm.conf"><code>docker/hypellm.conf</code></a>, delivered as a ConfigMap, so <code>just up</code> after an edit restarts the pod; state and secrets are hostPath mounts under <code>run/</code>.</p>
+<h3 id="reaching-it-over-tailscale">Reaching it over Tailscale</h3>
+<p>The pod has two containers: a <code>tailscale/tailscale</code> node and the router, sharing the pod's network namespace. The router therefore <em>is</em> a tailnet node — <code>hypellm-router.&lt;tailnet&gt;.ts.net</code> — rather than a port published on the host. The node's identity lives in <code>run/tailscale</code>, so it keeps its name and address across restarts.</p>
+<p>Which planes the tailnet can reach is decided by bind address, in <code>docker/hypellm.conf</code>:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Listener</th>
+<th>Bound to</th>
+<th>Tailnet</th>
+<th>This host</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Inference</td>
+<td><code>0.0.0.0:18000</code></td>
+<td>yes</td>
+<td>yes</td>
+</tr>
+<tr>
+<td>Management + SPA</td>
+<td>pod IP <code>:18001</code></td>
+<td>via HTTPS proxy only</td>
+<td>yes</td>
+</tr>
+<tr>
+<td>Metrics</td>
+<td>pod IP <code>:18002</code></td>
+<td>no</td>
+<td>yes</td>
+</tr>
+</tbody>
+</table></div>
+<p>The configuration names <code>10.89.7.2</code>, which the pod's <code>render-config</code> init container replaces with the pod's own address before the router starts. A listener bound to it is reachable through the published loopback ports (socat listeners on the node, <code>k8s/publish.yaml</code>) and is not bound on <code>tailscale0</code>, so a tailnet peer finds nothing listening. This fails closed and does not depend on a Tailscale ACL or a firewall rule elsewhere. Tailnet reachability is not authentication — inference still requires a router API key.</p>
+<p>The admin dashboard is the one deliberate exception: the sidecar serves it at <strong><code>https://hypellm-router.&lt;tailnet&gt;.ts.net/</code></strong> with <code>tailscale serve</code> (<code>docker/tailscale-serve.json</code>), terminating TLS with a certificate for the MagicDNS name and proxying to the pod address. It has to be HTTPS — the session cookie is <code>__Host-</code>, so a browser drops it over plain http on any name but <code>localhost</code>. The proxy withholds <code>/metrics</code>. Signing in still needs a <code>local_user</code> password or break-glass, and the URL must be listed in <code>cors_origins</code> or every sign-in fails with <code>origin_not_permitted</code>. The tailnet needs MagicDNS and HTTPS certificates enabled.</p>
+<p>First run needs the node authenticated: put a key in <code>run/secrets/tailscale.authkey</code>, or let <code>just up</code> print the login URL — and open it within a minute, because the container gives up after that and restarts with a new one. <code>just tailnet</code> shows the node's address and its learned routes.</p>
+<p>The network namespace belongs to the pod, not to either container, so a restart of the tailscale container no longer strands the router in a dead namespace.</p>
+<p>Slaves are reached by their <strong>LAN address</strong>, over a Tailscale subnet route advertised from their network — <code>--accept-routes</code> installs it and the RFC 1918 destination is preserved, so <code>egress=private_network</code> still describes the connection. Do not point a provider at a slave's <code>100.64.0.0/10</code> address: that classifies as <code>shared_address_space</code>, which <code>EgressProfile::permits</code> refuses under every profile, because carrier-grade NAT space is a well-known SSRF pivot.</p>
+<h2 id="documentation">Documentation</h2>
+<ul>
+<li><a href="index.html">Documentation index</a></li>
+<li><a href="using-the-router.html">Using the router</a> — pointing a project at a running instance</li>
+<li><a href="deployment.html">Deployment and configuration</a></li>
+<li><a href="runbooks.html">Operational runbooks</a></li>
+<li><a href="orchestration.html">Fleet orchestration</a> and the <a href="components/fleet-agent.html">fleet agent</a></li>
+<li><a href="components/identity-verifier.html">The identity verifier</a> — Google sign-in, and enrolling the first administrator</li>
+<li><a href="components/tray-monitor.html">The Windows tray monitor</a> — which models are in flight, and tokens per second per user and key, from the desktop</li>
+<li><a href="threat-model.html">Threat model</a></li>
+<li><a href="deferred-issues.html">Current limitations</a></li>
+<li><a href="router-specification.html">Detailed specification</a></li>
+</ul>
+<p>The specification defines the intended security and protocol contract. The operator documentation describes the current implementation. Current limitations are kept separately and do not retain closed issue history.</p>
+<h2 id="current-deployment-scope">Current deployment scope</h2>
+<p>The supported production shape is a hardened single node, or several independent nodes with conservative quota partitioning and separate state directories. HypeLLM Router does not currently provide state replication, leader election or a distributed configuration service.</p>
+<p>Fleet orchestration is single-router by design: one router manages a host, enforced agent-side. Four parts of the orchestration design are deliberately not built — a jobs API for long generations, predictive pre-warm, resumable artifact fetches and Windows-host actuation — and are listed rather than approximated.</p>
+<p>Review <a href="deferred-issues.html">current limitations</a> before deployment.</p>
+<h2 id="license">License</h2>
+<p><a href="../LICENSE">MIT</a></p>
+
+      </article>
+      <footer class="page-footer"><a href="index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#what-it-provides">What it provides</a></li>
+<li class="toc-level-2"><a href="#architecture-at-a-glance">Architecture at a glance</a></li>
+<li class="toc-level-2"><a href="#build-and-verify">Build and verify</a></li>
+<li class="toc-level-2"><a href="#quick-start-with-llamacpp">Quick start with llama.cpp</a></li>
+<li class="toc-level-2"><a href="#run-it-in-a-container">Run it in a container</a></li>
+<li class="toc-level-3"><a href="#reaching-it-over-tailscale">Reaching it over Tailscale</a></li>
+<li class="toc-level-2"><a href="#documentation">Documentation</a></li>
+<li class="toc-level-2"><a href="#current-deployment-scope">Current deployment scope</a></li>
+<li class="toc-level-2"><a href="#license">License</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

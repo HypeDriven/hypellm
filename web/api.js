@@ -52,6 +52,25 @@ export class ApiError extends Error {
 
 const BASE = '/admin/v1';
 
+/**
+ * Refuse a guarded change that has no version to guard against, before the
+ * operator has committed to it.
+ *
+ * @param {string} ifMatch
+ * @returns {string}
+ */
+function requireTag(ifMatch) {
+  if (!ifMatch) {
+    throw new ApiError(428, {
+      error: {
+        code: 'precondition_required',
+        message: 'this change needs the resource to be re-read first',
+      },
+    });
+  }
+  return ifMatch;
+}
+
 /** The management API client. */
 export class Api {
   constructor() {
@@ -82,10 +101,12 @@ export class Api {
    * @param {object} [options]
    * @param {object} [options.body]
    * @param {string} [options.ifMatch]
+   * @param {string} [options.idempotencyKey] Names the operation, so a retry
+   *   of it is recognised rather than applied twice.
    * @param {boolean} [options.shared] Do not cancel other in-flight requests.
    * @returns {Promise<{data: object, etag: string|null}>}
    */
-  async request(method, path, { body, ifMatch, shared = false } = {}) {
+  async request(method, path, { body, ifMatch, idempotencyKey, shared = false } = {}) {
     const mutating = !['GET', 'HEAD', 'OPTIONS'].includes(method);
 
     if (mutating && !this.csrfToken) {
@@ -106,6 +127,9 @@ export class Api {
     }
     if (ifMatch) {
       headers['If-Match'] = ifMatch;
+    }
+    if (idempotencyKey) {
+      headers['Idempotency-Key'] = idempotencyKey;
     }
 
     let controller = null;
@@ -194,6 +218,30 @@ export class Api {
       });
     }
     return this.request('PATCH', path, { body, ifMatch });
+  }
+
+  /**
+   * Replace a resource that was read first.
+   *
+   * @param {string} path
+   * @param {object} body
+   * @param {string} ifMatch The resource's current ETag.
+   */
+  put(path, body, ifMatch) {
+    return this.request('PUT', path, { body, ifMatch: requireTag(ifMatch) });
+  }
+
+  /**
+   * A guarded, idempotent action: applied once per `idempotencyKey`, and only
+   * against the version that was read.
+   *
+   * @param {string} path
+   * @param {object} body
+   * @param {string} ifMatch The resource's current ETag.
+   * @param {string} idempotencyKey
+   */
+  postOnce(path, body, ifMatch, idempotencyKey) {
+    return this.request('POST', path, { body, ifMatch: requireTag(ifMatch), idempotencyKey });
   }
 
   /** @param {string} path */

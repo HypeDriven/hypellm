@@ -1,0 +1,621 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: hypellm-router.">
+  <title>hypellm-router · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="../assets/wiki.css">
+  <script defer src="../assets/search-index.js"></script>
+  <script defer src="../assets/wiki.js"></script>
+</head>
+<body data-wiki-root="../" data-page-title="hypellm-router" data-page-group="Module contracts">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="../index.html">Wiki home</a></li>
+<li><a href="../overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="../router-specification.html">Router specification</a></li>
+<li><a href="../threat-model.html">Threat model</a></li>
+<li><a href="../orchestration.html">Fleet orchestration</a></li>
+<li><a href="../deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="../using-the-router.html">Using the router</a></li>
+<li><a href="../deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="../runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="../components/fleet-agent.html">Fleet agent</a></li>
+<li><a href="../components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="../components/container-init.html">Container init</a></li>
+<li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="hypellm-config.html">hypellm-config</a></li>
+<li><a href="hypellm-core.html">hypellm-core</a></li>
+<li><a href="hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="hypellm-net.html">hypellm-net</a></li>
+<li><a href="hypellm-router.html" aria-current="page">hypellm-router</a></li>
+<li><a href="hypellm-store.html">hypellm-store</a></li>
+<li><a href="hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="wire-http1.html">wire-http1</a></li>
+<li><a href="wire-json.html">wire-json</a></li>
+<li><a href="wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="../index.html">Wiki</a><span aria-hidden="true">/</span>Module contracts</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="module-hypellm-router">Module: hypellm-router</h1>
+<p>Specification 4.1 requires every in-repository module to declare an owner, threat
+notes, public API, unsafe-code declaration, fuzz targets, and maximum
+input/resource limits.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Owner</td>
+<td>Platform (primary), Security (secondary)</td>
+</tr>
+<tr>
+<td>Unsafe code</td>
+<td>None. <code>#![forbid(unsafe_code)]</code> is declared in both <code>lib.rs</code> and <code>main.rs</code> and inherited from the workspace lint table.</td>
+</tr>
+<tr>
+<td>External dependencies</td>
+<td>None. Rust standard library plus workspace path dependencies: <code>hypellm-adapters</code>, <code>hypellm-admin-api</code>, <code>hypellm-auth</code>, <code>hypellm-config</code>, <code>hypellm-core</code>, <code>hypellm-crypto</code>, <code>hypellm-fleet</code>, <code>hypellm-net</code>, <code>hypellm-store</code>, <code>hypellm-telemetry</code>, <code>wire-http1</code>, <code>wire-json</code>, <code>wire-sse</code>.</td>
+</tr>
+<tr>
+<td>Fuzz targets</td>
+<td>Implemented in <code>tests/fuzz.rs</code>: nine seeded mutation properties over the client protocol parsers and their trust boundaries.</td>
+</tr>
+</tbody>
+</table></div>
+<p>Ownership is Platform-primary because the crate's centre of gravity is the
+listener, the process lifecycle, and the request pipeline. Three areas inside it
+are nonetheless Security-review surface under specification 21.1 and must not be
+changed by one person: <code>routes::authenticate</code> and the scope gate in
+<code>InferenceHandler::inference</code>; the two client-protocol parsers in <code>protocol/</code>;
+and <code>dispatch::build_headers</code> / <code>state::CredentialStore</code>, which are the only
+places in this crate that touch provider credentials.</p>
+<h2 id="scope-and-what-this-module-deliberately-does-not-do">Scope, and what this module deliberately does not do</h2>
+<p>Specification 18.1 assigns this crate &quot;Binary, startup validation, listener
+orchestration, privilege drop, shutdown&quot;. In practice it is the seam that turns
+client bytes into a canonical request, walks specification 3.1's lifecycle, and
+turns canonical events back into client bytes:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>File</th>
+<th>Responsibility</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Accept and frame</td>
+<td><code>server.rs</code></td>
+<td>Bounded accept loop, strict head/body read, slow-client and keep-alive timeouts, overload shedding</td>
+</tr>
+<tr>
+<td>Dispatch</td>
+<td><code>routes.rs</code></td>
+<td>Exact undecoded path match, authentication, scope gate, health/metrics, <code>/v1/models</code> visibility</td>
+</tr>
+<tr>
+<td>Translate</td>
+<td><code>protocol/</code></td>
+<td>OpenAI and Anthropic dialects into <code>CanonicalRequest</code>, canonical events back out as JSON or SSE</td>
+</tr>
+<tr>
+<td>Lifecycle</td>
+<td><code>pipeline.rs</code></td>
+<td>Route once, reserve, attempt, meter, audit, record the decision trace</td>
+</tr>
+<tr>
+<td>Attempt</td>
+<td><code>dispatch.rs</code></td>
+<td>Encode, connect, send, stream, classify — and track how far the exchange got</td>
+</tr>
+<tr>
+<td>Assemble</td>
+<td><code>startup.rs</code>, <code>main.rs</code></td>
+<td>Validate configuration, open the store, check reachability, bind, serve, drain</td>
+</tr>
+<tr>
+<td>Management mount</td>
+<td><code>admin.rs</code></td>
+<td>Mount <code>hypellm-admin-api</code> and the static application on a separate listener</td>
+</tr>
+</tbody>
+</table></div>
+<p>What it does <strong>not</strong> do, and must not start doing:</p>
+<ul>
+<li><strong>No routing decisions.</strong> <code>PolicySnapshot::route</code> in <code>hypellm-core</code> decides;
+<code>pipeline::execute</code> calls it exactly once per request and walks the returned
+order. Re-routing between attempts would let a mid-request reload change the
+candidate list, which Appendix B forbids.</li>
+<li><strong>No provider knowledge.</strong> Endpoint paths, auth header shapes, wire encodings,
+and error classification live in <code>hypellm-adapters</code>. This crate holds an
+<code>&amp;dyn Adapter</code> and asks.</li>
+<li><strong>No parsing of its own.</strong> HTTP framing, JSON, and SSE are parsed by
+<code>wire-http1</code>, <code>wire-json</code>, and <code>wire-sse</code> under named limit sets. The
+<code>protocol/</code> modules consume an already-parsed <code>Value</code>; they do not scan bytes.</li>
+<li><strong>No proxying.</strong> No client byte reaches a provider and no provider byte reaches
+a client. Everything crosses the canonical model, which is what stops a
+provider quirk from becoming part of the client contract.</li>
+<li><strong>No destination selection from input.</strong> No client-controlled value reaches a
+host, port, SNI, credential handle, file path, or socket (specification 10).
+A <code>data:</code> image URI is decomposed for the adapter; a non-<code>data:</code> URL is carried
+as opaque text and never fetched.</li>
+<li><strong>No management surface on the data plane.</strong> <code>/admin/v1</code> is only reachable
+through <code>AdminHandler</code> on the management listener (specification 3).</li>
+</ul>
+<h3 id="a-stated-concurrency-deviation">A stated concurrency deviation</h3>
+<p>Specification 3.2 requires &quot;a fixed set of event-loop workers&quot;. This crate uses
+one thread per connection from a bounded pool, capped at accept time by
+<code>ServerConfig::max_connections</code>. The deviation is recorded in
+<code>spec/deferred-issues.html</code> and in the <code>server.rs</code> module comment: an epoll loop
+needs either <code>unsafe</code> FFI, which specification 18.2 forbids workspace-wide, or an
+approved crate under specification 4's exception profile. Every bound, deadline,
+and cancellation path is still enforced; what is lost is the 20,000-concurrent-
+stream target of specification 2.1.</p>
+<p><strong>Key budgets on the request path.</strong> <code>pipeline::execute_for_key</code> takes the
+caller's key, and every attempt reserves against its token budget
+(specification 12.1) after the admission reservation and before the fleet step
+and any outbound I/O — so a request the rate limits would refuse never touches
+the ledger, and a model is never evicted for a request the key cannot pay for.
+A refusal ends the request with <code>402 token_budget_exhausted</code> rather than moving
+to the next candidate: a target with a smaller output limit reserves less, and
+trying it would be the failover-to-bypass that specification 12.2 forbids. The
+hold is finished exactly once on every path beside the admission reservation:
+settled against provider-reported usage, retained whole when the provider
+accepted and reported none, released when it refused before acceptance. For a
+key with a finite limit the streaming response head is withheld until the
+pipeline reports the request admitted, which is what lets a refused stream be a
+real 402 instead of a 200 with an error frame; keys without a limit stream
+exactly as before. <code>/v1/tokenize</code> and callers without a key are not charged.</p>
+<h3 id="the-fleet-runtime">The fleet runtime</h3>
+<p><code>fleet.rs</code> is where a plan becomes an action. <code>hypellm-fleet</code> decides and holds
+no socket; this executes and makes no decision that is not already in the plan.</p>
+<p>The ordering is the load-bearing part: admission is reserved before the
+activation lease, the lease is written to the durable log before the mutating
+verb is sent, and both release exactly once on success, failure, timeout,
+cancellation and expiry. <code>Drop</code> is not trusted for either. A leaked lease pins a
+host out of service until it expires — a slow, confusing outage that reads as a
+capacity problem.</p>
+<p>Readiness is confirmed by <em>observation</em>, not by the verb returning. A TCP
+connect is not readiness and neither is an accepted <code>ACTIVATE</code>, so the executor
+re-observes and checks the inventory before it believes an activation succeeded.</p>
+<p>Activation failure occurs strictly before upstream acceptance, so specification
+6.5 failover applies unchanged: the pipeline records an exclusion, drops the
+reservation, and moves to the next candidate.</p>
+<p>The router still executes no process. Every fleet verb is a line on an
+owner-only Unix socket carrying opaque identifiers and bounded integers; the
+process that runs <code>ssh</code> and <code>docker</code> is <code>agent/</code>, outside this workspace.</p>
+<h2 id="threat-notes">Threat notes</h2>
+<p>These are the threats specific to what this code does, not the generic list.</p>
+<ul>
+<li><strong>Identity and group membership.</strong> <code>routes::groups_for</code> derives membership
+only from configured groups in the authenticated principal's tenant. Request
+bodies and identity-provider group claims cannot add memberships.</li>
+<li><strong>Pre-authentication health surface.</strong> The inference listener exposes only
+minimal liveness and readiness verdicts before authentication. Metrics and
+detailed configuration health remain on the management or dedicated metrics
+listener.</li>
+<li><strong>Failover splicing.</strong> Specification 6.5's rule — never emit failover output
+after client-visible semantic bytes — is carried by exactly one value:
+<code>AttemptPhase</code>, set at each failure site in <code>dispatch::attempt</code> and consulted by
+<code>AttemptFailure::may_failover</code>. It is deliberately <em>not</em> inferred from the error
+kind. Any refactor that derives the phase from an error, or that lets
+<code>pipeline::execute</code> continue its loop after <code>saw_output</code>, re-opens the ability
+to splice a second model's tokens into a stream the client is already reading.
+The truth table is pinned by tests in <code>dispatch.rs</code>.</li>
+<li><strong>Credential handling.</strong> <code>CredentialStore::with_secret</code> provides a scoped
+borrow with no owned getter, and its <code>Debug</code> implementation redacts values.
+Connection-pool credential isolation classes use length-prefixed tenant and
+credential identifiers so distinct pairs cannot collide.</li>
+<li><strong>Request smuggling and framing confusion.</strong> Framing is decided once, by
+<code>wire-http1</code>, and <code>serve_connection</code> treats any <code>HttpError</code> as terminal: it
+writes a stable error and breaks the loop rather than continuing, so bytes left
+in the buffer after an ambiguous request are never attributed to a following
+one. Streaming responses have no length, so <code>InferenceHandler::stream</code> always
+returns <code>Disposition::Close</code>. Both behaviours are load-bearing; a &quot;recover and
+continue&quot; path would reintroduce specification 10.1's smuggling row.</li>
+<li><strong>Path confusion.</strong> <code>routes::is_known_path</code> and <code>protocol_for</code> match the raw,
+undecoded path with <code>==</code>, and <code>admin::serve_static</code> matches against an explicit
+allowlist of relative filenames instead of joining a request path onto a root.
+There is no normalisation step to walk and no traversal surface. Adding prefix
+matching or a decode-then-match step would create both.</li>
+<li><strong>Resource exhaustion by slow drip.</strong> Every socket read carries
+<code>read_timeout</code>, but there is no aggregate deadline on assembling a request head
+or body. A client sending one byte just inside the timeout occupies a connection
+and a thread for as long as its byte budget lasts. The only real bound is
+<code>max_connections</code> (4096 inference, 256 management) and the 512 KiB thread stack;
+past the cap the listener answers 429 and closes rather than queueing. See
+<a href="#limits-not-enforced">Limits not enforced</a>.</li>
+<li><strong>Upstream is untrusted.</strong> Provider responses are read under
+<code>wire_http1::Limits::UPSTREAM</code> and <code>SseParser::with_default_limits()</code>, and a
+malformed event stream is a <code>ProtocolViolation</code> that ends the attempt rather
+than a parse that keeps going. Provider error text never reaches the client:
+<code>AttemptFailure::from_classification</code> copies only <code>ErrorClassification::safe_detail</code>
+and a capped <code>provider_code</code>, and an upstream <code>Authentication</code> failure maps to
+<code>InternalFault</code> so a router credential problem cannot be mistaken for the
+caller's key being wrong (specification 8.2).</li>
+<li><strong>Prompt injection into the control plane.</strong> Client-supplied <code>hypellm_routing</code>
+hints are dropped silently unless the principal holds
+<code>rbac::Permission::OperateTargets</code>; <code>prefer_target</code> is validated into a
+<code>TargetId</code> and resolved against configured targets by the router core, never
+used as an address. Prompts, tool schemas, and image URLs are carried as inert
+data. Nothing in <code>protocol/</code> interprets a field as configuration, destination,
+or credential.</li>
+<li><strong>The control socket is unauthenticated.</strong> <code>main.rs</code> binds a Unix socket and
+acts on a bare <code>shutdown</code>/<code>drain</code> line. Its only protection is filesystem
+permission on the containing directory; the router creates it under the process
+umask and does not <code>chmod</code> it. Anything that can open it can stop the router.
+Specification 20.1 requires graceful shutdown to exist; it does not authorise an
+unauthenticated trigger.</li>
+<li><strong>Entropy failure degrades identity rather than failing closed.</strong>
+<code>routes.rs</code> and <code>admin.rs</code> both use <code>random::u128_value().unwrap_or(0)</code> /
+<code>unwrap_or_else(…&quot;0&quot;×32)</code>. If <code>/dev/urandom</code> is unavailable, every request is
+assigned id <code>0</code>, and the decision trace, audit record, and <code>X-Request-Id</code>
+correlation collapse silently. A refusal would be the safer failure.</li>
+<li><strong>Reservation conservation.</strong> <code>pipeline::execute</code> reserves before any outbound
+I/O and either <code>commit</code>s with reconciled usage or <code>drop</code>s the reservation on the
+same iteration, so a failed attempt returns its capacity before the next one
+asks. Appendix B says <code>Drop</code> alone is not trusted for accounting; the explicit
+<code>drop(reservation)</code> in the failure arm is there to keep the release visible at
+the site that owns it. Any <code>?</code> inserted between <code>reserve</code> and that arm leaks
+capacity for the life of the process.</li>
+</ul>
+<h2 id="limits">Limits</h2>
+<p>Every value below is enforced by the named constant or field. The inference and
+management listeners differ, so both are given.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Input</th>
+<th>Inference</th>
+<th>Management</th>
+<th>Enforced by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Simultaneous connections</td>
+<td>4096</td>
+<td>256</td>
+<td><code>ServerConfig::max_connections</code>, checked before per-connection state is allocated; over the cap the peer gets 429 <code>capacity_exhausted</code></td>
+</tr>
+<tr>
+<td>Requests per connection</td>
+<td>1000</td>
+<td>200</td>
+<td><code>ServerConfig::max_requests_per_connection</code></td>
+</tr>
+<tr>
+<td>Per-read / per-write timeout</td>
+<td>30 s</td>
+<td>15 s</td>
+<td><code>ServerConfig::read_timeout</code> / <code>write_timeout</code>, applied as socket options</td>
+</tr>
+<tr>
+<td>Idle keep-alive</td>
+<td>75 s</td>
+<td>30 s</td>
+<td><code>ServerConfig::keepalive_timeout</code></td>
+</tr>
+<tr>
+<td>Connection thread stack</td>
+<td>512 KiB</td>
+<td>512 KiB</td>
+<td><code>std::thread::Builder::stack_size</code> in <code>Server::serve</code></td>
+</tr>
+<tr>
+<td>Request head bytes</td>
+<td>32 KiB</td>
+<td>16 KiB</td>
+<td><code>wire_http1::Limits::DEFAULT</code> / <code>::ADMIN</code> <code>.max_head_bytes</code> (hard ceiling 64 KiB, <code>HARD_MAX_HEAD_BYTES</code>)</td>
+</tr>
+<tr>
+<td>Header fields</td>
+<td>100</td>
+<td>64</td>
+<td><code>Limits::max_header_count</code></td>
+</tr>
+<tr>
+<td>Request target bytes</td>
+<td>8 KiB</td>
+<td>2 KiB</td>
+<td><code>Limits::max_target_bytes</code></td>
+</tr>
+<tr>
+<td>Method token bytes</td>
+<td>32</td>
+<td>16</td>
+<td><code>Limits::max_method_bytes</code></td>
+</tr>
+<tr>
+<td>Request body bytes</td>
+<td>16 MiB</td>
+<td>1 MiB</td>
+<td><code>Limits::max_body_bytes</code> via <code>BodyDecoder</code> — fixed, not configurable; see below</td>
+</tr>
+<tr>
+<td>Chunk-size line / trailer</td>
+<td>256 B / 4 KiB</td>
+<td>128 B / 1 KiB</td>
+<td><code>Limits::max_chunk_line_bytes</code>, <code>max_trailer_bytes</code></td>
+</tr>
+<tr>
+<td>JSON input bytes</td>
+<td><code>settings.max_body_bytes</code> (default 16 MiB)</td>
+<td>—</td>
+<td><code>JsonLimits::DEFAULT.with_max_input_bytes(...)</code> in <code>InferenceHandler::inference</code></td>
+</tr>
+<tr>
+<td>JSON depth / string / array / object</td>
+<td>64 levels / 8 MiB / 100 000 items / 10 000 entries</td>
+<td>—</td>
+<td><code>wire_json::Limits::DEFAULT</code>; duplicate keys rejected</td>
+</tr>
+<tr>
+<td>Upstream response head / body</td>
+<td>32 KiB / 64 MiB</td>
+<td>—</td>
+<td><code>wire_http1::Limits::UPSTREAM</code> in <code>dispatch::attempt</code> (cumulative across chunks)</td>
+</tr>
+<tr>
+<td>Upstream SSE line buffer / event</td>
+<td>256 KiB / 1 MiB</td>
+<td>—</td>
+<td><code>SseParser::with_default_limits()</code> (<code>SseLimits::DEFAULT</code>)</td>
+</tr>
+<tr>
+<td>Decoded upstream stream event JSON</td>
+<td>2 MiB, depth 32</td>
+<td>—</td>
+<td><code>wire_json::Limits::STREAM_EVENT</code>, applied inside the adapter</td>
+</tr>
+<tr>
+<td>Attempts per request</td>
+<td><code>settings.max_attempts</code>, default 3, floor 1</td>
+<td>—</td>
+<td>the candidate loop in <code>pipeline::execute</code></td>
+</tr>
+<tr>
+<td>Retry budget</td>
+<td><code>settings.retry_budget_ms</code>, default 30 s</td>
+<td>—</td>
+<td><code>Deadline::after</code>, then <code>min</code> with the request deadline</td>
+</tr>
+<tr>
+<td>End-to-end deadline</td>
+<td><code>settings.default_deadline_ms</code>, default 120 s</td>
+<td>—</td>
+<td><code>Deadline::after</code> in <code>InferenceHandler::inference</code>, checked each attempt</td>
+</tr>
+<tr>
+<td>Admission queue wait</td>
+<td><code>min(settings.queue_timeout_ms</code> (default 5 s)<code>, deadline remaining)</code></td>
+<td>—</td>
+<td><code>pipeline::execute</code> → <code>AdmissionController::reserve_queued</code>; zero never waits</td>
+</tr>
+<tr>
+<td>Admission queue depth</td>
+<td><code>quota queued=</code>, default 0 (no queue)</td>
+<td>—</td>
+<td><code>ScopeLimits::max_queued</code> in <code>Scope::join_queue</code></td>
+</tr>
+<tr>
+<td>Background threads</td>
+<td>4 fixed — accept loop, management listener, housekeeping, and the metrics listener when <code>settings metrics_listen</code> names one — plus <code>settings job_workers</code> (default 0)</td>
+<td>—</td>
+<td><code>Router::run</code>; none is created per request (3.2)</td>
+</tr>
+<tr>
+<td>Live jobs per tenant</td>
+<td><code>settings max_jobs_per_tenant</code>, default 32; counts retained jobs until they expire</td>
+<td>—</td>
+<td><code>JobStore::submit</code>, checked under the insert lock</td>
+</tr>
+<tr>
+<td>Queued jobs</td>
+<td><code>settings max_queued_jobs</code>, default 64, fleet-wide</td>
+<td>—</td>
+<td><code>JobStore::submit</code>; a full queue is a <code>429</code>, never growth</td>
+</tr>
+<tr>
+<td>Job result spool</td>
+<td><code>settings max_job_result_bytes</code>, default 8 MiB, in memory</td>
+<td>—</td>
+<td><code>JobStore::finish</code>; a larger result fails the job rather than truncating it</td>
+</tr>
+<tr>
+<td>Job retention</td>
+<td><code>settings job_retention_ms</code>, default 15 min</td>
+<td>—</td>
+<td><code>JobStore::sweep_locked</code>, run from every path that reads the table</td>
+</tr>
+<tr>
+<td>Control socket path</td>
+<td>100 bytes</td>
+<td>—</td>
+<td><code>startup::MAX_UNIX_PATH</code>, checked before bind</td>
+</tr>
+<tr>
+<td>Platform secret file</td>
+<td>≥ 32 bytes each, five files</td>
+<td>—</td>
+<td><code>Secrets::from_dir</code></td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="limits-not-enforced">Limits not enforced</h3>
+<p>Stated plainly, because a false assurance here is worse than a gap:</p>
+<ul>
+<li><strong><code>settings.max_body_bytes</code> does not reach the transport.</strong> <code>startup::Router::assemble</code>
+binds with <code>ServerConfig::inference()</code>, whose <code>limits</code> field is the hardcoded
+<code>Limits::DEFAULT</code>. The configured value is applied only to the JSON parser. An
+operator who sets <code>max_body_bytes=1048576</code> still has 16 MiB read off the wire
+and buffered before the JSON layer refuses it.</li>
+<li><strong><code>ServerConfig</code> is not configurable at all.</strong> Connection cap, timeouts,
+keep-alive, and requests-per-connection are compile-time constants in
+<code>ServerConfig::inference()</code> / <code>::management()</code>; no settings field reaches them.</li>
+<li><strong>No aggregate deadline on request assembly.</strong> <code>read_head</code> and <code>read_body</code> loop
+with only a per-read socket timeout. Total time to receive a head or body is
+unbounded as long as each individual read completes.</li>
+<li><strong>No explicit stream watermarks.</strong> Specification 14 asks for high/low
+watermarks that pause upstream reads. Backpressure here is emergent: the
+per-connection thread blocks in <code>StreamSink::push</code>, which stops it calling
+<code>connection.read_body</code>. The effect is correct for the blocking model, but there
+is no watermark to tune and none to assert on.</li>
+<li><strong>The full decoded event list is retained per streaming attempt.</strong>
+<code>dispatch::attempt</code> pushes every decoded <code>CanonicalEvent</code> into <code>collected</code> so
+usage and native model can be read after the stream ends. Bytes still reach the
+client incrementally, so specification 14's &quot;MUST NOT buffer an entire
+completion&quot; holds for latency — but memory for one attempt is bounded only
+transitively, by the 64 MiB <code>Limits::UPSTREAM.max_body_bytes</code> cumulative cap.</li>
+<li><strong>No privilege drop.</strong> Specification 18.1 names it as this crate's
+responsibility and 20.1 requires an unprivileged user. <code>startup.rs</code> binds
+listeners and serves; it never drops privileges or scrubs the environment.
+Today that is a deployment-image responsibility, undeclared in code.</li>
+<li><strong><code>testing</code> is a non-gated public module.</strong> <code>pub mod testing;</code> has no <code>cfg</code> or
+feature guard, so <code>FakeUpstream</code>, <code>TestRouter</code>, and a fixed store MAC key of
+<code>b&quot;test-store-mac-key&quot;</code> are part of the released library's public API. Nothing
+in the binary references them, but the surface is real and should be behind a
+<code>test-harness</code> feature.</li>
+</ul>
+<h2 id="fuzz-targets">Fuzz targets</h2>
+<p>The workspace has no <code>fuzz/</code> directory and no libFuzzer harness — specification
+4 admits no such dependency. Fuzzing is a seeded, deterministic mutation engine
+in <code>hypellm-test-corpus::fuzz</code>, driven from ordinary <code>tests/fuzz.rs</code> targets so
+that <code>cargo test</code> runs it and a failing seed is reproducible by number rather
+than by corpus file. All seven areas specification 21 names have a suite; see
+<code>spec/deferred-issues.html</code>, <code>DI-002</code>, for the table. <code>hypellm-core</code> carries the
+property layer in <code>tests/properties.rs</code>.</p>
+<p><code>tests/fuzz.rs</code> covers the client-facing protocol parsers — <code>parse_chat_request</code>,
+<code>parse_responses_request</code>, <code>parse_embeddings_request</code>, and
+<code>parse_messages_request</code> — with nine targets. Beyond termination they assert the
+Appendix B property that begins here: no mutation may produce a
+<code>CanonicalRequest</code> whose tenant, principal, request id, residency, or cost
+ceiling differs from the authenticated context, and no hint survives from a
+principal not permitted one. Each of those targets counts its own successful
+parses and fails if none were reached, because a property test that never
+reaches its assertion is decoration.</p>
+<p>The remaining targets below — the connection-level ones, and the stream
+renderers — are still requirements rather than facts:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Target</th>
+<th>Drives</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Client request parsers</td>
+<td>Mutated OpenAI chat, responses and embeddings plus Anthropic messages bodies terminate deterministically</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Identity isolation</td>
+<td>Parsed requests retain authenticated tenant, principal and request identity rather than caller-planted values</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Policy constraints</td>
+<td>Caller bodies cannot change residency, cost ceiling or unauthorized routing hints</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Bounds</td>
+<td>Oversized, deep and high-cardinality bodies are rejected under parser limits</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Prompt inertness</td>
+<td>Prompt-shaped destination and credential strings remain canonical content only</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>Every target must assert bounded work and a stable error, per specification 21.1:
+no panic, no allocation beyond the declared limits, and an error body containing
+no fragment of the input.</p>
+<p>Coverage today is unit tests inside each module plus
+<code>crates/hypellm-router/tests/end_to_end.rs</code>, which exercises the assembled router
+against <code>testing::FakeUpstream</code>. That is integration coverage, not fuzz coverage,
+and it does not satisfy specification 21's fuzz row.</p>
+<h2 id="public-api">Public API</h2>
+<p>See <code>lib.rs</code>. The crate is a library plus a thin binary so the pipeline is
+testable without spawning a process; <code>main.rs</code> contributes argument parsing, exit
+codes (2 configuration, 3 state, 4 listener, 5 secrets), and the control socket,
+and nothing else.</p>
+<p>The surface a caller is expected to use is small: <code>startup::Router::assemble</code> and
+<code>Router::serve</code> to run a node, <code>startup::check_config</code> for <code>--check</code>, and
+<code>server::Handler</code> to add a listener. Everything else is public because the
+integration tests and the benchmark harness must build the <em>same</em> router the
+binary builds — <code>pipeline::execute</code>, <code>dispatch::attempt</code>, and the <code>protocol</code>
+renderers are exposed for that reason, not as a stable extension point.</p>
+<p><code>server::ListenerMetrics</code> is optional and per-plane. A <code>Server</code> without one is
+still correct; it simply publishes no connection or byte counters, which is the
+right default for the benchmark harness and for tests that assert on behaviour
+rather than on telemetry. Specification 3.1 keeps the data and management planes
+separate, so the label is <code>inference</code> or <code>management</code> and never shared — a
+combined counter would undo that separation in the one view an operator reads
+during an incident.</p>
+
+      </article>
+      <footer class="page-footer"><a href="../index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#scope-and-what-this-module-deliberately-does-not-do">Scope, and what this module deliberately does not do</a></li>
+<li class="toc-level-3"><a href="#a-stated-concurrency-deviation">A stated concurrency deviation</a></li>
+<li class="toc-level-3"><a href="#the-fleet-runtime">The fleet runtime</a></li>
+<li class="toc-level-2"><a href="#threat-notes">Threat notes</a></li>
+<li class="toc-level-2"><a href="#limits">Limits</a></li>
+<li class="toc-level-3"><a href="#limits-not-enforced">Limits not enforced</a></li>
+<li class="toc-level-2"><a href="#fuzz-targets">Fuzz targets</a></li>
+<li class="toc-level-2"><a href="#public-api">Public API</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

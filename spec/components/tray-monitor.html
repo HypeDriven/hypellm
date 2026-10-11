@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: Windows tray monitor.">
+  <title>Windows tray monitor · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="../assets/wiki.css">
+  <script defer src="../assets/search-index.js"></script>
+  <script defer src="../assets/wiki.js"></script>
+</head>
+<body data-wiki-root="../" data-page-title="Windows tray monitor" data-page-group="Components">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="../index.html">Wiki home</a></li>
+<li><a href="../overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="../router-specification.html">Router specification</a></li>
+<li><a href="../threat-model.html">Threat model</a></li>
+<li><a href="../orchestration.html">Fleet orchestration</a></li>
+<li><a href="../deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="../using-the-router.html">Using the router</a></li>
+<li><a href="../deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="../runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="fleet-agent.html">Fleet agent</a></li>
+<li><a href="identity-verifier.html">Identity verifier</a></li>
+<li><a href="container-init.html">Container init</a></li>
+<li><a href="tray-monitor.html" aria-current="page">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="../modules/hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="../modules/hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="../modules/hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="../modules/hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="../modules/hypellm-config.html">hypellm-config</a></li>
+<li><a href="../modules/hypellm-core.html">hypellm-core</a></li>
+<li><a href="../modules/hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="../modules/hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="../modules/hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="../modules/hypellm-net.html">hypellm-net</a></li>
+<li><a href="../modules/hypellm-router.html">hypellm-router</a></li>
+<li><a href="../modules/hypellm-store.html">hypellm-store</a></li>
+<li><a href="../modules/hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="../modules/hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="../modules/wire-http1.html">wire-http1</a></li>
+<li><a href="../modules/wire-json.html">wire-json</a></li>
+<li><a href="../modules/wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="../index.html">Wiki</a><span aria-hidden="true">/</span>Components</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="hypellm-monitor">HypeLLM Monitor</h1>
+<p>A dependency-free Windows 11 tray companion for the HypeLLM Router, in the
+style of HypeLimits, its sibling allowance monitor: one compact floating
+monitor, a gauge glyph in the tray, and a process that stays at the
+bottom of every scheduler the OS has.</p>
+<p>It shows <strong>which models are going through the router right now</strong> — one row per
+target with requests in flight, queued, or streaming, as a bar of occupancy
+against the target's concurrency limit — and <strong>tokens per second per user and
+per key</strong>, ranked, with the fastest as the full bar.</p>
+<p>It is the fourth reference component in this repository that lives outside
+the workspace, beside <code>agent/</code>, <code>verifier/</code> and <code>supervisor/</code>, and like them it is deliberately not a workspace
+member: it is C++ against the Win32 API, built with CMake, and nothing in the
+router knows it exists.</p>
+<h2 id="build">Build</h2>
+<p>From a Visual Studio Developer Command Prompt:</p>
+<pre><code class="language-bat">cmake -S tray -B tray\build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build tray\build
+ctest --test-dir tray\build --output-on-failure
+</code></pre>
+<p>The executable is <code>tray\build\hypellm-monitor.exe</code>. It links only Windows
+system libraries (<code>winhttp</code>, <code>user32</code>, <code>gdi32</code>, <code>comctl32</code>, <code>dwmapi</code>, <code>uxtheme</code>,
+<code>advapi32</code>, <code>shell32</code>) and has no runtime dependency.</p>
+<p>The portable half — the JSON reader, the rate arithmetic, and the decision of
+what the monitor shows — builds and tests on any host, and a MinGW-w64
+toolchain cross-compiles the whole application from Linux:</p>
+<pre><code class="language-sh">cmake -S tray -B tray/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_TOOLCHAIN_FILE=&lt;file setting CMAKE_SYSTEM_NAME=Windows and the x86_64-w64-mingw32 compilers&gt;
+cmake --build tray/build
+</code></pre>
+<h2 id="connecting-it">Connecting it</h2>
+<p>The monitor reads the router's management API with an ordinary router API key
+that carries the <code>management:read</code> scope. Its principal must hold a role that
+grants <code>read_summary</code> (every role does) and, for the per-user and per-key
+figures, <code>read_tenant_usage</code> (<code>operator</code> and above). A key whose principal has
+only <code>viewer</code> sees its own principal's usage and no key breakdown, and the
+monitor says so in Options.</p>
+<p>Mint one on the router's Keys screen or with <code>just key monitor management:read</code>
+after adding <code>role_binding subject=principal:monitor role=operator</code> to the
+configuration, then in <strong>Options</strong> paste the management listener's address
+(<code>http://127.0.0.1:18001</code> for the shipped <code>k8s/</code> deployment, or the <code>https://</code>
+address of the TLS edge in front of it) and the key. The key is stored in
+Windows Credential Manager, never in the registry or a file, and is sent only
+as a bearer header to the address you typed: the monitor uses no proxy,
+follows no redirect, and takes nothing but the scheme, host, port and path
+prefix from the address.</p>
+<h2 id="what-it-shows-and-what-it-does-not">What it shows, and what it does not</h2>
+<p>Every two seconds (configurable) the monitor calls <code>GET /admin/v1/traffic</code> and
+<code>GET /admin/v1/usage</code>, plus <code>/session</code>, <code>/targets</code> and <code>/overview</code> on first
+contact and occasionally after.</p>
+<ul>
+<li>
+<p><strong>Models.</strong> One row per target the key can see: what it is, whether it can
+serve, and what it is doing, in that order.</p>
+<p><em>Whether it can serve</em> comes from <code>/targets</code> — the administrative state now
+in force, the worst circuit-breaker state across the target's operations, and
+the quarantine flag. A target that is enabled with a closed breaker is
+captioned <strong>ready</strong>; one that is drained, in maintenance, disabled or
+quarantined is captioned by whatever withdrew it; an open breaker reads as
+<strong>failing</strong> and a half-open one as <strong>recovering</strong>. Those rows are drawn in
+red and amber rather than dimmed, because dimming is the monitor's word for
+&quot;quiet&quot; and a quarantined target is not quiet. A target the listing does not
+contain is <code>unknown</code> and never <code>ready</code>: silence about a target is not
+evidence that it is fine. An administrative state this build has no word for
+is printed verbatim and treated as unavailable, so a state added later cannot
+read as ready by default.</p>
+<p><em>What it is doing</em> comes from <code>traffic.capacity.targets</code>, the router's own
+admission occupancy per target: in flight, queued, streaming, and the
+concurrency limit. The bar is in-flight over the limit, coloured green
+through red as it fills. A limit that no admission scope enforces is shown
+but named as declared-only in the tooltip. A row also carries its rate when
+<em>requests or tokens</em> are moving in the rate window — requests and not only
+tokens, because a SemIf scorer answers with scores and reports no output
+tokens at all: a rerank target tested for token throughput would never appear,
+and its calls are far too short to be caught in flight by a two-second poll.</p>
+<p>Rows are ordered busy, then moving, then ready, then recovering, then
+unavailable, then unknown; the heading counts what is not available.
+<strong>List every model, not only the busy ones</strong> is on by default and can be
+turned off in Options, which narrows the list to targets with traffic —
+except that a target which is not available is listed either way, since a
+broken target has no traffic to be found by.</p>
+<p>Each row is labelled <em>machine · model</em>, from the target's provider and model
+name, because a model name is not an identifier here: two machines run the
+same quantisation of the same weights, and a row reading only
+<code>Qwen3.5-4B-Q6_K</code> names neither of them. The machine leads so that it is what
+survives when a narrow window ellipsises the label; the tooltip carries the
+target identifier in full.</p>
+<p>A router that exposes no admission controller to the management API reports
+no occupancy at all. The section then lists the targets and their
+availability with no figures and no bars, rather than disappearing.</p>
+</li>
+<li>
+<p><strong>Users and Keys.</strong> The usage view holds cumulative counters, and the monitor
+differences them: the rate is the change over the sliding rate window
+(60 s by default), from the oldest sample still inside it to the newest.
+Rows appear when a rate is positive - in tokens, or in completed requests
+where the traffic generates no tokens - and disappear when the window
+empties. A section whose rows are all token-less ranks and draws its bars in
+requests per minute, and says so in the caption; it does not rank in a unit
+every row would score zero in.
+A counter that goes backwards, or a changed <code>since</code> epoch, restarts the
+series rather than producing a negative or absurd rate.</p>
+</li>
+<li>
+<p><strong>Tray.</strong> The ring takes the colour of the busiest target's utilisation and
+is grey when unconfigured, red when the router is unreachable, orange when
+the key is rejected. The centre dot is lit only while something is in
+flight. The tooltip counts in-flight requests, busy models, how many targets
+are ready out of how many the key can see, and total output tokens per second</p>
+<ul>
+<li>or, when nothing in flight is generating tokens, the completed requests per
+minute.</li>
+</ul>
+</li>
+</ul>
+<p>Three honest limits, all consequences of what the router exposes rather than of
+the monitor:</p>
+<ul>
+<li>
+<p><strong>&quot;Ready&quot; is not a liveness check.</strong> The router has no readiness probe: it
+learns that a target is broken by routing to it and watching it fail. So the
+strongest thing it can say about a target nothing has been routed to lately
+is that it is enabled and nothing is known to be wrong with it, which is what
+<strong>ready</strong> means here and what every ready row's tooltip says. A container
+that died quietly a minute ago still reads as ready until the first request
+finds out. The converse is solid: <strong>failing</strong>, <strong>draining</strong>, <strong>quarantined</strong>,
+<strong>maintenance</strong> and <strong>disabled</strong> are all things the router positively knows.</p>
+</li>
+<li>
+<p><strong>Rates count a request's tokens when it completes.</strong> The router does not
+publish the token position of a stream in progress, so a three-minute
+generation shows as a step at the end, not a ramp during. &quot;Tokens per second&quot;
+here is completed throughput smoothed over the window, and every tooltip says
+so. A row whose traffic reports no tokens is captioned in requests per minute
+instead, and its tooltip claims no token figure rather than a zero one.</p>
+</li>
+<li>
+<p><strong>Visibility is the key's.</strong> The router narrows every management read to the
+caller's tenant and permissions; the monitor shows what the key may see and
+never more. A tenant whose traffic samples the router dropped is shown
+without figures rather than with confident zeros.</p>
+</li>
+</ul>
+<p>On first run the monitor asks once whether to start at login (<strong>Yes</strong> registers
+it under the current user's Run key; <strong>No</strong> is not asked again) and then opens
+Options so the address and key can be entered. The choice can be changed in
+Options at any time, and a later start from a moved executable re-registers
+the path without changing the choice.</p>
+<p>A router that is unreachable keeps the last known rows on screen, dimmed under
+a red status line; a rejected key tints the line orange, and clicking it opens
+Options.</p>
+<h2 id="priorities">Priorities</h2>
+<p>The process runs in <code>IDLE_PRIORITY_CLASS</code> with priority boost disabled, low
+memory priority and EcoQoS execution-speed throttling; the UI thread is
+below-normal; the refresh thread is idle priority, in background mode, with
+thread-level EcoQoS. It never raises the timer resolution or asks for
+foreground or multimedia scheduling. This is the same set HypeLimits applies.</p>
+<h2 id="tests">Tests</h2>
+<p><code>tests/test_core.cpp</code> covers the JSON reader's limits and exactness, both
+management views against fixtures shaped like the router's handlers, rate
+arithmetic including window expiry and epoch and counter resets, the series
+bound, and every branch of what the monitor shows — a quiet enabled target
+listed and captioned ready, a withdrawn or failing one named by what withdrew
+it and surviving a list narrowed to traffic, an unlisted target left unknown,
+an unrecognised administrative state never read as ready, ready ranked above
+quarantined, a router with no admission controller still listing its targets
+with no figures, users ranked, keys shortened and hidden for principal-scoped
+keys, stale rates dropping off, token-less rerank traffic still listed and
+ranked by request rate, machines named beside their models where two rows would
+otherwise read alike, and each failure state naming itself. <code>ctest</code> runs it on
+Windows and on Linux.</p>
+
+      </article>
+      <footer class="page-footer"><a href="../index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#build">Build</a></li>
+<li class="toc-level-2"><a href="#connecting-it">Connecting it</a></li>
+<li class="toc-level-2"><a href="#what-it-shows-and-what-it-does-not">What it shows, and what it does not</a></li>
+<li class="toc-level-2"><a href="#priorities">Priorities</a></li>
+<li class="toc-level-2"><a href="#tests">Tests</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

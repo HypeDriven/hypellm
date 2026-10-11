@@ -1,0 +1,563 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: hypellm-telemetry.">
+  <title>hypellm-telemetry · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="../assets/wiki.css">
+  <script defer src="../assets/search-index.js"></script>
+  <script defer src="../assets/wiki.js"></script>
+</head>
+<body data-wiki-root="../" data-page-title="hypellm-telemetry" data-page-group="Module contracts">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="../index.html">Wiki home</a></li>
+<li><a href="../overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="../router-specification.html">Router specification</a></li>
+<li><a href="../threat-model.html">Threat model</a></li>
+<li><a href="../orchestration.html">Fleet orchestration</a></li>
+<li><a href="../deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="../using-the-router.html">Using the router</a></li>
+<li><a href="../deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="../runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="../components/fleet-agent.html">Fleet agent</a></li>
+<li><a href="../components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="../components/container-init.html">Container init</a></li>
+<li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="hypellm-config.html">hypellm-config</a></li>
+<li><a href="hypellm-core.html">hypellm-core</a></li>
+<li><a href="hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="hypellm-net.html">hypellm-net</a></li>
+<li><a href="hypellm-router.html">hypellm-router</a></li>
+<li><a href="hypellm-store.html">hypellm-store</a></li>
+<li><a href="hypellm-telemetry.html" aria-current="page">hypellm-telemetry</a></li>
+<li><a href="hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="wire-http1.html">wire-http1</a></li>
+<li><a href="wire-json.html">wire-json</a></li>
+<li><a href="wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="../index.html">Wiki</a><span aria-hidden="true">/</span>Module contracts</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="module-hypellm-telemetry">Module: hypellm-telemetry</h1>
+<p>Specification 4.1 requires every in-repository module to declare an owner, threat
+notes, public API, unsafe-code declaration, fuzz targets, and maximum
+input/resource limits.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Owner</td>
+<td>Platform (primary), Security (secondary)</td>
+</tr>
+<tr>
+<td>Unsafe code</td>
+<td>None. <code>#![forbid(unsafe_code)]</code> declared in <code>src/lib.rs</code>; <code>unsafe_code = &quot;forbid&quot;</code> inherited from the workspace lints.</td>
+</tr>
+<tr>
+<td>External dependencies</td>
+<td>None. Three workspace path dependencies: <code>hypellm-core</code>, <code>hypellm-crypto</code>, <code>wire-json</code>. No registry crates, no exporter SDK, no agent.</td>
+</tr>
+<tr>
+<td>Fuzz targets</td>
+<td><strong>None exist.</strong> The targets this module requires are listed under <a href="#fuzz-targets">Fuzz targets</a>, all marked not yet implemented.</td>
+</tr>
+</tbody>
+</table></div>
+<p>Platform owns this crate: it is the exposition and log-emission path, and its
+failure modes are operational — cardinality, allocation, blocking writes.
+Security holds the second signature because two of its three responsibilities are
+security controls in disguise. The label and field vocabularies are the
+mechanism that keeps specification 17's high-cardinality and sensitive-value
+prohibitions from being a convention, and <code>Pseudonymizer</code> holds long-lived key
+material. Changes to <code>LabelName</code>, <code>Field</code>, or <code>Pseudonymizer</code> are security
+changes.</p>
+<h2 id="scope-and-the-the-vocabulary-is-the-control-rule">Scope, and the &quot;the vocabulary is the control&quot; rule</h2>
+<p>Specification 18.1 assigns this crate &quot;bounded structured logs, counters,
+histograms, text exposition&quot;. Specification 17 fixes the shape: metrics are
+local-first text for a platform collector to scrape, logs are newline-delimited
+JSON, high-cardinality labels are forbidden, and identity correlation goes
+through deterministic pseudonyms.</p>
+<p>The defining decision is that both vocabularies are <strong>closed enums</strong>, not
+strings. <code>Labels::with</code> accepts a <code>LabelName</code> variant; <code>Event::str_field</code> accepts
+a <code>Field</code> variant. There is no <code>labels.with(&quot;user_id&quot;, …)</code> and no
+<code>event.field(&quot;prompt&quot;, …)</code> — those are compile errors, not runtime rejections.
+A runtime allowlist fails open the first time someone adds a dimension in a
+hurry; a closed enum fails at build time and shows up in review. Two unit tests
+assert the negative directly: <code>the_vocabulary_excludes_high_cardinality_dimensions</code>
+(metrics) and <code>the_field_vocabulary_excludes_request_content</code> (logs).</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Provides</th>
+<th>Where</th>
+<th>Specification</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Closed metric label vocabulary, 13 names (one reserved)</td>
+<td><code>metrics::LabelName</code></td>
+<td>17 (high-cardinality prohibition)</td>
+</tr>
+<tr>
+<td>Counters, gauges, fixed-bucket histograms</td>
+<td><code>metrics::Registry</code></td>
+<td>17 (<code>Metrics</code>)</td>
+</tr>
+<tr>
+<td>Text exposition, <code># HELP</code> / <code># TYPE</code> / samples</td>
+<td><code>Registry::exposition</code></td>
+<td>17 (local-first, no embedded exporter)</td>
+</tr>
+<tr>
+<td>Closed log field vocabulary, 26 fields</td>
+<td><code>logs::Field</code></td>
+<td>17 (<code>Structured logs</code>)</td>
+</tr>
+<tr>
+<td>Newline-delimited JSON events, capped fields</td>
+<td><code>logs::Event</code>, <code>logs::Logger</code></td>
+<td>17, 10 (capped strings)</td>
+</tr>
+<tr>
+<td>Keyed, domain-separated identity pseudonyms</td>
+<td><code>logs::Pseudonymizer</code></td>
+<td>17 (deterministic pseudonyms)</td>
+</tr>
+<tr>
+<td>The metric-name registry</td>
+<td><code>metrics::names</code>, 21 constants</td>
+<td>17 (required signals)</td>
+</tr>
+</tbody>
+</table></div>
+<p>This module deliberately does <strong>not</strong>:</p>
+<ul>
+<li><strong>Embed an agent, exporter, or push client.</strong> It opens no socket, resolves no
+host, and speaks no collector protocol. Specification 17 says the router does
+not embed third-party agents or exporters — partly because specification 4
+admits no such dependency, and more importantly because an in-process exporter
+with access to request state is an egress path that no configuration can close.
+Scraping is the collector's job; <code>exposition()</code> returns a <code>String</code>.</li>
+<li><strong>Own the audit chain.</strong> Specification 17 lists Audit as a separate signal with
+integrity requirements. The hash-chained, tamper-evident audit record lives in
+<code>hypellm-store::audit</code>. This crate emits an observational log line and can carry
+a truncated chain head in <code>Field::AuditHead</code> — it does not authenticate
+anything.</li>
+<li><strong>Own the decision trace.</strong> Policy digest, candidates, exclusion reason codes,
+and integer score terms are produced by <code>hypellm-core::decision</code> as structured
+values. This crate only flattens selected scalars into a log line.</li>
+<li><strong>Implement cryptography.</strong> Pseudonyms are HMAC-SHA-256 from <code>hypellm-crypto</code>.
+No digest, no encoding, and no comparison is reimplemented here (specification
+4, &quot;no novel cryptography&quot;).</li>
+<li><strong>Own time.</strong> <code>Clock</code>, <code>format_rfc3339</code>, <code>Histogram</code>, and <code>LATENCY_BUCKETS_MS</code>
+come from <code>hypellm-core::time</code>. The logger holds an <code>Arc&lt;dyn Clock&gt;</code> so that
+tests are deterministic and so that no module reads the clock directly.</li>
+<li><strong>Scrub free text.</strong> There is no PII detector and no regex redactor, because
+there is no free-text field to scrub. Prompts, completions, tool arguments, and
+provider bodies are excluded by the vocabulary rather than filtered out of it.
+A scrubber would imply that arbitrary text may be passed in, which is exactly
+the property this design refuses.</li>
+<li><strong>Manage log destinations.</strong> <code>Sink</code> is a one-method trait; the crate ships
+<code>StderrSink</code> and <code>MemorySink</code> only. No file sink, no rotation, no retention, no
+syslog. Where output goes is a deployment concern (specification 20).</li>
+</ul>
+<h3 id="fleet-labels">Fleet labels</h3>
+<p><code>host</code>, <code>deployment</code>, <code>accelerator</code>, <code>agent</code>, <code>capability</code> and <code>effort</code> join the
+closed label vocabulary. Each is admissible for the same reason the existing
+ones are: the first four are administrator-configured identifiers, bounded by
+the configuration; the last two are closed enums in the router. A user id, a
+request id, a prompt or a URL remain forbidden and always will.</p>
+<p>The fleet metrics are in <code>names</code>. Every one of them is emitted by
+<code>hypellm-router</code>; a declared series that nothing writes reads on a dashboard as
+&quot;this never happens&quot; rather than &quot;this is not measured&quot;, which is the more
+misleading of the two.</p>
+<h2 id="threat-notes">Threat notes</h2>
+<ul>
+<li><strong>The pseudonym key is secret material.</strong> <code>Pseudonymizer</code> uses a hand-written
+<code>Debug</code> implementation that redacts the key, and <code>Telemetry</code> inherits that
+safe rendering. Disclosure of the persisted key would still permit
+dictionary-based re-identification of historical pseudonyms, so
+<code>pseudonym.key</code> requires the same filesystem protection as other router keys.</li>
+<li><strong>Pseudonyms are 48 bits and never rotate.</strong> <code>Pseudonymizer::pseudonym</code>
+truncates the HMAC tag to 6 bytes. 48 bits is ample against accidental
+collision at any plausible tenant count, but it is a <em>linkage</em> identifier with
+no epoch: a principal's pseudonym is identical across every log line the
+deployment ever writes. That is the intended correlation property, and it is
+also the privacy cost — a pseudonymous log is not an anonymous one, and it
+should be retained and access-controlled as identity-bearing data.
+Domain separation (<code>tenant</code> vs <code>principal</code>) is enforced by prefixing the HMAC
+input and is covered by <code>pseudonyms_are_stable_and_domain_separated</code>.</li>
+<li><strong>Attacker-driven metric cardinality, and the metrics-blinding attack it
+becomes.</strong> <code>LabelName::Alias</code> and <code>LabelName::Target</code> are the two label names
+whose values can trace back to request content — a client chooses the model
+string in <code>requested_model</code>. <code>MAX_SERIES_PER_METRIC</code> stops that from exhausting
+memory. A full table admits a new series by evicting the stalest one, provided that
+series has gone <code>STALE_AFTER_ACCESSES</code> (8 × the cap) accesses untouched. A
+table full of <em>live</em> series still folds rather than evicting: that is a
+genuinely high-cardinality metric, and evicting from it would only thrash. The
+eviction scan runs once per <code>SCAN_INTERVAL</code> (256) insert attempts, because it
+is O(series) under the write lock and the path that triggers it is the
+sprayer's own. <code>hypellm_metric_series_evicted_total</code> and
+<code>hypellm_metric_series_overflowed_total</code> make both visible, so a metric that has
+stopped attributing says so instead of looking healthy.
+The control is still upstream: emit sites must label with the <em>resolved</em> alias
+or target identifier from the active policy snapshot, never the raw client
+string. Today no production call site uses <code>LabelName::Alias</code>; that must stay a
+deliberate decision rather than an accident.</li>
+<li><strong>Overflow folding is kind-dependent, and only the meaningful kind folds.</strong>
+A sum of counters that could not be attributed answers a question; a gauge
+folded with unrelated gauges is last-write-wins across things that have
+nothing to do with each other, and merged histograms describe no distribution
+that exists. Only counters get an overflow series now — gauge and histogram
+observations past the cap are dropped and counted, because a number that looks
+like data and describes nothing is worse than an absent sample. The overflow
+series carries <code>LabelName::Overflow</code> (<code>hypellm_overflow=&quot;true&quot;</code>), a reserved name
+no emit site uses, keeping folded values distinct from legitimate outcomes.</li>
+<li><strong>Log-line forging via field values, defended by delegation.</strong> The output
+format is newline-delimited JSON, so a value containing a newline followed by a
+plausible JSON object would inject a synthetic log record — a way for an
+attacker-influenced string (an upstream error message, a model name) to write
+attacker-chosen <code>severity</code> and <code>event</code> values into the audit-adjacent record.
+The defence is <code>wire_json::to_string</code>, which escapes C0 controls; the property
+is pinned by <code>hostile_field_values_cannot_forge_a_log_line</code>. Note that this
+crate does not escape anything itself — log-forging resistance is entirely
+inherited from <code>wire-json</code>'s encoder, and a regression there is a log-integrity
+vulnerability here.</li>
+<li><strong>Exposition-line forging, defended by narrowing rather than escaping.</strong> The
+text exposition format has no escape mechanism this crate could rely on, so
+<code>sanitize_value</code> narrows instead: it keeps ASCII alphanumerics and <code>-._:/</code> and
+replaces everything else with <code>_</code>. A quote, newline, backslash, space, or brace
+cannot survive into a sample line. Narrowing is the right choice precisely
+because it cannot be got wrong in the way escaping can — there is no escaping
+round-trip to disagree about. <code>label_values_are_narrowed_not_escaped</code> pins it.</li>
+<li><strong>Duplicate JSON keys are producible, and the router's own parser rejects
+them.</strong> <code>Event::str_field</code> appends to a <code>Vec</code>, and <code>wire_json::Object::push</code>
+appends without a duplicate check. Calling the same field twice on one event —
+easy to do in a builder chain assembled across branches — emits a line with a
+repeated key. <code>wire_json::Limits</code> sets <code>reject_duplicate_keys: true</code> in every
+profile, so the router's own parser would reject a line the router itself
+wrote, and third-party log consumers disagree about whether first or last wins.
+That is a parser differential the emitter can cause. No test covers it.</li>
+<li><strong>Telemetry fails silently, including for security signals.</strong> Every lock
+acquisition in <code>Registry</code>, <code>MemorySink</code>, and the exposition path uses <code>.ok()?</code>
+or <code>map_or</code>, so a poisoned <code>RwLock</code>/<code>Mutex</code> degrades to <em>no metric recorded</em> and
+<em>no error surfaced</em> — <code>exposition()</code> returns an empty string on a poisoned
+registry lock. <code>StderrSink</code> likewise discards the <code>writeln!</code> result. This is the
+correct trade for the data plane (specification 18.2 forbids panics on
+data-plane input, and a logging failure must not fail a request), but it means
+the disappearance of <code>AUTH_FAILURES</code> is indistinguishable from an absence of
+auth failures. Alerting must be built on positive liveness signals, not on the
+absence of a counter.</li>
+<li><strong><code>StderrSink</code> still blocks the emitting thread, and is no longer on the
+request path.</strong> <code>write_line</code> takes the process-wide stderr lock and writes
+synchronously with no deadline, so a stalled pipe would block every emitter —
+a data-path stall introduced by observability. <code>QueueingSink</code> puts one fixed
+writer thread behind a bounded queue (<code>MAX_QUEUED_LINES</code>, 4 096), and
+<code>Telemetry::stderr</code> composes the two, so a stalled reader now stalls only the
+writer. <strong>A caller constructing <code>Logger::new(Box::new(StderrSink), …)</code>
+directly reintroduces the stall</strong> — the router did exactly that until this was
+wired, and it is the mistake to watch for.
+Drops are oldest-first (during an incident the newest lines matter most) and
+counted, and the count is emitted with the next line that gets through.
+<code>Drop</code> joins the writer so shutdown drains: the lines most worth keeping are
+the ones written just before a process stopped.</li>
+<li><strong>Log volume is bounded per unit time, by a second-order control.</strong> Per event
+code, <code>PER_CODE_PER_WINDOW</code> (2 000) lines per second, so a flood of one code
+cannot starve another of the writer. <code>Critical</code> is never limited — it is the
+severity for things an operator must not miss.
+The number is high on purpose: the queue, not the rate limit, is what bounds
+memory and protects the data path, and a low limit would throttle ordinary
+per-request logging to defend against a flood that admission control has
+already bounded. Suppression is reported rather than silent.</li>
+<li><strong>Wall-clock timestamps are not monotonic.</strong> <code>Logger::emit</code> stamps lines with
+<code>clock.wall_millis()</code>. A clock step backwards produces out-of-order timestamps
+and can make an incident timeline appear to loop. Specification 17 requires
+monotonic clocks to govern durations and deadlines — durations reaching this
+crate as <code>int_field</code> values must be measured monotonically by the caller, never
+differenced from these timestamps. <code>names::CLOCK_STEPS</code> exists to make steps
+visible; nothing here enforces its use.</li>
+<li><strong><code>MemorySink</code> is unbounded and publicly exported from a production crate.</strong>
+It accumulates every line in a <code>Vec&lt;String&gt;</code> with no cap and a manual <code>clear()</code>.
+It is a test aid but is not <code>#[cfg(test)]</code>, so it links into the router binary
+and is one configuration mistake away from being an in-process memory leak
+proportional to log volume.</li>
+<li><strong>Prompts are inert here by construction.</strong> No <code>Field</code> or <code>LabelName</code> variant
+can carry prompt, message, completion, tool-argument, credential, or body
+content, and there is no dynamic key. This is the crate's contribution to
+specification 10.1's &quot;prompt injection affecting control plane&quot; row: content
+that never enters telemetry cannot be read back out of a dashboard or a log
+search as though it were router state.</li>
+</ul>
+<h2 id="limits">Limits</h2>
+<p>Values below were read from the source; the enforcing constant or expression is
+named for each. Rows marked <strong>Not enforced</strong> are honest gaps, not assurances.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Input / resource</th>
+<th>Limit</th>
+<th>Enforced by</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Log string field value</td>
+<td>256 bytes, truncated on a UTF-8 character boundary</td>
+<td><code>logs::MAX_FIELD_LEN</code> via <code>hypellm_core::sensitive::Capped::new</code> in <code>Event::str_field</code></td>
+<td>Enforced</td>
+</tr>
+<tr>
+<td>Distinct log fields</td>
+<td>26, the <code>Field</code> variants</td>
+<td>closed enum; <code>Field::all()</code></td>
+<td>Enforced structurally</td>
+</tr>
+<tr>
+<td>Fields attached to one event</td>
+<td>none — <code>Event::fields</code> is an unbounded <code>Vec</code>, and the same field may be pushed repeatedly</td>
+<td>—</td>
+<td><strong>Not enforced.</strong> Bounded in practice only because every call site is static router code</td>
+</tr>
+<tr>
+<td>Total log line length</td>
+<td>none — derived from field count × 256 bytes plus the fixed <code>ts</code>/<code>severity</code>/<code>event</code> prefix</td>
+<td>—</td>
+<td><strong>Not enforced.</strong> No cap on the assembled line</td>
+</tr>
+<tr>
+<td>Log emission rate</td>
+<td>none — no sampling, rate limit, or dedup</td>
+<td>—</td>
+<td><strong>Not enforced</strong></td>
+</tr>
+<tr>
+<td>Integer log field value</td>
+<td>Values above <code>i64::MAX</code> are rendered as an approximate <code>f64</code> by <code>wire_json::Value::from(u64)</code></td>
+<td><code>wire-json</code> <code>From&lt;u64&gt;</code></td>
+<td>Enforced, lossy at the top of the range</td>
+</tr>
+<tr>
+<td>Pseudonym output</td>
+<td>12 hex characters (48 bits)</td>
+<td><code>hex::encode_prefix(&amp;tag, 6)</code> in <code>Pseudonymizer::pseudonym</code></td>
+<td>Enforced</td>
+</tr>
+<tr>
+<td>Pseudonymizer key</td>
+<td>any length accepted; HMAC-SHA-256 hashes keys over 64 bytes down to 32</td>
+<td><code>hypellm_crypto::hmac_sha256_parts</code></td>
+<td>Enforced by the primitive</td>
+</tr>
+<tr>
+<td>Metric label value</td>
+<td>64 input characters, each retained character ASCII, so ≤ 64 bytes out; empty becomes <code>none</code></td>
+<td><code>metrics::MAX_LABEL_VALUE_LEN</code> via <code>sanitize_value</code></td>
+<td>Enforced</td>
+</tr>
+<tr>
+<td>Label character set</td>
+<td>ASCII alphanumerics plus <code>-._:/</code>; all else replaced with <code>_</code></td>
+<td><code>sanitize_value</code></td>
+<td>Enforced</td>
+</tr>
+<tr>
+<td>Labels per series</td>
+<td>12, the <code>LabelName</code> variants; <code>Labels::with</code> replaces rather than appends on a repeated name</td>
+<td>closed enum; <code>LabelName::all()</code></td>
+<td>Enforced structurally</td>
+</tr>
+<tr>
+<td>Series per metric</td>
+<td>2,000, plus one <code>{hypellm_overflow=&quot;true&quot;}</code> counter series, so 2,001 map entries</td>
+<td><code>metrics::MAX_SERIES_PER_METRIC</code> checked in <code>Registry::with_series</code></td>
+<td>Enforced</td>
+</tr>
+<tr>
+<td>Series staleness before eviction</td>
+<td>8 × the series cap, counted in accesses to that metric, not milliseconds</td>
+<td><code>metrics::STALE_AFTER_ACCESSES</code></td>
+<td>Enforced</td>
+</tr>
+<tr>
+<td>Distinct metric names</td>
+<td>21 today; registration requires a <code>&amp;'static str</code>, so no request-derived name can create one</td>
+<td><code>Registry::ensure</code> signature; <code>metrics::names</code></td>
+<td>Enforced structurally</td>
+</tr>
+<tr>
+<td>Histogram buckets per series</td>
+<td>16 bounds plus one overflow bucket = 17 <code>AtomicU64</code> counters</td>
+<td><code>hypellm_core::time::LATENCY_BUCKETS_MS</code></td>
+<td>Enforced</td>
+</tr>
+<tr>
+<td>Histogram sample value</td>
+<td>none — <code>histogram_observe</code> accepts any <code>u64</code>; <code>sum.fetch_add</code> wraps silently rather than aborting, because <code>overflow-checks</code> does not apply to atomic intrinsics</td>
+<td>—</td>
+<td><strong>Not enforced.</strong> A bogus sample (e.g. an underflowed duration) corrupts <code>_sum</code></td>
+</tr>
+<tr>
+<td>Counter value</td>
+<td>wraps at <code>u64::MAX</code> via <code>fetch_add</code>, silently</td>
+<td>—</td>
+<td>Wrap is unreachable in practice; noted because it is silent</td>
+</tr>
+<tr>
+<td>Registry resident memory</td>
+<td>bounded: (metric names) × 2,001 series × (one atomic, or a 17-counter histogram)</td>
+<td>the two caps above</td>
+<td>Enforced</td>
+</tr>
+<tr>
+<td>Exposition document size</td>
+<td>none — <code>exposition()</code> materializes every metric, series, and histogram bucket line into one <code>String</code>. At full cardinality a single histogram metric renders 2,001 × 19 ≈ 38,000 lines; at ~100 B/line that is ~4 MB per histogram metric, and roughly ten times that with maximal label sets</td>
+<td>—</td>
+<td><strong>Not enforced.</strong> Bounded by the cardinality caps, but the bound is large and the buffer is not streamed</td>
+</tr>
+<tr>
+<td>Captured lines in <code>MemorySink</code></td>
+<td>none</td>
+<td>—</td>
+<td><strong>Not enforced</strong> (test aid, but publicly exported)</td>
+</tr>
+<tr>
+<td>Sink write deadline</td>
+<td>none — <code>StderrSink::write_line</code> blocks</td>
+<td>—</td>
+<td><strong>Not enforced</strong></td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="fuzz-targets">Fuzz targets</h2>
+<p>The workspace has no <code>fuzz/</code> directory and no libFuzzer harness — specification
+4 admits no such dependency. Fuzzing is a seeded, deterministic mutation engine
+in <code>hypellm-test-corpus::fuzz</code>, driven from ordinary <code>tests/fuzz.rs</code> targets.
+All seven areas specification 21 names have a suite; see
+<code>spec/deferred-issues.html</code>, <code>DI-002</code>, for the table. None cover this
+crate: it contains no parser, so the targets below fuzz an <strong>encoder against a
+parser or a grammar</strong>, which is where an encoder's differentials live.</p>
+<p>This crate's fuzzable surface is unusual: it contains no parser. Every target
+below fuzzes an <strong>encoder against a parser or a grammar</strong>, which is where an
+encoder's differentials live.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Target</th>
+<th>Property to hold</th>
+<th>Specification</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>telemetry_log_line</code></td>
+<td>For arbitrary field values and combinations, <code>Event::to_json_line</code> yields exactly one line, containing no raw newline, that <code>wire_json::parse_str</code> accepts under <code>Limits::SMALL</code> — including the duplicate-key case, which currently violates it</td>
+<td>21 (<code>Fuzz</code>), 17</td>
+</tr>
+<tr>
+<td><code>telemetry_exposition</code></td>
+<td>For arbitrary label values and series, every non-comment line of <code>Registry::exposition</code> is <code>name[{labels}] value</code> with a numeric value, quotes appear only as the label-quoting pair, and no line contains a newline or an unbalanced brace</td>
+<td>21 (<code>Fuzz</code>), 17</td>
+</tr>
+<tr>
+<td><code>telemetry_label_sanitizer</code></td>
+<td><code>sanitize_value</code> output is always non-empty, at most <code>MAX_LABEL_VALUE_LEN</code> bytes, drawn only from the permitted character set, and never panics or slices mid-character on arbitrary UTF-8</td>
+<td>21 (<code>Fuzz</code>), 3.2</td>
+</tr>
+<tr>
+<td><code>telemetry_field_cap</code></td>
+<td><code>Capped::new</code> at <code>MAX_FIELD_LEN</code> never splits a UTF-8 character, never exceeds the cap, and is idempotent, for arbitrary multi-byte input</td>
+<td>21 (<code>Fuzz</code>), 10</td>
+</tr>
+<tr>
+<td><code>telemetry_registry_ops</code></td>
+<td>Under an arbitrary interleaving of counter/gauge/histogram operations and label sets, series count never exceeds <code>MAX_SERIES_PER_METRIC + 1</code>, exposition remains well-formed, and repeated renders of an unchanged registry are byte-identical</td>
+<td>21 (<code>Fuzz</code>, <code>Property</code>), 17</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>Required, not yet implemented:</strong> all five.</p>
+<p>Also required by specification 21 and absent: a property test that no <code>Field</code> or
+<code>LabelName</code> value can carry an attacker-supplied byte into an unescaped position,
+and a secret-leakage test asserting that <code>{:?}</code> on <code>Telemetry</code>, <code>Logger</code>, and
+<code>Pseudonymizer</code> contains no key material — the latter fails today, per the first
+threat note.</p>
+<h2 id="public-api">Public API</h2>
+<p>See <code>lib.rs</code>, <code>logs.rs</code>, and <code>metrics.rs</code>. The surface is deliberately small and
+almost entirely closed:</p>
+<ul>
+<li><code>Telemetry</code> — the facade a request handler holds: <code>metrics</code>, <code>logger</code>,
+<code>pseudonyms</code>. Constructed by <code>new</code> or <code>stderr</code>; <code>Send + Sync</code>, intended to be
+shared behind an <code>Arc</code>.</li>
+<li><code>metrics::{Registry, Labels, LabelName, MetricKind, sanitize_value, names}</code> —
+counters, gauges, histograms, and the exposition renderer.</li>
+<li><code>logs::{Event, Field, Severity, Logger, Sink, StderrSink, MemorySink, Pseudonymizer}</code> — event construction, severity filtering, and emission.</li>
+<li>Constants: <code>logs::MAX_FIELD_LEN</code>, <code>metrics::MAX_LABEL_VALUE_LEN</code>,
+<code>metrics::MAX_SERIES_PER_METRIC</code>.</li>
+</ul>
+<p>There is no dynamic label key, no dynamic log field key, no runtime allowlist, no
+metric unregistration, no exporter configuration, and no way to change a
+<code>Logger</code>'s minimum severity after construction — a level change requires building
+a new <code>Logger</code>, which is a gap for runtime reconfiguration under specification
+11's atomic activation model. <code>Sink</code> is the single extension point; anything it
+is given is already capped, narrowed, and escaped.</p>
+
+      </article>
+      <footer class="page-footer"><a href="../index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#scope-and-the-the-vocabulary-is-the-control-rule">Scope, and the &quot;the vocabulary is the control&quot; rule</a></li>
+<li class="toc-level-3"><a href="#fleet-labels">Fleet labels</a></li>
+<li class="toc-level-2"><a href="#threat-notes">Threat notes</a></li>
+<li class="toc-level-2"><a href="#limits">Limits</a></li>
+<li class="toc-level-2"><a href="#fuzz-targets">Fuzz targets</a></li>
+<li class="toc-level-2"><a href="#public-api">Public API</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

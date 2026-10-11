@@ -17,7 +17,7 @@
 //! coding harnesses selected at release time". Selecting and recording those is
 //! release work that has not happened. Naming a harness here without having run
 //! it would be the exact false assurance the versioning rule exists to prevent —
-//! so this module names classes, and the gap is recorded in `MODULE.md`.
+//! so this module names classes, and the gap is recorded in `spec/modules/hypellm-test-corpus.html`.
 //!
 //! # What is not checked
 //!

@@ -1,0 +1,495 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: hypellm-fleet.">
+  <title>hypellm-fleet · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="../assets/wiki.css">
+  <script defer src="../assets/search-index.js"></script>
+  <script defer src="../assets/wiki.js"></script>
+</head>
+<body data-wiki-root="../" data-page-title="hypellm-fleet" data-page-group="Module contracts">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="../index.html">Wiki home</a></li>
+<li><a href="../overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="../router-specification.html">Router specification</a></li>
+<li><a href="../threat-model.html">Threat model</a></li>
+<li><a href="../orchestration.html">Fleet orchestration</a></li>
+<li><a href="../deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="../using-the-router.html">Using the router</a></li>
+<li><a href="../deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="../runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="../components/fleet-agent.html">Fleet agent</a></li>
+<li><a href="../components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="../components/container-init.html">Container init</a></li>
+<li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="hypellm-config.html">hypellm-config</a></li>
+<li><a href="hypellm-core.html">hypellm-core</a></li>
+<li><a href="hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="hypellm-fleet.html" aria-current="page">hypellm-fleet</a></li>
+<li><a href="hypellm-net.html">hypellm-net</a></li>
+<li><a href="hypellm-router.html">hypellm-router</a></li>
+<li><a href="hypellm-store.html">hypellm-store</a></li>
+<li><a href="hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="wire-http1.html">wire-http1</a></li>
+<li><a href="wire-json.html">wire-json</a></li>
+<li><a href="wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="../index.html">Wiki</a><span aria-hidden="true">/</span>Module contracts</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="module-hypellm-fleet">Module: hypellm-fleet</h1>
+<p>Specification 4.1 requires every in-repository module to declare an owner, threat
+notes, public API, unsafe-code declaration, fuzz targets, and maximum
+input/resource limits.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Owner</td>
+<td>Platform (primary), Security (secondary)</td>
+</tr>
+<tr>
+<td>Unsafe code</td>
+<td>None. <code>#![forbid(unsafe_code)]</code> declared in <code>lib.rs</code> and inherited from the workspace lint table.</td>
+</tr>
+<tr>
+<td>External dependencies</td>
+<td>None. Rust standard library plus workspace path dependencies: <code>hypellm-core</code>, <code>hypellm-crypto</code>, <code>wire-json</code>; <code>hypellm-test-corpus</code> for tests only.</td>
+</tr>
+<tr>
+<td>Fuzz targets</td>
+<td>Eight, in <code>tests/fuzz.rs</code>, over three surfaces. See <a href="#fuzz-targets">Fuzz targets</a>.</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="why-this-crate-exists">Why this crate exists</h2>
+<p>It is one of the six crates not named in specification 18.1's list. HypeLLM
+routes a request to a target that is <em>already running</em>; this crate is what makes
+&quot;already running&quot; a decision rather than an assumption.</p>
+<p>It could not live in <code>hypellm-core</code>. Core is the routing policy: it answers
+&quot;which of these targets should serve this request&quot;. This answers a different
+question — &quot;what must the fleet become in order to serve it&quot; — against a
+different snapshot, on a different lifecycle, with its own governance state.
+Merging them would put eviction economics and dwell timers inside the crate whose
+whole claim is that routing is a pure function of policy and live state.</p>
+<p>It also could not live in the router binary. The planner has to be callable from
+<code>POST /admin/v1/fleet:simulate</code> with no side effects, and from the request path
+with them, and a planner that lived beside the socket that executes it would
+eventually acquire a shortcut to it.</p>
+<h2 id="scope">Scope</h2>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Concern</th>
+<th>Module</th>
+<th>Specification</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hosts, accelerators, deployments, artifacts, governance limits</td>
+<td><code>model</code></td>
+<td>extension 5, 13</td>
+</tr>
+<tr>
+<td>Observation, belief, intent, inventory parsing</td>
+<td><code>state</code></td>
+<td>extension 6</td>
+</tr>
+<tr>
+<td>Demand rate, queue depth, idleness</td>
+<td><code>demand</code></td>
+<td>extension 8.4, 21</td>
+</tr>
+<tr>
+<td>The planner: classification, eviction sets, cost model</td>
+<td><code>plan</code></td>
+<td>extension 7, 8</td>
+</tr>
+<tr>
+<td>Dwell, hysteresis, batching, cooldown, budgets</td>
+<td><code>governance</code></td>
+<td>extension 9</td>
+</tr>
+<tr>
+<td>The activation state machine and lease accounting</td>
+<td><code>activation</code></td>
+<td>extension 10</td>
+</tr>
+<tr>
+<td>The agent wire protocol, as a codec</td>
+<td><code>protocol</code></td>
+<td>extension 4.3</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="what-this-module-deliberately-does-not-do">What this module deliberately does not do</h3>
+<ul>
+<li><strong>No I/O of any kind.</strong> No socket, no file, no process, no clock. Callers pass
+the time in, exactly as they do for <code>hypellm_core::admission</code>. The socket that
+carries a plan to an agent is <code>hypellm_net::fleet</code>; the process that acts on it
+is not in this repository's build at all.</li>
+<li><strong>No process execution.</strong> Specification 4.1 forbids it and <code>depscan</code>'s
+<code>forbidden-api</code> rule fails the build on <code>process::Command</code>. Actuation happens
+out of process, across a narrow authenticated local socket, in the same shape
+specification 4 uses for TLS and 9.1 for JWT verification.</li>
+<li><strong>No secrets.</strong> No type here holds <code>fleet.key</code>. <code>protocol::hello_hmac</code> takes the
+key as a parameter and returns a tag; the key itself is read and held by the
+router's startup path, and the client in <code>hypellm-net</code> borrows it for the
+length of one handshake.</li>
+<li><strong>No routing decisions.</strong> Nothing here ranks targets, resolves an alias, or
+reads a request. <code>plan::plan</code> takes a <code>TargetId</code> that routing has already
+chosen to consider.</li>
+<li><strong>No prompt, message, document, or tool argument.</strong> There is no function in the
+public surface that accepts one. This is the structural form of the invariant
+that prompts are inert: a plan cannot be influenced by content the crate has no
+way to receive.</li>
+<li><strong>No container orchestration.</strong> No replica abstraction, no scheduling of
+non-inference workloads, no image building, no service discovery, no cluster
+networking. The router observes and toggles a closed, administrator-declared
+set, and nothing else.</li>
+</ul>
+<h2 id="threat-notes">Threat notes</h2>
+<ul>
+<li><strong>The agent's report is untrusted input.</strong> <code>state::parse_inventory</code> runs
+<code>wire-json</code> under <code>inventory_limits()</code>, drops every identifier the
+configuration does not declare (counting them in
+<code>Inventory::unknown_identifiers</code>), range-checks every numeric field, and fails
+the <em>whole</em> observation on any violation rather than partially updating belief.
+A half-applied observation is worse than none, because the router would then
+plan against a mixture of two moments. The property this buys is precise: a
+compromised agent can withhold information, and can lie about a deployment the
+router already knows about — which the divergence and drift rules cover — but
+it cannot introduce a host, accelerator, deployment, or artifact.</li>
+<li><strong>A compromised router must not reach a slave.</strong> Only identifiers and bounded
+integers cross the socket (<code>protocol::encode_request</code>). The identifier alphabet
+in <code>hypellm_core::ids</code> excludes whitespace and control characters, so no
+component can introduce a field or a line — there is no escaping to get wrong.
+The agent resolves each identifier against its own allowlist, which the router
+cannot extend.</li>
+<li><strong>A hostile agent's strings.</strong> The agent is trusted to actuate, not to author
+text the router will store and echo into an operator's browser.
+<code>protocol::sanitize_token</code> truncates to 64 characters and maps everything
+outside <code>[A-Za-z0-9_.-]</code> to <code>_</code>, closing terminal-escape, newline, and quote
+injection — the same treatment <code>hypellm_net::helper::sanitize_code</code> gives the
+TLS helper. <code>ActivationRecord::detail</code> is <code>&amp;'static str</code> for the same reason:
+the type makes an agent-supplied detail unstorable.</li>
+<li><strong>Replay.</strong> The <code>HELLO</code> tag covers version, nonce, and fleet digest as separate
+HMAC parts, so a captured handshake cannot be replayed and a nonce ending in
+digits cannot be read as part of a version. This is defence in depth — reaching
+an owner-only socket already requires the owner's privileges.</li>
+<li><strong>Thrash as denial of service.</strong> Five layers, in the order they engage:
+batching absorbs a burst (<code>ActivationQueue</code>), the dwell floor caps swap
+frequency absolutely (<code>plan::select_eviction_set</code>), the hysteresis margin stops
+oscillation between near-equal capabilities, cooldown and flap backoff punish
+repetition (<code>FlapCounter</code>), and the activation budget terminates the pattern
+with an explained rejection (<code>Budgets</code>). The budget is a <strong>sliding window</strong>
+rather than a token bucket, deliberately: a bucket that starts full permits
+twice its hourly rate in the first hour, and the safety claim this feature
+rests on is &quot;twelve swaps per host per hour regardless of the attacker's rate&quot;.</li>
+<li><strong>Eviction as a cross-tenant attack.</strong> Tenant priority enters as
+<code>PlanContext::priority_bonus</code>, clamped like every other term. A deployment
+with in-flight work above <code>max_drainable_inflight</code> is not evictable, a pinned
+or non-evictable one never enters a candidate set, and <code>force_stop</code> is opt-in
+and audited by the caller.</li>
+<li><strong>Storage exhaustion via fetch.</strong> <code>plan::plan</code> refuses a fetch unless the
+host's policy allows it <em>and</em> the principal holds the separate permission
+<em>and</em> free disk exceeds size plus headroom <em>and</em> the architecture matches.
+Fetch is off by default.</li>
+<li><strong>Stale belief.</strong> Acting on it is how a scheduler stops a container something
+else already restarted. <code>FleetSnapshot::belief_is_fresh</code> gates every plan, and
+<code>observation_age_ms</code> returns <code>None</code> — not zero — when no observation has ever
+succeeded, so a router that has never reached its agent cannot read as healthy.</li>
+<li><strong>Leaked leases.</strong> A leaked lease pins a host out of service until expiry: a
+slow, confusing outage that looks like a capacity problem.
+<code>ActivationLedger::release</code> returns <code>LeaseRelease::AlreadyReleased</code> rather than
+releasing twice, because a double release would return a slot a <em>different</em>
+activation now holds. <code>accounting()</code> exposes the two counters so the
+conservation property is checked against something other than the map the code
+maintains.</li>
+<li><strong>Concurrent plans.</strong> <code>plan</code> is pure and runs on whatever snapshot a request
+holds, so two plans can each be sound alone and unsound together. The planner
+counts <code>FleetSnapshot::leases</code> (a leased deployment is already coming up,
+holds a concurrency slot, and commits its memory, as do pending and fetching
+ones) and <code>FleetSnapshot::evicting</code> (never a second victim). The executor
+closes the remaining gap: <code>revalidate</code> against the ledger's commitments, then
+<code>ActivationLedger::acquire_exclusive</code>, which refuses the same deployment or an
+overlapping eviction set atomically.</li>
+<li><strong>Poisoned locks.</strong> Every <code>RwLock</code> here fails in the direction that cannot
+cause fleet work: budgets refuse, flap counters return the plain cooldown, and
+demand drops a sample. The one exception is <code>ActivationQueue::admit</code>, which
+fails toward activating — the budget and dwell floor still bound what can
+happen, and a lock failure that silently stalled every cold request would be an
+outage with no explanation.</li>
+</ul>
+<h2 id="limits">Limits</h2>
+<p>Enforced within this crate:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Input / resource</th>
+<th>Limit</th>
+<th>Enforced by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Inventory payload</td>
+<td>256 KiB</td>
+<td><code>state::MAX_INVENTORY_BYTES</code>, checked against the declared length before allocation</td>
+</tr>
+<tr>
+<td>Inventory hosts / accelerators / deployments / artifacts</td>
+<td>64 / 256 / 512 / 1024</td>
+<td><code>state::MAX_INVENTORY_*</code></td>
+</tr>
+<tr>
+<td>Inventory JSON depth / string / input</td>
+<td><code>Limits::SMALL</code> with a raised input bound</td>
+<td><code>state::inventory_limits</code></td>
+</tr>
+<tr>
+<td>Agent status line</td>
+<td>512 bytes</td>
+<td><code>protocol::MAX_LINE</code></td>
+</tr>
+<tr>
+<td>Agent-supplied token</td>
+<td>64 chars, <code>[A-Za-z0-9_.-]</code></td>
+<td><code>protocol::sanitize_token</code></td>
+</tr>
+<tr>
+<td>Status progress</td>
+<td>0–1000 permille</td>
+<td><code>protocol::parse_reply</code></td>
+</tr>
+<tr>
+<td>Plan steps</td>
+<td>8</td>
+<td><code>plan::MAX_PLAN_STEPS</code></td>
+</tr>
+<tr>
+<td>Eviction set</td>
+<td><code>max_eviction_set</code>, default 2</td>
+<td><code>plan::select_eviction_set</code></td>
+</tr>
+<tr>
+<td>Activations per host per hour</td>
+<td><code>max_activations_per_hour</code>, default 12</td>
+<td><code>governance::Budgets</code>, sliding window</td>
+</tr>
+<tr>
+<td>Activation window entries per host</td>
+<td>256</td>
+<td><code>governance::MAX_WINDOW_ENTRIES</code></td>
+</tr>
+<tr>
+<td>Queued requests per capability</td>
+<td>256</td>
+<td><code>governance::MAX_QUEUED_PER_CAPABILITY</code></td>
+</tr>
+<tr>
+<td>Flap backoff</td>
+<td><code>max_flap_cooldown_ms</code>, default 1 hour</td>
+<td><code>governance::FlapCounter</code></td>
+</tr>
+<tr>
+<td>Retained activation history</td>
+<td>256 records</td>
+<td><code>activation::MAX_HISTORY</code></td>
+</tr>
+<tr>
+<td>Remembered released leases (double-release detection)</td>
+<td>4 096</td>
+<td><code>activation::MAX_RELEASED</code>; an older identifier is refused as <code>Unknown</code> instead</td>
+</tr>
+<tr>
+<td>Zero samples folded per demand roll</td>
+<td>256 windows</td>
+<td><code>demand::MAX_WINDOWS_PER_ROLL</code></td>
+</tr>
+<tr>
+<td>Concurrent activations per host</td>
+<td><code>max_concurrent_activations</code>, default 1</td>
+<td><code>activation::ActivationLedger::acquire</code></td>
+</tr>
+<tr>
+<td>Observation-derived timing adjustment</td>
+<td>×¼ to ×4 of the declared figure</td>
+<td><code>state::TIMING_CLAMP_FACTOR</code></td>
+</tr>
+<tr>
+<td>Score and value terms</td>
+<td>Documented ranges, saturating</td>
+<td><code>plan::*_TERM_RANGE</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>Applied by this crate but defined elsewhere:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Input</th>
+<th>Limit</th>
+<th>Source</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Identifier length and alphabet</td>
+<td>128 bytes, <code>[A-Za-z0-9._:-]</code></td>
+<td><code>hypellm_core::ids</code></td>
+</tr>
+<tr>
+<td>Warmness contribution to the score</td>
+<td>40,000 of the affinity term</td>
+<td><code>hypellm_core::decision::ScoreTerms::WARMTH_SLICE</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>Not enforced — stated so the gap is not mistaken for a control:</p>
+<ul>
+<li><strong>Socket deadlines and reply sizes on the wire.</strong> This crate is a codec; the
+deadline, the read bound, and the connection lifetime belong to
+<code>hypellm_net::fleet</code>.</li>
+<li><strong>Durability.</strong> Leases and flap counters are held in memory here. Writing them
+to the append-only log before the mutating verb is the router's job, and the
+crash-recovery property depends on the router doing it.</li>
+</ul>
+<h2 id="fuzz-targets">Fuzz targets</h2>
+<p>The workspace has no <code>fuzz/</code> directory and no libFuzzer — specification 4 admits
+no such dependency. Fuzzing is a seeded, deterministic mutation engine in
+<code>hypellm-test-corpus::fuzz</code>, driven from an ordinary <code>tests/fuzz.rs</code> so that
+<code>cargo test</code> runs it and a failing seed is reproducible by number.</p>
+<p>Each target asserts a property, not the absence of a panic:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Target</th>
+<th>Surface</th>
+<th>Property asserted</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>agent_inventory_never_adopts_an_undeclared_identifier</code></td>
+<td>Mutated inventory payloads through <code>state::parse_inventory</code></td>
+<td>No identifier absent from the configuration is ever adopted, and no numeric field escapes its range</td>
+</tr>
+<tr>
+<td><code>an_inventory_that_is_refused_leaves_nothing_behind</code></td>
+<td>The same, on the failure path</td>
+<td>A refusal carries a stable code and yields no partial inventory</td>
+</tr>
+<tr>
+<td><code>an_oversized_inventory_is_refused_before_it_is_parsed</code></td>
+<td>A payload past the byte bound</td>
+<td>The bound is checked before anything is allocated</td>
+</tr>
+<tr>
+<td><code>no_malformed_agent_reply_advances_the_activation_state_machine</code></td>
+<td>Mutated reply lines against a live <code>ActivationLedger</code></td>
+<td>Parsing a reply never moves the machine; sanitised tokens stay inside the identifier alphabet; declared lengths and progress stay in range</td>
+</tr>
+<tr>
+<td><code>a_reply_is_never_parsed_against_a_verb_that_did_not_provoke_it</code></td>
+<td>Every reply against every verb</td>
+<td><code>OK 4096</code> is an inventory length after <code>OBSERVE</code> and nonsense elsewhere</td>
+</tr>
+<tr>
+<td><code>a_sanitised_token_never_escapes_the_identifier_alphabet</code></td>
+<td>Mutated tokens through <code>protocol::sanitize_token</code></td>
+<td>Length and alphabet hold for every input</td>
+</tr>
+<tr>
+<td><code>an_over_long_reply_line_is_refused_rather_than_read</code></td>
+<td>A line past <code>MAX_LINE</code></td>
+<td>Refused</td>
+</tr>
+<tr>
+<td><code>no_interleaving_of_lease_operations_leaks_a_lease</code></td>
+<td>Arbitrary interleavings of acquire, release, expiry, and spurious release against <code>ActivationLedger</code></td>
+<td>Acquisitions equal releases plus live leases; slots never diverge from live leases; a refused release returns no slot</td>
+</tr>
+</tbody>
+</table></div>
+<p>The property layer lives in <code>tests/properties.rs</code>, in the style of the fourteen
+properties in <code>hypellm-core/tests/properties.rs</code>: twelve seeded properties over
+extension 23's invariant list, each across many generated fleets. The capability
+contract's own properties are in <code>hypellm-core/tests/capability.rs</code>, and the
+end-to-end activation path is exercised in <code>hypellm-router/tests/fleet.rs</code>
+against a conformant simulated agent on a real socket.</p>
+<h2 id="public-api">Public API</h2>
+<p>See <code>lib.rs</code>. The surface is the domain model (<code>FleetConfig</code> and its records),
+the snapshot (<code>FleetSnapshot</code>, <code>Inventory</code>, <code>Lease</code>), the planner (<code>plan</code>,
+<code>Plan</code>, <code>PlanOutcome</code>, <code>PlanContext</code>, <code>retention_value</code>), the governance state
+(<code>Budgets</code>, <code>FlapCounter</code>, <code>ActivationQueue</code>), the activation machine
+(<code>ActivationLedger</code>, <code>ActivationState</code>, <code>ActivationRecord</code>), and the protocol
+codec (<code>AgentRequest</code>, <code>AgentReply</code>, <code>encode_request</code>, <code>parse_reply</code>).</p>
+<p>The narrowness is the point. There is no function that takes a request, a
+prompt, a URL, a host address, a file path, or a command; no function that opens
+anything; and no way to construct an <code>AgentRequest</code> naming a deployment the
+caller did not already hold an identifier for. Widening any of those requires
+two-person security review under 21.1, as do changes to the agent protocol, the
+lease accounting, and the eviction path.</p>
+
+      </article>
+      <footer class="page-footer"><a href="../index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#why-this-crate-exists">Why this crate exists</a></li>
+<li class="toc-level-2"><a href="#scope">Scope</a></li>
+<li class="toc-level-3"><a href="#what-this-module-deliberately-does-not-do">What this module deliberately does not do</a></li>
+<li class="toc-level-2"><a href="#threat-notes">Threat notes</a></li>
+<li class="toc-level-2"><a href="#limits">Limits</a></li>
+<li class="toc-level-2"><a href="#fuzz-targets">Fuzz targets</a></li>
+<li class="toc-level-2"><a href="#public-api">Public API</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

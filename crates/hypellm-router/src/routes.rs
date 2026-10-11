@@ -673,7 +673,14 @@ impl InferenceHandler {
     ) -> io::Result<Disposition> {
         let state = &self.state;
         let mut sink = AccumulatingSink::default();
-        let outcome = pipeline::execute(state, request, &principal.groups, principal.permissions(), &mut sink);
+        let outcome = pipeline::execute_for_key(
+            state,
+            request,
+            &principal.groups,
+            principal.permissions(),
+            principal.key_id.as_ref(),
+            &mut sink,
+        );
         let total = state.clock.now_millis().saturating_sub(started);
         // The key, not just the principal: specification 22.3 step 20 searches
         // usage by *key*, and one principal can hold several.
@@ -747,6 +754,15 @@ impl InferenceHandler {
 
         // The head goes out before the first upstream byte, so a client that
         // is waiting on headers sees the stream open promptly.
+        //
+        // With one exception. Specification 12.1: "Streaming MUST reserve
+        // before HTTP headers are sent", because "an already-started response
+        // cannot change its HTTP status to 402". A key with a finite budget
+        // therefore has its head withheld until the pipeline reports the
+        // request admitted — a few lines later for a request that fits, and
+        // never for one that does not, which is then answered with a real 402.
+        // A key with no limit cannot be refused that way, so nothing about its
+        // stream changes.
         let bytes_before = writer.bytes_written();
         let head = ResponseBuilder::new(200)
             .header("Content-Type", "text/event-stream")
@@ -755,16 +771,33 @@ impl InferenceHandler {
             .and_then(|b| b.header("X-Request-Id", &request.request_id.to_string()))
             .and_then(ResponseBuilder::finish_streaming)
             .map_err(|_| io::Error::other("response head"))?;
-        writer.write(&head)?;
-        writer.flush()?;
+        let budgeted = principal
+            .key_id
+            .as_ref()
+            .is_some_and(|key| state.budgets.view(key).limit.is_some());
+        let pending_head = if budgeted {
+            Some(head)
+        } else {
+            writer.write(&head)?;
+            writer.flush()?;
+            None
+        };
 
         let mut sink = StreamSink::new(
             request.clone(),
             writer,
             wall_seconds(state.clock.as_ref()),
             state.clock.as_ref(),
+            pending_head,
         );
-        let outcome = pipeline::execute(state, request, &principal.groups, principal.permissions(), &mut sink);
+        let outcome = pipeline::execute_for_key(
+            state,
+            request,
+            &principal.groups,
+            principal.permissions(),
+            principal.key_id.as_ref(),
+            &mut sink,
+        );
         let total = state.clock.now_millis().saturating_sub(started);
         // The key, not just the principal: specification 22.3 step 20 searches
         // usage by *key*, and one principal can hold several.
@@ -777,6 +810,17 @@ impl InferenceHandler {
         );
 
         if let Some(error) = &outcome.error {
+            if error.code == ErrorCode::TokenBudgetExhausted && sink.pending_head.is_some() {
+                // Nothing has been written, so this is still an ordinary
+                // response: HTTP 402 and the JSON envelope, as for a request
+                // that did not ask to stream.
+                return respond_error(
+                    sink.writer,
+                    error,
+                    Some(request.request_id),
+                    request.protocol,
+                );
+            }
             // Specification 14: "Emit protocol-supported error event if
             // possible, then close. Never append failover output."
             sink.emit_error(error);
@@ -837,6 +881,11 @@ struct StreamSink<'a> {
     responses: openai::ResponsesStreamState,
     saw_output: bool,
     closed: bool,
+    /// The response head, when it has not been written yet.
+    ///
+    /// Written by whichever comes first: the pipeline reporting the request
+    /// admitted, or the first frame.
+    pending_head: Option<Vec<u8>>,
 }
 
 impl<'a> StreamSink<'a> {
@@ -845,6 +894,7 @@ impl<'a> StreamSink<'a> {
         writer: &'a mut ClientWriter,
         created: u64,
         clock: &'a dyn Clock,
+        pending_head: Option<Vec<u8>>,
     ) -> Self {
         Self {
             request,
@@ -857,7 +907,20 @@ impl<'a> StreamSink<'a> {
             responses: openai::ResponsesStreamState::new(),
             saw_output: false,
             closed: false,
+            pending_head,
         }
+    }
+
+    /// Write the withheld head, if there is one.
+    fn open(&mut self) -> Result<(), SinkClosed> {
+        let Some(head) = self.pending_head.take() else {
+            return Ok(());
+        };
+        if self.writer.write(&head).and_then(|()| self.writer.flush()).is_err() {
+            self.closed = true;
+            return Err(SinkClosed);
+        }
+        Ok(())
     }
 
     fn is_anthropic(&self) -> bool {
@@ -875,6 +938,7 @@ impl<'a> StreamSink<'a> {
         if self.closed {
             return Err(SinkClosed);
         }
+        self.open()?;
         // Written straight through rather than accumulated: a stream that is
         // buffered until the end is not a stream, and specification 14 forbids
         // buffering a completion.
@@ -971,6 +1035,11 @@ impl EventSink for StreamSink<'_> {
         let mut comment = String::new();
         wire_sse::encode_keepalive(&mut comment);
         self.push(&comment)
+    }
+
+    fn admitted(&mut self) {
+        // A failed write marks the sink closed; the next delivery reports it.
+        let _ = self.open();
     }
 
     fn deliver(&mut self, event: &CanonicalEvent) -> Result<(), SinkClosed> {
@@ -1330,6 +1399,14 @@ fn respond_error(
     if error.code == ErrorCode::Unauthenticated {
         builder = builder
             .header("WWW-Authenticate", "Bearer")
+            .map_err(|_| io::Error::other("response head"))?;
+    }
+
+    // Specification 12.2. The answer changes the moment a credit lands, and
+    // the payment directions are not for a shared cache to keep.
+    if error.code == ErrorCode::TokenBudgetExhausted {
+        builder = builder
+            .header("Cache-Control", "no-store")
             .map_err(|_| io::Error::other("response head"))?;
     }
 

@@ -131,7 +131,7 @@ const RULES: &[&str] = &[
     "no-config-env-interpolation §4.1  configuration does not read the environment",
     "unsafe-forbidden            §18.2 every crate root declares #![forbid(unsafe_code)]",
     "workspace-members-complete  §18.1 every crate directory is a declared workspace member",
-    "module-documentation        §4.1  every module declares owner, unsafe status, fuzz targets",
+    "module-documentation        §4.1  HTML module contracts declare owner, threats, API, unsafe status, fuzz targets, limits",
     "dependencies-are-used       §4.1  every declared [dependencies] entry is referenced by src",
     "test-scaffolding-gated      §18.2 test fixtures are behind the test-harness feature",
     "lint-escalation-scoped      §18.2 crate-root clippy denies are scoped to not(test)",

@@ -1,0 +1,554 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: hypellm-net.">
+  <title>hypellm-net · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="../assets/wiki.css">
+  <script defer src="../assets/search-index.js"></script>
+  <script defer src="../assets/wiki.js"></script>
+</head>
+<body data-wiki-root="../" data-page-title="hypellm-net" data-page-group="Module contracts">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="../index.html">Wiki home</a></li>
+<li><a href="../overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="../router-specification.html">Router specification</a></li>
+<li><a href="../threat-model.html">Threat model</a></li>
+<li><a href="../orchestration.html">Fleet orchestration</a></li>
+<li><a href="../deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="../using-the-router.html">Using the router</a></li>
+<li><a href="../deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="../runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="../components/fleet-agent.html">Fleet agent</a></li>
+<li><a href="../components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="../components/container-init.html">Container init</a></li>
+<li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="hypellm-config.html">hypellm-config</a></li>
+<li><a href="hypellm-core.html">hypellm-core</a></li>
+<li><a href="hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="hypellm-net.html" aria-current="page">hypellm-net</a></li>
+<li><a href="hypellm-router.html">hypellm-router</a></li>
+<li><a href="hypellm-store.html">hypellm-store</a></li>
+<li><a href="hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="wire-http1.html">wire-http1</a></li>
+<li><a href="wire-json.html">wire-json</a></li>
+<li><a href="wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="../index.html">Wiki</a><span aria-hidden="true">/</span>Module contracts</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="module-hypellm-net">Module: hypellm-net</h1>
+<p>Specification 4.1 requires every in-repository module to declare an owner, threat
+notes, public API, unsafe-code declaration, fuzz targets, and maximum
+input/resource limits.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Owner</td>
+<td>Security (primary), Platform (secondary)</td>
+</tr>
+<tr>
+<td>Unsafe code</td>
+<td>None. <code>#![forbid(unsafe_code)]</code> declared in <code>lib.rs</code> and inherited from the workspace lint table.</td>
+</tr>
+<tr>
+<td>External dependencies</td>
+<td>None. Rust standard library plus workspace path dependencies: <code>hypellm-core</code>, <code>hypellm-crypto</code>, <code>hypellm-fleet</code>, <code>hypellm-auth</code>, <code>wire-http1</code>, <code>wire-json</code>, <code>wire-sse</code>; <code>hypellm-store</code> for tests only.</td>
+</tr>
+<tr>
+<td>Fuzz targets</td>
+<td><code>verifier_claims</code>, in <code>tests/fuzz.rs</code>. Three of the four required targets remain — see <a href="#fuzz-targets">Fuzz targets</a>.</td>
+</tr>
+</tbody>
+</table></div>
+<p>One declared dependency is not used by <code>src/</code> today: <code>wire-sse</code> appears only in a
+streaming integration test. Not a supply-chain concern — it is a workspace crate
+— but the manifest overstates the real coupling. <code>hypellm-crypto</code> is now used, by
+the fleet handshake.</p>
+<h2 id="scope">Scope</h2>
+<p>This crate is the only place the router opens an outbound socket. It owns four
+things:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Concern</th>
+<th>Module</th>
+<th>Specification</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Resolve, classify, pin, dial a destination</td>
+<td><code>egress</code></td>
+<td>10, 10.1 (SSRF / DNS rebinding)</td>
+</tr>
+<tr>
+<td>One bounded, deadline-driven upstream HTTP/1.1 exchange</td>
+<td><code>client</code></td>
+<td>14, 18.2</td>
+</tr>
+<tr>
+<td>Connection reuse keyed for credential isolation</td>
+<td><code>pool</code></td>
+<td>19, 22.2</td>
+</tr>
+<tr>
+<td>Clients for the platform TLS helper and the identity verifier</td>
+<td><code>helper</code></td>
+<td>4, 9.1</td>
+</tr>
+<tr>
+<td>Client for the fleet agent</td>
+<td><code>fleet</code></td>
+<td>26.2</td>
+</tr>
+<tr>
+<td>A conformant simulated fleet agent, behind <code>test-harness</code></td>
+<td><code>fleet_sim</code></td>
+<td>26.2</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="what-this-module-deliberately-does-not-do">What this module deliberately does not do</h3>
+<p>Specification 4 (<code>TLS reality</code>) and 9.1 (<code>OIDC dependency boundary</code>) both draw
+the line at the same place, and this crate sits on the router's side of it.</p>
+<ul>
+<li><strong>No TLS.</strong> There is no handshake, no certificate validation, no cipher
+selection, no session resumption here. <code>TlsHelper::connect</code> sends one line to
+a Unix socket and receives back a transport carrying the session's plaintext.
+If the helper is absent, <code>Egress::acquire</code> returns an error; it never falls
+back to a cleartext socket carrying a provider credential.</li>
+<li><strong>No JWT verification.</strong> <code>VerifierClient</code> submits a token and reads back a
+claims document. It performs no signature check, and <code>parse_claims</code>
+deliberately does <strong>not</strong> validate <code>iss</code>, <code>aud</code>, <code>exp</code>, or <code>nonce</code> — those live
+in <code>hypellm_auth::oidc::validate_claims</code> so that a check cannot be quietly
+skipped on one of two paths.</li>
+<li><strong>No DNS implementation.</strong> <code>SystemResolver</code> calls the platform resolver. The
+&quot;controlled resolver&quot; of specification 10 is the classification that follows,
+not a bespoke DNS parser in the trusted computing base.</li>
+<li><strong>No routing decisions.</strong> Nothing here ranks, scores, or selects a target.
+<code>Egress::acquire</code> takes an already-chosen <code>Endpoint</code> and <code>EgressProfile</code>, and
+<code>FleetSession</code> takes an already-chosen deployment identifier.</li>
+<li><strong>No fleet decisions, and no process execution.</strong> <code>fleet</code> is a socket, not a
+planner: what a line means and what a reply may contain is
+<code>hypellm_fleet::protocol</code>, which is pure and fuzzed. Nothing here decides what
+to start, and nothing here runs <code>ssh</code> or <code>docker</code> — that is <code>agent/</code>, outside
+the workspace, for the reason specification 4.1 gives.</li>
+<li><strong>No credentials.</strong> No type in this crate holds, reads, or constructs a
+provider credential. Authorization headers are built inside the adapter
+boundary and arrive here as opaque request bytes. The pool key carries a
+<em>credential isolation class</em> string, never a credential.</li>
+<li><strong>No URLs.</strong> There is no public function anywhere in the crate that accepts a
+URL, a redirect, or a client-supplied host. Every destination originates as a
+validated-configuration <code>Endpoint</code>. Proxy environment variables (<code>HTTP_PROXY</code>,
+<code>HTTPS_PROXY</code>, <code>ALL_PROXY</code>, <code>NO_PROXY</code>) are never read.</li>
+<li><strong>No protocol parsing.</strong> Head and body parsing is <code>wire-http1</code>; claims parsing
+is <code>wire-json</code>. This crate supplies bytes and bounds, and interprets neither.</li>
+</ul>
+<h2 id="threat-notes">Threat notes</h2>
+<ul>
+<li>
+<p><strong>SSRF and DNS rebinding (10.1).</strong> The defence is structural: <code>Dialer::connect</code>
+accepts only a <code>PinnedDestination</code>, never a host and port, and the only
+production path that yields one is <code>Resolver::resolve</code>, which classifies every
+candidate through <code>hypellm_core::netaddr::classify</code> and pins the first address
+the <code>EgressProfile</code> permits as a concrete <code>SocketAddr</code>. A second DNS answer
+has nothing to attach to. <code>AddressClass::Metadata</code> is refused by <em>every</em>
+profile including <code>LOCAL</code> — <code>EgressProfile::permits</code> returns <code>false</code> for it
+unconditionally, and IPv4-mapped forms such as <code>::ffff:169.254.169.254</code>
+classify as <code>Metadata</code> too. <strong>Caveat:</strong> <code>PinnedDestination</code> has public fields,
+so the type is a discipline, not a capability — a struct literal bypasses
+classification entirely. Only tests do this today; making the fields private
+behind a constructor would turn the discipline into an enforced invariant.</p>
+</li>
+<li>
+<p><strong>Pool hits skip classification.</strong> <code>Egress::acquire</code> consults
+<code>ConnectionPool::take</code> <em>before</em> <code>Resolver::resolve</code>, so a pool hit never faces
+the address-class check. <code>pool_key</code> therefore includes the <code>EgressProfile</code>
+alongside scheme, host, port, credential class, and protocol: a connection can
+only be reused under the profile it was opened for, which is what keeps a
+socket established under a permissive profile from serving a request made
+under a stricter one. Any new component of the decision to connect must join
+the key for the same reason.</p>
+</li>
+<li>
+<p><strong>Reuse failures are not upstream failures.</strong> A pooled connection can be
+closed by the peer at any point while it is idle, and that close is only
+observable by attempting the exchange. <code>UpstreamConnection::is_pooled</code>
+distinguishes a reused socket from a fresh one so the caller can tell the two
+apart, and <code>Egress::dial_fresh</code> opens a connection bypassing the pool — but
+<strong>not</strong> the egress guard, which it applies exactly as <code>acquire</code> does. The
+retry policy itself lives in the router's dispatch layer, not here: this crate
+still contains no retry loop.</p>
+<p><code>is_pooled</code> on its own is <strong>not</strong> sufficient grounds to replay a request, and
+a caller that treats it that way has a specification 6.5 defect. A live pooled
+connection can also fail while reading the head — a timeout, a partial head —
+and there the provider may have read the request and begun work. That is what
+<code>UpstreamConnection::has_received_any</code> is for: a close with zero bytes ever
+received is the idle-socket case and is replayable; anything else is not.</p>
+</li>
+<li>
+<p><strong>Cross-tenant reuse (19).</strong> The credential isolation class is a key
+component, so two tenants using different provider credentials against the
+same endpoint never share a socket. This matters where a provider binds
+authentication to the connection rather than to the request: sharing would
+send one tenant's request under another's credential. <code>drain_key</code> exists so a
+single credential rotation (22.2 step 17) closes only the affected sockets.</p>
+</li>
+<li>
+<p><strong>Response desynchronisation.</strong> A pooled connection whose framing is in doubt
+becomes the next caller's answer. <code>UpstreamConnection</code> poisons itself on a
+head that exceeds <code>MAX_HEAD_BUFFER</code>, on truncation before or during the body,
+on <code>Connection: close</code>, and in <code>finish_body</code> whenever the body ended at EOF
+rather than at its declared boundary. A connection is also not
+<code>is_reusable()</code> from the moment a request is sent until its response has been
+read to the end of its framing with nothing buffered past it, so a stream
+abandoned at <code>data: [DONE]</code> or on a client disconnect is closed rather than
+handed to the next caller half-read. <code>ConnectionPool::put</code> closes rather than
+stores anything not <code>is_reusable()</code>, so a caller cannot pool a bad socket by
+mistake. TE/CL ambiguity is rejected upstream in <code>wire-http1</code> and surfaces as
+<code>UpstreamError::Protocol</code>.</p>
+</li>
+<li>
+<p><strong>Hostile upstream resource exhaustion.</strong> A provider is not trusted (8.2 has a
+dedicated <code>upstream_invalid_response</code> status). The head phase is bounded by
+<code>MAX_HEAD_BUFFER</code>; <code>fill</code> grows the buffer by a fixed <code>READ_CHUNK</code> and
+reclaims the consumed prefix rather than growing without bound. <strong>Gap:</strong> there
+is no per-stream high/low watermark in this crate. Specification 3.2's 256 KiB
+per-stream budget and 14's backpressure rules are the caller's responsibility
+today — <code>read_body</code> will keep appending to the caller's <code>Vec</code> and
+<code>read_body_to_end</code> is bounded only by the <code>BodyDecoder</code>'s own
+<code>max_body_bytes</code>.</p>
+</li>
+<li>
+<p><strong>Blocking, undeadlined DNS.</strong> <code>SystemResolver::lookup</code> calls
+<code>ToSocketAddrs::to_socket_addrs</code>, which has no timeout and no cancellation
+path. Specification 3.2 requires blocking DNS to run on a bounded worker pool
+and 18.2 requires every I/O to have a deadline. Neither is satisfied inside
+this crate; a hostile or failing resolver stalls the calling thread. This is a
+known gap, not a delegated concern.</p>
+</li>
+<li>
+<p><strong>A hostile helper's strings.</strong> The TLS helper is trusted to terminate TLS,
+not to author text the router will echo. Its status line is capped at
+<code>MAX_STATUS_LINE</code> and any <code>ERR</code> code passes <code>sanitize_code</code>, which truncates
+to 64 characters and maps everything outside <code>[A-Za-z0-9_-]</code> to <code>_</code> — closing
+terminal-escape and quote injection into logs and error bodies.</p>
+</li>
+<li>
+<p><strong>Helper over-read discards bytes.</strong> <code>TlsHelper::connect</code> reads the status
+line through a temporary <code>BufReader</code> over a cloned handle, then returns the
+<em>original</em> stream. <code>BufReader::read</code> into a one-byte buffer fills its internal
+buffer first, so any bytes the helper writes in the same flush as <code>OK\n</code> are
+buffered and then dropped when the <code>BufReader</code> falls out of scope. Today the
+helper has nothing to send at that moment, because the router writes its
+request only after <code>connect</code> returns. A helper that ever pipelines would
+silently lose the head of its first response. Do not remove this note without
+removing the <code>BufReader</code>.</p>
+</li>
+<li>
+<p><strong>The verifier as an identity oracle.</strong> Failure must never read as success:
+an unreachable verifier maps to <code>OidcError::VerifierUnavailable</code> and a refusal
+to <code>OidcError::SignatureInvalid</code> — both rejections. <code>parse_claims</code> returns
+<code>None</code> without <code>iss</code> or <code>sub</code>, and defaults <code>email_verified</code> to <code>false</code> so an
+absent claim cannot read as verified. Note one imprecision: a token over
+<code>MAX_TOKEN_BYTES</code> is reported as <code>ReplyTooLarge</code> and therefore reaches the
+caller as <code>VerifierUnavailable</code>, so an oversized-token attack shows up in
+metrics as an availability problem rather than a rejected credential.</p>
+</li>
+<li>
+<p><strong>Error text is for operators, not clients.</strong> <code>EgressError</code> and
+<code>HelperError</code> <code>Display</code> include the configured host and the underlying
+<code>io::Error</code> text. Those values are administrator-supplied, but per 10 and 17
+they must not be echoed to a caller verbatim or used as a metric label. The
+stable <code>code()</code> strings (<code>destination_refused</code>, <code>resolution_failed</code>,
+<code>invalid_host</code>, <code>connect_failed</code>, <code>connect_timeout</code>, <code>upstream_truncated</code>,
+<code>upstream_timeout</code>, <code>upstream_io_error</code>, <code>upstream_head_too_large</code>,
+<code>helper_unavailable</code>, <code>helper_refused</code>, <code>helper_protocol_violation</code>,
+<code>helper_reply_too_large</code>) are the public surface.</p>
+</li>
+<li>
+<p><strong>Prompts are inert (10.1).</strong> Request bytes pass through <code>send</code> and
+<code>write_chunk</code> as an opaque slice. Nothing in this crate inspects them, and no
+value derived from them can reach a destination, a <code>Host</code>, an SNI name, a
+socket path, or a pool key.</p>
+</li>
+</ul>
+<h2 id="limits">Limits</h2>
+<p>Enforced within this crate:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Input / resource</th>
+<th>Limit</th>
+<th>Enforced by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Buffered response-head bytes</td>
+<td>128 KiB</td>
+<td><code>client::MAX_HEAD_BUFFER</code>; poisons the connection and returns <code>HeadTooLarge</code></td>
+</tr>
+<tr>
+<td>Socket read increment</td>
+<td>16 KiB</td>
+<td><code>client::READ_CHUNK</code></td>
+</tr>
+<tr>
+<td>Helper status line</td>
+<td>256 bytes</td>
+<td><code>helper::MAX_STATUS_LINE</code> → <code>ReplyTooLarge</code></td>
+</tr>
+<tr>
+<td>Verifier claims document</td>
+<td>64 KiB</td>
+<td><code>helper::MAX_CLAIMS_BYTES</code>, checked against the declared length before allocating</td>
+</tr>
+<tr>
+<td>Token submitted for verification</td>
+<td>16 KiB</td>
+<td><code>helper::MAX_TOKEN_BYTES</code>, checked before any socket is opened</td>
+</tr>
+<tr>
+<td>Helper-supplied error code</td>
+<td>64 chars, <code>[A-Za-z0-9_-]</code></td>
+<td><code>helper::sanitize_code</code></td>
+</tr>
+<tr>
+<td>Fleet reply line</td>
+<td>512 bytes</td>
+<td><code>fleet::MAX_LINE</code>, byte-at-a-time against a fixed ceiling</td>
+</tr>
+<tr>
+<td>Fleet inventory payload</td>
+<td>256 KiB</td>
+<td><code>hypellm_fleet::state::MAX_INVENTORY_BYTES</code>, checked against the declared length before allocation</td>
+</tr>
+<tr>
+<td>Idle connections per pool key</td>
+<td>32 (default)</td>
+<td><code>PoolConfig::max_idle_per_key</code></td>
+</tr>
+<tr>
+<td>Idle connections overall</td>
+<td>512 (default)</td>
+<td><code>PoolConfig::max_idle_total</code></td>
+</tr>
+<tr>
+<td>Idle connection lifetime</td>
+<td>60 s (default)</td>
+<td><code>PoolConfig::idle_timeout_millis</code>, checked in <code>take</code> and <code>sweep</code></td>
+</tr>
+<tr>
+<td>Unix-socket connect (TLS helper, verifier, fleet agent, Unix upstreams)</td>
+<td>Caller's timeout; at most <code>MAX_ABANDONED_UNIX_CONNECTS</code> (16) connect threads left behind by callers that timed out</td>
+<td><code>egress::connect_unix</code>: std has no Unix <code>connect_timeout</code>, so the connect runs on a helper thread the caller waits on with a deadline; a connect past its deadline keeps its thread until the kernel answers, and the cap bounds how many can; past it, new connects are refused at once</td>
+</tr>
+<tr>
+<td>Connect / read / write deadline</td>
+<td>Caller-supplied</td>
+<td><code>Egress::connect_timeout</code>, <code>UpstreamConnection::apply_deadline</code>; clamped to ≥ 1 ms in <code>Dialer::connect</code> and <code>Transport::set_timeouts</code> so an exhausted budget fails fast instead of meaning &quot;block forever&quot; to the kernel</td>
+</tr>
+<tr>
+<td>Destination host syntax</td>
+<td>≤ 253 bytes, labels ≤ 63</td>
+<td><code>hypellm_core::netaddr::is_valid_host</code>, before resolution</td>
+</tr>
+</tbody>
+</table></div>
+<p>Applied by this crate but defined elsewhere, and therefore only as tight as the
+caller makes them:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Input</th>
+<th>Limit</th>
+<th>Source</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Response head bytes / header count</td>
+<td>32 KiB / 100</td>
+<td><code>wire_http1::Limits::UPSTREAM</code>, passed into <code>read_head</code> by the caller</td>
+</tr>
+<tr>
+<td>Response body bytes</td>
+<td>64 MiB</td>
+<td><code>wire_http1::Limits::UPSTREAM</code> via the caller's <code>BodyDecoder</code></td>
+</tr>
+<tr>
+<td>Chunk-size line / trailer bytes</td>
+<td>256 B / 4 KiB</td>
+<td><code>wire_http1::Limits::UPSTREAM</code></td>
+</tr>
+<tr>
+<td>Claims JSON depth / string / input</td>
+<td>32 / 64 KiB / 1 MiB</td>
+<td><code>wire_json::Limits::SMALL</code>, fixed by <code>VerifierClient::verify</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>Not enforced — stated so the gap is not mistaken for a control:</p>
+<ul>
+<li><strong>Per-stream buffered data (3.2: 256 KiB).</strong> No watermark exists here; see the
+resource-exhaustion note above.</li>
+<li><strong>Concurrent outbound connections.</strong> <code>ConnectionPool</code> bounds <em>idle</em> sockets
+only. Nothing in this crate caps how many exchanges are in flight; that bound
+belongs to admission control in <code>hypellm-core</code>.</li>
+<li><strong>DNS resolution time.</strong> No deadline; see the blocking-DNS note above.</li>
+</ul>
+<h2 id="fuzz-targets">Fuzz targets</h2>
+<p>The workspace has no <code>fuzz/</code> directory and no libFuzzer harness — specification
+4 admits no such dependency. Fuzzing is a seeded, deterministic mutation engine
+in <code>hypellm-test-corpus::fuzz</code>, driven from ordinary <code>tests/fuzz.rs</code> targets so
+that <code>cargo test</code> runs it and a failing seed is reproducible by number rather
+than by corpus file. All seven areas specification 21 names have a suite; see
+<code>spec/deferred-issues.html</code>, <code>DI-002</code>, for the table. <code>hypellm-core</code> carries the
+property layer in <code>tests/properties.rs</code>.</p>
+<p><code>tests/fuzz.rs</code> covers the identity verifier boundary. The rest are required by
+specification 21 (Fuzz: HTTP, provider events, state recovery) and 18.2
+(&quot;configuration and protocol parsers are fuzzed&quot;):</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Target</th>
+<th>Surface</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>upstream_response</code></td>
+<td>Arbitrary bytes, split at arbitrary offsets, through <code>UpstreamConnection::read_head</code> and <code>read_body</code>. Asserts bounded allocation and no panic.</td>
+<td>Required, not yet implemented (§21)</td>
+</tr>
+<tr>
+<td><code>helper_status_line</code></td>
+<td>Arbitrary helper replies through <code>read_status_line</code> and <code>sanitize_code</code>. Asserts the 256-byte bound and that no output escapes the identifier alphabet.</td>
+<td>Required, not yet implemented (§21)</td>
+</tr>
+<tr>
+<td><code>verifier_claims</code></td>
+<td>Arbitrary <code>VERIFY</code> replies through <code>VerifierClient</code> and <code>parse_claims</code>, over a real Unix socket. Asserts no claim is fabricated from a malformed document.</td>
+<td><strong>Implemented</strong>, <code>tests/fuzz.rs</code> (5 cases)</td>
+</tr>
+<tr>
+<td><code>egress_resolve</code></td>
+<td>Arbitrary host strings and resolver answers through <code>Resolver::resolve</code>. Asserts the invariant that no address whose class the profile refuses is ever pinned.</td>
+<td>Required, not yet implemented (§21)</td>
+</tr>
+</tbody>
+</table></div>
+<p>The <code>egress_resolve</code> invariant is also a property test obligation under 21
+(Property: bounded allocation) and 21.1 (Security: SSRF).</p>
+<h3 id="what-verifier_claims-asserts-and-the-faults-it-was-checked-against">What <code>verifier_claims</code> asserts, and the faults it was checked against</h3>
+<p>The verifier (<code>verifier/</code>) is a separate process in the trusted computing base.
+&quot;Trusted&quot; bounds what it is allowed to assert; it is not a licence for the
+router to believe a malformed reply, and identity is the one thing on this path
+that decides who a caller is. Each property was verified by reintroducing a
+fault and watching it fail:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Property</th>
+<th>Fault it catches</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Nothing in <code>IdTokenClaims</code> is absent from the document it came from</td>
+<td><code>email_verified</code> defaulting to <code>true</code> instead of <code>false</code></td>
+</tr>
+<tr>
+<td>An unverified email never reads as verified</td>
+<td>the same, isolated — <code>validate_claims</code> refuses an unverified email, so a <code>true</code> invented here is a sign-in that should not have happened</td>
+</tr>
+<tr>
+<td>The client returns exactly what the frame carried</td>
+<td>reading the body to end-of-stream instead of to its declared length, which picks up whatever follows it</td>
+</tr>
+<tr>
+<td>A refusal never yields an identity</td>
+<td>skipping a leading <code>ERR</code> line and reading the next status line, where a valid claims frame may be waiting</td>
+</tr>
+<tr>
+<td>A reply past the 64 KiB bound is refused</td>
+<td>deleting the bound. The fixture is a <em>complete, valid, over-long</em> reply: a truncated one would be refused by <code>read_exact</code> even with the bound gone, and the test would prove nothing</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="public-api">Public API</h2>
+<p>See <code>lib.rs</code>. The surface is <code>Egress</code> plus the four modules' types:
+<code>Resolver</code> / <code>Resolve</code> / <code>StaticResolver</code> / <code>SystemResolver</code>,
+<code>PinnedDestination</code> / <code>DestinationAddress</code> / <code>Dialer</code> / <code>Transport</code> /
+<code>EgressError</code>, <code>UpstreamConnection</code> / <code>UpstreamError</code>, <code>ConnectionPool</code> /
+<code>PoolConfig</code> / <code>pool_key</code>, and <code>TlsHelper</code> / <code>VerifierClient</code> / <code>HelperError</code>.</p>
+<p>The narrowness is the point. There is no function taking a URL, no redirect
+follower, no retry loop, and no proxy support; the only production path to a
+dialable <code>PinnedDestination</code> is <code>Resolver::resolve</code>. Widening any of those, or
+loosening the pinning discipline noted above, requires two-person security
+review under 21.1.</p>
+
+      </article>
+      <footer class="page-footer"><a href="../index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#scope">Scope</a></li>
+<li class="toc-level-3"><a href="#what-this-module-deliberately-does-not-do">What this module deliberately does not do</a></li>
+<li class="toc-level-2"><a href="#threat-notes">Threat notes</a></li>
+<li class="toc-level-2"><a href="#limits">Limits</a></li>
+<li class="toc-level-2"><a href="#fuzz-targets">Fuzz targets</a></li>
+<li class="toc-level-3"><a href="#what-verifier_claims-asserts-and-the-faults-it-was-checked-against">What verifier_claims asserts, and the faults it was checked against</a></li>
+<li class="toc-level-2"><a href="#public-api">Public API</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

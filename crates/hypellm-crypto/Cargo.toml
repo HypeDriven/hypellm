@@ -10,4 +10,4 @@ description = "In-repository reviewed primitives: SHA-256, HMAC-SHA-256, CRC-32,
 [lints]
 workspace = true
 
-# No dependencies. See MODULE.md for the security decision record.
+# No dependencies. See spec/modules/hypellm-crypto.html for the security decision record.

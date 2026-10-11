@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: hypellm-bench.">
+  <title>hypellm-bench · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="../assets/wiki.css">
+  <script defer src="../assets/search-index.js"></script>
+  <script defer src="../assets/wiki.js"></script>
+</head>
+<body data-wiki-root="../" data-page-title="hypellm-bench" data-page-group="Module contracts">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="../index.html">Wiki home</a></li>
+<li><a href="../overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="../router-specification.html">Router specification</a></li>
+<li><a href="../threat-model.html">Threat model</a></li>
+<li><a href="../orchestration.html">Fleet orchestration</a></li>
+<li><a href="../deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="../using-the-router.html">Using the router</a></li>
+<li><a href="../deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="../runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="../components/fleet-agent.html">Fleet agent</a></li>
+<li><a href="../components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="../components/container-init.html">Container init</a></li>
+<li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="hypellm-bench.html" aria-current="page">hypellm-bench</a></li>
+<li><a href="hypellm-config.html">hypellm-config</a></li>
+<li><a href="hypellm-core.html">hypellm-core</a></li>
+<li><a href="hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="hypellm-net.html">hypellm-net</a></li>
+<li><a href="hypellm-router.html">hypellm-router</a></li>
+<li><a href="hypellm-store.html">hypellm-store</a></li>
+<li><a href="hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="wire-http1.html">wire-http1</a></li>
+<li><a href="wire-json.html">wire-json</a></li>
+<li><a href="wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="../index.html">Wiki</a><span aria-hidden="true">/</span>Module contracts</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="module-hypellm-bench">Module: hypellm-bench</h1>
+<p>Specification 4.1 requires every in-repository module to declare an owner, threat
+notes, public API, unsafe-code declaration, fuzz targets, and maximum
+input/resource limits.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Owner</td>
+<td>Platform (primary), Security (secondary)</td>
+</tr>
+<tr>
+<td>Unsafe code</td>
+<td>None. <code>#![forbid(unsafe_code)]</code> declared in <code>src/lib.rs</code> and <code>src/main.rs</code>; <code>unsafe_code = &quot;forbid&quot;</code> inherited from the workspace lints.</td>
+</tr>
+<tr>
+<td>External dependencies</td>
+<td>None. Rust standard library plus the workspace path dependencies <code>hypellm-core</code>, <code>hypellm-router</code>, <code>hypellm-adapters</code>. No benchmark framework, no statistics library, no plotting.</td>
+</tr>
+<tr>
+<td>Fuzz targets</td>
+<td><strong>None, and none are required.</strong> This crate parses no untrusted input: its only input is <code>--scale N</code> from an operator's own command line. The fuzz targets specification 21 requires belong to the parsers (<code>wire-http1</code>, <code>wire-json</code>, <code>wire-sse</code>, <code>hypellm-config</code>) and are tracked in <code>spec/modules/hypellm-test-corpus.html</code>.</td>
+</tr>
+</tbody>
+</table></div>
+<p>Platform owns this crate because the numbers it produces gate a release
+(specification 2.3, <code>Performance</code>). Security is secondary because a benchmark
+that quietly measures the error path, or whose thresholds are relaxed to make a
+red build green, removes a gate without removing the appearance of one.</p>
+<h2 id="what-this-crate-is-for">What this crate is for</h2>
+<p>Specification 19 states the router's performance contract:</p>
+<blockquote>
+<p>Warm router overhead — p50 &lt; 2 ms, p99 &lt; 10 ms at 70% rated load, excluding
+edge/provider network.</p>
+</blockquote>
+<p>Specification 21 (<code>Performance</code>) requires microbenchmarks and end-to-end
+benchmarks, and adds the reporting rule: <strong>&quot;benchmarks report distributions, not
+averages&quot;</strong>. Specification 21.1 requires the benchmark results to be retained
+with the release artifact. This crate produces those numbers and that report.</p>
+<pre><code>cargo run --release -p hypellm-bench --offline
+cargo run --release -p hypellm-bench --offline -- --scale 10   # quick smoke run
+</code></pre>
+<p>Run it under <code>--release</code>. A debug build measures the debug build.</p>
+<h2 id="timing-units">Timing units</h2>
+<p><code>DecisionTrace::routing_micros</code> and the benchmark's routing distributions use a
+microsecond clock, allowing the specification's low-millisecond latency target
+to be measured without millisecond quantisation. The public
+<code>hypellm_router_overhead_milliseconds</code> metric and <code>router_ms</code> log field retain
+milliseconds for compatibility; values are rounded up at the emit site.</p>
+<p>Use the benchmark's <code>routing_micros</code> distribution for sub-millisecond analysis.
+The metrics series is intended for operational trends and alerts, not precise
+microbenchmarking.</p>
+<h2 id="scope-and-the-a-benchmark-is-not-a-load-test-rule">Scope, and the &quot;a benchmark is not a load test&quot; rule</h2>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Does</th>
+<th>Does not</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Measure <code>PolicySnapshot::route</code> in isolation</td>
+<td>Generate open-loop or concurrent load</td>
+</tr>
+<tr>
+<td>Measure non-streaming and streaming chat end to end against <code>hypellm_router::testing::FakeUpstream</code></td>
+<td>Reach any network beyond 127.0.0.1</td>
+</tr>
+<tr>
+<td>Report p50/p90/p99/p99.9, min, max, n, and the mean beside them</td>
+<td>Report a mean on its own</td>
+</tr>
+<tr>
+<td>Compare routed against direct-to-provider latency (specification 19.1)</td>
+<td>Measure a real provider, TLS, or DNS</td>
+</tr>
+<tr>
+<td>Fail CI on an order-of-magnitude regression</td>
+<td>Certify that specification 19's target is met</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="honest-gaps">Honest gaps</h2>
+<p>Specification 19.1 describes a larger suite than this crate implements. Every
+row below is <strong>not implemented</strong>. None of it is approximated, stubbed, or
+partially covered; treat each as an open gap in release evidence.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Specification 19 / 19.1 requirement</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>&quot;at 70% rated load&quot;</td>
+<td><strong>Not implemented.</strong> Every scenario is closed-loop and single-threaded. The measured numbers are for an idle router; the specification's qualifier is not exercised.</td>
+</tr>
+<tr>
+<td>Open-loop tests</td>
+<td><strong>Not implemented.</strong></td>
+</tr>
+<tr>
+<td>Controllable first-token delay, token cadence, errors, malformed frames, stalls, disconnects</td>
+<td><strong>Not implemented.</strong> <code>FakeUpstream</code> answers canned responses immediately.</td>
+</tr>
+<tr>
+<td>Large prompts, tools, embeddings, slow clients, cancellations</td>
+<td><strong>Not implemented.</strong> One two-message chat request, streaming and buffered.</td>
+</tr>
+<tr>
+<td>CPU and memory comparison; base &lt; 100 MiB, per-connection &lt; 8 KiB (specification 19)</td>
+<td><strong>Not implemented.</strong> Nothing here samples RSS or allocation.</td>
+</tr>
+<tr>
+<td>Connection reuse (specification 19)</td>
+<td><strong>Not measured.</strong> <code>FakeUpstream</code> serves one request per connection, so the non-streaming scenario declares <code>Connection: close</code> to avoid benchmarking a failed reuse. Pooled reuse is never on the measured path.</td>
+</tr>
+<tr>
+<td>Configuration reload, pointer swap &lt; 1 ms</td>
+<td><strong>Not implemented.</strong></td>
+</tr>
+<tr>
+<td>Overload behaviour, admission rejection under pressure</td>
+<td><strong>Not implemented.</strong></td>
+</tr>
+<tr>
+<td>Soak with reloads, credential rotation, DNS changes, circuit transitions, log rotation, audit checkpointing</td>
+<td><strong>Not implemented.</strong></td>
+</tr>
+<tr>
+<td>Adversarial parser performance: header fragmentation, slowloris, oversized SSE, deep JSON and retry storms</td>
+<td><strong>Not implemented in this benchmark.</strong> Functional adversarial corpora exist in <code>hypellm-test-corpus</code>, but this crate does not measure them.</td>
+</tr>
+<tr>
+<td>Result retention with the release artifact (specification 21.1)</td>
+<td><strong>Not implemented.</strong> The report is printed to stdout; nothing archives it.</td>
+</tr>
+</tbody>
+</table></div>
+<p>Two further limitations of what <em>is</em> implemented:</p>
+<ul>
+<li><strong><code>router_overhead</code> is a reconstruction.</strong> It is the pipeline's own
+<code>routing_micros</code> plus the adapter's encode and decode calls re-run on the same
+inputs in the same iteration. The pipeline does not instrument its own
+translate step, so the reported figure excludes the pipeline's call overhead
+around those adapter calls. <code>overhead_by_diff</code> (end-to-end minus a bare socket
+exchange with the same upstream) is reported alongside as an independent
+estimate; a large disagreement between the two means one of them is wrong.</li>
+<li><strong>The routing decision is below the clock's resolution.</strong> On release builds the
+<code>route</code> series reports a p50 of 0 µs. That means &quot;under one microsecond&quot;, not
+&quot;free&quot;. A finer measurement would need a hardware counter, which the dependency
+policy of specification 4 does not admit.</li>
+</ul>
+<h2 id="threat-notes">Threat notes</h2>
+<ul>
+<li><strong>A benchmark that measures the error path reports improvement as things
+break.</strong> An error is faster than success: a routing failure skips the adapter,
+and a connection refusal skips the upstream. Every scenario therefore checks
+the outcome and counts non-success in <code>ScenarioReport::failures</code>; the report
+prints a banner and the binary exits nonzero when that count is nonzero, and
+failed iterations contribute no samples.</li>
+<li><strong>Thresholds are a security-adjacent control and moving them is a change to a
+gate.</strong> The tripwire constants in <code>tests/targets.rs</code> exist to catch a
+regression. Raising one to make a red build green disables the gate while
+leaving the suite green — the same failure mode specification 21.1 guards
+against for golden expectations. <code>the_tripwire_sits_below_the_specification_target</code>
+is a structural check that a tripwire can never be raised past specification
+19's own number.</li>
+<li><strong>A benchmark that claims more than it measured is a false assurance.</strong> The
+report's verdict block states explicitly that the &quot;70% rated load&quot; qualifier
+was not satisfied, and the regression test's module header states that its
+thresholds are not the specification's targets. Deleting either turns a smoke
+test into an unearned release claim.</li>
+<li><strong>Test-only code must not reach the data plane.</strong> This crate depends on
+<code>hypellm-router</code>, not the other way round, and nothing in <code>hypellm-router</code>
+references it. It is a workspace member so that it is built, linted, and
+scanned by <code>depscan</code>; it is not linked into the router binary.</li>
+<li><strong>No secrets, no prompts, no network.</strong> The fixture credential is the literal
+<code>test-provider-secret</code> from <code>hypellm_router::testing</code>, the prompt is a fixture
+string, and the only destination is <code>127.0.0.1</code> on an ephemeral port bound by
+the harness itself. Nothing here reads an environment variable, a credential
+file, or a configuration path.</li>
+<li><strong>A measurement clock is not a deadline clock.</strong> <code>Clock::now_micros</code> exists for
+measurement. Using it for a deadline would not be wrong, but mixing the two
+resolutions in one comparison would be; deadlines stay on <code>now_millis</code>
+throughout the workspace.</li>
+</ul>
+<h2 id="limits">Limits</h2>
+<p>Specification 18.2: no unbounded buffer may originate from a request. Nothing
+here originates from a request, but the same discipline applies, because an
+unbounded sample buffer turns a mistyped iteration count into an out-of-memory
+kill rather than a truncated report.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Input / resource</th>
+<th>Limit</th>
+<th>Enforced by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Retained samples per series</td>
+<td>1,048,576 (<code>distribution::MAX_SAMPLES</code>), 8 MiB of <code>u64</code></td>
+<td><code>Samples::new</code> clamps the requested capacity; <code>Samples::push</code> counts overflow instead of growing</td>
+</tr>
+<tr>
+<td>Samples discarded on overflow</td>
+<td>Counted in <code>Distribution::overflowed</code>, printed as a banner, asserted zero in tests</td>
+<td><code>report::render_scenario</code>, <code>tests/targets.rs</code></td>
+</tr>
+<tr>
+<td>Iterations, routing scenario</td>
+<td>20,000 measured + 2,000 warmup (<code>Plan::DECISION</code>)</td>
+<td>compile-time constant</td>
+</tr>
+<tr>
+<td>Iterations, end-to-end scenarios</td>
+<td>500 measured + 50 warmup (<code>Plan::END_TO_END</code>)</td>
+<td>compile-time constant</td>
+</tr>
+<tr>
+<td>Command-line arguments</td>
+<td><code>--scale N</code> (positive integer) and <code>--help</code>; anything else exits nonzero</td>
+<td><code>main.rs</code></td>
+</tr>
+<tr>
+<td>Concurrency</td>
+<td>One request at a time, one thread, one fake upstream thread</td>
+<td>scenario structure</td>
+</tr>
+<tr>
+<td>Sockets</td>
+<td>Loopback only, ephemeral port chosen by <code>FakeUpstream</code>; 5 s read and write timeouts on the direct-comparison socket</td>
+<td><code>scenarios::direct_exchange</code>, <code>hypellm_router::testing</code></td>
+</tr>
+<tr>
+<td>Filesystem</td>
+<td>One <code>TempDir</code> per fixture, created and removed by <code>hypellm_router::testing</code></td>
+<td><code>hypellm-store::TempDir</code></td>
+</tr>
+<tr>
+<td>Output</td>
+<td>Plain text to stdout; nothing is written to disk</td>
+<td><code>main.rs</code></td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="public-api">Public API</h2>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>distribution::Samples</code></td>
+<td>Bounded microsecond sample collector</td>
+</tr>
+<tr>
+<td><code>distribution::Distribution</code></td>
+<td>Sorted-sample summary: n, min, p50, p90, p99, p99.9, max, sum, mean</td>
+</tr>
+<tr>
+<td><code>distribution::Unit</code></td>
+<td>Microseconds or a dimensionless count, so a report cannot mislabel a series</td>
+</tr>
+<tr>
+<td><code>distribution::MAX_SAMPLES</code></td>
+<td>The retention bound</td>
+</tr>
+<tr>
+<td><code>scenarios::Plan</code></td>
+<td>Measured iterations and warmup, with <code>DECISION</code> / <code>END_TO_END</code> defaults and <code>scaled</code></td>
+</tr>
+<tr>
+<td><code>scenarios::ScenarioReport</code></td>
+<td>Name, description, series, failure count, caveats</td>
+</tr>
+<tr>
+<td><code>scenarios::routing_decision</code></td>
+<td><code>PolicySnapshot::route</code> alone</td>
+</tr>
+<tr>
+<td><code>scenarios::chat_non_streaming</code></td>
+<td>Buffered chat end to end over the fake upstream</td>
+</tr>
+<tr>
+<td><code>scenarios::chat_streaming</code></td>
+<td>Streamed chat end to end over the fake upstream</td>
+</tr>
+<tr>
+<td><code>scenarios::all</code></td>
+<td>Every scenario at its default plan, optionally scaled</td>
+</tr>
+<tr>
+<td><code>report::render_run</code> / <code>render_scenario</code> / <code>render_targets</code></td>
+<td>Fixed-width text rendering</td>
+</tr>
+<tr>
+<td><code>report::TARGET_P50_MICROS</code> / <code>TARGET_P99_MICROS</code></td>
+<td>Specification 19's targets, in microseconds, defined once</td>
+</tr>
+</tbody>
+</table></div>
+<p>Quantiles use the nearest-rank definition with the rank rounded <strong>up</strong>, matching
+<code>hypellm_core::time::Histogram::quantile_upper_bound</code>. Two quantile definitions in
+one codebase produce two answers for the same data and an argument about which
+one is real. No interpolation: an interpolated quantile invents a value that was
+never observed, and a latency report should contain only measurements.</p>
+<h2 id="why-a-binary-and-not-bench">Why a binary and not <code>#[bench]</code></h2>
+<p><code>#[bench]</code> and <code>test::Bencher</code> are unstable and require a nightly compiler.
+Specification 21.1 requires the release artifact's compiler version to be
+retained with its benchmark results, and moving the workspace to nightly to
+obtain a timing loop is a poor trade for a project whose dependency policy
+(specification 4) already rules out every third-party benchmark framework. A
+plain <code>[[bin]]</code> plus an ordinary <code>#[test]</code> needs nothing beyond stable Rust.</p>
+
+      </article>
+      <footer class="page-footer"><a href="../index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#what-this-crate-is-for">What this crate is for</a></li>
+<li class="toc-level-2"><a href="#timing-units">Timing units</a></li>
+<li class="toc-level-2"><a href="#scope-and-the-a-benchmark-is-not-a-load-test-rule">Scope, and the &quot;a benchmark is not a load test&quot; rule</a></li>
+<li class="toc-level-2"><a href="#honest-gaps">Honest gaps</a></li>
+<li class="toc-level-2"><a href="#threat-notes">Threat notes</a></li>
+<li class="toc-level-2"><a href="#limits">Limits</a></li>
+<li class="toc-level-2"><a href="#public-api">Public API</a></li>
+<li class="toc-level-2"><a href="#why-a-binary-and-not-bench">Why a binary and not #[bench]</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

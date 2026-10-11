@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: wire-sse.">
+  <title>wire-sse · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="../assets/wiki.css">
+  <script defer src="../assets/search-index.js"></script>
+  <script defer src="../assets/wiki.js"></script>
+</head>
+<body data-wiki-root="../" data-page-title="wire-sse" data-page-group="Module contracts">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="../index.html">Wiki home</a></li>
+<li><a href="../overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="../router-specification.html">Router specification</a></li>
+<li><a href="../threat-model.html">Threat model</a></li>
+<li><a href="../orchestration.html">Fleet orchestration</a></li>
+<li><a href="../deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="../using-the-router.html">Using the router</a></li>
+<li><a href="../deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="../runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="../components/fleet-agent.html">Fleet agent</a></li>
+<li><a href="../components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="../components/container-init.html">Container init</a></li>
+<li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="hypellm-config.html">hypellm-config</a></li>
+<li><a href="hypellm-core.html">hypellm-core</a></li>
+<li><a href="hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="hypellm-net.html">hypellm-net</a></li>
+<li><a href="hypellm-router.html">hypellm-router</a></li>
+<li><a href="hypellm-store.html">hypellm-store</a></li>
+<li><a href="hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="wire-http1.html">wire-http1</a></li>
+<li><a href="wire-json.html">wire-json</a></li>
+<li><a href="wire-sse.html" aria-current="page">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="../index.html">Wiki</a><span aria-hidden="true">/</span>Module contracts</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="module-wire-sse">Module: wire-sse</h1>
+<p>Specification 4.1 requires every in-repository module to declare an owner, threat
+notes, public API, unsafe-code declaration, fuzz targets, and maximum
+input/resource limits.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Owner</td>
+<td>Security (primary), Platform (secondary)</td>
+</tr>
+<tr>
+<td>Unsafe code</td>
+<td>None. <code>#![forbid(unsafe_code)]</code> inherited from the workspace root and restated in <code>lib.rs</code>.</td>
+</tr>
+<tr>
+<td>External dependencies</td>
+<td>None. Rust standard library only; the crate has no <code>[dependencies]</code> section at all, not even a workspace path dependency.</td>
+</tr>
+<tr>
+<td>Fuzz targets</td>
+<td><code>tests/fuzz.rs</code> — 8 targets over the incremental parser and its bounds, driven by <code>hypellm-test-corpus::fuzz</code>. See <a href="#fuzz-targets">Fuzz targets</a>.</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="scope-and-the-framing-only-rule">Scope and the &quot;framing only&quot; rule</h2>
+<p>Specification 14 makes this crate responsible for exactly one thing: turning a
+byte stream into complete Server-Sent Events frames, and turning router-produced
+frames back into bytes. &quot;SSE parsing handles CRLF/LF, multiple data lines,
+comments, bounded event size, and terminal markers.&quot;</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Responsibility</th>
+<th>Where</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Incremental line splitting over LF, CRLF, and bare CR</td>
+<td><code>parse::SseParser::push</code></td>
+</tr>
+<tr>
+<td>WHATWG <code>EventSource</code> field semantics (<code>data</code>/<code>event</code>/<code>id</code>/<code>retry</code>, one leading space stripped, unknown fields ignored, data-less events not dispatched)</td>
+<td><code>parse::SseParser::finish_line</code>, <code>next_event</code></td>
+</tr>
+<tr>
+<td>Hard ceilings on line, event, and field-name size, with typed sticky errors</td>
+<td><code>parse::SseLimits</code>, <code>parse::SseError</code></td>
+</tr>
+<tr>
+<td>Frame-safe encoding of payloads, event names, comments, keepalives, and <code>retry</code></td>
+<td><code>encode::*</code></td>
+</tr>
+<tr>
+<td>Recognition of the OpenAI-profile terminal marker</td>
+<td><code>encode::DONE_MARKER</code>, <code>SseEvent::is_done_marker</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>What this module deliberately does <strong>not</strong> do:</p>
+<ul>
+<li><strong>It does not parse JSON.</strong> <code>SseEvent::data</code> is an opaque <code>String</code>. Specification
+14 requires that &quot;JSON fragments are assembled only within declared provider
+event boundaries&quot;; this crate establishes the boundary and hands the bytes to
+<code>wire-json</code> through the adapter. It has no view of tool calls, deltas, or usage.</li>
+<li><strong>It does not interpret provider semantics.</strong> Mapping <code>event: content_block_delta</code>
+to a canonical event is adapter work (specification 10). This crate knows one
+provider-specific string, <code>[DONE]</code>, and only as a convenience predicate.</li>
+<li><strong>It does no I/O, holds no credentials, and starts no tasks.</strong> It is a state
+machine over caller-supplied <code>&amp;[u8]</code> and a formatter into a caller-supplied
+<code>String</code>. Sockets, deadlines, backpressure watermarks, and cancellation belong
+to the caller (specification 3.2, 14).</li>
+<li><strong>It does not decide failover.</strong> It reports a typed error; specification 6.5 and
+the <code>AttemptPhase</code> logic in <code>hypellm-router::dispatch</code> decide whether that error
+may be retried. See the note on stickiness below.</li>
+<li><strong>It applies no reconnection logic.</strong> <code>retry:</code> is parsed and surfaced; the crate
+never acts on it. The router does not reconnect to upstreams on a <code>retry</code>
+directive.</li>
+</ul>
+<h2 id="threat-notes">Threat notes</h2>
+<ul>
+<li><strong>Frame injection through payload content.</strong> A model completion is attacker-
+influenceable text that the router re-emits to a client. A raw <code>\n\n</code> inside a
+<code>data:</code> line would forge a frame boundary and let prompt content synthesize
+events the model never produced. <code>encode::write_data_lines</code> splits every payload
+on <code>\n</code> and <code>\r</code> into separate <code>data:</code> lines, and <code>push_single_line</code> replaces CR
+and LF with a space in event names and comments. The encoder tests assert the
+property directly (<code>event_name_cannot_inject_a_frame</code>,
+<code>comment_cannot_inject_a_frame</code>). Any new encoder entry point must route field
+values through one of those two helpers.</li>
+<li><strong>Encoding is lossy on CR, by design.</strong> <code>write_data_lines</code> normalizes <code>\r\n</code> and
+bare <code>\r</code> to <code>\n</code>, so encode-then-decode is <em>not</em> byte-identical for payloads
+containing carriage returns — it is identical modulo that normalization. An
+adapter that assumes byte-exact passthrough of upstream content will be wrong on
+such payloads. Do not use this crate to relay bytes that must survive intact.</li>
+<li><strong>Split-terminator differential.</strong> A CRLF landing across two socket reads is the
+classic incremental-parser bug: treating the CR and the LF as two terminators
+turns the LF into a blank line and dispatches the event one frame early,
+splitting a JSON payload in half and producing a decode error attributed to the
+provider. <code>pending_cr</code> carries the half-terminator across <code>push</code> calls; the test
+<code>crlf_split_across_chunks_is_one_terminator</code> pins it. Any refactor of <code>push</code> must
+preserve chunk-boundary independence — that is the single most valuable property
+a fuzz target here can check.</li>
+<li><strong>Truncation must not look like completion.</strong> An upstream cut mid-frame leaves an
+unterminated line. <code>finish</code> discards it rather than dispatching a truncated JSON
+fragment, and <code>has_incomplete_tail</code> exists so the caller can distinguish a
+truncated stream from a clean end of stream. <strong>As of this writing no caller in
+the workspace invokes either method</strong> — <code>hypellm-router::dispatch::pump_sse_stream</code>
+ends on decoder completion or terminator only. Until a caller checks
+<code>has_incomplete_tail</code> before dropping the parser, a stream severed after the last
+complete frame is indistinguishable from a normal finish. This is an open gap,
+not a control.</li>
+<li><strong>Errors are sticky and fatal on purpose.</strong> Once <code>failed</code> is set, every
+subsequent <code>push</code>, <code>next_event</code>, and <code>drain</code> returns the same error. A malformed
+frame means event boundaries can no longer be trusted, so continuing to parse
+would let an attacker-shaped stream resynchronize on a boundary of its choosing.
+The router maps these to <code>upstream_invalid_response</code> (502, specification 12). If
+the error arrives after semantic output has reached the client, specification 6.5
+forbids splicing a replacement response — the stream must end with a normalized
+error, never a second model response.</li>
+<li><strong>Known divergence: no BOM handling.</strong> WHATWG <code>EventSource</code> strips a leading
+U+FEFF from the stream. This parser does not. A stream beginning with a UTF-8
+BOM yields a first field named <code>&quot;\u{feff}data&quot;</code>, which is silently ignored as an
+unknown field; because a data-less event is not dispatched, the entire first
+frame disappears with no error. No provider in scope is known to emit a BOM, but
+this is a real parser differential and a silent-loss path, so it is recorded
+rather than assumed harmless.</li>
+<li><strong>Terminal-marker confusion.</strong> <code>is_done_marker</code> compares <code>data.trim()</code> against
+<code>[DONE]</code>, so any payload whose trimmed form equals that literal ends the stream.
+For the OpenAI profile the payload is JSON and cannot collide; a provider whose
+stream carries bare text could truncate a response early. Adapters should prefer
+their own <code>is_stream_terminator</code> (as <code>hypellm-adapters::openai</code> does) rather than
+treating this predicate as universal.</li>
+<li><strong>Completion content in <code>Debug</code> output.</strong> <code>SseEvent</code> derives <code>Debug</code> and its
+<code>data</code> field holds raw model output. Specifications 7.1 and 17 forbid logging
+prompt/completion bodies by default; there is no <code>Sensitive</code> wrapper here.
+Never log an <code>SseEvent</code>, an <code>SseEvent</code> collection, or a <code>Vec&lt;u8&gt;</code> chunk fed to
+<code>push</code>. <code>SseError</code> is safe to log: its <code>Display</code> and <code>code</code> strings are fixed
+and echo no upstream bytes.</li>
+<li><strong>Stall without error.</strong> A stream of comment lines (<code>: keepalive</code>) parses
+forever, allocates nothing permanent, and produces no events. The parser has no
+time budget and no event-count budget; a peer that never sends data is a live
+connection as far as this crate is concerned. Slow-upstream and slow-client
+detection is the caller's deadline (specification 3.2, 14).</li>
+<li><strong>Allocation churn under many short lines.</strong> <code>finish_line</code> takes <code>line_buf</code> by
+<code>core::mem::take</code>, so the buffer restarts at zero capacity after every line. A
+stream of millions of one-byte lines forces one allocation per line. Bounded and
+not a leak, but it is a cheap way for an upstream to spend router CPU.</li>
+<li><strong>Unbounded prompts are not a threat vector here.</strong> Client input never reaches
+this parser; it only ever sees upstream response bytes and adapter-produced
+encoder input. Specification 8's rule that prompts are inert data is upheld
+trivially — nothing in this crate branches on payload content except the
+<code>[DONE]</code> comparison noted above.</li>
+</ul>
+<h2 id="limits">Limits</h2>
+<p>Defaults come from <code>SseLimits::DEFAULT</code>; every value is caller-overridable via
+<code>SseParser::new</code>.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Input / resource</th>
+<th>Enforced maximum</th>
+<th>Enforced by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Single line held in the assembly buffer</td>
+<td>256 KiB (specification 3.2 per-stream figure)</td>
+<td><code>SseLimits::max_buffer_bytes</code>, checked in <code>push</code> before each byte is appended; violation is <code>SseError::LineTooLong</code></td>
+</tr>
+<tr>
+<td>Accumulated <code>data</code> payload for one event</td>
+<td>1 MiB</td>
+<td><code>SseLimits::max_event_bytes</code>, checked in <code>next_event</code> before appending (the joining <code>\n</code> counts); violation is <code>SseError::EventTooLarge</code></td>
+</tr>
+<tr>
+<td>Field name length</td>
+<td>64 bytes</td>
+<td><code>SseLimits::max_field_name_bytes</code>, checked in <code>finish_line</code>; violation is <code>SseError::FieldNameTooLong</code></td>
+</tr>
+<tr>
+<td>Line encoding</td>
+<td>UTF-8 required per line</td>
+<td><code>String::from_utf8</code> in <code>finish_line</code>; violation is <code>SseError::InvalidUtf8</code></td>
+</tr>
+<tr>
+<td><code>retry:</code> value</td>
+<td><code>u64</code> range; anything else, including negatives, is ignored rather than clamped</td>
+<td><code>value.parse::&lt;u64&gt;()</code> in <code>next_event</code></td>
+</tr>
+<tr>
+<td><code>id:</code> value</td>
+<td>Rejected outright if it contains NUL, per <code>EventSource</code></td>
+<td><code>value.contains('\u{0}')</code> in <code>next_event</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>Gaps — resources this crate does <strong>not</strong> bound:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Resource</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>pending</code> completed-line queue</td>
+<td><strong>Not bounded.</strong> A caller that calls <code>push</code> repeatedly without <code>next_event</code>/<code>drain</code> grows the queue without limit. In practice <code>hypellm-router::dispatch</code> drains after every push, so residency is one read chunk — but that is a caller contract, not an enforced invariant.</td>
+</tr>
+<tr>
+<td><code>event:</code> and <code>id:</code> field values retained on <code>current</code></td>
+<td><strong>Not counted against <code>max_event_bytes</code>.</strong> Each is bounded only indirectly by the line ceiling, so up to 256 KiB apiece can be held alongside a 1 MiB <code>data</code> accumulator.</td>
+</tr>
+<tr>
+<td>Peak per-stream parser residency</td>
+<td>Worst case is roughly <code>max_buffer_bytes + max_event_bytes + 2 × max_buffer_bytes</code> ≈ 1.75 MiB with defaults, plus <code>pending</code>. This <strong>exceeds</strong> the 256 KiB per-stream figure of specification 3.2, which the <code>SseLimits::DEFAULT</code> doc comment cites. Deployments targeting the 20,000-concurrent-stream goal of specification 2 should lower <code>max_event_bytes</code> explicitly rather than rely on the default.</td>
+</tr>
+<tr>
+<td>Encoder output size</td>
+<td><strong>Not bounded.</strong> Every <code>encode_*</code> function appends to a caller-owned <code>String</code> and never inspects its length. Byte accounting and watermarks live in the caller.</td>
+</tr>
+<tr>
+<td>Events returned by <code>drain</code></td>
+<td><strong>Not bounded</strong> except transitively by <code>pending</code>.</td>
+</tr>
+<tr>
+<td>Time / event count per stream</td>
+<td><strong>Not bounded.</strong> No deadline or frame budget exists in this crate.</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="fuzz-targets">Fuzz targets</h2>
+<p>Specification 21 lists SSE in the required fuzz layer. <code>tests/fuzz.rs</code> — eight
+targets, run by <code>cargo test -p wire-sse</code>, driven by the seeded mutation engine
+in <code>hypellm-test-corpus::fuzz</code>. There is no <code>fuzz/</code> directory and no libFuzzer
+harness, because specification 4 admits no such dependency.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Target</th>
+<th>Property asserted</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>no_mutation_of_the_corpus_panics_the_parser</code></td>
+<td>Termination and no panic</td>
+</tr>
+<tr>
+<td><code>an_arbitrary_chunk_split_produces_the_same_decision_as_the_whole</code></td>
+<td>Incremental parsing agrees with whole-input parsing at every split</td>
+</tr>
+<tr>
+<td><code>an_event_that_is_never_terminated_is_refused_at_its_bound</code></td>
+<td>An unterminated event cannot grow without limit</td>
+</tr>
+<tr>
+<td><code>the_default_limits_also_bound_an_unterminated_event</code></td>
+<td>The same, under shipped defaults rather than test-sized ones</td>
+</tr>
+<tr>
+<td><code>a_single_line_that_never_ends_is_refused_by_the_buffer_bound</code></td>
+<td>The no-newline shape of the same</td>
+</tr>
+<tr>
+<td><code>a_single_oversize_event_is_refused</code></td>
+<td>The per-event bound</td>
+</tr>
+<tr>
+<td><code>random_bytes_are_handled_without_panicking</code></td>
+<td>Unstructured input</td>
+</tr>
+<tr>
+<td><code>truncation_at_every_offset_is_handled</code></td>
+<td>Every prefix is a clean state</td>
+</tr>
+</tbody>
+</table></div>
+<p>Still outstanding:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Target</th>
+<th>Property to assert</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Split delivery</td>
+<td>Mutated streams split at arbitrary boundaries match whole-input parsing</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Limits</td>
+<td>Buffered and accumulated event data remain within <code>SseLimits</code>; limit errors stay terminal</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Encoding round trip</td>
+<td>Encoded payloads produce one equivalent event and cannot forge frame boundaries</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Provider fixtures</td>
+<td>Mutated recorded streams produce typed errors or complete well-formed events</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="public-api">Public API</h2>
+<p>Re-exported from <code>lib.rs</code>: <code>SseParser</code>, <code>SseLimits</code>, <code>SseEvent</code>, <code>SseError</code> from
+<code>parse</code>; <code>DONE_MARKER</code>, <code>encode_data</code>, <code>encode_event</code>, <code>encode_done</code>,
+<code>encode_comment</code>, <code>encode_keepalive</code>, <code>encode_retry</code> from <code>encode</code>.</p>
+<p>The parse surface is push/drain and nothing else — no callbacks, no owned reader,
+no async. <code>push</code> accepts bytes, <code>next_event</code>/<code>drain</code> yield assembled events,
+<code>finish</code> marks upstream close, <code>has_incomplete_tail</code> reports truncation, and
+<code>buffered</code> exposes residency for watermark accounting. The encode surface is a set
+of free functions that append to a caller-owned <code>String</code>; there is no encoder
+object and no hidden state, which is what makes frame-boundary sanitization
+auditable at each call site. Consumers today are <code>hypellm-router</code> (dispatch and the
+client-facing stream), <code>hypellm-adapters</code>, and <code>hypellm-net</code>.</p>
+<p>Two-person review applies to any change in this crate: it is a parser on the data
+path (specification 21).</p>
+
+      </article>
+      <footer class="page-footer"><a href="../index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#scope-and-the-framing-only-rule">Scope and the &quot;framing only&quot; rule</a></li>
+<li class="toc-level-2"><a href="#threat-notes">Threat notes</a></li>
+<li class="toc-level-2"><a href="#limits">Limits</a></li>
+<li class="toc-level-2"><a href="#fuzz-targets">Fuzz targets</a></li>
+<li class="toc-level-2"><a href="#public-api">Public API</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

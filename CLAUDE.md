@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository state
 
-The specification is `secure_llm_router_specification.md` (v1.0, "HypeLLM Router"). It is the authority: when this file and the specification disagree, the specification wins.
+The specification is `spec/router-specification.html` (v1.0, "HypeLLM Router"). It is the authority: when this file and the specification disagree, the specification wins.
 
-The implementation is a Rust workspace of 17 crates, a static admin SPA under `web/`, and four reference out-of-process components that are deliberately **not** workspace members: the fleet agent under `agent/`, the identity verifier under `verifier/`, the container init under `supervisor/`, and the Windows tray monitor under `tray/`. It is **not** feature-complete against the specification; `docs/deferred-issues.md` lists only the current limitations and accepted deviations.
+The implementation is a Rust workspace of 17 crates, a static admin SPA under `web/`, and four reference out-of-process components that are deliberately **not** workspace members: the fleet agent under `agent/`, the identity verifier under `verifier/`, the container init under `supervisor/`, and the Windows tray monitor under `tray/`. It is **not** feature-complete against the specification; `spec/deferred-issues.html` lists only the current limitations and accepted deviations.
 
 The repository uses Git. Do not assume an edited working tree is disposable.
 
@@ -68,7 +68,7 @@ These are the spec's defining decisions. Most "obvious" implementation choices v
 
 Two artifacts: the `hypellm-router` binary and a directory of immutable static web assets. The data path (inference listener) and management path (`/admin/v1`) are separated in code, scheduling, rate limits, auth scopes, and listeners — even while in one process — so they can split later without API changes.
 
-Workspace crates as built. §18.1 names most of these; the six marked *(addition)* are not in the specification's list and each has a stated reason in its `MODULE.md`.
+Workspace crates as built. §18.1 names most of these; the six marked *(addition)* are not in the specification's list and each has a stated reason in its module contract in `spec/modules/`.
 
 | Crate | Responsibility |
 |---|---|
@@ -80,7 +80,7 @@ Workspace crates as built. §18.1 names most of these; the six marked *(addition
 | `hypellm-auth` | API keys, OIDC transactions and sessions, peer/edge identity |
 | `hypellm-adapters` | Compile-time provider families. The only code that touches provider credentials |
 | `hypellm-net` | Egress guard, bounded upstream client, connection pool, DNS pool, TLS/verifier helpers *(addition)* |
-| `hypellm-crypto` | SHA-256, HMAC, CRC-32, PBKDF2, scrypt, base64, hex, constant-time compare, OS randomness *(addition)* — see its `MODULE.md`; it deliberately implements **no** TLS, asymmetric signatures, or JWT verification |
+| `hypellm-crypto` | SHA-256, HMAC, CRC-32, PBKDF2, scrypt, base64, hex, constant-time compare, OS randomness *(addition)* — see its module contract in `spec/modules/`; it deliberately implements **no** TLS, asymmetric signatures, or JWT verification |
 | `hypellm-admin-api` | `/admin/v1` surface, CORS/CSRF, drafts, usage and audit views |
 | `hypellm-telemetry` | Bounded metrics and structured logs with closed label vocabularies |
 | `wire-http1`, `wire-json`, `wire-sse` | Strict bounded parsers written in-repo |
@@ -88,7 +88,7 @@ Workspace crates as built. §18.1 names most of these; the six marked *(addition
 | `hypellm-devtools` | `depscan`: the supply-chain and static-web gate, plus the build manifest *(addition)* |
 | `hypellm-bench` | The §19.1 benchmark harness *(addition)* |
 
-Every crate carries a `MODULE.md` — §4.1 requires owner, threat notes, public API, unsafe-code declaration, fuzz targets, and resource limits. `depscan` checks they exist and are filled in.
+Every crate has a contract at `spec/modules/<crate>.html` — §4.1 requires owner, threat notes, public API, unsafe-code declaration, fuzz targets, and resource limits. `depscan` checks they exist and are filled in.
 
 Layer responsibilities that matter when placing new code:
 
@@ -109,6 +109,7 @@ Appendix B is the checklist; the ones most easily broken by ordinary edits:
 - **Fleet: only `Infeasible` excludes.** A target that is merely not running is still a candidate, ranked below a warm one. If "not currently running" excluded a target, no target would ever start (§26.4).
 - **Fleet: admission is reserved before the activation lease**, and both release exactly once on every path. Evicting a running model and *then* discovering the tenant is over quota is the unforced error the ordering exists to prevent.
 - **Fleet: no plan executes on stale belief.** Past `observation_max_age_ms` cold targets are ineligible; warm ones keep serving. A stale-state swap costs minutes of fleet time and can cascade.
+- **Key budgets: the durable mark covers everything held.** A key's token budget (§12.1) is persisted as a high-water mark, raised on disk *before* the reservation that needs it is granted; on restart consumption is taken to be the mark. Nothing may be reserved or charged above it without a successful journal commit, or a crash returns spent credit. The hold is finished exactly once per attempt beside the admission reservation — settle on provider-reported usage, retain when accepted with none, release before acceptance — and a budget refusal ends the request rather than trying the next candidate.
 - No client-controlled value may influence an upstream destination, Host/SNI, credential handle, file path, or socket. Destinations are administrator-configured tuples; redirects off; proxy env vars ignored (§10).
 - The models endpoint and all management responses reveal only what the caller's tenant and permissions allow.
 - Prompts are inert data — never interpreted as configuration, destination, credential, or admin instruction.
@@ -123,8 +124,8 @@ Credentials live behind opaque handles resolved only inside the adapter boundary
 
 All layers except a few fuzz rows now exist:
 
-- **Property** — `crates/hypellm-core/tests/properties.rs`: 14 properties over Appendix B (routing determinism, deny monotonicity, pin semantics, reservation conservation, score overflow), each across 400 seeded cases. `crates/hypellm-core/tests/capability.rs` adds 16 over the §26.1 contract, and `crates/hypellm-fleet/tests/properties.rs` 12 over the §26.4/§26.5 fleet invariants.
-- **Fuzz** — `tests/fuzz.rs` in `wire-json` (6), `wire-http1` (7), `wire-sse` (8), `hypellm-config` (7), `hypellm-store` (7), `hypellm-adapters` (9), `hypellm-admin-api` (9), `hypellm-router` (9), `hypellm-fleet` (8: agent inventory, agent replies, lease accounting), and `hypellm-net` (5: the identity verifier boundary — no claim fabricated from a malformed reply, no identity from a refusal). That is all seven areas §21 names, plus the client protocol parsers. There is **no `fuzz/` directory and no libFuzzer** — §4 admits no such dependency. The engine is a seeded deterministic mutator in `hypellm-test-corpus::fuzz`, driven from ordinary `#[test]` functions so `cargo test` runs it and a failure is reproducible by seed number.
+- **Property** — `crates/hypellm-core/tests/properties.rs`: 14 properties over Appendix B (routing determinism, deny monotonicity, pin semantics, reservation conservation, score overflow), each across 400 seeded cases. `crates/hypellm-core/tests/capability.rs` adds 16 over the §26.1 contract, `crates/hypellm-fleet/tests/properties.rs` 12 over the §26.4/§26.5 fleet invariants, and `crates/hypellm-core/tests/budget.rs` 2 over the §12.1 key-budget ledger (one of them a 400-case interleaving of reservations, settlements, credits, journal failures and crashes).
+- **Fuzz** — `tests/fuzz.rs` in `wire-json` (6), `wire-http1` (7), `wire-sse` (8), `hypellm-config` (7), `hypellm-store` (7), `hypellm-adapters` (9), `hypellm-admin-api` (11), `hypellm-router` (9), `hypellm-fleet` (8: agent inventory, agent replies, lease accounting), and `hypellm-net` (5: the identity verifier boundary — no claim fabricated from a malformed reply, no identity from a refusal). That is all seven areas §21 names, plus the client protocol parsers. There is **no `fuzz/` directory and no libFuzzer** — §4 admits no such dependency. The engine is a seeded deterministic mutator in `hypellm-test-corpus::fuzz`, driven from ordinary `#[test]` functions so `cargo test` runs it and a failure is reproducible by seed number.
 - **What that does not mean.** It is not coverage-guided and does not shrink, so it finds what its seeds and mutation strategies reach. A failing case prints at whatever size it was generated.
 
 A fuzz target that only asserts "does not panic" is close to worthless here. Each of these asserts a property the code could plausibly violate — no silent widening, no leaked body, no identity taken from a caller, no unauthenticated success — and three of them have found real defects. When adding one, write the property first.
@@ -155,7 +156,9 @@ Open decisions with recommended defaults are in §25 — check there before desi
 
 This is a security artifact, and its documentation is read as one. Two rules follow:
 
-- **Never describe something as implemented when it is not.** A `MODULE.md` claiming fuzz targets that do not exist, or a handler replying `stored: true` after discarding the secret, is worse than an acknowledged gap — it removes the reason anyone would go looking.
+- **Never describe something as implemented when it is not.** A module contract claiming fuzz targets that do not exist, or a handler replying `stored: true` after discarding the secret, is worse than an acknowledged gap — it removes the reason anyone would go looking.
 - **When a capability is missing, say so where the reader will be.** The SPA screens with no backing endpoint render an explicit "not available yet" rather than plausible-looking rows. Keep public documentation focused on current behavior; closed defects belong in version control, not in current limitations.
 
-`docs/deferred-issues.md` lists current limitations. Add a newly confirmed limitation there rather than quietly working around it, and remove it when the limitation is resolved.
+`spec/deferred-issues.html` lists current limitations. Add a newly confirmed limitation there rather than quietly working around it, and remove it when the limitation is resolved.
+
+Documentation is maintained as HTML in `spec/`. After editing a page, run `python3 spec/wiki.py update` and `python3 spec/wiki.py check`. `spec/index.html` is the wiki entry point; do not recreate the former Markdown copies.

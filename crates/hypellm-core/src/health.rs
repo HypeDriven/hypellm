@@ -696,7 +696,7 @@ pub struct HealthRegistry {
     /// override an operator sets from the management API.
     ///
     /// Held in memory only. A restart re-reads the configuration, so a drain
-    /// set here does not survive one — recorded in `docs/deferred-issues.md`
+    /// set here does not survive one — recorded in `spec/deferred-issues.html`
     /// rather than left for an operator to discover.
     admin_states: RwLock<BTreeMap<TargetId, AdminState>>,
 }

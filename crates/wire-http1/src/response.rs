@@ -25,6 +25,7 @@ pub const fn reason_phrase(status: u16) -> &'static str {
         204 => "No Content",
         304 => "Not Modified",
         400 => "Bad Request",
+        402 => "Payment Required",
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",

@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: Container init.">
+  <title>Container init · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="../assets/wiki.css">
+  <script defer src="../assets/search-index.js"></script>
+  <script defer src="../assets/wiki.js"></script>
+</head>
+<body data-wiki-root="../" data-page-title="Container init" data-page-group="Components">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="../index.html">Wiki home</a></li>
+<li><a href="../overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="../router-specification.html">Router specification</a></li>
+<li><a href="../threat-model.html">Threat model</a></li>
+<li><a href="../orchestration.html">Fleet orchestration</a></li>
+<li><a href="../deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="../using-the-router.html">Using the router</a></li>
+<li><a href="../deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="../runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="fleet-agent.html">Fleet agent</a></li>
+<li><a href="identity-verifier.html">Identity verifier</a></li>
+<li><a href="container-init.html" aria-current="page">Container init</a></li>
+<li><a href="tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="../modules/hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="../modules/hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="../modules/hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="../modules/hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="../modules/hypellm-config.html">hypellm-config</a></li>
+<li><a href="../modules/hypellm-core.html">hypellm-core</a></li>
+<li><a href="../modules/hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="../modules/hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="../modules/hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="../modules/hypellm-net.html">hypellm-net</a></li>
+<li><a href="../modules/hypellm-router.html">hypellm-router</a></li>
+<li><a href="../modules/hypellm-store.html">hypellm-store</a></li>
+<li><a href="../modules/hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="../modules/hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="../modules/wire-http1.html">wire-http1</a></li>
+<li><a href="../modules/wire-json.html">wire-json</a></li>
+<li><a href="../modules/wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="../index.html">Wiki</a><span aria-hidden="true">/</span>Components</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="the-reference-init">The reference init</h1>
+<p><code>hypellm-init</code> runs <code>hypellm-router</code> as its child and turns <code>SIGTERM</code> into
+<code>hypellm-router --shutdown</code>.</p>
+<h2 id="why-this-exists">Why this exists</h2>
+<p>The router cannot handle a signal. <code>sigaction</code> and <code>signalfd</code> are both <code>unsafe</code>
+FFI, specification 18.2 forbids <code>unsafe</code> workspace-wide, and the Rust standard
+library has no signal API. The router's answer is an authenticated control
+socket, and <code>hypellm-router --shutdown</code> is how every documented stop path
+reaches it.</p>
+<p>That was enough for <code>systemd</code>, which has <code>ExecStop</code>. It was not enough for a
+container. <strong>A container's PID 1 receives no default signal actions from the
+kernel</strong>, so a router running as PID 1 does not merely fail to drain on
+<code>SIGTERM</code> — it ignores the signal entirely. <code>docker stop</code>, <code>docker compose down</code>, <code>kubectl delete pod</code> and any supervisor that sends only a signal all wait
+out the grace period and then <code>SIGKILL</code>, cutting every in-flight stream. The
+drain the control socket exists to provide was reachable only by an operator who
+knew to run <code>just down</code>.</p>
+<p>This process is PID 1 instead. The router still handles no signals, still
+contains no <code>unsafe</code>, and still shuts down only when its authenticated control
+socket says so — it simply now has something to say it on its behalf.</p>
+<p>It is the fourth out-of-process component here, and it is the same pattern as
+the other three: <code>hypellm-net::helper</code> is a client for a TLS terminator,
+<code>verifier/</code> verifies OIDC signatures the router may not, <code>agent/</code> runs the <code>ssh</code>
+and <code>docker</code> the router may not, and this handles the signals the router cannot.</p>
+<h2 id="what-it-does">What it does</h2>
+<pre><code class="language-text">hypellm-init --config &lt;path&gt; --secrets &lt;dir&gt; [router arguments...]
+</code></pre>
+<ul>
+<li>Starts <code>hypellm-router</code> with every argument passed through verbatim.</li>
+<li>On <code>SIGTERM</code> or <code>SIGINT</code>, runs
+<code>hypellm-router --shutdown --config &lt;path&gt; --secrets &lt;dir&gt;</code>.</li>
+<li>Waits for the router to finish its own drain, up to <code>HYPELLM_DRAIN_DEADLINE</code>
+seconds (40 by default), then kills it.</li>
+<li>Exits with the router's status, or <code>70</code> if the shutdown was not graceful.</li>
+</ul>
+<p><code>--config</code> and <code>--secrets</code> are read twice: the router needs them to run, and
+this needs them to address the control socket. Missing either is exit <code>71</code>,
+refused before the router starts — a router running with no usable shutdown path
+is the situation this exists to prevent.</p>
+<p><strong>One-shot commands pass straight through.</strong> <code>--generate-secrets</code>, <code>--check</code>,
+<code>--hash-password</code>, <code>--adopt-config</code>, <code>--shutdown</code>, <code>--ping</code>, <code>--backup</code>,
+<code>--version</code> and <code>--help</code> are <code>exec</code>ed directly: there is nothing to supervise
+and no drain to arrange. This is not a convenience — <code>docker run hypellm-router:local --generate-secrets /etc/hypellm/secrets</code> is how a fresh
+checkout creates its secret bundle, and the image's contract is &quot;append
+arguments and they reach the router&quot;. Putting an init in front of it must not
+change that.</p>
+<h2 id="what-it-deliberately-is-not">What it deliberately is not</h2>
+<p><strong>Not a supervisor.</strong> One child, one shutdown, one exit status. It does not
+restart the router. Under Compose that was <code>restart: &quot;no&quot;</code>, because a router
+that exited cleanly after a drain must not be started again. The Kubernetes
+Deployment in <code>k8s/</code> restarts any exit, so <code>just down</code> deletes the pod rather
+than asking the router to exit; a <code>--shutdown</code> sent by hand is followed by a
+restart.</p>
+<p><strong>Not a decision maker.</strong> It reads nothing from the network, from a file, or
+from the router. Its whole input is its own argv.</p>
+<p><strong>Not silent about failure.</strong> A refused shutdown, an undeliverable one, and a
+router that outlives the deadline each print to stderr and exit <code>70</code>. A quiet
+fallback to <code>SIGKILL</code> would be indistinguishable from having no init at all,
+which is the state this replaced.</p>
+<p><strong>Not escalating.</strong> A second <code>SIGTERM</code> during a drain is logged and otherwise
+ignored. Escalating would kill the drain the first signal started.</p>
+<h2 id="bash-not-python">Bash, not Python</h2>
+<p><code>agent/</code> and <code>verifier/</code> are Python because they do real work — sockets, JSON,
+HMAC, subprocess orchestration. This does not, and <code>docker/Dockerfile</code> installs
+no packages in either stage: the runtime layer is a bare Debian plus one binary
+and the static assets. Adding a Python runtime to the <em>router's</em> image to gain a
+forty-line init would expand its attack surface for no security return. Bash is
+already there.</p>
+<h2 id="two-numbers-that-have-to-be-ordered">Two numbers that have to be ordered</h2>
+<ol>
+<li>The inference listener's <code>drain_timeout</code> — 30 s (<code>ServerConfig::inference</code>).</li>
+<li><code>HYPELLM_DRAIN_DEADLINE</code> — 40 s, longer than (1), or this kills the router
+part-way through the drain it just asked for.</li>
+<li>The supervisor's grace period — <code>terminationGracePeriodSeconds: 45</code> in
+<code>k8s/hypellm.yaml</code>, longer than (2), or the supervisor kills <em>this</em>
+part-way through.</li>
+</ol>
+<p>Each has to exceed the one before it. Getting the order wrong reintroduces
+exactly the dropped streams the whole chain exists to prevent, and it does so
+silently.</p>
+<h2 id="tests">Tests</h2>
+<pre><code class="language-bash">python3 supervisor/test_hypellm_init.py
+</code></pre>
+<p>Eight tests, no container and no real router: the router is replaced by a script
+the test controls, connected to its own <code>--shutdown</code> invocation through a
+sentinel file the way the real one is connected through the control socket. They
+cover the signal becoming the right command with the right paths, a second
+signal not cutting the drain, a router that ignores the drain being killed <em>and
+reported</em>, a refused shutdown being reported rather than absorbed, and the exit
+status being forwarded. Four of them fail if the signal traps are removed.</p>
+<p>Not part of <code>cargo test --workspace</code>, because this component is deliberately
+outside the Rust workspace.</p>
+<h2 id="using-it-outside-a-container">Using it outside a container</h2>
+<p>You probably do not need to. <code>systemd</code> has <code>ExecStop</code>, and
+<a href="../deployment.html#shutdown">deployment.html</a> gives the unit. This is for
+runtimes whose only stop mechanism is a signal.</p>
+
+      </article>
+      <footer class="page-footer"><a href="../index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#why-this-exists">Why this exists</a></li>
+<li class="toc-level-2"><a href="#what-it-does">What it does</a></li>
+<li class="toc-level-2"><a href="#what-it-deliberately-is-not">What it deliberately is not</a></li>
+<li class="toc-level-2"><a href="#bash-not-python">Bash, not Python</a></li>
+<li class="toc-level-2"><a href="#two-numbers-that-have-to-be-ordered">Two numbers that have to be ordered</a></li>
+<li class="toc-level-2"><a href="#tests">Tests</a></li>
+<li class="toc-level-2"><a href="#using-it-outside-a-container">Using it outside a container</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

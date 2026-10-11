@@ -1,0 +1,1519 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: Deployment &amp; configuration.">
+  <title>Deployment &amp; configuration · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="./assets/wiki.css">
+  <script defer src="./assets/search-index.js"></script>
+  <script defer src="./assets/wiki.js"></script>
+</head>
+<body data-wiki-root="./" data-page-title="Deployment &amp; configuration" data-page-group="Operator guides">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="index.html">Wiki home</a></li>
+<li><a href="overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="router-specification.html">Router specification</a></li>
+<li><a href="threat-model.html">Threat model</a></li>
+<li><a href="orchestration.html">Fleet orchestration</a></li>
+<li><a href="deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="using-the-router.html">Using the router</a></li>
+<li><a href="deployment.html" aria-current="page">Deployment &amp; configuration</a></li>
+<li><a href="runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="components/fleet-agent.html">Fleet agent</a></li>
+<li><a href="components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="components/container-init.html">Container init</a></li>
+<li><a href="components/tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="modules/hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="modules/hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="modules/hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="modules/hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="modules/hypellm-config.html">hypellm-config</a></li>
+<li><a href="modules/hypellm-core.html">hypellm-core</a></li>
+<li><a href="modules/hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="modules/hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="modules/hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="modules/hypellm-net.html">hypellm-net</a></li>
+<li><a href="modules/hypellm-router.html">hypellm-router</a></li>
+<li><a href="modules/hypellm-store.html">hypellm-store</a></li>
+<li><a href="modules/hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="modules/hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="modules/wire-http1.html">wire-http1</a></li>
+<li><a href="modules/wire-json.html">wire-json</a></li>
+<li><a href="modules/wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="index.html">Wiki</a><span aria-hidden="true">/</span>Operator guides</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="hypellm-router--deployment">HypeLLM Router — deployment</h1>
+<p>This guide explains how to deploy the current router: supported runtime
+profiles, platform dependencies, secrets and state, listener separation,
+configuration, lifecycle and host hardening.</p>
+<p>Contents: <a href="#the-binary">The binary</a> · <a href="#deployment-profiles">Deployment
+profiles</a> · <a href="#the-tls-boundary">The TLS boundary</a> ·
+<a href="#secrets-directory">Secrets directory</a> · <a href="#state-directory">State
+directory</a> · <a href="#listener-separation">Listener separation</a> ·
+<a href="#configuration">Configuration</a> · <a href="#startup">Startup</a> · <a href="#shutdown">Shutdown</a> ·
+<a href="#process-hardening">Process hardening</a></p>
+<hr />
+<h2 id="the-binary">The binary</h2>
+<pre><code>hypellm-router --config &lt;path&gt; --secrets &lt;dir&gt; [--static &lt;dir&gt;] [--log &lt;level&gt;]
+hypellm-router --check --config &lt;path&gt;
+hypellm-router --generate-secrets &lt;dir&gt;
+hypellm-router --version
+</code></pre>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>-c</code>, <code>--config &lt;path&gt;</code></td>
+<td>The configuration file. Required except for <code>--generate-secrets</code>.</td>
+</tr>
+<tr>
+<td><code>--secrets &lt;dir&gt;</code></td>
+<td>Directory holding the platform secret files. Required to serve.</td>
+</tr>
+<tr>
+<td><code>--static &lt;dir&gt;</code></td>
+<td>Serve the admin application from this directory. Omit and no SPA is served.</td>
+</tr>
+<tr>
+<td><code>--log &lt;level&gt;</code></td>
+<td><code>debug</code>, <code>info</code>, <code>warn</code>, <code>error</code>, <code>critical</code>. Default <code>info</code>.</td>
+</tr>
+<tr>
+<td><code>--check</code></td>
+<td>Validate the configuration and exit.</td>
+</tr>
+<tr>
+<td><code>--generate-secrets &lt;dir&gt;</code></td>
+<td>Write a fresh secret bundle and exit.</td>
+</tr>
+<tr>
+<td><code>-V</code>, <code>--version</code> / <code>-h</code>, <code>--help</code></td>
+<td>Print and exit 0.</td>
+</tr>
+</tbody>
+</table></div>
+<p>Exit codes, so a supervisor can distinguish the failure
+(<code>crates/hypellm-router/src/main.rs</code>):</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>Clean shutdown</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Configuration or arguments invalid</td>
+</tr>
+<tr>
+<td>3</td>
+<td>State directory unusable, or an integrity failure</td>
+</tr>
+<tr>
+<td>4</td>
+<td>A listener (including the control socket) could not be bound</td>
+</tr>
+<tr>
+<td>5</td>
+<td>A required secret was missing</td>
+</tr>
+</tbody>
+</table></div>
+<p>There is no environment-variable configuration and no implicit file discovery.
+Secret <em>paths</em> are given on the command line so that secret <em>material</em> never
+appears in <code>/proc/&lt;pid&gt;/cmdline</code> or in an inherited environment
+(<code>crates/hypellm-router/src/startup.rs</code>, <code>Secrets</code>).</p>
+<hr />
+<h2 id="deployment-profiles">Deployment profiles</h2>
+<p>Specification 20's four profiles, and what each requires of this build.</p>
+<h3 id="developer-local">Developer local</h3>
+<p>Router binds loopback; llama.cpp over loopback; file state with strict
+permissions. This profile works end to end today.</p>
+<pre><code>settings inference_listen=127.0.0.1:8000 admin_listen=127.0.0.1:8001 \
+         state_dir=/var/lib/hypellm control_socket=/run/hypellm/control.sock
+provider id=local family=llamacpp scheme=http host=127.0.0.1 port=8080 egress=local
+</code></pre>
+<p>The router listens on 8000/8001 because llama.cpp commonly listens on 8080.
+Keep the inference and provider addresses distinct to avoid routing the router
+back to itself.</p>
+<p>Cleartext <code>http</code> is permitted to a loopback literal or the name <code>localhost</code>,
+and — under <code>egress=private_network</code> only — to a private address or a host
+<em>name</em> (see <a href="#fleet-records">Fleet records</a>); anything else is refused at load
+time (<code>crates/hypellm-config/src/build.rs</code>, <code>validate_endpoint</code>). A remote
+provider in this profile still needs the TLS helper.</p>
+<h3 id="behind-an-overlay-network-tailscale-wireguard">Behind an overlay network (Tailscale, WireGuard)</h3>
+<p>Two facts decide the shape of this deployment, and both surprise people.</p>
+<p><strong>Overlay addresses are refused as destinations.</strong> Tailscale assigns from
+<code>100.64.0.0/10</code>, which classifies as <code>shared_address_space</code>, and
+<code>EgressProfile::permits</code> refuses that class under <strong>every</strong> profile including
+<code>local</code> (<code>crates/hypellm-core/src/netaddr.rs</code>; see the
+<a href="threat-model.html">threat model</a>). Carrier-grade NAT space is a well-known SSRF
+pivot and the router denies it outright. A <code>provider</code> naming a <code>100.64.x.y</code>
+address fails at load time and there is no profile that permits it.</p>
+<p>The way to reach a provider across a tailnet is therefore a <strong>subnet route</strong>,
+not a node address. A subnet router on the provider's network advertises its
+RFC 1918 CIDR; the client accepts it with <code>--accept-routes</code>; the destination
+address is preserved end to end. The router dials <code>192.168.x.y</code> and
+<code>egress=private_network</code> remains an accurate description of what it is talking
+to. Nothing in the router needs to know an overlay is involved, which is the
+point.</p>
+<pre><code>provider id=slave-1 family=llamacpp scheme=http host=192.168.1.50 port=8080 \
+         egress=private_network
+</code></pre>
+<p><code>tailscale status --json | jq '.Peer[].PrimaryRoutes'</code> lists what is advertised.
+If it is empty, no such path exists yet.</p>
+<p><strong>Inbound exposure is decided by bind address.</strong> Where the router runs inside a
+namespace that has an overlay interface, a listener bound to <code>0.0.0.0</code> accepts
+on it and a listener bound to a specific address does not. That is the whole
+control, it is visible in <code>netstat</code>, and it fails closed — unlike an ACL or a
+firewall rule maintained somewhere else.</p>
+<pre><code>settings inference_listen=0.0.0.0:18000 \
+         admin_listen=10.89.7.2:18001 \
+         metrics_listen=10.89.7.2:18002
+</code></pre>
+<p>Here the inference plane is reachable over the overlay and the management and
+metrics planes are not, while all three stay reachable at the namespace's other
+addresses. Reaching a listener is not authenticating to it: inference still
+requires a router API key, and being on the tailnet grants nothing by itself.</p>
+<p>A plane bound off the overlay can still be published on it deliberately, by a
+proxy that runs in the same namespace. The worked example below serves the
+admin SPA this way: <code>tailscale serve</code> terminates TLS for the node's MagicDNS
+name and proxies to the bridge-bound management listener, so the listener stays
+unbound on the overlay and the exposure is one reviewable file
+(<a href="../docker/tailscale-serve.json"><code>docker/tailscale-serve.json</code></a>). Two
+constraints shape it. It must be HTTPS, because the session cookie is
+<code>__Host-</code>-prefixed and a browser discards a <code>Secure</code> cookie over plain http on
+any host but <code>localhost</code>. And the proxy answers <code>/metrics</code> itself instead of
+forwarding it, because the management listener serves metrics unauthenticated.
+The served origin has to be added to <code>cors_origins</code> as well.</p>
+<p><a href="../k8s"><code>k8s/</code></a> and <a href="../docker/hypellm.conf"><code>docker/hypellm.conf</code></a> in this
+repository are a worked example: a pod in which a <code>tailscale/tailscale</code>
+container and the router share one network namespace. Making the pod itself a
+tailnet node means nothing has to bind a host's overlay address, which Docker
+Desktop could not do at all (it accepted <code>-p 100.64.x.y:port:port</code> and bound
+nothing, because its daemon runs in a VM with no overlay interface).</p>
+<h3 id="single-secure-node">Single secure node</h3>
+<p>TLS edge on the same host, admin listener on a separate socket or network,
+platform secrets, system service sandbox. This is the intended production
+profile for a single node.</p>
+<p>What the router supplies: two independent listeners with independent limits and
+independent handlers, an authenticated control socket that stops admission and
+drains within a deadline, a MAC-protected state directory, and 0600 credential
+files written through the management API.</p>
+<p>What the deployment must supply: the TLS edge in front of both listeners, the
+TLS helper for outbound HTTPS, the identity verifier socket, the unprivileged
+user, the filesystem layout, and the sandbox. See
+<a href="#process-hardening">Process hardening</a> — none of that last group is done in
+code.</p>
+<blockquote>
+<p><strong>Unix-socket listeners are supported.</strong> Specification 20's &quot;Unix socket to
+router&quot; is implemented: any listener address beginning with <code>unix:</code> or with
+<code>/</code> is bound as a <code>UnixListener</code> instead of a TCP socket, and the socket file
+is restricted to its owner. So <code>inference_listen=/run/hypellm/inference.sock</code>
+works, and the TLS edge can reach the router without a loopback port at all.</p>
+<p>A Unix peer has no IP address, so an API key with a source-network restriction
+fails closed over a Unix socket rather than matching every peer.</p>
+</blockquote>
+<h3 id="ha-stateless-data-plane">HA stateless data plane</h3>
+<p><strong>Not supported.</strong> <code>hypellm-store</code> is single-node by construction: a PID-file
+process lock, no replication, no leader election, no distributed lock
+(<code>crates/hypellm-store/src/durable.rs</code>, <code>ProcessLock</code>). Specification 11.2 defers
+multi-node to an external consensus/config distributor and none is implemented.
+Running two routers against one state directory is unsafe — the lock is advisory
+and its stale-reclaim path is racy.</p>
+<p>Multiple routers with <em>separate</em> state directories and a shared upstream is
+possible, and the quota half of it is now addressed. Specification 12 requires
+&quot;an authoritative allocator <strong>or</strong> conservative node partitions&quot; for
+admission-critical quotas; there is no allocator, but <code>settings quota_partitions=N</code> implements the partitions. Each router enforces <code>limit / N</code>,
+so N nodes honour the configured figure between them rather than each enforcing
+it alone. Set it to the number of routers you actually run — leaving it unset on
+a four-node deployment quadruples every tenant limit, and setting it higher than
+the node count under-admits.</p>
+<p>What that does <em>not</em> give you: shared keys, a shared audit chain, shared
+sessions, or shared decision traces. Each node has its own state directory and
+its own view of everything in it. This is &quot;several independent routers whose
+quota arithmetic adds up&quot;, not a cluster.</p>
+<h3 id="air-gapped--local-only">Air-gapped / local-only</h3>
+<p>Supported and the easiest profile to reason about: configure only <code>scheme=http</code>
+loopback or <code>scheme=unix</code> providers, omit <code>tls_helper_socket</code> entirely, and omit
+the OIDC settings. Outbound TLS then has no path at all — <code>Egress::acquire</code>
+returns an error rather than falling back to a cleartext socket
+(<code>crates/hypellm-net/src/egress.rs</code>).</p>
+<p>Omitting the OIDC settings disables Google sign-in completely, which for an
+air-gapped deployment is the point. A <code>local_user</code> password account or
+break-glass is the management plane there — and only break-glass carries
+<code>manage_keys</code>:
+set <code>break_glass_principal</code>, <code>break_glass_tenant</code>, and a <code>role_binding</code>, keep the
+token, and sign in through the admin application's sign-in screen or
+<code>POST /admin/v1/auth/break-glass</code> directly (see
+<a href="runbooks.html#break-glass-access"><code>runbooks.html</code> 22.4</a>). With no <code>oidc</code> record the
+sign-in screen reveals the break-glass panel on its own, because Google sign-in
+answers <code>not_found</code> on this profile.</p>
+<p><strong>Capture the token when the bundle is generated.</strong> It is printed once and
+cannot be recovered, and on this profile it is the only way into the management
+plane.</p>
+<p>Two consequences worth planning for. Every session is time-limited to
+<code>break_glass_ttl_secs</code>, so an air-gapped operator signs in per task rather than
+staying signed in. And every sign-in emits a <code>critical</code> log event and an audit
+record — correct for an emergency path, noisy as a daily one, so size the
+retention accordingly.</p>
+<hr />
+<h2 id="local-password-sign-in">Local password sign-in</h2>
+<p><strong>A deviation, not a supported steady state.</strong> Specification 9.2 lists four ways
+a principal is established and a password is none of them; the reasoning and the
+full list of what it does and does not keep are in
+<a href="deferred-issues.html#local-password-sign-in-is-a-deviation"><code>deferred-issues.html</code></a>.
+It exists so a deployment can be operated before an OAuth client, a redirect URI
+and a verifier process are in place. Use it to get started, then move to
+<code>identity</code> records.</p>
+<p>Declare an account with a derived verifier — never a password:</p>
+<pre><code class="language-bash">printf '%s' 'the-password' | hypellm-router --hash-password
+</code></pre>
+<pre><code class="language-text">local_user id=admin principal=user:admin tenant=local \
+           verifier=scrypt$15$8$1$…$…
+role_binding subject=principal:user:admin role=operator
+</code></pre>
+<p>The password is read from stdin, never from an argument: <code>/proc/&lt;pid&gt;/cmdline</code>
+is world-readable. With no <code>local_user</code> record the endpoint answers 404 and the
+sign-in screen's local panel says so.</p>
+<p>The verifier is scrypt (RFC 7914) at <code>ln=15, r=8, p=1</code> — 32 MiB and about
+100 ms per check, bounded by the management plane's concurrency limit.
+<code>pbkdf2-sha256$…</code> verifiers written by an earlier release still authenticate, so
+an upgrade does not lock anyone out; the router logs
+<code>startup.password_verifier_legacy</code> naming each account still on one, and
+re-running the command above moves it.</p>
+<p>Three things to know before relying on it:</p>
+<ul>
+<li><strong><code>manage_keys</code>, <code>manage_principals</code> and <code>manage_settings</code> belong to
+<code>break_glass_admin</code> alone.</strong> An <code>operator</code> password account can drive every
+other screen but cannot mint an API key. Give the account
+<code>break_glass_admin</code> if it needs to, and accept that the admin application will
+then mark every session it opens as a break-glass session — which is accurate.</li>
+<li><strong>Five failures lock one account for a minute.</strong> The lockout is checked before
+the password is hashed, so a locked account is cheap to refuse; the right
+password does not reopen it early.</li>
+<li><strong><code>docker/hypellm.conf</code> ships <code>admin</code>/<code>admin</code>.</strong> The router logs <code>critical</code>
+<code>startup.default_password_in_use</code> for any account whose password is its own
+username, on every start, until it is changed.</li>
+</ul>
+<h2 id="the-tls-boundary">The TLS boundary</h2>
+<p><strong>The router does not implement TLS, in either direction.</strong> This is a
+specification requirement, not an omission: specification 4's &quot;TLS reality&quot; note
+and 9.1's OIDC dependency boundary both forbid novel TLS or signature code, and
+the no-dependency policy admits no TLS crate.</p>
+<h3 id="inbound">Inbound</h3>
+<p>There is no inbound TLS. Both listeners speak cleartext HTTP/1.1
+(<code>crates/wire-http1/</code>). <strong>A TLS edge in front of the router is mandatory for any
+non-loopback deployment</strong>, and specifically for the management listener: the
+session cookie is <code>__Host-hypellm_session</code> with the <code>Secure</code> attribute
+(<code>crates/hypellm-auth/src/session.rs</code>), which browsers will not store over plain
+HTTP. Management sign-in simply does not work without HTTPS.</p>
+<p>The edge is also where specification 10.1's &quot;edge normalization&quot; for request
+smuggling belongs. The router's own parser rejects TE/CL ambiguity and duplicate
+framing headers and closes the connection on any framing error, but a
+normalising edge is the specification's first line.</p>
+<p>The router never trusts an inbound forwarding header unless the peer is a
+configured trusted edge, and <code>TrustedEdge::none()</code> — trusting nothing — is what
+<code>RouterState</code> is constructed with today (<code>crates/hypellm-router/src/startup.rs</code>).
+<code>X-Forwarded-For</code> is therefore ignored, and the peer address used for API-key
+source restrictions is the real socket peer.</p>
+<h3 id="outbound">Outbound</h3>
+<p>Outbound HTTPS goes through a platform TLS helper over a Unix socket, named by
+<code>settings tls_helper_socket</code>. The wire protocol is deliberately tiny
+(<code>crates/hypellm-net/src/helper.rs</code>):</p>
+<pre><code class="language-text">→ CONNECT &lt;host&gt; &lt;port&gt; &lt;sni&gt;\n
+← OK\n              then the socket carries the TLS session's plaintext
+← ERR &lt;code&gt;\n      and the socket closes
+</code></pre>
+<p>The router sends only a host, a port, and an SNI name, all of which came from
+configuration — never a URL, a path, or a header. The helper is inside the
+trusted computing base: it validates certificates, selects ciphers, and should
+enforce its own destination allowlist. Its error codes are sanitised to 64
+characters of <code>[A-Za-z0-9_-]</code> before they reach a log or an error body.</p>
+<p><strong>If <code>tls_helper_socket</code> is not configured and any provider declares
+<code>scheme=https</code>, startup fails</strong> with
+<code>StartupError::Unreachable</code> (exit 2) listing each endpoint that &quot;requires
+outbound TLS, but no <code>tls_helper_socket</code> is configured&quot;. The router never
+silently downgrades.</p>
+<h3 id="identity-verification">Identity verification</h3>
+<p>JWT signature verification is delegated the same way, to a local verifier socket
+at <code>settings oidc_verifier_socket</code>:</p>
+<pre><code class="language-text">→ VERIFY &lt;length&gt;\n&lt;token bytes&gt;
+← OK &lt;length&gt;\n&lt;claims JSON&gt;
+← ERR &lt;code&gt;\n
+</code></pre>
+<p>The verifier checks the signature; it must <strong>not</strong> validate <code>iss</code>, <code>aud</code>, <code>exp</code>,
+or <code>nonce</code> — those are checked in exactly one place,
+<code>hypellm_auth::oidc::validate_claims</code>, so that a check cannot be skipped on one of
+two paths (<code>crates/hypellm-net/src/helper.rs</code>, <code>crates/hypellm-auth/src/oidc.rs</code>).</p>
+<p>A reference implementation is in <code>verifier/</code>, outside the workspace for the same
+reason <code>agent/</code> is. It performs no cryptography of its own: the RSA check is
+<code>openssl dgst -verify</code> and the HTTPS is the platform's, which is what
+specification 4's &quot;never write novel signature or TLS code&quot; requires. See
+<a href="components/identity-verifier.html"><code>spec/components/identity-verifier.html</code></a> for setup, the obligations it
+keeps, and the procedure for enrolling the first administrator.</p>
+<p>Both helper sockets are Unix sockets; their access control is filesystem
+permission on the containing directory, which the router does not set.</p>
+<hr />
+<h2 id="secrets-directory">Secrets directory</h2>
+<p>Created by <code>hypellm-router --generate-secrets &lt;dir&gt;</code>, read by <code>--secrets &lt;dir&gt;</code>.</p>
+<pre><code class="language-text">&lt;secrets&gt;/
+  store_mac.key       authenticates protected store frames and the audit chain
+  key_verifier.key    derives API key verifiers
+  session.key         derives session digests and CSRF tokens
+  pseudonym.key       derives log pseudonyms
+  oidc.key            derives OIDC transaction handles
+  control.key         authenticates control-socket commands
+  fleet.key           authenticates the fleet-agent handshake (only when a fleet is used)
+  break_glass.verifier  verifies the break-glass token — the digest, not the token
+  credentials/
+    &lt;credential-id&gt;   one provider secret per declared `credential` record
+</code></pre>
+<p>Rules the code enforces (<code>crates/hypellm-router/src/startup.rs</code>):</p>
+<ul>
+<li>
+<p>Each of the seven core files must exist and be <strong>at least 32 bytes</strong>. A
+missing or short file is <code>StartupError::MissingSecret</code>, exit 5. A missing file is
+never silently replaced with a generated default: a router that invents its
+own store MAC key on first boot cannot detect tampering across a restart,
+because an attacker can delete the state and let it invent a new one.</p>
+</li>
+<li>
+<p>Provider credential files are read <strong>only</strong> for the credential ids the active
+configuration declares. A file nobody declared is never read — specification
+4.1 forbids implicit file discovery. The id is validated by <code>CredentialRef</code>,
+so it cannot contain a path separator or <code>..</code>.</p>
+</li>
+<li>
+<p>A declared credential whose file is missing or empty is a startup failure
+(<code>StartupError::CredentialUnreadable</code>), not a deferred surprise on the first
+request.</p>
+</li>
+<li>
+<p>Trailing <code>\n</code> and <code>\r</code> are trimmed, so <code>echo key &gt; file</code> works.</p>
+</li>
+<li>
+<p><strong><code>fleet.key</code> is optional, and conditionally required.</strong> A deployment with no
+fleet has no such file and starts normally. A deployment with <code>fleet_enabled=true</code>
+and declared deployments and <em>no</em> key fails at startup rather than starting and
+refusing every orchestrated target with a reason nobody expects. It is
+deliberately not <code>control.key</code>: that one is sent as a bearer line, which is
+adequate for a local stop command and inadequate for verbs that stop production
+models. Copy it to the agent host, owner-readable only — see
+<a href="components/fleet-agent.html">the fleet agent guide</a>.</p>
+</li>
+<li>
+<p><strong><code>break_glass.verifier</code> is a digest, not a token.</strong> The token itself is
+printed once by <code>--generate-secrets</code> and stored nowhere: specification 22.4
+requires it to be held offline, and a copy on the router would mean reading
+the secrets directory was itself a way in. Losing it means generating a new
+bundle; there is no recovery from the verifier.</p>
+</li>
+<li>
+<p>Every file is <code>chmod</code>ed to 0600 and the <code>credentials/</code> directory to 0700 by
+<code>--generate-secrets</code>, so a default <code>umask 022</code> no longer leaves the router's
+root of trust world-readable. Still own the directory as the router's user —
+the mode protects it from other accounts, not from a wrong owner.</p>
+</li>
+</ul>
+<p>Rotation of the router keys is an offline operation with consequences:
+rotating <code>store_mac.key</code> invalidates every protected frame already on disk and
+requires a rewritten state directory; rotating <code>key_verifier.key</code> invalidates
+every API key; rotating <code>session.key</code> invalidates every session. There is no
+runtime re-key path. Provider credentials rotate at runtime — see
+<a href="runbooks.html#222-credential-rotation"><code>runbooks.html</code> 22.2</a>.</p>
+<h3 id="fleet">Fleet</h3>
+<p>When <code>settings fleet_enabled=true</code> and the configuration declares deployments,
+the router additionally:</p>
+<ul>
+<li>reads <code>&lt;secrets&gt;/fleet.key</code> and refuses to start without it;</li>
+<li>opens each configured <code>fleet_agent</code> socket, performs the authenticated
+handshake, and compares the fleet digest;</li>
+<li>replays activation leases and flap counters from the durable log, audits any
+lease that outlived its expiry, and takes a first observation;</li>
+<li>observes on <code>observation_interval_ms</code> from the housekeeping thread, and
+releases expired leases on the same tick.</li>
+</ul>
+<p>Until an observation succeeds, every cold orchestrated target is ineligible.
+That is the fail-closed reading of &quot;no observation has ever succeeded&quot;, and it
+is what stops a router that cannot see the fleet from planning against a picture
+it does not have.</p>
+<p>Confirm both sides agree about what the identifiers mean before enabling it:</p>
+<pre><code class="language-bash">hypellm-router --check --config /etc/hypellm/hypellm.conf   # prints &quot;fleet digest ...&quot;
+fleet-agent --config /etc/hypellm/fleet.json --print-digest
+</code></pre>
+<p>The two are computed independently from two different files. When they differ
+the router issues no mutating verb at all.</p>
+<h4 id="managing-the-fleet-from-the-dashboard">Managing the fleet from the dashboard</h4>
+<p>None of this has to be in the configuration file. The Fleet screen's Machines
+panel adds and edits agents, hosts, accelerators, deployments, their providers
+(by hostname) and fleet policies, and the Policies screen's Routing priority
+panel reorders alias targets and binding preferences. Each change becomes a
+<strong>draft</strong> (<code>POST /admin/v1/policies:edit</code>) that still validates and publishes
+through the usual workflow; a published configuration survives restarts, and
+a fleet it first enables starts within one housekeeping interval, without a
+restart, provided <code>&lt;secrets&gt;/fleet.key</code> exists.</p>
+<p>The agent's allowlist is the one part the dashboard cannot write: specification
+26.2 makes it the trust boundary, so a compromised router cannot add a command.
+To add a machine:</p>
+<ol>
+<li>Add the host to the agent's JSON (the panel shows the entry to paste; <code>ssh</code>
+takes a hostname). The agent reloads the file on change.</li>
+<li>Publish the router-side records from the Machines panel.</li>
+</ol>
+<p>Between the two steps the digests differ and orchestration pauses with
+<code>fleet_configuration_mismatch</code>; it resumes once both sides agree. See
+<a href="orchestration.html">orchestration.html</a> for the design and
+<a href="runbooks.html#225-fleet-incidents">runbooks.html 22.5</a> for what to do when they do.</p>
+<hr />
+<h2 id="state-directory">State directory</h2>
+<blockquote>
+<p><strong>A state directory written before the <code>hypellm</code> rename is not readable.</strong> The
+log frame magic and the snapshot-metadata magic both changed, so <code>log.bin</code> and
+<code>snapshot.meta</code> from an older build are refused at startup with a message
+naming the file. That refusal is deliberate: the alternative was truncating
+the log and reporting the loss as a routine torn tail . There is no
+migration path — start from an empty <code>state_dir</code>, and re-issue API keys.</p>
+</blockquote>
+<p><code>settings state_dir</code>. Opened with an advisory process lock and replayed at
+startup (<code>crates/hypellm-store/src/lib.rs</code>).</p>
+<pre><code class="language-text">&lt;state_dir&gt;/
+  lock              single-writer lock (boot id, pid, start time; see below)
+  snapshot.bin      the last compacted state
+  snapshot.meta     sequence, audit head, audit count, payload digest, MAC
+  log.bin           frames appended since the snapshot
+</code></pre>
+<p>Startup sequence:</p>
+<ol>
+<li>Acquire the process lock, reclaiming it if the recorded process is gone.</li>
+<li>Read the snapshot. <code>snapshot.meta</code> is MAC-verified against <code>store_mac.key</code>
+and cross-checked against a SHA-256 of <code>snapshot.bin</code>; either failing is
+<code>StoreError::SnapshotIntegrity</code> and startup aborts (exit 3).</li>
+<li>Replay <code>log.bin</code>. A <strong>torn tail</strong> (incomplete frame, bad CRC) is truncated
+and the router starts, logging <code>store.tail_truncated</code>. A <strong>protected-record
+integrity failure</strong> (MAC mismatch, missing MAC, unexpected MAC) or a
+non-monotonic sequence aborts startup. That asymmetry is deliberate: a power
+loss must not become an outage, and an edited audit history must not become a
+boot.</li>
+<li>Resume the audit chain from the snapshot's recorded head, and resume the last
+activated configuration.</li>
+</ol>
+<p>Writes use temporary file → <code>fsync</code> → atomic rename → directory <code>fsync</code>
+(<code>durable::write_atomic</code>). Compaction writes the new snapshot durably <em>before</em>
+resetting the log, so a crash leaves either the old snapshot plus the full log
+or the new snapshot plus an empty log.</p>
+<p>Backup: <code>hypellm-router --backup</code> asks the running router to copy a validated
+snapshot plus a log boundary into <code>settings backup_dir</code>, under the log lock. See
+<a href="#backup">backup</a>. There is no schedule and no retention policy in the router.</p>
+<p>Operational notes that matter:</p>
+<ul>
+<li><strong>The lock is a lock file, not an OS lock.</strong> <code>flock</code> would need <code>unsafe</code> FFI,
+which the workspace forbids. The file records the boot id, the pid, and the
+process start time from <code>/proc/&lt;pid&gt;/stat</code>, and the holder is considered live
+only if all three still match — so a reused pid, a fresh container's pid 1,
+and a pid from before a reboot are each reclaimed rather than mistaken for a
+running router. Reclaiming happens inside an <code>O_EXCL</code> critical section
+(<code>lock.claim</code> beside it), so two starters racing after a crash cannot both
+proceed. <strong>On a shared or network volume it provides no protection at all</strong>,
+because both of those are local facts. Give each router its own local state
+directory.</li>
+<li><strong>Startup memory is roughly twice the log size.</strong> <code>Log::replay</code> reads the
+whole file. Nothing triggers compaction automatically; size the volume and
+schedule compaction for the log growth your audit and key-change rate implies.</li>
+<li><strong>Sequence gaps are legal</strong> — a failed append leaves a hole and replay
+requires strictly increasing, not contiguous, numbers. Gaps are not evidence
+of deletion; the audit chain is what covers that.</li>
+<li><strong>Audit checkpoints are produced, not exported.</strong> <code>settings audit_checkpoint_interval</code> controls the cadence; shipping checkpoints to
+immutable storage (specification 11.2, 17) is the caller's job and there is no
+spool directory: <code>GET /admin/v1/audit/export</code> (permission <code>ExportAudit</code>)
+emits the chain with its checkpoints on request, but nothing ships them
+off-node on its own. Arrange a periodic export to immutable storage —
+otherwise the trust anchor lives in the same directory as the data it anchors.
+See <a href="deferred-issues.html#data-lifecycle-and-external-operations">data lifecycle and external operations</a>.</li>
+</ul>
+<hr />
+<h2 id="listener-separation">Listener separation</h2>
+<p>Specification 3 requires the management path to be separated from the data path
+&quot;in code, scheduling, rate limits, authentication scopes, and listener
+configuration&quot;. The separation as built:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th></th>
+<th>Inference listener</th>
+<th>Management listener</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Address</td>
+<td><code>settings inference_listen</code></td>
+<td><code>settings admin_listen</code></td>
+</tr>
+<tr>
+<td>Handler</td>
+<td><code>InferenceHandler</code> (<code>routes.rs</code>)</td>
+<td><code>AdminHandler</code> (<code>admin.rs</code>) → <code>AdminApi</code></td>
+</tr>
+<tr>
+<td>Authentication</td>
+<td>Router API key (<code>Authorization: Bearer</code> or <code>x-api-key</code>)</td>
+<td>Google OIDC session cookie + CSRF</td>
+</tr>
+<tr>
+<td>Authorization</td>
+<td>Key scopes</td>
+<td>RBAC permissions</td>
+</tr>
+<tr>
+<td>Max connections</td>
+<td>4096</td>
+<td>256</td>
+</tr>
+<tr>
+<td>Requests per connection</td>
+<td>1000</td>
+<td>200</td>
+</tr>
+<tr>
+<td>Read / write timeout</td>
+<td>30 s</td>
+<td>15 s</td>
+</tr>
+<tr>
+<td>Keep-alive</td>
+<td>75 s</td>
+<td>30 s</td>
+</tr>
+<tr>
+<td>Request head / target / headers</td>
+<td>32 KiB / 8 KiB / 100</td>
+<td>16 KiB / 2 KiB / 64</td>
+</tr>
+<tr>
+<td>Request body</td>
+<td>16 MiB (from <code>settings max_body_bytes</code>)</td>
+<td>1 MiB</td>
+</tr>
+</tbody>
+</table></div>
+<p>Values from <code>crates/hypellm-router/src/server.rs</code> (<code>ServerConfig::inference</code> /
+<code>::management</code>) and <code>crates/wire-http1/src/limits.rs</code>
+(<code>Limits::DEFAULT</code> / <code>Limits::ADMIN</code>). <code>settings max_head_bytes</code>,
+<code>max_body_bytes</code>, <code>slow_client_timeout_ms</code>, <code>default_deadline_ms</code>,
+<code>max_connections</code>, <code>max_requests_per_connection</code>, <code>read_timeout_ms</code>,
+<code>keepalive_timeout_ms</code>, and <code>connection_stack_kib</code> all reach the listeners
+through
+<code>startup::listener_config</code>. Zero keeps the profile default, so tune what you
+mean to and inherit the rest; every value is clamped, so a configuration
+mistake can move a bound but not remove one.</p>
+<blockquote>
+<p><strong>Running more than one router? Set <code>quota_partitions</code>.</strong> Each router counts
+admissions alone, so N routers behind a load balancer enforce every quota N
+times over — a tenant limit of 100 becomes 400 across four nodes, silently.
+<code>settings quota_partitions=4</code> divides every quota limit by four so the four
+together honour the configured figure (specification 12's &quot;conservative node
+partitions&quot;). Division truncates, so the sum never exceeds the limit. See
+<a href="deferred-issues.html#independent-nodes-are-not-a-cluster-and-that-is-the-decision">multi-node limitations</a>.
+A quota smaller than the partition count is a load error rather than a
+clamp, because zero encodes &quot;unlimited&quot; and clamping would invert the setting.
+This makes the quota arithmetic right for a fanned-out data plane. It does
+<strong>not</strong> make the router highly available, and two routers still must not share
+a state directory.</p>
+</blockquote>
+<blockquote>
+<p><strong><code>max_connections</code> is not the real connection ceiling.</strong> The router serves
+<a href="deferred-issues.html#connection-model">one thread per connection</a>, so the
+practical limit is address space divided by <code>connection_stack_kib</code>, whichever
+is lower. The default 512 KiB stack is what makes the inference profile's 4096 connections reachable at all
+— the platform default of 8 MiB would reserve 32 GiB for the same number. If
+you raise <code>max_connections</code>, check the product; if a handler needs deeper
+stacks, raise <code>connection_stack_kib</code> and expect a lower ceiling in exchange.
+The setting is clamped to 128 KiB–8 MiB: too small overflows a handler stack,
+which aborts the process rather than failing a request.</p>
+</blockquote>
+<blockquote>
+<p><strong><code>keepalive_timeout_ms</code> is not <code>keepalive_interval_ms</code>.</strong> The first is how
+long an idle connection waits for its next request. The second is
+specification 14's SSE comment cadence — how often the router writes into an
+<em>open stream</em> so an intermediary with an idle timeout does not drop a
+connection whose provider is still thinking. Tuning either must not move the
+other, which is why they are separate settings .</p>
+</blockquote>
+<p>Failed sign-ins on the two pre-session endpoints — the OIDC callback and
+break-glass — are audited under a bound: the first ten in a sixty-second window
+are recorded individually and the rest are summarised in one record per window.
+Each path has its own budget, so a flood against one cannot suppress records
+from the other. <code>hypellm_auth_failures_total</code> counts every attempt regardless, so
+alert on the metric rather than on audit-row volume .</p>
+<p><code>POST /admin/v1/targets</code> proposes a target rather than creating one: it returns
+a policy draft carrying the new <code>target</code> record, which then follows the ordinary
+validate → approve → activate path. Nothing routes to the proposed target until
+that draft is activated, and the response says so (<code>target_created: false</code>).</p>
+<p><code>/admin/v1</code> is reachable <strong>only</strong> on the management listener. The inference
+listener matches an exact, undecoded path set and answers anything else with
+404 — there is no prefix matching and no normalisation step to walk.</p>
+<p>The inference listener answers <code>GET /health/live</code> and <code>GET /health/ready</code>
+<strong>before</strong> authentication, because health must answer when the configuration is
+broken. Both return the verdict and nothing more: <code>/health/ready</code> is
+<code>{&quot;status&quot;:&quot;ready&quot;}</code> or <code>{&quot;status&quot;:&quot;not_ready&quot;}</code>, with no configuration version,
+digest, target, or address. The detailed form, including configuration information, lives on the
+management listener behind authentication.</p>
+<p>The metrics exposition is served on the management listener at <code>GET /metrics</code>
+and is deliberately <strong>not</strong> on the inference listener — it carries target
+identifiers, breaker states, queue depths, and auth-failure counts, which is an
+operational map of the deployment.</p>
+<blockquote>
+<p><strong><code>settings metrics_listen</code> binds a third listener.</strong> When it names an
+address, the router binds a separate server answering exactly two routes —
+<code>GET /metrics</code> and <code>GET /health/live</code> — and 404 for everything else, so a
+scraper and a supervisor can reach it without any path to the management
+plane. Leave it unset and the exposition stays on the management listener.</p>
+<p>The exposition is still an operational map (target identifiers, breaker
+states, queue depths), so restrict this listener to your monitoring network.</p>
+</blockquote>
+<p>One series is worth knowing about when diagnosing a slow stream:
+<code>hypellm_stream_backpressure_milliseconds</code> is how long a stream spent blocked
+writing to its client. The router serves one thread per connection, so a client
+that stops reading blocks that thread, which stops it reading from the provider
+— <a href="deferred-issues.html#streaming-backpressure">backpressure without a configurable watermark</a>.
+A high value here means the <em>client</em> is slow; <code>hypellm_upstream_latency_milliseconds</code> on the same request
+means the <em>provider</em> is. Without the first, the two were indistinguishable.</p>
+<h3 id="the-static-admin-application">The static admin application</h3>
+<p><code>--static &lt;dir&gt;</code> serves the SPA from the management listener. Assets are served
+from an explicit allowlist of relative filenames, never by joining a request
+path onto a root (<code>crates/hypellm-router/src/admin.rs</code>, <code>serve_static</code>), and every
+response carries:</p>
+<pre><code class="language-text">Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self';
+  img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none';
+  frame-ancestors 'none'; form-action 'self'; object-src 'none'
+X-Content-Type-Options: nosniff
+Referrer-Policy: no-referrer
+X-Frame-Options: DENY
+Permissions-Policy: accelerometer=(), camera=(), geolocation=(), gyroscope=(),
+  magnetometer=(), microphone=(), payment=(), usb=()
+</code></pre>
+<p>The absence of <code>'unsafe-inline'</code> is the load-bearing part: the application in
+<code>web/</code> has no inline script and no inline event handlers, so a content injection
+has nothing to execute. That property is enforced mechanically by
+<code>depscan</code> (<code>crates/hypellm-devtools/src/web_scan.rs</code>), which also refuses
+<code>vendor/</code>, remote origins, <code>eval</code>, <code>Function</code>, <code>innerHTML</code>, service workers, and
+WebAssembly.</p>
+<p><code>settings cors_origins</code> must list the exact origin the SPA is served from.
+Matching is exact string equality — no suffix matching, no scheme coercion, no
+case folding, no trailing-slash tolerance, and no wildcard is ever emitted
+(<code>crates/hypellm-admin-api/src/cors.rs</code>).</p>
+<hr />
+<h2 id="configuration">Configuration</h2>
+<p>A line-oriented grammar, not YAML or TOML (specification 11.1). Records are
+<code>type key=value …</code>; strings use JSON-style quoted escapes; <code>#</code> begins a comment
+outside a string; a trailing <code>\</code> continues a line. <strong>Unknown record types and
+unknown fields are errors.</strong> Includes, environment expansion, anchors,
+expressions, and executable templates do not exist — <code>crates/hypellm-config/src/parse.rs</code>
+has no evaluation step at all, so <code>${SECRET}</code> and <code>*anchor</code> are literal strings.</p>
+<p>Record types (<code>crates/hypellm-config/src/schema.rs</code>, <code>SCHEMAS</code> — a closed set of
+thirteen):</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Record</th>
+<th>Required fields</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>settings</code></td>
+<td>— (singleton)</td>
+<td>Listeners, limits, deadlines, OIDC, CORS, state dir, sockets</td>
+</tr>
+<tr>
+<td><code>tenant</code></td>
+<td><code>id</code></td>
+<td>Tenant, residency, status</td>
+</tr>
+<tr>
+<td><code>provider</code></td>
+<td><code>id</code>, <code>family</code>, <code>scheme</code>, <code>host</code></td>
+<td>Provider family, endpoint, credential reference, egress profile</td>
+</tr>
+<tr>
+<td><code>target</code></td>
+<td><code>id</code>, <code>provider</code>, <code>model</code></td>
+<td>Native model, declared capabilities, limits, cost class, state</td>
+</tr>
+<tr>
+<td><code>alias</code></td>
+<td><code>id</code>, <code>targets</code></td>
+<td>Client-visible name and its permitted target set</td>
+</tr>
+<tr>
+<td><code>binding</code></td>
+<td><code>id</code>, <code>scope</code></td>
+<td>Per-principal/group/tenant priorities, denies, pins</td>
+</tr>
+<tr>
+<td><code>grant</code></td>
+<td><code>scope</code></td>
+<td>Which aliases and operations a scope may use (default-deny)</td>
+</tr>
+<tr>
+<td><code>quota</code></td>
+<td><code>scope</code></td>
+<td>Concurrency, queue, queue class, request rate, token rate</td>
+</tr>
+<tr>
+<td><code>role_binding</code></td>
+<td><code>subject</code>, <code>role</code></td>
+<td>Management permissions</td>
+</tr>
+<tr>
+<td><code>group</code></td>
+<td><code>id</code>, <code>tenant</code></td>
+<td>Group membership, used by <code>binding</code> and <code>grant</code> scopes</td>
+</tr>
+<tr>
+<td><code>identity</code></td>
+<td><code>issuer</code>, <code>subject</code>, <code>principal</code>, <code>tenant</code></td>
+<td>Binds a Google account to a local principal — without one, that account cannot sign in</td>
+</tr>
+<tr>
+<td><code>credential</code></td>
+<td><code>id</code></td>
+<td>Credential <strong>metadata</strong> only — never a secret value</td>
+</tr>
+<tr>
+<td><code>price</code></td>
+<td><code>target</code></td>
+<td>Per-target token rates and the date they take effect, for usage estimates</td>
+</tr>
+</tbody>
+</table></div>
+<p>Two of these decide <em>who</em> rather than <em>what</em>, and both are explicit on purpose:</p>
+<ul>
+<li><strong><code>identity</code></strong> maps the <code>(iss, sub)</code> pair of specification 9.1 to a principal
+and a tenant. The <code>subject</code> is the <code>sub</code> claim, never the email address —
+an email can be reassigned to a different person, a <code>sub</code> cannot. The tenant
+is named rather than inferred, because it decides whose data the operator
+sees.</li>
+<li><strong><code>group</code></strong> declares membership rather than deriving it. Specification 25:
+&quot;do not infer Google group membership from email domain.&quot;</li>
+</ul>
+<p>A minimal working document:</p>
+<pre><code class="language-text">settings state_dir=/var/lib/hypellm inference_listen=127.0.0.1:8000 \
+         admin_listen=127.0.0.1:8001 control_socket=/run/hypellm/control.sock
+tenant id=acme
+provider id=local family=llamacpp scheme=http host=127.0.0.1 port=8080 egress=local
+target id=local:m provider=local model=m local=true operations=chat streaming=true \
+       context=1000 max_output=100 concurrency=4
+alias id=a targets=local:m
+grant scope=tenant:acme model=* allow=true
+binding id=b scope=tenant:acme model=* prefer=local:m
+</code></pre>
+<h3 id="price-schedules">Price schedules</h3>
+<p>A billing system is among the things the specification says this router is not,
+and this is not one: no invoice, no ledger, no account. It is an <em>estimate</em>, so that an operator reading the
+usage view can see which alias is expensive before the provider's own bill
+arrives a month later. Specification 25 recommends exactly this — &quot;a configured
+price schedule with effective dates&quot; — and the effective dates are the point:
+provider prices change, and a figure computed with today's rate against last
+month's tokens is worse than no figure.</p>
+<pre><code class="language-text">price target=openai:gpt-4o input_per_million=2500 output_per_million=10000 \
+      cached_input_per_million=1250 currency=USD effective_from=1767225600000
+price target=openai:gpt-4o input_per_million=2000 output_per_million=8000 \
+      currency=USD effective_from=1780272000000
+</code></pre>
+<p><code>effective_from</code> is <strong>epoch milliseconds</strong>, not an ISO date — the two values
+above are 2026-01-01 and 2026-06-01 UTC. The grammar has no date parser: turning
+<code>YYYY-MM-DD</code> into an instant is calendar arithmetic, and the workspace has no
+date library and may not acquire one (specification 4). The same reasoning keeps
+<code>budget_period</code> to fixed rolling windows rather than calendar months.</p>
+<p>Rates are in <strong>minor units per million tokens</strong> — cents for <code>USD</code> — so the
+arithmetic is integer throughout and never touches a float. The schedule entry
+in effect is the latest one whose <code>effective_from</code> is on or before the usage
+row's day; usage before the earliest entry is reported without a figure rather
+than with a guessed one. A <code>price</code> naming a target that does not exist is an
+<code>unknown_reference</code> error, so a renamed target cannot leave a stale rate
+silently attached to nothing.</p>
+<p>Two rounding decisions worth knowing when the number is compared against a real
+invoice:</p>
+<ul>
+<li>Each term rounds <strong>up</strong> to the minor unit, so an estimate errs high rather
+than low. A number that undersells the bill is the one that causes trouble.</li>
+<li><code>cached_input_per_million</code> defaults to <code>input_per_million</code> when omitted, not
+to zero — the same preference for over-reporting. Set it explicitly if the
+provider discounts cache reads and you want that reflected.</li>
+</ul>
+<p>The figure appears as <code>estimated_cost</code> on usage rows from <code>GET /admin/v1/usage</code>, alongside its currency, and is labelled an estimate there.
+The tokenizer half of specification 25's cost question — pre-flight token
+<em>counting</em> — is not implemented; see <a href="deferred-issues.html#conservative-token-estimation">current limitations</a>.</p>
+<h3 id="alias-sampler-settings-llamacpp">Alias sampler settings (llama.cpp)</h3>
+<p>A llama.cpp server's sampler flags apply to every client, and a default that suits one workload
+breaks another. DRY (<code>--dry-multiplier</code>) keeps a chat model from looping, but it also stops an agent
+from copying an identifier out of a tool result, because a verbatim copy is the repetition DRY
+penalises. With <code>--dry-multiplier 0.8 --dry-allowed-length 2</code>, a model asked to repeat
+<code>ds_5a8c1f0e2b7d4e93a61c</code> returns <code>ds_5a8c1e2b7d4a61c</code>.</p>
+<p>An alias can fix two of these for every request it routes, without changing the server:</p>
+<pre><code class="language-text">alias id=agent targets=spark-q8kp:qwen38 dry_multiplier=0 repeat_penalty=1 capability=chat \
+      description=&quot;tool-using agents: DRY off so identifiers survive&quot;
+</code></pre>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Range</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>dry_multiplier</code></td>
+<td>0–5</td>
+<td>llama.cpp <code>dry_multiplier</code>; <code>0</code> turns DRY off</td>
+</tr>
+<tr>
+<td><code>repeat_penalty</code></td>
+<td>0–2</td>
+<td>llama.cpp <code>repeat_penalty</code>; <code>1</code> turns it off</td>
+</tr>
+</tbody>
+</table></div>
+<p>These are operator settings: no client protocol can set or clear them, and a request that spells
+them gets nothing for it. Only llama.cpp-family providers receive them, and configuration refuses
+(<code>sampling_family_mismatch</code>) an alias that sets them and lists a target on any other family. Remember
+to add the alias to the target's own <code>aliases=</code> list.</p>
+<h3 id="alias-quotas">Alias quotas</h3>
+<p>Specification 12's admission hierarchy has five layers. A <code>quota</code> may scope to
+an alias, optionally for one operation:</p>
+<pre><code class="language-text">quota scope=alias:code concurrency=10
+quota scope=alias:code operation=embeddings concurrency=2
+</code></pre>
+<p>The alias layer sits between the principal and the target, and that is the
+reason to use it: an alias is what the caller asked for, a target is what the
+router picked. A cap of two on each of three targets admits six requests for
+that alias; a cap of two on the alias admits two.</p>
+<p>An operation-specific quota replaces the alias-wide one for that operation
+rather than combining with it, so the effective ceiling never depends on which
+was evaluated first. Scopes available: <code>global</code>, <code>tenant:&lt;id&gt;</code>,
+<code>principal:&lt;id&gt;</code>, <code>alias:&lt;id&gt;</code>, <code>target:&lt;id&gt;</code>.</p>
+<h3 id="byte-rates-and-spend-budgets">Byte rates and spend budgets</h3>
+<p>Two more of specification 12's controls, both off unless configured.</p>
+<pre><code class="language-text">quota scope=global input_bytes_per_second=1048576 output_bytes_per_second=4194304
+quota scope=tenant:acme budget=250000 budget_period=monthly
+</code></pre>
+<p><strong>Byte rates</strong> belong on <code>global</code> and nowhere else — the grammar refuses them on
+a narrower scope rather than ignoring them. They catch what the neighbouring
+limits cannot: <code>max_body_bytes</code> bounds any one request and <code>rps</code> bounds how many
+arrive, but nothing else bounds their product. Input is charged before
+admission; output is charged after the response, so it throttles the <em>next</em>
+request rather than truncating the current one.</p>
+<p><strong>Budgets</strong> are a spend ceiling per rolling period, in the same minor units as
+the <code>price</code> schedule — cents for <code>USD</code>. Charged from provider-reported usage
+rather than from the admission estimate, because the byte-based estimator
+over-counts by roughly two and a budget on it would refuse a tenant at half
+their allowance. The cost of that choice is a bounded overshoot: requests
+already in flight when the budget is crossed still complete.</p>
+<p>Periods are fixed rolling windows — <code>daily</code> is 24 hours, <code>monthly</code> is 30 days —
+not calendar months. Exhaustion reports <code>budget_exhausted</code>, separately from the
+rate limits, because it does not clear when load drops; it clears when the
+period rolls. Both partition under <code>quota_partitions</code>.</p>
+<h3 id="per-key-token-budgets">Per-key token budgets</h3>
+<p>Separate from every quota above. A <code>quota</code> is a rate or a rolling spend limit
+on a scope and lives in the configuration; a <strong>token budget</strong> is a cumulative
+allowance on one API key, does not refill, and is runtime state changed through
+the management API — so topping one up needs no publication and no restart.</p>
+<pre><code class="language-text">GET  /admin/v1/keys/&lt;id&gt;/budget          # limit, consumed, reserved, remaining; ETag
+PUT  /admin/v1/keys/&lt;id&gt;/budget          # {"token_limit": 1000000}   — null removes the limit
+POST /admin/v1/keys/&lt;id&gt;/budget:credit   # {"tokens": 500000}         — adds to a finite limit
+</code></pre>
+<p>Both mutations need <code>If-Match</code> with the budget's current <code>ETag</code>, and a credit
+also needs an <code>Idempotency-Key</code> naming the payment it records. Replaying a
+credit with the same key and body returns the original receipt and adds
+nothing, so a payment webhook can retry safely; the same key with a different
+body is <code>409 idempotency_conflict</code>. A key can also be created with
+<code>token_limit</code> already set.</p>
+<p>The permission is <code>manage_key_budgets</code>, carried by the <code>key_budget_manager</code>
+role. It reads and changes budgets within its tenant and nothing else — it
+cannot list, mint or revoke keys — and it is one an API key may hold, so a
+payment system runs as a service principal:</p>
+<pre><code class="language-text">role_binding subject=principal:svc:billing role=key_budget_manager
+</code></pre>
+<p>with a key for <code>svc:billing</code> carrying <code>management:read</code> and <code>management:write</code>.</p>
+<p>When a request cannot be funded the caller gets HTTP <code>402</code> and
+<code>token_budget_exhausted</code>. To tell them where to go, give the tenant a default,
+or set an override on one key through <code>PUT …/budget</code>:</p>
+<pre><code class="language-text">tenant id=acme payment_message="Purchase more tokens in the customer portal." payment_url="https://billing.example/tokens"
+</code></pre>
+<p>The URL must be absolute HTTPS with no credentials; the router returns it as
+data and never calls it.</p>
+<p><code>settings budget_draw_tokens</code> (default 1048576, read at startup) bounds what an
+<strong>unclean</strong> stop can cost a key. The router writes a key's budget to disk in
+steps rather than on every request, drawing this much headroom each time; a
+clean shutdown records exactly what was used, and a crash charges the headroom
+that had been drawn and not spent — never more than this, and for a finite
+budget never more than an eighth of what remained. <code>0</code> removes the headroom, at
+the price of a durable write on most requests. Spent credit is never returned
+either way. See <a href="deferred-issues.html#per-key-token-budgets">current limitations</a>
+for what a budget does not cover: more than one node, anonymous callers, and
+providers that report no usage.</p>
+<h3 id="admission-queueing">Admission queueing</h3>
+<p>A <code>quota</code> with <code>queued=</code> non-zero lets a request wait for a concurrency slot
+instead of being refused the moment the scope is full:</p>
+<pre><code class="language-text">quota scope=target:local:m concurrency=4 queued=16 class=interactive
+</code></pre>
+<ul>
+<li><strong>Order</strong> is specification 12's: weighted fair across tenants, by priority
+class, FIFO within a tenant and class. A tenant with sixteen queued requests
+delays another tenant's single request by one place, not sixteen.</li>
+<li><strong><code>class</code></strong> is <code>interactive</code>, <code>standard</code> (the default), or <code>batch</code>. A
+principal's class wins over its tenant's.</li>
+<li><strong>The wait</strong> is the smaller of <code>settings queue_timeout_ms</code> (default 5000) and
+what remains of the request deadline, so specification 12's &quot;requests past
+deadline are removed without invoking the provider&quot; holds for a queued request
+too. <code>queue_timeout_ms=0</code> disables queueing outright — there is no way to
+express an unbounded wait, because specification 3.2 makes the timeout
+mandatory.</li>
+<li><strong>Only concurrency queues.</strong> A rate-limit rejection has nothing to wake on, so
+it is reported rather than waited out.</li>
+<li>A target with a <code>concurrency</code> and no <code>quota</code> of its own queues up to
+<code>settings default_target_queued</code> (default 32); set it to 0 to refuse
+immediately. Other scopes without <code>queued=</code> refuse immediately.</li>
+</ul>
+<p>Queue depth and wait are published as <code>hypellm_queue_depth</code> and
+<code>hypellm_queue_wait_milliseconds</code>.</p>
+<h3 id="waiting-out-an-outage">Waiting out an outage</h3>
+<p>By default a request fails as soon as every target for its alias is
+unreachable. A provider can instead ask for requests to wait for it to come
+back — a machine rebooting, or llama.cpp answering <code>503</code> while it loads:</p>
+<pre><code class="language-text">provider id=spark family=llamacpp scheme=http host=spark.lan port=8000 \
+    egress=private_network recovery_wait_ms=90000
+</code></pre>
+<ul>
+<li><strong>When it applies:</strong> nothing has reached the client, at least one target was
+unreachable (connection refused or timed out, a <code>5xx</code> before acceptance, an
+open breaker, stale fleet state), and nothing failed for a reason time does
+not cure. A caller over quota, an unknown alias or a <code>4xx</code> fails at once.</li>
+<li><strong>How long:</strong> the longest <code>recovery_wait_ms</code> among the alias's providers, at
+most 600000, and never past the request deadline (<code>default_deadline_ms</code>, or
+the caller's own). Retries back off from 250 ms to 2 s. A streamed request
+gets an SSE keepalive each round, and a client that leaves ends the wait.</li>
+<li><strong>How many:</strong> at most <code>settings max_recovery_waiters</code> (default 256) wait at
+once. Past that, a request fails at once, because each waiter holds a
+connection worker.</li>
+<li>It is set per provider (one machine's endpoint) and editable from the
+dashboard's Machines panel.</li>
+</ul>
+<h3 id="metrics-for-prometheus">Metrics for Prometheus</h3>
+<p><code>GET /metrics</code> serves the Prometheus text exposition. It is unauthenticated on
+the management listener, or on its own address with <code>settings metrics_listen=</code>
+(which serves nothing else). A scrape job:</p>
+<pre><code class="language-yaml">scrape_configs:
+  - job_name: hypellm
+    static_configs: [{ targets: [&quot;router.lan:9464&quot;] }]   # metrics_listen
+</code></pre>
+<p>Throughput and waiting, by model:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Series</th>
+<th>Meaning</th>
+<th>Query</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>hypellm_model_output_tokens_total{target,alias}</code></td>
+<td>Output tokens served</td>
+<td><code>sum by (target) (rate(hypellm_model_output_tokens_total[1m]))</code> is tokens per second per model</td>
+</tr>
+<tr>
+<td><code>hypellm_model_input_tokens_total{target,alias}</code></td>
+<td>Prompt tokens sent</td>
+<td>as above</td>
+</tr>
+<tr>
+<td><code>hypellm_output_tokens_per_second{target}</code></td>
+<td>Histogram of one request's generation speed, from first byte when streamed</td>
+<td><code>histogram_quantile(0.5, sum by (le, target) (rate(hypellm_output_tokens_per_second_bucket[5m])))</code></td>
+</tr>
+<tr>
+<td><code>hypellm_pending_requests{alias,reason}</code></td>
+<td>Requests waiting for a model right now: <code>capacity</code> (admission queue), <code>activation</code> (a cold model starting), <code>recovery</code> (an outage wait)</td>
+<td><code>sum by (alias) (hypellm_pending_requests)</code></td>
+</tr>
+<tr>
+<td><code>hypellm_recovery_waits_total{alias,outcome}</code></td>
+<td>Outage waits ended <code>recovered</code>, <code>failed</code>, <code>expired</code>, <code>client_gone</code> or <code>refused</code></td>
+<td></td>
+</tr>
+</tbody>
+</table></div>
+<p>The <code>alias</code> label appears only for aliases declared in the configuration; a
+caller-supplied name never becomes a label value.</p>
+<p>Provider families: <code>llamacpp</code> (or <code>llama.cpp</code>), <code>openai</code>, <code>anthropic</code>,
+<code>deepseek</code>, <code>moonshot</code> (or <code>kimi</code>), and <code>generic_openai</code>. The last requires
+<code>settings allow_generic_adapter=true</code> — it is refused otherwise
+(<code>crates/hypellm-config/src/build.rs</code>), per specification 25.</p>
+<p>Schemes: <code>http</code> (loopback only), <code>https</code> (needs the TLS helper), <code>unix</code>
+(absolute path only).</p>
+<p>Validate before deploying:</p>
+<pre><code>hypellm-router --check --config /etc/hypellm/hypellm.conf
+</code></pre>
+<p>which prints provider/target/alias counts and the configuration digest, and
+exits 2 with every accumulated error on failure. Validation collects all errors
+rather than stopping at the first.</p>
+<p><strong>Lifecycle settings.</strong> <code>settings capture_bodies=true</code> is a <strong>configuration
+error</strong> and the router refuses to start: specification 17 admits body capture
+only as per-tenant, sampled, encrypted, access-controlled and time-limited, and
+none of that exists. Setting it to <code>false</code>, or omitting it, loads — the router
+captures no prompt or completion bodies either way.</p>
+<p><code>tenant retention_days</code> loads and is reported on the Settings screen, but is a
+<strong>declaration, not an enforcement</strong>: nothing in the router deletes state, audit
+records, usage, or exported logs when the window elapses. It is recorded so the
+deployment's own lifecycle tooling has one authoritative place to read it. Apply
+retention to exported logs and audit data externally; see
+<a href="deferred-issues.html#data-lifecycle-and-external-operations">current limitations</a>.</p>
+<p><strong>Several nodes.</strong> There is no cluster mode and will not be one in v1
+(specification 25: &quot;single-writer versioned bundles; do not build consensus&quot;).
+Give each node its own state and secrets directory, set <code>quota_partitions</code> to
+the node count, and distribute policy by hand: <code>GET /admin/v1/policies/active</code>
+on the writer returns the canonical text, its version and its digest; write
+those bytes to the other node's configuration file and confirm
+<code>hypellm-router --check</code> prints the same digest there. Matching digests are the
+guarantee, and they are checkable.</p>
+<p><strong>Jobs.</strong> <code>settings job_workers=N</code> starts a fixed pool of <code>N</code> threads serving
+<code>POST /v1/jobs</code>; zero, the default, disables the endpoint. The pool size is what
+bounds how much long-running generation the router carries at once, and it is
+separate from <code>max_connections</code>: that is the point of the endpoint. See
+<a href="deferred-issues.html#jobs-are-in-memory-and-a-restart-loses-them">current limitations</a>
+before relying on a job identifier across a restart. The bounds are
+<code>max_jobs_per_tenant</code>, <code>max_queued_jobs</code>, <code>max_job_result_bytes</code> and
+<code>job_retention_ms</code>.</p>
+<p>Related active settings:</p>
+<ul>
+<li><code>settings keepalive_interval_ms</code> controls the SSE keepalive cadence. A stream
+whose provider is silent gets a comment at that interval (default 15 s; zero
+disables it).</li>
+<li><code>settings metrics_listen</code> binds a dedicated listener serving only
+<code>GET /metrics</code> and <code>GET /health/live</code>. Everything else on that address
+answers 404.</li>
+<li><code>credential rotates_after_days</code> makes <code>GET /admin/v1/credentials</code> report
+<code>last_rotated</code> and <code>overdue</code>. Rotation remains an operator action so an
+expired schedule cannot automatically create a provider outage.</li>
+</ul>
+<hr />
+<h3 id="fleet-records">Fleet records</h3>
+<p>Six record types declare the fleet. All are optional: a configuration with none
+of them routes exactly as it did before orchestration existed, and validation
+runs whether or not <code>fleet_enabled</code> is set.</p>
+<pre><code class="language-text">fleet_agent id=local socket=&quot;/run/hypellm/fleet.sock&quot; \
+    observation_interval_ms=5000 observation_max_age_ms=30000 \
+    request_timeout_ms=10000
+
+host id=spark agent=local arch=aarch64 status=enabled \
+    reserved_memory_bytes=17179869184 max_concurrent_activations=1
+
+accelerator host=spark id=spark-gb10 kind=unified pool=spark-unified \
+    memory_bytes=130673213440
+
+deployment id=spark-music3 target=spark:minimax-music3 accelerator=spark-gb10 \
+    artifact=music3-arm64 memory_bytes=68719476736 \
+    start_ms=180000 stop_ms=15000 drain_ms=30000 probe_ms=10000 \
+    readiness=inference min_resident_ms=600000 \
+    evictable=true pinned=false autostart=true retention_weight=0 \
+    max_drainable_inflight=0 force_stop=false
+
+artifact id=music3-arm64 kind=image arch=aarch64 size_bytes=21474836480 \
+    digest=&quot;sha256:…&quot; source=mirror-local
+
+fleet_policy scope=host:spark max_activations_per_hour=12 \
+    eviction_margin_permille=250 max_eviction_set=2 \
+    activation_min_demand=1 activation_max_wait_ms=20000 \
+    reactivation_cooldown_ms=120000 flap_window_ms=900000 \
+    max_flap_cooldown_ms=3600000 allow_fetch=false \
+    fetch_disk_headroom_bytes=17179869184 \
+    memory_drift_tolerance_permille=100 adopt_unmanaged=false
+</code></pre>
+<p><code>fleet_policy scope=fleet</code> sets the defaults; <code>scope=host:&lt;id&gt;</code> overrides them
+for one host and inherits everything it does not restate, whatever order the two
+records appear in.</p>
+<p>The fields worth thinking about rather than copying:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Why it matters</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>reserved_memory_bytes</code></td>
+<td>On a unified-memory host this is the operating system's and everything else's share of the <em>same</em> pool the models draw on. Set it generously; the Spark's 124 GiB is not 124 GiB of model.</td>
+</tr>
+<tr>
+<td><code>pool</code></td>
+<td>Accelerators sharing a pool share one budget. Give a unified accelerator and its host the same pool so a resident model correctly reduces host RAM availability. A pool may not span two hosts, and validation refuses one that does.</td>
+</tr>
+<tr>
+<td><code>start_ms</code></td>
+<td>Not a formality. A 20 GB Q5 GGUF with a speculative-decoding sidecar takes minutes, and every planning decision is dominated by this number. Observation refines it within a factor of four; it does not overrule you.</td>
+</tr>
+<tr>
+<td><code>readiness</code></td>
+<td><code>http_ok</code> is a health endpoint, <code>inference</code> a trivial completion, <code>container_healthy</code> the runtime's own check. A TCP connect is not readiness — a llama.cpp server accepts connections long before it has mapped its weights.</td>
+</tr>
+<tr>
+<td><code>min_resident_ms</code></td>
+<td>The dwell floor, and the only hard one. At five minutes a host swaps at most twelve times an hour whatever demand does.</td>
+</tr>
+<tr>
+<td><code>autostart</code></td>
+<td>Off unless declared. Routing demand starting a model is the feature; acquiring it by omission is not.</td>
+</tr>
+<tr>
+<td><code>pinned</code>, <code>evictable</code></td>
+<td>Operator anchors. The planner is not asked to be clever about something you have already decided.</td>
+</tr>
+</tbody>
+</table></div>
+<p>Existing records gain optional fields only:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Record</th>
+<th>New fields</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>settings</code></td>
+<td><code>fleet_enabled</code>, <code>max_documents_per_request</code>, <code>max_document_bytes</code>, <code>max_inline_document_bytes</code>, <code>default_document_token_estimate</code>, <code>activation_effort_headroom_ms</code></td>
+</tr>
+<tr>
+<td><code>tenant</code></td>
+<td><code>min_quality</code></td>
+</tr>
+<tr>
+<td><code>alias</code></td>
+<td><code>capability</code>, <code>dry_multiplier</code>, <code>repeat_penalty</code> (llama.cpp only; see <a href="#alias-sampler-settings-llamacpp">Alias sampler settings</a>)</td>
+</tr>
+<tr>
+<td><code>target</code></td>
+<td><code>capabilities</code>, <code>quality_class</code>, <code>reasoning_efforts</code>, <code>effort_multipliers</code>, <code>document_token_estimate</code>, <code>bytes_per_token</code>, and <code>document</code> among <code>modalities</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>Slave-hosted providers use <code>egress=private_network</code>. That profile — and only that
+profile — also permits cleartext HTTP to a <strong>private</strong> address, because a
+llama.cpp server on a LAN speaks plain HTTP and requiring TLS would mean a
+terminator on every slave. A host may be named rather than numbered
+(<code>host=spark.lan</code>): the name is resolved when the router connects, the address
+it resolved to is pinned for that connection, and cleartext is refused unless
+that address is private — so a name that one day resolves publicly gets no
+plaintext prompt. The cost is real and is recorded in
+<a href="deferred-issues.html">current limitations</a>: traffic to an orchestrated slave is
+unencrypted on your own network.</p>
+<hr />
+<h2 id="startup">Startup</h2>
+<p>Order (<code>crates/hypellm-router/src/startup.rs</code>, <code>Router::assemble</code>):</p>
+<ol>
+<li>Read and validate the configuration file. Invalid → exit 2.</li>
+<li>Open the state directory, take the lock, replay the log. Integrity failure →
+exit 3.</li>
+<li>Resume the last durably activated configuration if one exists, otherwise use
+the file. <strong>If a policy has ever been published through the management API,
+the file on disk is ignored</strong> — a reviewed policy must not vanish on a
+restart. To override it deliberately, start once with
+<code>--adopt-config &quot;&lt;reason&gt;&quot;</code>: the file becomes a new activation, the reason is
+recorded in the audit chain, and it persists across later restarts
+.</li>
+<li>Load the provider credentials the <em>resumed</em> configuration declares. Missing
+or empty → exit 5.</li>
+<li>Check reachability: every <code>https</code> endpoint needs <code>tls_helper_socket</code>.
+Otherwise → exit 2 with the offending endpoints listed.</li>
+<li>Build health registry, admission controller, credential store, key store
+(restoring keys and revocations from the log), session store.</li>
+<li>Bind the inference listener, then the management listener. Failure → exit 4.</li>
+<li>Bind the control socket. <strong>Failure → exit 4</strong>, deliberately: without it the
+router cannot be drained, and specification 20.1 requires graceful shutdown.</li>
+<li>Append a <code>RouterStarted</code> audit record and serve.</li>
+</ol>
+<p>The router logs <code>store.tail_truncated</code>, <code>store.key_records_unreadable</code>,
+<code>config.activation_resumed</code> / <code>config.loaded_from_file</code>, and <code>router.started</code>
+with the configuration digest. Alert on the first two.</p>
+<hr />
+<h2 id="shutdown">Shutdown</h2>
+<p><strong>The router has no signal handler.</strong> <code>sigaction</code> would need <code>unsafe</code> FFI, which
+specification 18.2 forbids workspace-wide. Shutdown is driven through the
+control socket at <code>settings control_socket</code> (a Unix socket, path ≤ 100 bytes):</p>
+<pre><code>hypellm-router --shutdown --config /etc/hypellm/hypellm.conf --secrets /etc/hypellm/secrets
+hypellm-router --ping     --config /etc/hypellm/hypellm.conf --secrets /etc/hypellm/secrets
+</code></pre>
+<p><strong>Commands are authenticated.</strong> A control line is <code>&lt;hex token&gt; &lt;command&gt;</code>, where
+the token is the contents of <code>&lt;secrets&gt;/control.key</code> — written by
+<code>--generate-secrets</code> and narrowed to 0600 with the rest of the bundle. The
+socket itself is <code>chmod</code>ed to 0600 immediately after bind, and a failure to do
+so aborts startup rather than leaving it at the umask. Two controls rather than
+one, because either alone is a single mistake from failing open.</p>
+<p>Use the flags above rather than <code>socat</code>: they read the token from the secrets
+directory and send it themselves, so it never enters the process list or shell
+history. Sending the line by hand works, but an operator who has to assemble it
+will eventually put the token in an argument.</p>
+<p>Commands: <code>shutdown</code> and <code>drain</code> (identical — both set the shutdown flag on both
+listeners), <code>ping</code> → <code>pong</code>, and <code>backup</code> (see below). An unauthenticated line
+gets <code>unauthenticated</code> and a log entry; an authenticated but unknown one gets
+<code>unknown command</code>. A command that failed replies <code>error: &lt;detail&gt;</code> and the CLI
+exits 3, so a wrapper script does not report green over a backup that did not
+happen.</p>
+<p>A bundle generated before <code>control.key</code> existed will not start: <code>--generate-secrets</code>
+into a fresh directory and migrate the other five files, or add a <code>control.key</code>
+of at least 32 random bytes. The router refuses rather than inventing one,
+because a generated token would authenticate the socket with a value no operator
+holds.</p>
+<h3 id="backup">Backup</h3>
+<pre><code>hypellm-router --backup --config /etc/hypellm/hypellm.conf --secrets /etc/hypellm/secrets
+</code></pre>
+<p>The running router copies a consistent point-in-time snapshot plus log boundary
+into <code>settings backup_dir</code>, holding the log lock so the boundary is exact. It
+prints the sequence, the bytes copied, and the audit chain head:</p>
+<pre><code>backed up to /var/backups/hypellm: sequence 4711 log 918233 bytes snapshot 40960 bytes audit_head 0a95…
+</code></pre>
+<p>Three things about this are deliberate:</p>
+<ul>
+<li><strong>The destination is configured, not sent.</strong> A backup is the whole of the
+router's durable state — API key verifiers, session digests, the audit chain.
+A command that carried its own destination would turn possession of
+<code>control.key</code> into the ability to write that state anywhere the router's user
+can write. With no <code>backup_dir</code> set the command is refused.</li>
+<li><strong>The router does the copy while running.</strong> <code>cp -r</code> on a live state directory
+can catch a half-written frame; this cannot, because the writer is holding its
+own lock. There is no need to stop the router first.</li>
+<li><strong>The copy contains the record of its own creation.</strong> The <code>state_backed_up</code>
+audit record is appended before the copy runs, so a restored directory can
+say when it was taken and by what. A <code>backup.manifest</code> beside the copy
+repeats the boundary in plain text.</li>
+</ul>
+<p>Restore is a file copy in the other direction into a stopped router's
+<code>state_dir</code>; drop <code>backup.manifest</code>, which is not a store file. Verify first
+with <code>hypellm-router --check</code>, and keep backups on the same protection footing
+as <code>&lt;secrets&gt;</code> — together they are the router's whole trust base.</p>
+<p>There is still <strong>no scheduler</strong>. Run the command from <code>systemd</code>, <code>cron</code>, or
+whatever already runs the deployment's backups.</p>
+<p><strong>Drain waits.</strong> <code>Server::serve</code> returns only after the accept loop stops <em>and</em>
+its connections have drained within <code>ServerConfig::drain_timeout</code>; the count
+still running at the deadline is reported and logged as <code>router.drain_incomplete</code>.
+Connections are not killed — each already carries a request deadline and a write
+timeout, so they end on their own.</p>
+<p><code>SIGTERM</code> sent to the router binary itself is <strong>not</strong> graceful: nothing in the
+router handles it, so the process dies immediately and in-flight streams are
+cut. In the shipped container that does not arise —
+<a href="components/container-init.html"><code>supervisor/hypellm-init</code></a> is PID 1 and turns the
+signal into <code>--shutdown</code> — but a unit that runs the binary directly needs
+<code>ExecStop</code>. Handling it needs
+<code>sigaction</code> or <code>signalfd</code>, both <code>unsafe</code> FFI, which specification 18.2 forbids
+workspace-wide — so the control socket is the router's shutdown mechanism and
+<code>ExecStop=</code> is how a supervisor reaches the <a href="deferred-issues.html#graceful-shutdown-uses-the-control-socket">graceful shutdown path</a>.</p>
+<p><strong>Use this unit rather than assembling one</strong>, because the <code>ExecStop=</code> line is
+the whole point and a unit without it drops streams on every restart:</p>
+<pre><code class="language-ini">[Unit]
+Description=HypeLLM Router
+After=network-online.target
+
+[Service]
+Type=simple
+User=hypellm
+Group=hypellm
+ExecStart=/usr/local/bin/hypellm-router --config /etc/hypellm/hypellm.conf \
+          --secrets /etc/hypellm/secrets --static /usr/share/hypellm/web
+# Graceful shutdown. Without this, systemd sends SIGTERM, nothing handles it,
+# and every in-flight stream is cut mid-response.
+ExecStop=/usr/local/bin/hypellm-router --shutdown \
+         --config /etc/hypellm/hypellm.conf --secrets /etc/hypellm/secrets
+# Long enough for the drain to finish; the router bounds its own drain, so this
+# only has to exceed it.
+TimeoutStopSec=90
+Restart=on-failure
+
+# Specification 20.1's process hardening, none of which the router can do for
+# itself; host hardening is supplied by the service manager.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/hypellm /run/hypellm
+LimitCORE=0
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
+</code></pre>
+<p>The socket file is removed on clean exit and force-removed before bind, so a
+crashed router does not block a restart.</p>
+<hr />
+<h2 id="process-hardening">Process hardening</h2>
+<p>Specification 20.1, item by item, against what exists.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Requirement (20.1)</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Dedicated unprivileged user</td>
+<td><strong>Detected, not enforced.</strong> The router cannot drop privilege — <code>setuid</code> is <code>unsafe</code> FFI — so run it as an unprivileged user from the start. It does check: an effective uid of 0 logs <code>startup.hardening_missing</code> at critical.</td>
+</tr>
+<tr>
+<td>Read-only executable and configuration</td>
+<td>Deployment concern. The router opens the configuration read-only and never writes to it.</td>
+</tr>
+<tr>
+<td>Writable directories separated for state, audit spool, temporary files</td>
+<td>Partly. State and secrets are separate directories, and the router writes temporary files only inside the directory it is replacing a file in. There is no audit <em>spool</em>: the chain and its checkpoints are exported on request through <code>GET /admin/v1/audit/export</code>, not pushed.</td>
+</tr>
+<tr>
+<td>No shell, compiler, package manager, or writable executable directory in the image</td>
+<td>Deployment concern. The router spawns no subprocess and links no dynamic loader beyond libc.</td>
+</tr>
+<tr>
+<td>System-call / filesystem / network sandbox</td>
+<td><strong>Detected, not enforced.</strong> No seccomp, no Landlock, no namespace work — all would need <code>unsafe</code> FFI. Supply it from systemd (<code>SystemCallFilter</code>, <code>ProtectSystem=strict</code>, <code>ReadWritePaths</code>, <code>PrivateTmp</code>, <code>RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6</code>) or the container runtime. The router reads <code>Seccomp:</code> and <code>NoNewPrivs:</code> from <code>/proc/self/status</code> at startup and logs <code>startup.hardening_missing</code> if either is absent, so a directive that silently failed to apply is visible.</td>
+</tr>
+<tr>
+<td>Outbound connections restricted to resolved approved endpoints</td>
+<td>Partly. In-process: destinations are administrator-configured tuples, addresses are classified and pinned, redirects are off, proxy environment variables are ignored (<code>crates/hypellm-net/src/egress.rs</code>). At the OS level: nothing. An egress firewall is still worth having.</td>
+</tr>
+<tr>
+<td>Core dumps disabled or restricted</td>
+<td><strong>Detected, not enforced.</strong> Set <code>LimitCORE=0</code> / <code>RLIMIT_CORE=0</code> in the unit. The release profile uses <code>panic = &quot;abort&quot;</code> and <code>strip = &quot;symbols&quot;</code>, so a dump would be both likely on panic and full of key material. The router reads the <em>soft</em> core limit from <code>/proc/self/limits</code> at startup and logs <code>startup.hardening_missing</code> if it is non-zero.</td>
+</tr>
+<tr>
+<td>Memory locking for secret pages</td>
+<td><strong>Not implemented.</strong> <code>mlock</code> needs <code>unsafe</code> FFI. <code>hypellm_crypto::Secret&lt;N&gt;</code> zeroes on drop as a best effort; Rust gives no guarantee against compiler copies. Disable swap, or use an encrypted swap device.</td>
+</tr>
+<tr>
+<td>Environment scrubbed after startup</td>
+<td><strong>Not implemented.</strong> The router reads no configuration from the environment, so there is little to scrub, but nothing clears what it inherited.</td>
+</tr>
+<tr>
+<td>Graceful shutdown: stop admission, drain within deadline, cancel remainder, flush audit/state, exit nonzero on integrity failure</td>
+<td><strong>Implemented.</strong> Admission stops, <code>Server::serve</code> drains within <code>drain_timeout</code> and reports what was still running at the deadline (<code>router.drain_incomplete</code>), the audit <code>RouterStopped</code> record and <code>Store::sync</code> run, and a failed flush exits nonzero. The remainder is not killed: each connection already carries a request deadline and a write timeout.</td>
+</tr>
+</tbody>
+</table></div>
+<blockquote>
+<p><strong>Check the first few log lines after a deploy.</strong> Every row above marked
+&quot;detected&quot; is read from <code>/proc/self</code> at startup and reported as
+<code>startup.hardening_missing</code> at critical, one line per missing property, each
+naming the systemd directive that supplies it. A clean start emits none. This
+is how you find out that a unit-file typo or a container runtime silently
+dropped a directive you believed was in force — the router cannot apply any of
+this, but it can tell you it is not there.</p>
+</blockquote>
+<p>Two properties the build gives you for free, worth stating because they bound
+the impact of everything above:</p>
+<ul>
+<li>
+<p><code>#![forbid(unsafe_code)]</code> at every crate root, verified by <code>depscan</code>, so the
+usual memory-safety classes are out of scope.</p>
+</li>
+<li>
+<p>No third-party code at all. <code>cargo tree</code> shows only workspace path
+dependencies, and the release build runs <code>--offline</code>. Verify with:</p>
+<pre><code>cargo run -q -p hypellm-devtools --bin depscan --offline -- --root .
+cargo run -q -p hypellm-devtools --bin depscan --offline -- --root . --manifest
+</code></pre>
+<p>The second emits the content-addressed manifest of release inputs
+(specification 4.1).</p>
+</li>
+</ul>
+
+      </article>
+      <footer class="page-footer"><a href="index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#the-binary">The binary</a></li>
+<li class="toc-level-2"><a href="#deployment-profiles">Deployment profiles</a></li>
+<li class="toc-level-3"><a href="#developer-local">Developer local</a></li>
+<li class="toc-level-3"><a href="#behind-an-overlay-network-tailscale-wireguard">Behind an overlay network (Tailscale, WireGuard)</a></li>
+<li class="toc-level-3"><a href="#single-secure-node">Single secure node</a></li>
+<li class="toc-level-3"><a href="#ha-stateless-data-plane">HA stateless data plane</a></li>
+<li class="toc-level-3"><a href="#air-gapped--local-only">Air-gapped / local-only</a></li>
+<li class="toc-level-2"><a href="#local-password-sign-in">Local password sign-in</a></li>
+<li class="toc-level-2"><a href="#the-tls-boundary">The TLS boundary</a></li>
+<li class="toc-level-3"><a href="#inbound">Inbound</a></li>
+<li class="toc-level-3"><a href="#outbound">Outbound</a></li>
+<li class="toc-level-3"><a href="#identity-verification">Identity verification</a></li>
+<li class="toc-level-2"><a href="#secrets-directory">Secrets directory</a></li>
+<li class="toc-level-3"><a href="#fleet">Fleet</a></li>
+<li class="toc-level-3"><a href="#managing-the-fleet-from-the-dashboard">Managing the fleet from the dashboard</a></li>
+<li class="toc-level-2"><a href="#state-directory">State directory</a></li>
+<li class="toc-level-2"><a href="#listener-separation">Listener separation</a></li>
+<li class="toc-level-3"><a href="#the-static-admin-application">The static admin application</a></li>
+<li class="toc-level-2"><a href="#configuration">Configuration</a></li>
+<li class="toc-level-3"><a href="#price-schedules">Price schedules</a></li>
+<li class="toc-level-3"><a href="#alias-sampler-settings-llamacpp">Alias sampler settings (llama.cpp)</a></li>
+<li class="toc-level-3"><a href="#alias-quotas">Alias quotas</a></li>
+<li class="toc-level-3"><a href="#byte-rates-and-spend-budgets">Byte rates and spend budgets</a></li>
+<li class="toc-level-3"><a href="#per-key-token-budgets">Per-key token budgets</a></li>
+<li class="toc-level-3"><a href="#admission-queueing">Admission queueing</a></li>
+<li class="toc-level-3"><a href="#waiting-out-an-outage">Waiting out an outage</a></li>
+<li class="toc-level-3"><a href="#metrics-for-prometheus">Metrics for Prometheus</a></li>
+<li class="toc-level-3"><a href="#fleet-records">Fleet records</a></li>
+<li class="toc-level-2"><a href="#startup">Startup</a></li>
+<li class="toc-level-2"><a href="#shutdown">Shutdown</a></li>
+<li class="toc-level-3"><a href="#backup">Backup</a></li>
+<li class="toc-level-2"><a href="#process-hardening">Process hardening</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

@@ -205,6 +205,15 @@ pub struct Settings {
     /// deployment that fans out behind a load balancer, which is otherwise the
     /// part that silently multiplies every tenant's limit by the node count.
     pub quota_partitions: u32,
+    /// Headroom, in tokens, taken beyond what a request needs each time a
+    /// key's durable budget mark is raised (specification 12.1).
+    ///
+    /// The trade is durable writes against what an unclean stop can cost: a
+    /// key is charged for headroom it had drawn and not used if the router
+    /// dies without flushing. Zero writes on every reservation that does not
+    /// fit under the mark and loses only what was in flight. For a finite
+    /// budget the headroom is further capped at an eighth of what remains.
+    pub budget_draw_tokens: u64,
     /// Stack size for each connection thread, in KiB. Zero keeps the profile
     /// default.
     ///
@@ -327,6 +336,7 @@ impl Default for Settings {
             max_recovery_waiters: 256,
             max_connections: 0,
             quota_partitions: 0,
+            budget_draw_tokens: hypellm_core::budget::DEFAULT_DRAW_TOKENS,
             connection_stack_kib: 0,
             max_requests_per_connection: 0,
             read_timeout_ms: 0,
@@ -376,7 +386,7 @@ pub struct TenantConfig {
     /// records, usage, or exported logs when this elapses; specification 5's
     /// "retention profile" is recorded here so that the deployment's own
     /// lifecycle tooling has one authoritative place to read it, and every
-    /// surface that shows it says so. See `docs/deferred-issues.md`.
+    /// surface that shows it says so. See `spec/deferred-issues.html`.
     pub retention_days: u32,
     /// The most expensive class this tenant's requests may select.
     ///
@@ -391,6 +401,13 @@ pub struct TenantConfig {
     /// request will accept, which is the caller's business, while lowering one
     /// would opt out of an operator's decision.
     pub min_quality_class: Option<QualityClass>,
+    /// Where a caller whose key has run out of token budget is sent
+    /// (specification 12.2): `payment_message` and `payment_url`.
+    ///
+    /// The tenant default. A key may carry its own override, set through the
+    /// management API; with neither, a budget refusal says only that the
+    /// budget is exhausted.
+    pub payment: Option<hypellm_core::budget::PaymentInstructions>,
 }
 
 /// A quota scope selector.
@@ -592,7 +609,7 @@ pub struct IdentityBinding {
 
 /// A local account that signs in with a username and a password.
 ///
-/// **A deviation, recorded in `docs/deferred-issues.md`.** Specification 9.2
+/// **A deviation, recorded in `spec/deferred-issues.html`.** Specification 9.2
 /// lists four ways a principal is established and this is not one of them: a
 /// human is meant to arrive through the identity provider, and the path that
 /// works when the provider does not is the preprovisioned break-glass token of
@@ -1409,6 +1426,7 @@ fn build_settings(document: &Document) -> Result<Settings, ConfigError> {
         max_recovery_waiters: f.u32_field("max_recovery_waiters", d.max_recovery_waiters)?,
         max_connections: f.u64_field("max_connections", d.max_connections)?,
         quota_partitions: f.u32_field("quota_partitions", d.quota_partitions)?,
+        budget_draw_tokens: f.u64_field("budget_draw_tokens", d.budget_draw_tokens)?,
         connection_stack_kib: f.u64_field("connection_stack_kib", d.connection_stack_kib)?,
         max_requests_per_connection: f
             .u32_field("max_requests_per_connection", d.max_requests_per_connection)?,
@@ -1561,6 +1579,11 @@ fn build_tenant(f: &Fields<'_>) -> Result<TenantConfig, ConfigError> {
                 Some(CostClass(u8::try_from(raw).unwrap_or(9)))
             }
         },
+        payment: hypellm_core::budget::PaymentInstructions::new(
+            f.opt_str("payment_message"),
+            f.opt_str("payment_url"),
+        )
+        .map_err(|e| f.error("invalid_payment_instructions", e.describe().to_owned()))?,
     })
 }
 
@@ -1729,7 +1752,7 @@ fn validate_endpoint(
         // What it costs is stated rather than hidden: traffic to an
         // orchestrated slave is unencrypted on the operator's own network, and
         // an attacker already on that network can read prompts and completions
-        // in flight. `docs/deferred-issues.md` records it.
+        // in flight. `spec/deferred-issues.html` records it.
         let private_cleartext = class == netaddr::AddressClass::Private
             && profile == EgressProfile::PRIVATE_NETWORK;
         if scheme == EndpointScheme::Http

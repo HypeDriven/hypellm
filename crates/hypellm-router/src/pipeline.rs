@@ -32,7 +32,7 @@ use hypellm_core::canonical::CanonicalRequest;
 use hypellm_core::decision::{Attempt, AttemptOutcome, DecisionTrace, ExclusionReason};
 use hypellm_core::error::{ErrorCode, RouterError};
 use hypellm_core::event::CanonicalEvent;
-use hypellm_core::ids::{GroupId, TargetId};
+use hypellm_core::ids::{GroupId, KeyId, TargetId};
 use hypellm_core::policy::RoutingContext;
 use hypellm_core::target::ProviderFamily;
 use hypellm_core::time::Deadline;
@@ -80,6 +80,24 @@ pub fn execute(
     permissions: hypellm_core::rbac::PermissionSet,
     sink: &mut dyn EventSink,
 ) -> Outcome {
+    execute_for_key(state, request, groups, permissions, None, sink)
+}
+
+/// [`execute`], for a request authenticated by a router API key.
+///
+/// `key` is what specification 12.1's token budget is charged to: every
+/// upstream attempt first reserves against it, and a key that cannot fund one
+/// is refused with `token_budget_exhausted` before anything is sent. `None`
+/// is a caller with no key — anonymous access, a management probe — and has
+/// no budget to charge.
+pub fn execute_for_key(
+    state: &RouterState,
+    request: &CanonicalRequest,
+    groups: &[GroupId],
+    permissions: hypellm_core::rbac::PermissionSet,
+    key: Option<&KeyId>,
+    sink: &mut dyn EventSink,
+) -> Outcome {
     // One snapshot for every round, recovery rounds included: a reload that
     // lands while a request waits for a machine to come back does not change
     // the policy that request is decided under.
@@ -88,12 +106,30 @@ pub fn execute(
     // recovery rounds included — sends the same request.
     let with_alias_sampling = alias_sampling(&config, request);
     let request = with_alias_sampling.as_ref().unwrap_or(request);
-    let first = execute_once(state, &config, request, groups, &permissions, sink);
+    // A stream settles a finite budget against the usage the provider
+    // reports, and an OpenAI-shaped provider reports it on a stream only when
+    // asked. Without this, a client that did not ask would be charged its whole
+    // reservation on every stream. The cost is one trailing usage chunk the
+    // client did not request, which is the chunk llama.cpp sends unasked
+    // anyway; keys without a limit are left exactly as they were.
+    let with_usage = key
+        .filter(|key| {
+            request.stream.enabled
+                && !request.stream.include_usage
+                && state.budgets.view(key).limit.is_some()
+        })
+        .map(|_| {
+            let mut request = request.clone();
+            request.stream.include_usage = true;
+            request
+        });
+    let request = with_usage.as_ref().unwrap_or(request);
+    let first = execute_once(state, &config, request, groups, &permissions, key, sink);
     let budget = recovery_budget(&config, request);
     if budget.is_zero() || !awaits_recovery(&first) {
         return first;
     }
-    await_recovery(state, &config, request, groups, &permissions, sink, first, budget)
+    await_recovery(state, &config, request, groups, &permissions, key, sink, first, budget)
 }
 
 /// The request with its alias's llama.cpp sampler settings applied, or `None`
@@ -202,6 +238,7 @@ fn await_recovery(
     request: &CanonicalRequest,
     groups: &[GroupId],
     permissions: &hypellm_core::rbac::PermissionSet,
+    key: Option<&KeyId>,
     sink: &mut dyn EventSink,
     first: Outcome,
     budget: Duration,
@@ -235,7 +272,7 @@ fn await_recovery(
         if sink.keepalive().is_err() {
             break "client_gone";
         }
-        outcome = execute_once(state, config, request, groups, permissions, sink);
+        outcome = execute_once(state, config, request, groups, permissions, key, sink);
         if !awaits_recovery(&outcome) {
             break if outcome.is_success() { "recovered" } else { "failed" };
         }
@@ -308,13 +345,76 @@ impl Drop for PendingGauge<'_> {
     }
 }
 
+/// The tokens one attempt against `target` reserves from the key's budget.
+///
+/// Specification 12.1: "a conservative input-token bound plus the enforced
+/// maximum output tokens", and when the client supplied no output limit, "the
+/// effective policy/target limit". The input bound uses the target's own
+/// declarations, as the context-window filter does. The output bound is the
+/// client's limit, else the limit the adapter will send on the target's
+/// behalf, else — for a target that declares none — its context window, which
+/// is the only ceiling left. Operations that generate nothing reserve no
+/// output.
+fn budget_tokens(
+    request: &CanonicalRequest,
+    target: &hypellm_core::target::Target,
+    default_document_token_estimate: u32,
+) -> u64 {
+    use hypellm_core::canonical::Operation;
+    let estimate = target.token_estimate(request.reasoning_effort, default_document_token_estimate);
+    let input = request.estimated_input_tokens_for(&estimate);
+    let output = match request.operation {
+        Operation::Embeddings | Operation::Rerank | Operation::Tokenize => 0,
+        Operation::Chat | Operation::Responses => {
+            let capabilities = &target.capabilities;
+            let cap = request.limits.max_output_tokens.unwrap_or(
+                if capabilities.max_output_tokens == 0 {
+                    capabilities.max_context_tokens
+                } else {
+                    capabilities.max_output_tokens
+                },
+            );
+            // The reasoning tier's multiplier, for the reason the admission
+            // estimate applies it: a high-effort request can produce several
+            // times its visible output.
+            u64::from(cap).saturating_mul(u64::from(estimate.output_multiplier.max(1)))
+        }
+    };
+    input.saturating_add(output)
+}
+
+/// Finish a budget hold and say so if the ledger could not keep up with it.
+fn finish_budget(
+    state: &RouterState,
+    hold: Option<hypellm_core::budget::BudgetReservation>,
+    usage: Option<u64>,
+) {
+    let Some(hold) = hold else { return };
+    let settlement = match usage {
+        Some(actual) => hold.settle(actual),
+        None => hold.retain(),
+    };
+    if !settlement.durable {
+        // The charge stands in memory and the key admits nothing until it is
+        // written; what an operator needs to know is that the disk is why.
+        state.telemetry.log(
+            &hypellm_telemetry::Event::critical("budget.overrun_not_durable").int_field(
+                hypellm_telemetry::Field::Count,
+                settlement.overrun,
+            ),
+        );
+    }
+}
+
 /// One pass through routing and the attempt loop.
+#[allow(clippy::too_many_arguments)]
 fn execute_once(
     state: &RouterState,
     config: &hypellm_config::ValidatedConfig,
     request: &CanonicalRequest,
     groups: &[GroupId],
     permissions: &hypellm_core::rbac::PermissionSet,
+    key: Option<&KeyId>,
     sink: &mut dyn EventSink,
 ) -> Outcome {
     let clock = state.clock.as_ref();
@@ -533,6 +633,82 @@ fn execute_once(
             }
         };
 
+        // Specification 12.1: "After authentication and authorization,
+        // admission MUST atomically reserve ... before upstream dispatch", and
+        // "each retry/failover attempt needs funded capacity before dispatch".
+        // So: per attempt, after the admission reservation (a request the
+        // rate limits would refuse anyway should not touch the ledger) and
+        // before the fleet step (a model must not be evicted for a request
+        // the key cannot pay for).
+        //
+        // A refusal ends the request. Trying the next candidate would be
+        // specification 12.2's "fail over to bypass the key budget": a target
+        // with a smaller output limit reserves less, and the caller would be
+        // quietly steered to it by an empty balance.
+        //
+        // `/v1/tokenize` is not a token-metered inference operation and is
+        // not charged.
+        let metered = request.operation != hypellm_core::canonical::Operation::Tokenize;
+        let mut budget_hold = match key.filter(|_| metered) {
+            None => None,
+            Some(key) => {
+                let tokens =
+                    budget_tokens(request, target, snapshot.default_document_token_estimate);
+                match state.budgets.reserve(key, &request.tenant, tokens) {
+                    Ok(hold) => Some(hold),
+                    Err(refusal) => {
+                        reservation.release_unused();
+                        permit.release(clock.now_millis());
+                        trace.exclusions.push(hypellm_core::decision::Exclusion {
+                            target: target.id.clone(),
+                            reason: ExclusionReason::BudgetExceeded,
+                        });
+                        let error = match refusal {
+                            hypellm_core::budget::BudgetRefusal::Exhausted { payment } => {
+                                state.telemetry.count(
+                                    hypellm_telemetry::names::ADMISSION_REJECTIONS,
+                                    "Admission rejections by scope and reason.",
+                                    &hypellm_telemetry::Labels::new()
+                                        .with(hypellm_telemetry::LabelName::Scope, "key")
+                                        .with(
+                                            hypellm_telemetry::LabelName::Reason,
+                                            ErrorCode::TokenBudgetExhausted.as_str(),
+                                        ),
+                                );
+                                // The key's own instructions, else its
+                                // tenant's, else none.
+                                RouterError::token_budget_exhausted(payment.or_else(|| {
+                                    config
+                                        .tenants
+                                        .get(&request.tenant)
+                                        .and_then(|tenant| tenant.payment.clone())
+                                }))
+                            }
+                            // The ledger could not be written. That says
+                            // nothing about the balance, so it is not a 402 —
+                            // and it is not admitted on the strength of a
+                            // reservation that would not survive a restart.
+                            hypellm_core::budget::BudgetRefusal::Unavailable => {
+                                state.telemetry.log(&hypellm_telemetry::Event::critical(
+                                    "budget.reservation_not_durable",
+                                ));
+                                RouterError::internal()
+                            }
+                        };
+                        return Outcome {
+                            trace,
+                            summary: None,
+                            error: Some(error),
+                            saw_output,
+                        };
+                    }
+                }
+            }
+        };
+
+        // Every reservation this attempt needs is now held.
+        sink.admitted();
+
         // The fleet step, placed here deliberately: after the admission
         // reservation and before any outbound I/O. Evicting a running model and
         // *then* discovering the tenant is over quota is exactly the unforced
@@ -557,6 +733,9 @@ fn execute_once(
                 });
                 // Nothing was sent: the whole estimate goes back.
                 reservation.release_unused();
+                if let Some(hold) = budget_hold.take() {
+                    hold.release();
+                }
                 permit.release(clock.now_millis());
                 continue;
             }
@@ -575,6 +754,9 @@ fn execute_once(
                     // every other, before the next candidate asks for
                     // capacity. Nothing was sent, so nothing was consumed.
                     reservation.release_unused();
+                    if let Some(hold) = budget_hold.take() {
+                        hold.release();
+                    }
                     permit.release(clock.now_millis());
                     last_failure = Some(AttemptFailure {
                         phase: dispatch::AttemptPhase::BeforeAcceptance,
@@ -751,6 +933,16 @@ fn execute_once(
                     estimate.saturating_sub(actual),
                 );
                 reservation.commit(actual);
+                // The key's budget settles against *validated provider usage*
+                // only. Where the provider reported none, the reservation is
+                // kept as the charge: specification 12.1 retains it "rather
+                // than refunding uncertain consumption", and the router's own
+                // estimate of what was used is exactly that uncertainty.
+                finish_budget(
+                    state,
+                    budget_hold.take(),
+                    summary.usage.is_reported().then_some(actual),
+                );
                 health.finish_success(
                     permit,
                     summary.first_byte_millis.unwrap_or(0),
@@ -784,9 +976,21 @@ fn execute_once(
                 // work and reported nothing, so the estimate is charged —
                 // the conservative direction.
                 match failure.phase {
-                    dispatch::AttemptPhase::BeforeAcceptance => reservation.release_unused(),
+                    dispatch::AttemptPhase::BeforeAcceptance => {
+                        reservation.release_unused();
+                        // "Requests rejected before upstream acceptance incur
+                        // no token charge."
+                        if let Some(hold) = budget_hold.take() {
+                            hold.release();
+                        }
+                    }
                     dispatch::AttemptPhase::AfterAcceptance
-                    | dispatch::AttemptPhase::AfterOutput => reservation.commit(estimate),
+                    | dispatch::AttemptPhase::AfterOutput => {
+                        reservation.commit(estimate);
+                        // Accepted, and no usage to settle against: a cut
+                        // stream, a timeout, a client that left.
+                        finish_budget(state, budget_hold.take(), None);
+                    }
                 }
                 if failure.client_cancelled {
                     // The caller went away. That is not the target's fault, so

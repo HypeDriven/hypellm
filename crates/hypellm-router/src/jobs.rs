@@ -573,11 +573,12 @@ pub fn worker_loop(state: &Arc<RouterState>) {
         }
 
         let mut sink = AccumulatingSink::default();
-        let outcome = pipeline::execute(
+        let outcome = pipeline::execute_for_key(
             state,
             &pending.request,
             &pending.groups,
             pending.permissions,
+            pending.key_id.as_ref(),
             &mut sink,
         );
         let now_wall = state.clock.wall_millis();

@@ -2142,20 +2142,36 @@ impl ResponsesStreamState {
 }
 
 fn error_frame(error: &RouterError) -> Frame {
-    frame(
-        "error",
-        vec![
-            ("code", Value::from(error.code.as_str())),
-            ("message", Value::from(error.detail.as_str())),
-            (
-                "param",
-                error
-                    .param
-                    .as_ref()
-                    .map_or(Value::Null, |p| Value::from(p.as_str())),
-            ),
-        ],
-    )
+    let mut fields = vec![
+        ("code", Value::from(error.code.as_str())),
+        ("message", Value::from(error.detail.as_str())),
+        (
+            "param",
+            error
+                .param
+                .as_ref()
+                .map_or(Value::Null, |p| Value::from(p.as_str())),
+        ),
+    ];
+    if let Some(payment) = payment_required(error) {
+        fields.push(("payment_required", payment));
+    }
+    frame("error", fields)
+}
+
+/// The `payment_required` object of specification 12.2, when the operator
+/// configured one.
+///
+/// Shared by every protocol's envelope so the details cannot differ between
+/// them. Two strings and nothing else: the instructions are data, and a client
+/// decides what to do with a URL it was merely told about.
+#[must_use]
+pub(crate) fn payment_required(error: &RouterError) -> Option<Value> {
+    let payment = error.payment_required.as_ref()?;
+    let mut object = Object::new();
+    object.push_opt("message", payment.message().map(Value::from));
+    object.push_opt("payment_url", payment.payment_url().map(Value::from));
+    Some(Value::Object(object))
 }
 
 /// Render the Responses stream frames for one canonical event.
@@ -2185,6 +2201,7 @@ pub fn render_error(error: &RouterError, request_id: Option<RequestId>) -> Strin
         "param",
         error.param.as_ref().map(|p| Value::from(p.as_str())),
     );
+    inner.push_opt("payment_required", payment_required(error));
 
     let mut root = Object::new();
     root.push("error", Value::Object(inner));

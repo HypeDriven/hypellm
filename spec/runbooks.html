@@ -1,0 +1,963 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: Operational runbooks.">
+  <title>Operational runbooks · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="./assets/wiki.css">
+  <script defer src="./assets/search-index.js"></script>
+  <script defer src="./assets/wiki.js"></script>
+</head>
+<body data-wiki-root="./" data-page-title="Operational runbooks" data-page-group="Operator guides">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="index.html">Wiki home</a></li>
+<li><a href="overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="router-specification.html">Router specification</a></li>
+<li><a href="threat-model.html">Threat model</a></li>
+<li><a href="orchestration.html">Fleet orchestration</a></li>
+<li><a href="deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="using-the-router.html">Using the router</a></li>
+<li><a href="deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="runbooks.html" aria-current="page">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="components/fleet-agent.html">Fleet agent</a></li>
+<li><a href="components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="components/container-init.html">Container init</a></li>
+<li><a href="components/tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="modules/hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="modules/hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="modules/hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="modules/hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="modules/hypellm-config.html">hypellm-config</a></li>
+<li><a href="modules/hypellm-core.html">hypellm-core</a></li>
+<li><a href="modules/hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="modules/hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="modules/hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="modules/hypellm-net.html">hypellm-net</a></li>
+<li><a href="modules/hypellm-router.html">hypellm-router</a></li>
+<li><a href="modules/hypellm-store.html">hypellm-store</a></li>
+<li><a href="modules/hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="modules/hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="modules/wire-http1.html">wire-http1</a></li>
+<li><a href="modules/wire-json.html">wire-json</a></li>
+<li><a href="modules/wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="index.html">Wiki</a><span aria-hidden="true">/</span>Operator guides</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="hypellm-router--operational-runbooks">HypeLLM Router — operational runbooks</h1>
+<p>These runbooks cover the four operational incidents defined by the project:
+provider outage, provider credential rotation, compromised router API key and
+Google identity outage. Commands and response fields match the current
+management API.</p>
+<p>Contents: <a href="#preconditions">Preconditions</a> · <a href="#221-provider-outage">22.1 Provider
+outage</a> · <a href="#222-credential-rotation">22.2 Credential
+rotation</a> · <a href="#223-compromised-router-api-key">22.3 Compromised router API
+key</a> · <a href="#224-google-identity-outage">22.4 Google identity
+outage</a></p>
+<hr />
+<h2 id="preconditions">Preconditions</h2>
+<p>Every management step below assumes an authenticated session on the management
+listener. Establish it once and reuse it.</p>
+<p><strong>Where the listener is.</strong> <code>settings admin_listen</code> in the configuration file
+(<code>crates/hypellm-config/src/schema.rs</code>). The inference listener is
+<code>settings inference_listen</code> and is a separate socket with a separate handler;
+<code>/admin/v1</code> is not reachable on it at all
+(<code>crates/hypellm-router/src/routes.rs</code>, exact-path matching).</p>
+<p><strong>How to authenticate.</strong> Sign in through Google OIDC:</p>
+<ol>
+<li><code>POST /admin/v1/auth/google/start</code> — returns the authorization URL and sets
+the transaction cookie.</li>
+<li>Complete the Google flow; the browser lands on
+<code>GET /admin/v1/auth/google/callback</code>.</li>
+<li>On success the router sets <code>__Host-hypellm_session</code>
+(<code>Secure; HttpOnly; SameSite=Lax; Path=/</code>) and returns <code>csrf_token</code> in the
+response body (<code>crates/hypellm-auth/src/session.rs</code>,
+<code>crates/hypellm-admin-api/src/handlers.rs</code>).</li>
+</ol>
+<p><strong>What every request needs.</strong></p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Requirement</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Session cookie</td>
+<td><code>__Host-hypellm_session=&lt;token&gt;</code></td>
+</tr>
+<tr>
+<td>CSRF header, on every non-GET/HEAD/OPTIONS request</td>
+<td><code>x-hypellm-csrf: &lt;csrf_token&gt;</code></td>
+</tr>
+<tr>
+<td><code>Origin</code>, if sent at all, must be on the allowlist</td>
+<td><code>settings cors_origins</code></td>
+</tr>
+<tr>
+<td><code>If-Match</code>, on mutating endpoints that expose an ETag</td>
+<td>the ETag from the preceding GET</td>
+</tr>
+</tbody>
+</table></div>
+<p>Read the current token at any time with <code>GET /admin/v1/session</code>, which also
+returns the principal, tenant, roles, and permissions. The CSRF token is
+returned in the <strong>body</strong>, never in a cookie.</p>
+<p><strong>The <code>__Host-</code> cookie prefix requires <code>Secure</code>, which requires HTTPS.</strong> The
+router does not terminate TLS (see <a href="deployment.html"><code>deployment.html</code></a>); the
+management listener must sit behind a TLS edge or sign-in will not work in any
+modern browser.</p>
+<p><strong>Permissions used below</strong> (<code>crates/hypellm-core/src/rbac.rs</code>):
+<code>ReadSummary</code>, <code>OperateTargets</code>, <code>QuarantineTargets</code>, <code>EditPolicy</code>,
+<code>SimulatePolicy</code>, <code>PublishPolicy</code>, <code>ManageKeys</code>, <code>ManageCredentials</code>,
+<code>ReadAudit</code>, <code>ReadDecisionTraces</code>.</p>
+<p><strong>Sensitive actions need a recent sign-in.</strong> <code>ManageCredentials</code>, <code>ManageKeys</code>,
+<code>PublishPolicy</code>, <code>ManagePrincipals</code>, <code>ManageSettings</code>, and <code>BreakGlass</code> require
+an authentication within the last 5 minutes
+(<code>crates/hypellm-core/src/rbac.rs</code>, <code>Permission::requires_reauthentication</code>;
+<code>SessionPolicy::reauthentication_millis</code>). A session older than that is refused
+with <code>reauthentication_required</code> — sign in again before starting 22.2 or 22.3,
+and note the consequence for 22.4.</p>
+<p><strong>Every mutation below writes a durable audit record before it is reported as
+applied.</strong> If the audit append fails, the action is refused with
+<code>internal_fault</code> and is <em>not</em> applied
+(<code>crates/hypellm-admin-api/src/handlers.rs</code>, <code>record_audit</code>).</p>
+<hr />
+<h2 id="221-provider-outage">22.1 Provider outage</h2>
+<p>Specification 22.1 steps 9–13. Read the whole runbook before acting: step 3 is
+the only <em>runtime</em> override — steps 4 and 5 are policy changes, and they go
+through the draft → validate → approve → activate path rather than taking effect
+on the spot.</p>
+<h3 id="1-confirm-target-health-and-breaker-reason">1. Confirm target health and breaker reason</h3>
+<pre><code>GET /admin/v1/overview        # ReadSummary
+GET /admin/v1/targets         # ReadSummary, paginated
+GET /admin/v1/traffic         # ReadSummary
+</code></pre>
+<p><code>overview</code> returns <code>targets_total</code>, <code>targets_healthy</code>, <code>targets_degraded</code>,
+<code>config_version</code>, <code>config_digest</code>, <code>audit_head</code>, <code>audit_records</code>.</p>
+<p><code>targets</code> returns, per target: <code>state</code>, <code>breaker_state</code>
+(<code>closed</code> / <code>open</code> / <code>half_open</code>), <code>in_flight</code>, <code>total_requests</code>,
+<code>total_failures</code>, <code>quarantined</code>, plus declared capabilities and cost class
+(<code>handlers.rs</code>, <code>render_target</code>).</p>
+<p><code>traffic</code> returns the figures the other two cannot: a rolling rate and latency
+window, and the admission limits beside their occupancy. The counters on
+<code>targets</code> are cumulative since the router started, so the ratio between them is
+the average over the whole uptime — on a router that was busy yesterday and is
+idle now, it reads as busy. Use <code>traffic</code> for &quot;what is happening&quot;, <code>targets</code> for
+&quot;what has happened&quot;.</p>
+<p>Two things about it are worth knowing before quoting a number from it:</p>
+<ul>
+<li><strong>Every window reports <code>covered_millis</code> as well as <code>window_millis</code>.</strong> The rate
+is <code>requests / covered_millis</code>, never <code>requests / window_millis</code>: a router up
+for thirty seconds has not lived through a minute, and dividing by the nominal
+window would understate it by half.</li>
+<li><strong>Percentiles are bucket upper bounds.</strong> <code>p99_millis: 25</code> means &quot;at or below
+25 ms&quot;. A percentile that fell past the largest bucket is <code>null</code> with a
+non-zero <code>above_largest_bucket</code>, which is &quot;longer than two minutes&quot; rather
+than &quot;two minutes&quot;. Specification 19.1's measured distributions come from
+<code>hypellm-bench</code>.</li>
+</ul>
+<p>Rate and latency are scoped to the caller's own tenant (Appendix B). <code>attributed: false</code> means this tenant's samples were not recorded — the router keeps a bounded
+set of per-tenant windows and every one was in use — and is <em>not</em> the same as no
+traffic. <code>capacity.available: false</code> means the deployment attached no admission
+controller to the management API.</p>
+<p>Neither response contains a provider credential, a provider error message, or
+any prompt content. Provider error text is dropped at the adapter boundary;
+only a sanitised <code>type</code>/<code>code</code> token ever survives
+(<code>crates/hypellm-adapters/src/contract.rs</code>, <code>safe_detail_for</code>).</p>
+<p><strong>Two caveats that will mislead you if you do not know them:</strong></p>
+<ul>
+<li><strong><code>breaker_state</code> is the worst state across operations</strong>, not the chat one.
+Health is tracked per <code>(target, operation)</code>; the summary answers &quot;is anything
+about this target broken&quot;, and <code>breaker_state_by_operation</code> alongside it says
+which. <code>targets_healthy</code> in the overview counts on the same rule, so the two
+views cannot disagree .</li>
+<li><strong>There is no &quot;breaker reason&quot; field.</strong> The specification asks for one; the
+API exposes counters and a state, not a cause. Use the decision traces and
+logs below to infer it.</li>
+</ul>
+<p>For a specific failed request, retrieve its trace:</p>
+<pre><code>GET /admin/v1/decisions/{request_id}      # ReadDecisionTraces
+</code></pre>
+<p>The <code>request_id</code> is the <code>X-Request-Id</code> response header the client received
+(<code>crates/hypellm-router/src/routes.rs</code>). The trace holds the policy digest, the
+ranked candidates, integer score terms, and exclusion reason codes — and by
+construction can hold no prompt, credential, or upstream URL. A trace belonging
+to another tenant is reported as <strong>not found</strong>, not as forbidden.</p>
+<p>Traces are an in-memory ring of 4 096 entries and are lost on restart
+(<code>crates/hypellm-admin-api/src/decisions.rs</code>).</p>
+<h3 id="2-automatic-breaking-is-already-running">2. Automatic breaking is already running</h3>
+<p>Before you intervene, know what the router does on its own
+(<code>crates/hypellm-core/src/health.rs</code>): a breaker opens on the configured failure
+threshold, cools down with a doubling delay capped at <code>max_cooldown_millis</code>
+(60 s by default), then admits <code>half_open_probes</code> (1) concurrent probes and
+closes after <code>half_open_successes_to_close</code> (3) consecutive successes.</p>
+<p>An upstream failure classified <code>Authentication</code> deliberately does <strong>not</strong> count
+against health (<code>crates/hypellm-adapters/src/contract.rs</code>,
+<code>UpstreamErrorClass::affects_health</code>) — a wrong router credential is a
+configuration problem, not an upstream outage, and must not trip a breaker.
+That is also why a hostile upstream can suppress breaker input by labelling its
+failures <code>authentication_error</code>; see <code>spec/modules/hypellm-adapters.html</code>.</p>
+<h3 id="3-quarantine-only-when-automatic-breaking-is-insufficient">3. Quarantine, only when automatic breaking is insufficient</h3>
+<pre><code>GET   /admin/v1/targets                    # capture the target's ETag
+PATCH /admin/v1/targets/{id}               # OperateTargets + QuarantineTargets
+      If-Match: &lt;etag&gt;
+      x-hypellm-csrf: &lt;token&gt;
+      {&quot;state&quot;:&quot;quarantined&quot;,&quot;reason&quot;:&quot;INC-1234 provider 5xx storm&quot;,&quot;duration_seconds&quot;:3600}
+</code></pre>
+<p><code>reason</code> is mandatory and must be non-empty; the request is refused without it.
+<code>duration_seconds</code> defaults to 3 600. Quarantine expiry uses the <strong>wall clock</strong>
+so it survives a restart, which also means a backwards clock step lengthens a
+quarantine and a forwards step shortens it (<code>crates/hypellm-core/src/time.rs</code>).</p>
+<p>Lift it with <code>{&quot;state&quot;:&quot;enabled&quot;}</code> on the same endpoint; lifting also requires
+<code>QuarantineTargets</code>, because un-quarantining is a quarantine-level action.</p>
+<blockquote>
+<p><strong><code>draining</code>, <code>maintenance</code>, <code>disabled</code> and <code>quarantined</code> all take effect
+immediately.</strong> The state is applied as a runtime override
+(<code>HealthRegistry::set_admin_state</code>) that routing prefers over the configured
+<code>target … state=</code> value, and the response reads the <em>effective</em> state back
+rather than echoing what you asked for — so if a live quarantine outranks a
+weaker state you requested, you will see that.</p>
+<p><strong>The override does not survive a restart.</strong> It is held in memory, and a
+restart re-reads the configuration. The response says so explicitly
+(<code>persists_across_restart: false</code>). For a change meant to outlive a restart,
+publish a policy draft (step 4).</p>
+<p><code>duration_seconds</code> is capped at 90 days and refused above it. For an
+indefinite removal use <code>{&quot;state&quot;:&quot;disabled&quot;}</code>, which is what it means anyway —
+a quarantine has a review time by definition (specification 13).</p>
+</blockquote>
+<h3 id="4-take-a-target-out-of-rotation-properly-policy-change">4. Take a target out of rotation properly (policy change)</h3>
+<p>Draining, disabling, or re-ranking a target is a configuration change and goes
+through the draft workflow:</p>
+<pre><code>POST /admin/v1/policies                    # EditPolicy
+     {&quot;configuration&quot;:&quot;&lt;the full configuration text&gt;&quot;}
+POST /admin/v1/policies/{draft}:validate   # EditPolicy or SimulatePolicy
+POST /admin/v1/policies/{draft}:simulate   # SimulatePolicy  (see the caveat below)
+POST /admin/v1/policies/{draft}:publish    # PublishPolicy, If-Match on the active ETag
+</code></pre>
+<p>A draft is the <strong>whole</strong> configuration document, not a patch. Publication is a
+durable <code>ConfigActivation</code> frame followed by an atomic pointer swap; requests
+already in flight keep their prior snapshot.</p>
+<p><strong>A publisher may not be the draft's author.</strong> The refusal lives in
+<code>DraftStore::prepare_publish</code> and is keyed on the draft, so no second code path
+can bypass it. During a single-operator incident this will block you: plan for a
+second authorised operator, or accept quarantine (step 3) as the only unilateral
+lever.</p>
+<p><strong>Undoing a publication does not need a second operator.</strong></p>
+<pre><code>POST /admin/v1/policies:rollback           # PublishPolicy, If-Match on the active ETag
+     {&quot;reason&quot;:&quot;routing regression, incident 4711&quot;}
+</code></pre>
+<p>The reason is required (8–256 characters) and is what a post-incident review
+reads. Publication needs two people because it activates something nobody has
+reviewed; rollback restores a configuration that was already published under
+that rule, so the second signature has already been given — and requiring
+another would put the recovery path out of reach exactly when one operator is
+awake.</p>
+<p>The restored configuration comes back under a <strong>new</strong> version number, not the
+old one. <code>config_version</code> therefore goes up, never back: two different
+configurations must never share a version, since <code>If-Match</code> ETags derive from
+it. The response reports <code>restored_from_version</code> so you can see which one came
+back. Eight versions are retained; a rollback with nothing to restore is a
+refusal, not a silent no-op.</p>
+<p><strong>Drafts survive a restart</strong> (256 retained, oldest evicted), so one awaiting a
+second approver is still there afterwards — during an incident that is the
+difference between waiting for a colleague and re-authoring a configuration
+under pressure.</p>
+<blockquote>
+<p><strong>A restored draft is unvalidated and must be validated again.</strong> The verdict
+is not persisted on purpose: it depends on the configuration grammar the
+running binary implements, so a stored &quot;valid&quot; replayed across an upgrade
+would let a draft that no longer builds be published as though it had been
+checked. Re-run <code>:validate</code> after a restart; it costs one call .</p>
+</blockquote>
+<h3 id="5-simulate-critical-aliases">5. Simulate critical aliases</h3>
+<pre><code>POST /admin/v1/policies/active:simulate?live=true   # SimulatePolicy
+POST /admin/v1/policies/{draft}:simulate            # SimulatePolicy
+     {&quot;alias&quot;:&quot;code-premium&quot;,&quot;operation&quot;:&quot;chat&quot;,&quot;input_tokens&quot;:120000,
+      &quot;principal&quot;:&quot;user:42&quot;,&quot;groups&quot;:[&quot;eng&quot;],&quot;residency&quot;:&quot;eu&quot;}
+</code></pre>
+<p>The simulation runs the production routing function
+(<code>PolicySnapshot::route</code>) so it cannot drift from what the router would decide,
+and it takes a <em>size</em> rather than prompt text — <code>input_tokens</code>, never a prompt.
+It returns the policy digest, whether the selection was pinned, the ranked
+candidates, and the exclusion reasons.</p>
+<p><strong>During an incident, use <code>active:simulate</code> with <code>live=true</code>.</strong> That routes
+against the real health registry — breakers, quarantines, operator overrides,
+observed failure rates, remaining capacity — and answers &quot;would this work right
+now&quot;. Without <code>live=true</code> it evaluates against <code>IdealLiveState</code>, which answers
+&quot;does policy permit this&quot; and is what you want when reviewing a <em>draft</em>: a
+target that happens to be breaking should not make a policy look wrong.</p>
+<p>The response carries <code>live_state</code>, so you can tell which question you asked. An
+answer of &quot;no eligible target&quot; means something different in each mode
+.</p>
+<blockquote>
+<p><strong>A simulation reserves nothing and calls no provider</strong> (specification 15.4).
+A live one reads admission and health state without consuming any, so
+simulating cannot cause the rejection it is investigating.</p>
+<p><code>input_tokens</code> is bounded ; keep it realistic anyway, since it is
+expanded into filler.</p>
+</blockquote>
+<h3 id="6-do-not-broaden-model-families-or-residency-during-an-incident">6. Do not broaden model families or residency during an incident</h3>
+<p>This is a procedural rule, and the code supports holding it: residency,
+capability, and allowlist constraints are <em>eligibility filters</em>, never score
+penalties (<code>crates/hypellm-core/src/policy.rs</code>, <code>PolicySnapshot::evaluate</code>
+returns <code>Err(ExclusionReason)</code> and never constructs a <code>Candidate</code>). There is no
+&quot;soften the filter&quot; knob to reach for under pressure, and adding one would be a
+compliance bypass expressed as a tuning change.</p>
+<p>A higher-precedence deny is sticky downward: no lower-precedence binding can
+re-enable it, and an exact-specificity tie ORs the deny bits, failing closed
+(<code>MergedBindings::is_denied</code>). Adding a permissive binding during an incident
+will therefore <em>not</em> lift an existing deny.</p>
+<h3 id="7-after-recovery">7. After recovery</h3>
+<p>Half-open probing and closure are automatic (step 2); no operator action is
+needed and none is available. Lift any quarantine you set with
+<code>PATCH /admin/v1/targets/{id}</code> <code>{&quot;state&quot;:&quot;enabled&quot;}</code>, then watch
+<code>total_failures</code> and <code>breaker_state</code> on <code>GET /admin/v1/targets</code>.</p>
+<p><strong>Weight restoration is automatic too.</strong> For thirty seconds after a breaker
+closes, the target's health score is ramped back rather than restored at once,
+so it takes a growing share of traffic instead of all of it — two successful
+probes make a target <em>probably</em> healthy, and the cost of &quot;probably&quot; being wrong
+is the full load arriving at something still warming up and reopening the
+breaker.</p>
+<blockquote>
+<p>The ramp is a <strong>score</strong> term, never a filter. A recovered target that is the
+only candidate is still chosen; it is merely less preferred than one that has
+been healthy throughout. Do not read a lower rank during that window as the
+target being excluded .</p>
+</blockquote>
+<p>Close the incident against the audit record. <code>GET /admin/v1/audit</code> shows the
+quarantine and any policy publication, tenant-scoped and cursor-paginated. It
+reads a 2 048-entry in-memory ring by default; add <code>durable=true</code> to read the
+authoritative chain in <code>&lt;state_dir&gt;/log.bin</code> instead, which is what an incident
+needing evidence should use.</p>
+<hr />
+<h2 id="222-credential-rotation">22.2 Credential rotation</h2>
+<p>Specification 22.2 steps 14–18.</p>
+<h3 id="where-a-provider-credential-actually-lives">Where a provider credential actually lives</h3>
+<ul>
+<li>On disk: <code>&lt;secrets&gt;/credentials/&lt;credential-id&gt;</code>, one file per <code>credential</code>
+record, mode 0600 when the router wrote it
+(<code>crates/hypellm-router/src/state.rs</code>, <code>CredentialStore::store</code>).</li>
+<li>Read at startup by <code>Secrets::load_provider_credentials</code>
+(<code>crates/hypellm-router/src/startup.rs</code>), which reads <strong>only</strong> the files the
+configuration declares — a file nobody declared is never read, and a declared
+file that is missing or empty is a startup failure (exit code 5). Trailing
+<code>\n</code>/<code>\r</code> are trimmed, so <code>echo key &gt; file</code> works.</li>
+<li>In memory: <code>CredentialStore</code>, reachable only through a scoped borrow inside
+the adapter boundary. No management endpoint can read a secret back; there is
+no handler and no permission for it.</li>
+<li><strong>Never</strong> in the append-only log, and never in configuration — the
+<code>credential</code> record carries <code>id</code>, <code>scope</code>, <code>description</code>, and
+<code>rotates_after_days</code>, never a value.</li>
+</ul>
+<h3 id="1-write-the-new-credential-version">1. Write the new credential version</h3>
+<pre><code>POST /admin/v1/credentials/{id}:rotate      # ManageCredentials
+     x-hypellm-csrf: &lt;token&gt;
+     {&quot;secret&quot;:&quot;&lt;the new provider key&gt;&quot;}
+</code></pre>
+<p>The endpoint is write-only: the secret is accepted, never echoed, never logged.
+The reference must already exist as a <code>credential</code> record in the active
+configuration — rotating an unknown id returns 404 rather than silently creating
+one, because a typo that created a new credential would leave you believing you
+had rotated something you had not.</p>
+<p><code>store_credential</code> writes <code>&lt;secrets&gt;/credentials/&lt;id&gt;</code> atomically, <code>chmod</code>s it
+to 0600, and only then updates the in-memory value — durable first, so a
+rotation reported as applied is not undone by the next restart. If the router
+was started without <code>--secrets</code> (no credential directory), the endpoint fails
+closed with <code>internal_fault</code> and the message &quot;this router has no credential
+store configured, so the secret was not stored&quot;.</p>
+<p><code>POST /admin/v1/credentials</code> (same permission, body <code>{&quot;id&quot;:…,&quot;secret&quot;:…}</code>)
+creates a new one. It writes the file but does <strong>not</strong> add the <code>credential</code>
+record to the configuration — do that through a policy draft (22.1 step 4)
+before the router will load it at the next start.</p>
+<h3 id="2-validate-with-a-low-cost-probe">2. Validate with a low-cost probe</h3>
+<pre><code>POST /admin/v1/credentials/{id}:probe
+</code></pre>
+<p><code>ManageCredentials</code>, no body. It issues one request through the ordinary adapter
+and dispatch path — the cheapest enabled target that uses the credential, one
+output token, ten-second deadline — and answers:</p>
+<pre><code class="language-json">{&quot;id&quot;:&quot;provider-secret&quot;,&quot;ok&quot;:true,&quot;target&quot;:&quot;openai:gpt&quot;,&quot;elapsed_ms&quot;:412}
+</code></pre>
+<p>On failure, <code>ok</code> is false and <code>class</code> and <code>provider_code</code> say what the provider
+returned. The provider's <em>message</em> is never included: an authentication error is
+exactly where a provider echoes the key back.</p>
+<p><strong>Probe immediately after every rotation.</strong> Do not wait for traffic to tell you.
+A probe that cannot run — no enabled target uses the credential — is reported as
+a refusal, not as a pass; treat that as &quot;unvalidated&quot;, because it is.</p>
+<p>The probe does not reserve admission capacity, so it cannot be pushed out by
+tenant load and cannot push tenant traffic out. It does cost one provider call.</p>
+<p>An upstream authentication failure is deliberately reported to the client as
+<code>internal_fault</code>, not as an auth error, so that a router credential problem is
+never mistaken for the caller's key being wrong
+(<code>crates/hypellm-router/src/dispatch.rs</code>). It also does not trip the breaker. A
+bad rotation therefore presents as a quiet per-request 500 — watch the router's
+own logs, not the breaker state.</p>
+<h3 id="3-activation-and-the-overlap-window">3. Activation, and the overlap window</h3>
+<p>The new value is live the instant <code>store_credential</code> returns. There is no
+staging step and nothing further to activate.</p>
+<p>Specification 22.2 step 16's <strong>bounded overlap</strong> covers one specific mistake:
+rotating before the provider has activated the new secret. For five minutes
+after a rotation, a request that the provider refuses <em>on authentication</em> is
+retried once with the superseded secret, so a premature rotation does not take
+the target out of service.</p>
+<blockquote>
+<p><strong>The window is not a grace period, and it tells on itself.</strong> Any use of the
+superseded secret sets <code>rotation_unaccepted: true</code> on the credential, emits a
+<code>critical</code> <code>credential.rotation_unaccepted</code> log event, and increments
+<code>hypellm_credential_fallbacks_total</code>. That flag means <em>the provider is refusing
+your new credential</em> — act on it now, because when the window closes every
+request fails at once.</p>
+<p>A rotation the provider has already accepted retires the old secret on its
+first success, so the healthy case lasts one request and emits nothing.</p>
+<p><strong>Still rotate in the right order</strong>, because the window is five minutes and
+not a plan: create the new key at the provider, confirm it works, rotate here,
+probe (step 2), and only then revoke the old one at the provider .</p>
+</blockquote>
+<h3 id="4-drain-connections-whose-authentication-is-connection-bound">4. Drain connections whose authentication is connection-bound</h3>
+<p>Provider authentication in this router is per-request (an <code>Authorization</code> or
+<code>x-api-key</code> header built inside the adapter), so a pooled socket does not carry
+a stale credential. The connection pool nonetheless keys on a credential
+isolation class, and <code>ConnectionPool::drain_key</code> exists so that one rotation
+closes only the affected sockets (<code>crates/hypellm-net/src/pool.rs</code>).</p>
+<p>Rotation drains automatically: the response carries <code>connections_drained</code>, the
+count of idle pooled sockets that were opened under that credential and have now
+been closed. A connection currently serving a request is left alone — it was
+authenticated under the old secret and its exchange is already in flight, so
+killing it would turn a rotation into a client-visible failure.</p>
+<blockquote>
+<p><strong><code>connections_drained: 0</code> is normal.</strong> Provider authentication in this router
+is per-request, so a pooled socket carries no stale credential and there is
+usually nothing that needs dropping. The wiring exists so that a provider with
+connection-bound authentication works correctly without anyone having to
+notice this first .</p>
+</blockquote>
+<p>If you want certainty, restart the router (see
+<a href="deployment.html#shutdown"><code>deployment.html</code></a>); the credential is already durable, so
+the restart picks up the new value.</p>
+<h3 id="5-revoke-the-old-credential-and-close-the-record">5. Revoke the old credential and close the record</h3>
+<p>Revoke the old key <strong>at the provider</strong>. The router has no notion of a previous
+version — the old value was overwritten in step 1 and is not recoverable from
+the router.</p>
+<p>Confirm no further use by watching the target's <code>total_failures</code> and the
+router's logs for upstream authentication failures.</p>
+<p>The rotation is already recorded: <code>rotate_credential</code> appends an
+<code>AuditAction::CredentialRotated</code> record naming the actor, the credential
+reference, and the tenant, and refuses the rotation outright if that record
+cannot be written durably. It is in <code>log.bin</code>.</p>
+<p><strong>Reading it back.</strong> <code>GET /admin/v1/audit?action=credential_rotated&amp;durable=true</code>
+shows the rotation, read from the durable chain rather than from the in-memory
+ring — so it is there however long ago it happened and across any restart since.</p>
+<hr />
+<h2 id="223-compromised-router-api-key">22.3 Compromised router API key</h2>
+<p>Specification 22.3 steps 19–22. This is about a <em>client</em> key — the
+<code>hypellmk_…</code> credential a coding harness presents on the inference listener — not
+about a provider credential.</p>
+<h3 id="1-revoke-the-key-id-immediately">1. Revoke the key id immediately</h3>
+<pre><code>GET    /admin/v1/keys                # ManageKeys, tenant-scoped, no secret material
+DELETE /admin/v1/keys/{key_id}       # ManageKeys
+       x-hypellm-csrf: &lt;token&gt;
+</code></pre>
+<p><code>revoke_key</code> appends a durable <code>ApiKeyRevocation</code> frame <strong>before</strong> revoking in
+memory, and refuses the revocation if that append fails. A revocation that never
+reached the log would be undone by the next restart, resurrecting the key that
+was revoked precisely because it leaked
+(<code>crates/hypellm-admin-api/src/handlers.rs</code>, <code>revoke_key</code>;
+<code>crates/hypellm-router/src/startup.rs</code>, <code>restore_keys</code>).</p>
+<p>Revocation is in-process and takes effect on the next verification. It does not
+go through the policy draft workflow, so specification 22.3's &quot;revocation
+bypasses configuration publication delay&quot; holds: there is no publication delay
+in this path at all.</p>
+<p>A key that belongs to another tenant returns 404, not 403.</p>
+<p><strong>If a request is in flight when you revoke, it finishes.</strong> Revocation is
+checked at authentication, not per-attempt. Streaming responses can therefore
+outlive the revocation by up to the request deadline
+(<code>settings default_deadline_ms</code>, 120 s by default).</p>
+<h3 id="2-search-the-audit-and-usage-record">2. Search the audit and usage record</h3>
+<pre><code>GET /admin/v1/audit?limit=500        # ReadAudit, cursor-paginated, tenant-scoped
+GET /admin/v1/usage                  # ReadOwnUsage / ReadTenantUsage
+</code></pre>
+<blockquote>
+<p><strong>The view is a window, not the record.</strong> Every management mutation is
+durably audited — <code>record_audit</code> refuses the action outright if the append
+fails — and <code>GET /admin/v1/audit</code> shows those records for your tenant.</p>
+<p><strong>Pass <code>durable=true</code> for an investigation.</strong> Without it the endpoint reads a
+bounded 2 048-entry in-memory ring that does not survive a restart. With it,
+and with any of <code>actor</code>, <code>action</code>, <code>since</code>, or <code>until</code>, it reads the
+authoritative chain in <code>&lt;state_dir&gt;/log.bin</code>. For anything that has to stand
+up as evidence, use <code>GET /admin/v1/audit/export</code>, which emits the chain
+together with the checkpoints that authenticate it.</p>
+</blockquote>
+<p>Audit records carry <code>sequence</code>, <code>timestamp</code>, <code>actor</code>,
+<code>action</code>, <code>outcome</code>, <code>object</code>, <code>tenant</code>, and where set a <code>reason</code> and <code>source</code>.
+<code>GET /admin/v1/usage</code> is unaffected and returns per-(alias, target, operation,
+status, cost class) totals for the caller's tenant, distinguishing
+provider-reported from router-estimated numbers so an estimate cannot read as a
+bill.</p>
+<blockquote>
+<p><strong>Searching &quot;by key pseudonym&quot; is not available.</strong> Specification 22.3 step 20
+asks for it. <code>Pseudonymizer</code> produces deterministic tenant and principal
+pseudonyms for <strong>log lines</strong> (<code>crates/hypellm-telemetry/src/logs.rs</code>), and
+<code>GET /admin/v1/usage</code> still carries no key dimension, so &quot;search <em>usage</em> by
+key pseudonym&quot; is unmet. For the audit half, filter directly:</p>
+<pre><code>GET /admin/v1/audit?actor=user:someone&amp;action=key_revoked&amp;since=&lt;ms&gt;&amp;until=&lt;ms&gt;&amp;durable=true
+</code></pre>
+<p>Every parameter narrows and none widens: the tenant filter runs first, so no
+query string reaches another tenant's records. For usage, filter the router's
+structured logs by the principal pseudonym and correlate to the key through
+<code>GET /admin/v1/keys</code> .</p>
+<p><strong><code>method</code> distinguishes how a caller authenticated:</strong> <code>api_key</code>, <code>oidc</code>,
+<code>break_glass</code>, or <code>local_peer</code>.</p>
+<p>The in-memory audit index is a 2 048-record ring and is lost on restart; the
+durable chain in <code>log.bin</code> is authoritative. <code>durable=true</code> reads it, and
+<code>GET /admin/v1/audit/export</code> emits it with its checkpoints.</p>
+</blockquote>
+<p>Also inspect decision traces for suspicious requests, if they are still in the
+4 096-entry ring: <code>GET /admin/v1/decisions/{request_id}</code>.</p>
+<h3 id="3-rotate-downstream-provider-credentials-only-on-evidence">3. Rotate downstream provider credentials only on evidence</h3>
+<p>A client key does <strong>not</strong> grant a read of any provider secret. There is no
+endpoint, no permission, and no code path that returns one; adapters hold the
+only access, through a scoped borrow. A leaked client key lets the holder <em>spend</em>
+against your providers through the router, and does not disclose the provider
+credential itself.</p>
+<p>Rotate provider credentials (22.2) only if you have evidence of adapter or
+credential exposure — for example filesystem access to <code>&lt;secrets&gt;/credentials/</code>,
+or a process-memory compromise. Assess the blast radius from
+<code>GET /admin/v1/usage</code> and the target-level counters.</p>
+<h3 id="4-create-a-least-privilege-replacement">4. Create a least-privilege replacement</h3>
+<pre><code>POST /admin/v1/keys                  # ManageKeys
+     x-hypellm-csrf: &lt;token&gt;
+     {&quot;principal&quot;:&quot;svc:harness-a&quot;,&quot;scopes&quot;:[&quot;inference&quot;],
+      &quot;expires_at&quot;:&lt;unix-millis&gt;,&quot;description&quot;:&quot;INC-1234 replacement&quot;}
+</code></pre>
+<p>The secret is returned <strong>exactly once</strong>, in the creation response, and is never
+retrievable again (<code>NewKey::into_secret</code>, and the type is not <code>Clone</code>).
+<code>list_keys</code> returns no secret and no verifier material.</p>
+<p>At least one scope is required. The scope vocabulary is closed —
+<code>inference</code>, <code>embeddings</code>, <code>models</code>, <code>tokenize</code>, <code>management:read</code>,
+<code>management:write</code> (<code>crates/hypellm-auth/src/apikey.rs</code>, <code>Scope::as_str</code>) — and an
+unknown scope string is rejected. A browser session carries an <strong>empty</strong> scope
+set by design (<code>Principal::from_session</code>), so a CSRF against the admin UI can
+never spend a tenant's token budget.</p>
+<p>A key carrying a management scope reaches <code>/admin/v1</code>, with the permissions its
+principal's <code>role_binding</code> records grant and never <code>BreakGlass</code> or <code>ManageKeys</code>.
+The key record itself carries no roles, so <strong>withdrawing a role binding
+de-powers every key that principal holds immediately</strong> — that, rather than
+revocation, is the fastest way to stop a compromised automation without
+breaking the ones that share its tenant.</p>
+<p>The key is created in the <strong>creating session's tenant</strong>, not in a tenant named
+in the request.</p>
+<p>Pin the replacement to the network it will actually be used from — that is the
+least-privilege step this runbook exists for:</p>
+<pre><code class="language-json">{&quot;principal&quot;:&quot;svc:worker&quot;,&quot;scopes&quot;:[&quot;inference&quot;],
+ &quot;source_networks&quot;:[&quot;10.2.0.0/16&quot;]}
+</code></pre>
+<p>Each entry is a CIDR block; a bare address is refused, so write <code>/32</code> if you
+mean one host. Omitting <code>source_networks</code> gives an unrestricted key, and a
+listing shows <code>null</code> for one. A restricted key whose peer address cannot be
+determined <strong>fails closed</strong> — worth knowing if the key will be used from behind
+a proxy that does not preserve the source address .</p>
+<p>Document the incident in the audit trail by attaching a <code>description</code> to the
+key; key creation and revocation both append audit records automatically.</p>
+<hr />
+<h2 id="224-google-identity-outage">22.4 Google identity outage</h2>
+<p>Specification 22.4. <strong>Read this section before you need it, and preprovision the
+break-glass token now</strong> — it is minted once by <code>--generate-secrets</code>, printed
+once, and cannot be recovered afterwards. See <a href="#break-glass-access">Break-glass
+access</a> below.</p>
+<h3 id="before-an-outage-bind-the-identities">Before an outage: bind the identities</h3>
+<p>Sign-in resolves a Google account to a local principal through an <code>identity</code>
+record, and refuses any account that has none. A deployment with no <code>identity</code>
+records has nobody who can sign in — which fails closed correctly, but is
+discovered at the worst moment.</p>
+<pre><code class="language-text">identity issuer=https://accounts.google.com subject=&lt;the sub claim&gt; \
+         principal=user:alice tenant=acme description=&quot;on-call&quot;
+role_binding subject=principal:user:alice role=operator
+</code></pre>
+<p>The <code>subject</code> is the <code>sub</code> claim, not the email address: specification 9.1
+makes <code>(iss, sub)</code> the stable identity because an email can be reassigned to a
+different person. The <code>tenant</code> is explicit for the same reason — it decides
+whose data that operator sees.</p>
+<p><code>GET /admin/v1/access</code> lists the identities, service principals, groups and
+live sessions of your tenant, which is the fastest way to check who can
+currently reach the management plane. <code>GET /admin/v1/settings</code> reports whether
+sign-in is configured at all (<code>oidc.configured</code>, <code>oidc.verifier_configured</code>)
+without disclosing the verifier's socket path.</p>
+<h3 id="what-happens-automatically">What happens automatically</h3>
+<ul>
+<li><strong>Existing sessions continue</strong> until their configured lifetime expires:
+30 minutes idle, 12 hours absolute by default, overridable through
+<code>settings session_idle_secs</code> and <code>settings session_absolute_secs</code>
+(<code>crates/hypellm-auth/src/session.rs</code>, <code>SessionPolicy</code>;
+<code>crates/hypellm-router/src/startup.rs</code>).</li>
+<li><strong>New sign-ins fail closed.</strong> <code>oidc_start</code> requires a configured
+<code>OidcConfig</code>; <code>oidc_callback</code> requires the verifier to return claims. An
+unreachable verifier maps to <code>OidcError::VerifierUnavailable</code> and a refusal to
+<code>OidcError::SignatureInvalid</code> — both are rejections. <code>parse_claims</code> returns
+nothing without <code>iss</code> and <code>sub</code>, and defaults <code>email_verified</code> to <code>false</code>, so
+an absent claim can never read as verified
+(<code>crates/hypellm-net/src/helper.rs</code>, <code>crates/hypellm-auth/src/oidc.rs</code>).</li>
+<li><strong>The inference data plane is unaffected.</strong> It authenticates with router API
+keys and never consults the identity verifier
+(<code>crates/hypellm-router/src/routes.rs</code>, <code>authenticate</code>). A Google outage is a
+management-plane outage only.</li>
+</ul>
+<h3 id="do-not-do-this">Do not do this</h3>
+<p>The specification is explicit and so is the code's shape: <strong>the router MUST NOT
+disable authentication or accept unverified identity claims to restore
+convenience.</strong> There is no configuration flag that skips verification, no
+&quot;trust the id_token without checking&quot; path, and <code>validate_claims</code> is the single
+place <code>iss</code>, <code>aud</code>, <code>exp</code>, and <code>nonce</code> are checked so a check cannot be skipped
+on one of two paths. Removing <code>oidc_verifier_socket</code> from the configuration does
+not weaken authentication — it disables sign-in entirely, which is the correct
+failure.</p>
+<h3 id="break-glass-access">Break-glass access</h3>
+<p>Specification 22.4's preprovisioned local method. It does not touch the identity
+provider, because the case it exists for is that provider being unreachable.</p>
+<p><strong>Preparation, before you need it.</strong> <code>--generate-secrets</code> prints the token once
+and stores only a verifier; the token is yours to keep offline. Then declare who
+it authenticates as:</p>
+<pre><code class="language-text">settings break_glass_principal=user:oncall break_glass_tenant=acme \
+         break_glass_ttl_secs=900
+role_binding subject=principal:user:oncall role=break_glass_admin
+</code></pre>
+<p>Both settings are required. Omit either and the endpoint returns 404 — a
+deployment with no preprovisioned token should not advertise that the path is
+live. The <code>role_binding</code> is required too: the token establishes <em>who</em> you are,
+not <em>what</em> you may do, and a principal with no binding is refused rather than
+handed a session that fails at every endpoint.</p>
+<p><strong>Use.</strong> The admin application offers it on the sign-in screen, under
+<strong>Use break-glass access</strong> — and reveals it by itself when Google sign-in
+answers <code>not_found</code>, which is what a deployment with no <code>oidc</code> record answers.
+That is the path to prefer during an incident: it is the same endpoint, and it
+keeps the token out of a shell history.</p>
+<p>Directly, for automation and for a router serving no static assets:</p>
+<pre><code>curl -X POST https://admin.example/admin/v1/auth/break-glass \
+     -H 'Content-Type: application/json' \
+     -d '{&quot;token&quot;:&quot;&lt;the offline token&gt;&quot;,&quot;reason&quot;:&quot;google oidc unreachable, incident 4711&quot;}'
+</code></pre>
+<p>The reason is mandatory (8–256 characters) and is what a later review reads. It
+is checked <em>before</em> the token, so the endpoint answers identically whether or
+not the caller holds one.</p>
+<p>The response sets the session cookie and returns <code>csrf_token</code> and
+<code>expires_in_seconds</code>. The session's absolute lifetime is
+<code>break_glass_ttl_secs</code>, independent of the ordinary twelve-hour ceiling and
+clamped to it; when the window closes the session stops working, whether or not
+it has been in continuous use.</p>
+<p><strong>What it records.</strong> <code>break_glass_opened</code> with the reason, <code>break_glass_closed</code>
+on sign-out, and a <code>login_failed</code> record on every refusal — all in the durable
+chain and all visible in <code>GET /admin/v1/audit</code>. Each also emits a <code>critical</code> log
+event, which is what your alerting should key on:</p>
+<pre><code>event=auth.break_glass_opened
+event=auth.break_glass_closed
+event=auth.break_glass_refused
+</code></pre>
+<p>Alert on all three. A refusal means either an operator with a stale copy of the
+token or someone probing the recovery path, and both are worth waking somebody
+for.</p>
+<p><strong>Sign out when done.</strong> <code>POST /admin/v1/logout</code> writes the closing record, which
+is what gives a review the window rather than only its start. An expiring
+session leaves no closing record; the opening one carries the lifetime, so the
+window is still bounded, but explicitly closing is better evidence.</p>
+<blockquote>
+<p><strong>The reauthentication rule still applies.</strong> <code>Permission::requires_reauthentication</code>
+covers credential changes, key management, and policy publication, and it
+requires an authentication within the last 5 minutes. A break-glass session
+authenticates at issue, so those actions are available for the first five
+minutes of the window. Plan the sensitive step first.</p>
+</blockquote>
+<h3 id="what-you-can-actually-do-during-an-outage">What you can actually do during an outage</h3>
+<ol>
+<li>
+<p><strong>Use break-glass.</strong> That is what it is for; see above. The remaining steps
+apply when no break-glass token was preprovisioned, or when it too has been
+lost.</p>
+</li>
+<li>
+<p><strong>Keep an open session.</strong> If an operator already has one, do not log out —
+<code>POST /admin/v1/logout</code> is irreversible until Google returns. Note the
+absolute lifetime: a 12-hour ceiling applies regardless of activity, and
+sensitive actions additionally require a re-authentication within the last
+5 minutes (<code>SessionPolicy::reauthentication_millis</code>), which a Google outage
+makes impossible. In practice a long outage locks out even an open session
+for privileged operations.</p>
+</li>
+<li>
+<p><strong>Verify the outage is Google's, not yours.</strong> The verifier is a local Unix
+socket at <code>settings oidc_verifier_socket</code>. Check the socket exists and the
+helper process is running before blaming the identity provider — an
+unreachable <em>local</em> verifier is indistinguishable from an unreachable Google
+from inside the router, and both surface as <code>VerifierUnavailable</code>. An
+oversized token is also reported as <code>VerifierUnavailable</code>, so this signal is
+not precise (<code>crates/hypellm-net/src/helper.rs</code>).</p>
+</li>
+<li>
+<p><strong>The data plane needs nothing.</strong> Inference continues on the existing
+configuration and existing API keys. Resist the temptation to restart the
+router &quot;to clear it&quot;: a restart drops every management session and, with
+Google down, leaves the control plane unreachable. The router does resume the
+last durably activated configuration on restart
+(<code>startup::resume_activation</code>), so routing itself survives — but you will
+have no way back into <code>/admin/v1</code>.</p>
+</li>
+<li>
+<p><strong>Emergency configuration changes go through the file, with a restart.</strong> The
+configuration file named by <code>--config</code> is validated at startup and, if no
+activation is recorded in the state log, becomes the active configuration.
+Validate first without touching the running process:</p>
+<pre><code>hypellm-router --check --config /etc/hypellm/hypellm.conf
+</code></pre>
+<p>which prints the provider, target, and alias counts and the digest, and exits
+2 on any error.</p>
+<blockquote>
+<p><strong>Editing the file is not enough on its own.</strong> If a policy has ever been
+published through the management API, startup resumes <em>that</em> configuration
+from the durable log and ignores your edited file — which is correct, or a
+reviewed policy would vanish on a restart.</p>
+<p>To override it, start once with the reason recorded:</p>
+<pre><code>hypellm-router --adopt-config &quot;google outage, reverting to file, incident 4711&quot; \
+             --config /etc/hypellm/hypellm.conf --secrets /etc/hypellm/secrets
+</code></pre>
+<p>This writes the file as a new activation and appends a <code>config_adopted</code>
+audit record, so the override is attributable afterwards and persists
+across later restarts. It is <strong>not</strong> the old workaround of starting against
+an empty state directory, which discarded the audit chain and every stored
+API key .</p>
+</blockquote>
+</li>
+<li>
+<p><strong>Review afterwards.</strong> Every break-glass window is in <code>GET /admin/v1/audit</code>
+with its reason. Read them after the incident, not during it.</p>
+</li>
+</ol>
+<h3 id="preparing-before-the-next-outage">Preparing before the next outage</h3>
+<ul>
+<li><strong>Preprovision a break-glass token and store it offline</strong>, and check that the
+principal it names still has its <code>role_binding</code>. A token whose principal lost
+its binding fails at exactly the moment you need it, and nothing tells you
+before then.</li>
+<li>Keep at least two operators with <code>PublishPolicy</code> (publication requires a
+distinct approver, so one operator alone cannot change policy even with a
+session).</li>
+<li>Keep the configuration file on disk in sync with the last published policy, so
+the file-adoption path in step 5 is a viable last resort rather than a rewrite.</li>
+<li>Take routine backups of the state directory (<code>Store::backup_to</code>, or a copy of
+a quiesced directory) so the destructive path in step 5 is recoverable.</li>
+</ul>
+<h2 id="225-fleet-incidents">22.5 Fleet incidents</h2>
+<p>The fleet is the set of accelerator hosts behind the aliases, and its failures
+look different from a provider outage: the model an alias points at may be
+correct, declared, and simply <em>not running</em>. Specification §26 and
+<a href="orchestration.html">orchestration.html</a> are the design; this is what to do at three
+in the morning.</p>
+<h3 id="symptom-requests-refused-with-the-requested-capability-is-not-available">Symptom: requests refused with &quot;the requested capability is not available&quot;</h3>
+<p>The data-plane error names nothing on purpose — host identifiers and residency
+are management-plane data — so the diagnosis happens on the Fleet screen or:</p>
+<pre><code class="language-bash">curl -s --unix-socket /dev/null https://admin.example/admin/v1/fleet | jq .
+</code></pre>
+<p>Read <code>observation_age_ms</code> <strong>first</strong>. It gates every other decision:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>What you see</th>
+<th>What it means</th>
+<th>What to do</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>null</code></td>
+<td>The router has never reached an agent. This is not &quot;0 seconds&quot;; it is &quot;never&quot;.</td>
+<td>Check the agent is running and the socket path in <code>fleet_agent</code> matches.</td>
+</tr>
+<tr>
+<td>Larger than <code>observation_max_age_ms</code></td>
+<td>Belief has expired. Cold targets are ineligible and no plan will execute; warm ones keep serving.</td>
+<td>Check the agent's process and the SSH path to each host. Nothing will start until an observation succeeds.</td>
+</tr>
+<tr>
+<td><code>digest_agreed: false</code></td>
+<td>The router and an agent disagree about what the identifiers mean. <strong>No deployment will be started or stopped.</strong></td>
+<td>Compare the digests (below) and reconcile the two files. Do not restart the agent hoping it clears — it will not.</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="reconciling-a-digest-mismatch">Reconciling a digest mismatch</h3>
+<p>The two sides compute the digest independently, from two different files:</p>
+<pre><code class="language-bash">agent/fleet-agent --config /etc/hypellm/fleet.json --print-digest
+hypellm-router --check --config /etc/hypellm/hypellm.conf   # prints &quot;fleet digest ...&quot;
+</code></pre>
+<p>They cover identifiers, placement, and architecture — not timings or governance,
+so a dwell floor can be retuned without touching the agent. A mismatch means a
+host, accelerator, deployment or artifact was added, removed, renamed or moved
+on one side only. Fix the file that is wrong, then restart the agent (the router
+picks the new digest up on its next configuration activation).</p>
+<p>Fail closed is deliberate here. A router and an agent that disagree about what
+<code>spark-music3</code> means must not act on that disagreement: the failure mode of
+acting is stopping the wrong production model.</p>
+<h3 id="symptom-a-model-will-not-start">Symptom: a model will not start</h3>
+<p>Ask the planner directly rather than guessing. It is a pure function, so this
+changes nothing:</p>
+<pre><code class="language-bash">curl -X POST https://admin.example/admin/v1/fleet:simulate \
+     -H 'content-type: application/json' \
+     -d '{&quot;target&quot;:&quot;spark:minimax-music3&quot;,&quot;patience_ms&quot;:900000}'
+</code></pre>
+<p>The reply carries the class, the estimated time to ready, the steps it would
+take, and — when it refuses — the reason code:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Reason</th>
+<th>Meaning</th>
+<th>Response</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>deployment_in_dwell</code></td>
+<td>Something that would have to be evicted has not been resident long enough, or the deployment itself is inside its reactivation cooldown.</td>
+<td>Wait. The trace shows how long. This is the mechanism working.</td>
+</tr>
+<tr>
+<td><code>eviction_value_insufficient</code></td>
+<td>There <em>is</em> an admissible eviction set and it is large enough; the incoming demand simply does not beat its retention value by the configured margin.</td>
+<td>Nothing is broken. Lower <code>eviction_margin_permille</code>, raise the deployment's <code>retention_weight</code>, or accept the answer.</td>
+</tr>
+<tr>
+<td><code>host_capacity_insufficient</code></td>
+<td>No admissible set frees enough memory — usually because everything else on the host is pinned, not evictable, or not router-owned.</td>
+<td>Check <code>pinned</code> and <code>router_owned</code> on the Fleet screen. A deployment the router did not start is never evicted by it.</td>
+</tr>
+<tr>
+<td><code>activation_budget_exhausted</code></td>
+<td>The host has spent its hourly allowance.</td>
+<td>Wait, or raise <code>max_activations_per_hour</code> deliberately. It is a hard ceiling on purpose: it is what bounds the worst case.</td>
+</tr>
+<tr>
+<td><code>activation_exceeds_deadline</code></td>
+<td>The model takes longer to load than the request has left.</td>
+<td>Raise the alias's deadline. A three-minute model cannot serve a thirty-second request, and offering it would turn a fast failure into a slow one.</td>
+</tr>
+<tr>
+<td><code>artifact_unavailable</code></td>
+<td>The artifact is absent, on the wrong architecture, or fetching is not permitted.</td>
+<td>Place it out of band, or grant <code>fleet.fetch</code> and set <code>allow_fetch=true</code> deliberately.</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="symptom-the-fleet-is-swapping-constantly">Symptom: the fleet is swapping constantly</h3>
+<p>Read <code>hypellm_fleet_thrash_ratio_permille</code>. It is activations per thousand
+requests served from activated deployments. A healthy fleet trends toward zero
+as batching amortises each swap; a value near 1,000 means every request costs a
+swap and the configuration is wrong.</p>
+<p>The usual causes, in the order they are worth checking:</p>
+<ol>
+<li><strong>Two capabilities that cannot co-reside, both in demand.</strong> Raise
+<code>min_resident_ms</code> on both. It costs responsiveness and buys throughput,
+because each swap costs minutes.</li>
+<li><strong><code>eviction_margin_permille</code> too low.</strong> Two capabilities of near-identical
+value trade places on noise. Raise it.</li>
+<li><strong><code>activation_max_wait_ms</code> too short.</strong> Batching is what turns ten requests
+into one swap; too short a window defeats it.</li>
+<li><strong>A model that keeps failing to stay up.</strong> Check the Activations screen for
+repeated <code>failed</code> outcomes on one deployment. The flap counter is already
+backing it off; the underlying problem is on the host.</li>
+</ol>
+<h3 id="stopping-the-fleet-moving-at-all">Stopping the fleet moving at all</h3>
+<p>Two levers, in increasing order of bluntness:</p>
+<pre><code class="language-text"># One deployment: the planner stops considering it for eviction.
+PATCH /admin/v1/fleet/deployments/spark-qwen38  {&quot;pinned&quot;: true}
+
+# One deployment: routing demand can no longer start it, only an operator.
+PATCH /admin/v1/fleet/deployments/spark-music3  {&quot;autostart&quot;: false}
+</code></pre>
+<p>and, in the configuration, <code>fleet_enabled=false</code> — which leaves every record
+declared and validated while the router opens no agent socket, takes no
+observation, and routes exactly as it did before orchestration existed.</p>
+<p>An operator action bypasses the <em>demand</em> threshold, because a person asking is
+demand enough. It does not bypass the dwell floor, the cooldown, the
+concurrency limit, or the activation budget. Those protect the fleet from every
+caller, and an operator who could step over them would find the protections
+absent at exactly the moment an incident makes them want to.</p>
+<h3 id="after-an-incident">After an incident</h3>
+<p>Every start and stop is in the audit chain — <code>fleet.activate</code>, <code>fleet.evict</code>,
+<code>fleet.rollback</code>, <code>fleet.forced_stop</code> — and each names either the operator or
+the decision identifier that caused it. The Activations screen links each row to
+the decision trace, so &quot;why did this model stop&quot; resolves to a specific request.</p>
+
+      </article>
+      <footer class="page-footer"><a href="index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#preconditions">Preconditions</a></li>
+<li class="toc-level-2"><a href="#221-provider-outage">22.1 Provider outage</a></li>
+<li class="toc-level-3"><a href="#1-confirm-target-health-and-breaker-reason">1. Confirm target health and breaker reason</a></li>
+<li class="toc-level-3"><a href="#2-automatic-breaking-is-already-running">2. Automatic breaking is already running</a></li>
+<li class="toc-level-3"><a href="#3-quarantine-only-when-automatic-breaking-is-insufficient">3. Quarantine, only when automatic breaking is insufficient</a></li>
+<li class="toc-level-3"><a href="#4-take-a-target-out-of-rotation-properly-policy-change">4. Take a target out of rotation properly (policy change)</a></li>
+<li class="toc-level-3"><a href="#5-simulate-critical-aliases">5. Simulate critical aliases</a></li>
+<li class="toc-level-3"><a href="#6-do-not-broaden-model-families-or-residency-during-an-incident">6. Do not broaden model families or residency during an incident</a></li>
+<li class="toc-level-3"><a href="#7-after-recovery">7. After recovery</a></li>
+<li class="toc-level-2"><a href="#222-credential-rotation">22.2 Credential rotation</a></li>
+<li class="toc-level-3"><a href="#where-a-provider-credential-actually-lives">Where a provider credential actually lives</a></li>
+<li class="toc-level-3"><a href="#1-write-the-new-credential-version">1. Write the new credential version</a></li>
+<li class="toc-level-3"><a href="#2-validate-with-a-low-cost-probe">2. Validate with a low-cost probe</a></li>
+<li class="toc-level-3"><a href="#3-activation-and-the-overlap-window">3. Activation, and the overlap window</a></li>
+<li class="toc-level-3"><a href="#4-drain-connections-whose-authentication-is-connection-bound">4. Drain connections whose authentication is connection-bound</a></li>
+<li class="toc-level-3"><a href="#5-revoke-the-old-credential-and-close-the-record">5. Revoke the old credential and close the record</a></li>
+<li class="toc-level-2"><a href="#223-compromised-router-api-key">22.3 Compromised router API key</a></li>
+<li class="toc-level-3"><a href="#1-revoke-the-key-id-immediately">1. Revoke the key id immediately</a></li>
+<li class="toc-level-3"><a href="#2-search-the-audit-and-usage-record">2. Search the audit and usage record</a></li>
+<li class="toc-level-3"><a href="#3-rotate-downstream-provider-credentials-only-on-evidence">3. Rotate downstream provider credentials only on evidence</a></li>
+<li class="toc-level-3"><a href="#4-create-a-least-privilege-replacement">4. Create a least-privilege replacement</a></li>
+<li class="toc-level-2"><a href="#224-google-identity-outage">22.4 Google identity outage</a></li>
+<li class="toc-level-3"><a href="#before-an-outage-bind-the-identities">Before an outage: bind the identities</a></li>
+<li class="toc-level-3"><a href="#what-happens-automatically">What happens automatically</a></li>
+<li class="toc-level-3"><a href="#do-not-do-this">Do not do this</a></li>
+<li class="toc-level-3"><a href="#break-glass-access">Break-glass access</a></li>
+<li class="toc-level-3"><a href="#what-you-can-actually-do-during-an-outage">What you can actually do during an outage</a></li>
+<li class="toc-level-3"><a href="#preparing-before-the-next-outage">Preparing before the next outage</a></li>
+<li class="toc-level-2"><a href="#225-fleet-incidents">22.5 Fleet incidents</a></li>
+<li class="toc-level-3"><a href="#symptom-requests-refused-with-the-requested-capability-is-not-available">Symptom: requests refused with &quot;the requested capability is not available&quot;</a></li>
+<li class="toc-level-3"><a href="#reconciling-a-digest-mismatch">Reconciling a digest mismatch</a></li>
+<li class="toc-level-3"><a href="#symptom-a-model-will-not-start">Symptom: a model will not start</a></li>
+<li class="toc-level-3"><a href="#symptom-the-fleet-is-swapping-constantly">Symptom: the fleet is swapping constantly</a></li>
+<li class="toc-level-3"><a href="#stopping-the-fleet-moving-at-all">Stopping the fleet moving at all</a></li>
+<li class="toc-level-3"><a href="#after-an-incident">After an incident</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

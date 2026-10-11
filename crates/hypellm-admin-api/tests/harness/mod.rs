@@ -1321,8 +1321,14 @@ impl HarnessBuilder {
         });
 
         let dir = TempDir::new("admin-api");
-        let (store, _recovery) =
+        let (store, recovery) =
             Store::open(dir.path(), b"harness-store-mac-key", 0).expect("open the store");
+        let store = Arc::new(store);
+        let (budgets, _) = hypellm_admin_api::budget::restore(
+            &store,
+            &recovery,
+            config.settings.budget_draw_tokens,
+        );
 
         let clock = Arc::new(TestClock::new());
         let shared_clock: Arc<dyn Clock> = clock.clone();
@@ -1385,6 +1391,7 @@ impl HarnessBuilder {
             anonymous_access: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config: Arc::new(Activatable::new(config)),
             keys: Arc::new(KeyStore::new(b"harness-verifier-key")),
+            budgets,
             sessions: Arc::new(SessionStore::new(
                 b"harness-session-key",
                 self.session_policy,
@@ -1393,7 +1400,7 @@ impl HarnessBuilder {
             oidc_config: self.oidc_config,
             verifier: self.verifier,
             health,
-            store: Arc::new(store),
+            store,
             telemetry: Arc::new(telemetry),
             clock: shared_clock,
             cors: self.cors,

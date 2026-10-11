@@ -3,7 +3,7 @@
 //!
 //! # Why this is admissible here
 //!
-//! This crate's `MODULE.md` admits a primitive when it is "fully specified,
+//! This crate's `spec/modules/hypellm-crypto.html` admits a primitive when it is "fully specified,
 //! deterministic, test-vector-verifiable" and the router cannot function
 //! without it. scrypt meets the first three exactly: RFC 7914 specifies
 //! Salsa20/8 core, `scryptBlockMix`, `scryptROMix` and `scrypt` itself in full,

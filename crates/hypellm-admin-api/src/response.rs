@@ -32,6 +32,13 @@ pub enum ApiErrorCode {
     PreconditionRequired,
     /// The resource already exists.
     Conflict,
+    /// An `Idempotency-Key` was reused with different content
+    /// (specification 12.3).
+    ///
+    /// Distinct from [`Self::Conflict`] because the caller's remedy differs:
+    /// this one means their own records disagree about what an operation was,
+    /// and retrying it unchanged will never succeed.
+    IdempotencyConflict,
     /// The CSRF token was absent or wrong.
     CsrfRequired,
     /// The request origin is not on the allowlist.
@@ -62,6 +69,7 @@ impl ApiErrorCode {
             Self::PreconditionFailed => "precondition_failed",
             Self::PreconditionRequired => "precondition_required",
             Self::Conflict => "conflict",
+            Self::IdempotencyConflict => "idempotency_conflict",
             Self::CsrfRequired => "csrf_required",
             Self::OriginNotPermitted => "origin_not_permitted",
             Self::ValidationFailed => "validation_failed",
@@ -81,7 +89,7 @@ impl ApiErrorCode {
             | Self::CsrfRequired
             | Self::OriginNotPermitted => 403,
             Self::NotFound => 404,
-            Self::Conflict => 409,
+            Self::Conflict | Self::IdempotencyConflict => 409,
             Self::PreconditionFailed => 412,
             Self::PreconditionRequired => 428,
             Self::TooManyRequests => 429,
@@ -101,6 +109,7 @@ impl ApiErrorCode {
             Self::PreconditionFailed,
             Self::PreconditionRequired,
             Self::Conflict,
+            Self::IdempotencyConflict,
             Self::CsrfRequired,
             Self::OriginNotPermitted,
             Self::ValidationFailed,

@@ -12,7 +12,7 @@
 //! the listener answers 503 and closes, so no request creates an unbounded
 //! thread and memory stays proportional to a configured constant.
 //!
-//! The deviation is deliberate and recorded in `docs/deferred-issues.md`. An
+//! The deviation is deliberate and recorded in `spec/deferred-issues.html`. An
 //! epoll-driven event loop needs either `unsafe` FFI to `epoll_create1` — which
 //! specification 18.2 forbids workspace-wide — or an approved low-level crate
 //! under specification 4's exception profile. Neither is in place, and a

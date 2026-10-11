@@ -468,6 +468,11 @@ pub struct AdminState {
     pub anonymous_access: Arc<std::sync::atomic::AtomicBool>,
     /// API keys.
     pub keys: Arc<hypellm_auth::KeyStore>,
+    /// Per-key token budgets (specification 12.1).
+    ///
+    /// The same ledger the inference path reserves against, so a committed
+    /// credit is visible to the next admission with no reload in between.
+    pub budgets: Arc<hypellm_core::budget::BudgetLedger>,
     /// Management sessions.
     pub sessions: Arc<hypellm_auth::SessionStore>,
     /// Open OIDC transactions.
@@ -664,6 +669,10 @@ impl AdminRequest<'_> {
 
     fn if_match(&self) -> Option<&str> {
         self.headers.get("if-match")
+    }
+
+    fn idempotency_key(&self) -> Option<&str> {
+        self.headers.get("idempotency-key")
     }
 
     fn is_mutating(&self) -> bool {
@@ -864,7 +873,7 @@ const MAX_CONCURRENT_PASSWORD_CHECKS: u32 = 2;
 /// and it is a deliberate trade: the alternative — hashing a dummy verifier so
 /// the two take the same time — hands an unauthenticated caller a CPU
 /// amplifier, and a management plane that stops answering is worse than one
-/// that confirms `admin` exists. Recorded in `docs/deferred-issues.md`.
+/// that confirms `admin` exists. Recorded in `spec/deferred-issues.html`.
 #[derive(Debug)]
 struct PasswordThrottle {
     /// Recent failures, keyed by username.
@@ -1380,6 +1389,18 @@ impl AdminApi {
                 let id = suffix(path, "/admin/v1/targets/")?;
                 self.patch_target(request, session, &id)
             }
+            (Method::Get, _) if budget_route(path).is_some_and(|(_, credit)| !credit) => {
+                let (id, _) = budget_route(path).unwrap_or_default();
+                self.key_budget(session, id)
+            }
+            (Method::Put, _) if budget_route(path).is_some_and(|(_, credit)| !credit) => {
+                let (id, _) = budget_route(path).unwrap_or_default();
+                self.set_key_budget(request, session, id)
+            }
+            (Method::Post, _) if budget_route(path).is_some_and(|(_, credit)| credit) => {
+                let (id, _) = budget_route(path).unwrap_or_default();
+                self.credit_key_budget(request, session, id)
+            }
             (Method::Delete, _) if path.starts_with("/admin/v1/keys/") => {
                 let id = suffix(path, "/admin/v1/keys/")?;
                 self.revoke_key(session, &id)
@@ -1862,7 +1883,7 @@ impl AdminApi {
     /// Local username-and-password sign-in.
     ///
     /// **Not one of specification 9.2's four authentication methods.** It is a
-    /// recorded deviation (`docs/deferred-issues.md`) that exists so a
+    /// recorded deviation (`spec/deferred-issues.html`) that exists so a
     /// deployment can be operated before an identity provider and a verifier
     /// process have been set up, and it is the weakest way into the management
     /// plane. Everything below is an attempt to keep "weakest" from meaning
@@ -4315,6 +4336,7 @@ impl AdminApi {
 
     fn list_keys(&self, session: &Session) -> Result<ApiResponse, ApiError> {
         self.require(session, Permission::ManageKeys)?;
+        let tenant_payment = self.tenant_payment(&session.tenant);
         let items: Vec<Value> = self
             .state
             .keys
@@ -4350,6 +4372,14 @@ impl AdminApi {
                     "source_networks",
                     render_source_restriction(&record.source),
                 );
+                object.push(
+                    "budget",
+                    crate::budget::budget_value(
+                        &record.id,
+                        &self.state.budgets.view(&record.id),
+                        tenant_payment.as_ref(),
+                    ),
+                );
                 // The verifier is never returned: it is not the secret, but it
                 // is key-derived material with no reason to leave the process.
                 Value::Object(object)
@@ -4377,9 +4407,21 @@ impl AdminApi {
         for raw in body.opt_field_array("scopes").ok().flatten().unwrap_or(&[]) {
             let text = raw.as_str().unwrap_or("");
             let scope = hypellm_auth::Scope::parse(text).ok_or_else(|| {
+                // The valid set rather than the offending value. `echo` keeps
+                // 32 characters, which is a typo for most fields and, here, was
+                // long enough to return a pasted secret whole: the management
+                // fuzz target caught exactly that once its seeds shifted.
+                let _ = text;
                 ApiError::new(
                     ApiErrorCode::InvalidRequest,
-                    format!("unknown scope '{}'", echo(text)),
+                    format!(
+                        "unknown scope; expected one of {}",
+                        hypellm_auth::Scope::all()
+                            .iter()
+                            .map(|scope| scope.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
                 )
             })?;
             scopes.push(scope);
@@ -4467,6 +4509,13 @@ impl AdminApi {
         // specification 22.3's least-privilege replacement could not be built.
         let source = parse_source_restriction(&body)?;
 
+        // Specification 12.1: a budget may be set "at creation". Parsed before
+        // the key exists, so a malformed one creates nothing.
+        let initial_budget = match (parse_token_limit(&body)?, parse_payment_override(&body)?) {
+            (None, None) => None,
+            budget => Some(budget),
+        };
+
         let new_key = self
             .state
             .keys
@@ -4509,9 +4558,34 @@ impl AdminApi {
         )
         .with_object(key_id.as_str())
         .with_tenant(session.tenant.as_str());
+        let event = match &initial_budget {
+            Some((limit, _)) => event.with_reason(&format!(
+                "initial token_limit {}",
+                limit.map_or_else(|| "unlimited".to_owned(), |limit| limit.to_string())
+            )),
+            None => event,
+        };
         if let Err(error) = self.record_audit(event.clone()) {
             self.state.keys.revoke(&key_id);
             return Err(error);
+        }
+        // The budget before the key record. A budget for a key that never
+        // became durable is inert; a durable key whose limit failed to commit
+        // would be an unlimited key somebody had asked to be limited.
+        if let Some((limit, payment)) = initial_budget {
+            if self
+                .state
+                .budgets
+                .set(&key_id, &session.tenant, None, limit, payment)
+                .is_err()
+            {
+                self.state.keys.revoke(&key_id);
+                self.record_abandoned(event, "the key's budget could not be written durably");
+                return Err(ApiError::new(
+                    ApiErrorCode::InternalFault,
+                    "the key's budget could not be recorded durably and the key was not created",
+                ));
+            }
         }
         if self
             .state
@@ -4537,6 +4611,14 @@ impl AdminApi {
         root.push("principal", Value::from(principal.as_str()));
         root.push_opt("expires_at", expires_at.map(Value::from));
         root.push("secret", Value::from(secret.as_str()));
+        root.push(
+            "budget",
+            crate::budget::budget_value(
+                &key_id,
+                &self.state.budgets.view(&key_id),
+                self.tenant_payment(&session.tenant).as_ref(),
+            ),
+        );
         root.push(
             "notice",
             Value::from("this secret is shown once and cannot be retrieved again"),
@@ -4609,6 +4691,264 @@ impl AdminApi {
         )?;
 
         Ok(ApiResponse::no_content())
+    }
+
+    // -- Key budgets -------------------------------------------------------
+
+    /// The tenant's default payment instructions, from the active
+    /// configuration.
+    fn tenant_payment(&self, tenant: &TenantId) -> Option<hypellm_core::budget::PaymentInstructions> {
+        self.state
+            .config()
+            .tenants
+            .get(tenant)
+            .and_then(|tenant| tenant.payment.clone())
+    }
+
+    /// Authorize a budget call and resolve the key it names.
+    ///
+    /// Specification 12.3: `ManageKeyBudgets`, within the caller's tenant. A
+    /// key in another tenant is indistinguishable from one that does not
+    /// exist. A revoked or expired key still resolves — its consumption
+    /// remains readable, and crediting it restores nothing, because the
+    /// budget is not what refuses it.
+    fn budget_key(
+        &self,
+        session: &Session,
+        raw_id: &str,
+    ) -> Result<hypellm_core::ids::KeyId, ApiError> {
+        self.require(session, Permission::ManageKeyBudgets)?;
+        let key_id =
+            hypellm_core::ids::KeyId::new(raw_id).map_err(|_| ApiError::not_found("key"))?;
+        self.state
+            .keys
+            .get(&key_id)
+            .filter(|record| record.tenant == session.tenant)
+            .ok_or_else(|| ApiError::not_found("key"))?;
+        Ok(key_id)
+    }
+
+    fn budget_response(
+        &self,
+        session: &Session,
+        key_id: &hypellm_core::ids::KeyId,
+        view: &hypellm_core::budget::BudgetView,
+    ) -> ApiResponse {
+        let mut response = ApiResponse::ok(&crate::budget::budget_value(
+            key_id,
+            view,
+            self.tenant_payment(&session.tenant).as_ref(),
+        ));
+        response.etag = Some(crate::budget::budget_etag(key_id, view));
+        response
+    }
+
+    /// `GET /admin/v1/keys/{id}/budget`.
+    fn key_budget(&self, session: &Session, raw_id: &str) -> Result<ApiResponse, ApiError> {
+        let key_id = self.budget_key(session, raw_id)?;
+        let view = self.state.budgets.view(&key_id);
+        Ok(self.budget_response(session, &key_id, &view))
+    }
+
+    /// `PUT /admin/v1/keys/{id}/budget`: the absolute limit and the payment
+    /// override. Consumption and in-flight reservations are left alone.
+    fn set_key_budget(
+        &self,
+        request: &AdminRequest<'_>,
+        session: &Session,
+        raw_id: &str,
+    ) -> Result<ApiResponse, ApiError> {
+        let key_id = self.budget_key(session, raw_id)?;
+        let before = self.state.budgets.view(&key_id);
+        if_match_satisfied(request.if_match(), &crate::budget::budget_etag(&key_id, &before))?;
+        let expected = (request.if_match().map(str::trim) != Some("*")).then_some(before.revision);
+
+        let body = request.json(&Limits::SMALL)?;
+        if body.as_object().is_none() {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidRequest,
+                "a budget is a JSON object",
+            ));
+        }
+        let limit = parse_token_limit(&body)?;
+        let payment = parse_payment_override(&body)?;
+
+        let event = AuditEvent::new(
+            self.state.clock.wall_millis(),
+            session.principal.as_str(),
+            AuditAction::KeyBudgetSet,
+        )
+        .with_object(key_id.as_str())
+        .with_tenant(session.tenant.as_str())
+        .with_request_id(request.request_id.as_str())
+        .with_reason(&format!(
+            "token_limit {} -> {}; payment override {}",
+            describe_limit(before.limit),
+            describe_limit(limit),
+            if payment.is_some() { "set" } else { "inherited" },
+        ));
+        self.record_audit(event.clone())?;
+
+        match self
+            .state
+            .budgets
+            .set(&key_id, &session.tenant, expected, limit, payment)
+        {
+            Ok(view) => Ok(self.budget_response(session, &key_id, &view)),
+            Err(error) => {
+                self.record_abandoned(event, budget_failure(&error));
+                Err(budget_error(&error))
+            }
+        }
+    }
+
+    /// `POST /admin/v1/keys/{id}/budget:credit`: add tokens to a finite limit,
+    /// once per `Idempotency-Key`.
+    ///
+    /// The order of the checks is the contract. A replay is recognised before
+    /// the `If-Match` comparison, because the caller retrying a payment
+    /// notification still holds the tag it had the first time and
+    /// specification 12.3 says that replay succeeds; but the header must be
+    /// *present* either way, so a client cannot learn to omit it.
+    fn credit_key_budget(
+        &self,
+        request: &AdminRequest<'_>,
+        session: &Session,
+        raw_id: &str,
+    ) -> Result<ApiResponse, ApiError> {
+        let key_id = self.budget_key(session, raw_id)?;
+        let before = self.state.budgets.view(&key_id);
+        if request.if_match().is_none() {
+            // The same 428 every other guarded mutation answers.
+            if_match_satisfied(None, "")?;
+        }
+        let idempotency_key = request
+            .idempotency_key()
+            .map(str::trim)
+            .filter(|key| crate::budget::valid_idempotency_key(key))
+            .ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::InvalidRequest,
+                    "a credit requires an Idempotency-Key header of 1 to 128 printable ASCII \
+                     characters identifying the external payment or credit operation",
+                )
+            })?;
+
+        let body = request.json(&Limits::SMALL)?;
+        let tokens = body
+            .get("tokens")
+            .and_then(Value::as_u64)
+            .filter(|tokens| *tokens > 0 && *tokens <= hypellm_core::budget::MAX_TOKENS)
+            .ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::ValidationFailed,
+                    "'tokens' must be a positive integer",
+                )
+            })?;
+        let reason = match body.get("reason") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .filter(|reason| crate::budget::valid_reason(reason))
+                    .ok_or_else(|| {
+                        ApiError::new(
+                            ApiErrorCode::ValidationFailed,
+                            "'reason' must be 1 to 256 bytes of plain text",
+                        )
+                    })?,
+            ),
+        };
+        // The normalized body: what the operation *was*, independent of key
+        // order, whitespace and fields this endpoint does not read.
+        let mut normalized = Object::new();
+        normalized.push("tokens", Value::from(tokens));
+        normalized.push_opt("reason", reason.map(Value::from));
+        let digest = etag_for(&Value::Object(normalized));
+
+        let respond = |outcome: &hypellm_core::budget::CreditOutcome| {
+            let mut root = Object::new();
+            root.push("receipt", crate::budget::receipt_value(&outcome.receipt));
+            root.push(
+                "budget",
+                crate::budget::budget_value(
+                    &key_id,
+                    &outcome.view,
+                    self.tenant_payment(&session.tenant).as_ref(),
+                ),
+            );
+            root.push("replayed", Value::from(outcome.replayed));
+            let mut response = ApiResponse::ok(&Value::Object(root));
+            response.etag = Some(crate::budget::budget_etag(&key_id, &outcome.view));
+            response
+        };
+
+        if let Some(receipt) = self.state.budgets.receipt(&key_id, idempotency_key) {
+            if receipt.request_digest != digest {
+                return Err(budget_error(
+                    &hypellm_core::budget::BudgetMutationError::IdempotencyConflict,
+                ));
+            }
+            return Ok(respond(&hypellm_core::budget::CreditOutcome {
+                receipt,
+                view: before,
+                replayed: true,
+            }));
+        }
+
+        if_match_satisfied(request.if_match(), &crate::budget::budget_etag(&key_id, &before))?;
+        let expected = (request.if_match().map(str::trim) != Some("*")).then_some(before.revision);
+
+        // Refused before the audit record rather than after it: neither is a
+        // change that was attempted and failed, they are requests that could
+        // never have been applied.
+        let limit = before.limit.ok_or_else(|| {
+            budget_error(&hypellm_core::budget::BudgetMutationError::Unlimited)
+        })?;
+        let limit_after = limit
+            .checked_add(tokens)
+            .filter(|limit| *limit <= hypellm_core::budget::MAX_TOKENS)
+            .ok_or_else(|| budget_error(&hypellm_core::budget::BudgetMutationError::Overflow))?;
+
+        let actor = session.principal.as_str();
+        let event = AuditEvent::new(
+            self.state.clock.wall_millis(),
+            actor,
+            AuditAction::KeyBudgetCredited,
+        )
+        .with_object(key_id.as_str())
+        .with_tenant(session.tenant.as_str())
+        .with_request_id(request.request_id.as_str())
+        .with_reason(&format!(
+            "credited {tokens}; token_limit {limit} -> {limit_after}; operation {idempotency_key}{}",
+            reason.map_or_else(String::new, |reason| format!("; {reason}")),
+        ));
+        self.record_audit(event.clone())?;
+
+        match self.state.budgets.credit(
+            &key_id,
+            &session.tenant,
+            expected,
+            tokens,
+            idempotency_key,
+            &digest,
+            reason,
+            actor,
+            self.state.clock.wall_millis(),
+        ) {
+            Ok(outcome) => {
+                if outcome.replayed {
+                    // A concurrent request with the same key won the race
+                    // between the receipt lookup above and here.
+                    self.record_abandoned(event, "the credit had already been applied");
+                }
+                Ok(respond(&outcome))
+            }
+            Err(error) => {
+                self.record_abandoned(event, budget_failure(&error));
+                Err(budget_error(&error))
+            }
+        }
     }
 
     // -- Credentials --------------------------------------------------------
@@ -6296,6 +6636,111 @@ fn session_error(rejection: SessionRejection) -> ApiError {
         _ => "a valid session is required",
     };
     ApiError::new(code, message)
+}
+
+fn describe_limit(limit: Option<u64>) -> String {
+    limit.map_or_else(|| "unlimited".to_owned(), |limit| limit.to_string())
+}
+
+/// `token_limit` from a request body: absent or `null` is unlimited
+/// (specification 12.1), anything else must be a non-negative integer the
+/// ledger can represent.
+fn parse_token_limit(body: &Value) -> Result<Option<u64>, ApiError> {
+    match body.get("token_limit") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|limit| *limit <= hypellm_core::budget::MAX_TOKENS)
+            .map(Some)
+            .ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::ValidationFailed,
+                    "'token_limit' must be null or a non-negative integer",
+                )
+            }),
+    }
+}
+
+/// `payment_required` from a request body: absent or `null` inherits the
+/// tenant default.
+fn parse_payment_override(
+    body: &Value,
+) -> Result<Option<hypellm_core::budget::PaymentInstructions>, ApiError> {
+    let invalid = |message: &str| ApiError::new(ApiErrorCode::ValidationFailed, message.to_owned());
+    let object = match body.get("payment_required") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(value) => value.as_object().ok_or_else(|| {
+            invalid("'payment_required' must be null or an object with 'message' and 'payment_url'")
+        })?,
+    };
+    let text = |name: &str| match object.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(Some)
+            .ok_or_else(|| invalid("payment instructions are strings")),
+    };
+    hypellm_core::budget::PaymentInstructions::new(text("message")?, text("payment_url")?)
+        .map_err(|error| invalid(error.describe()))
+}
+
+/// Why a budget change was not applied, for the audit trail.
+const fn budget_failure(error: &hypellm_core::budget::BudgetMutationError) -> &'static str {
+    use hypellm_core::budget::BudgetMutationError as E;
+    match error {
+        E::RevisionChanged => "the budget changed since it was read",
+        E::Unlimited => "the budget is unlimited",
+        E::InvalidAmount => "the amount is invalid",
+        E::Overflow => "the limit would overflow",
+        E::IdempotencyConflict => "the idempotency key was reused with different content",
+        E::Unavailable => "the budget could not be written durably",
+    }
+}
+
+fn budget_error(error: &hypellm_core::budget::BudgetMutationError) -> ApiError {
+    use hypellm_core::budget::BudgetMutationError as E;
+    match error {
+        E::RevisionChanged => ApiError::new(
+            ApiErrorCode::PreconditionFailed,
+            "the resource changed since it was read; re-read it and retry",
+        ),
+        // Specification 12.3: "An unlimited budget is a validation error, not
+        // an implicit conversion."
+        E::Unlimited => ApiError::new(
+            ApiErrorCode::ValidationFailed,
+            "the key's budget is unlimited; set a finite token_limit before crediting it",
+        ),
+        E::InvalidAmount => ApiError::new(
+            ApiErrorCode::ValidationFailed,
+            "the token amount is not a valid quantity",
+        ),
+        E::Overflow => ApiError::new(
+            ApiErrorCode::ValidationFailed,
+            "the credit would raise the limit beyond the largest representable budget",
+        ),
+        E::IdempotencyConflict => ApiError::new(
+            ApiErrorCode::IdempotencyConflict,
+            "this Idempotency-Key was already used for a different credit",
+        ),
+        E::Unavailable => ApiError::new(
+            ApiErrorCode::InternalFault,
+            "the budget could not be recorded durably and was not changed",
+        ),
+    }
+}
+
+/// Split `/admin/v1/keys/{id}/budget` or `…/budget:credit` into the key
+/// identifier and whether it is the credit action.
+///
+/// The identifier is returned as written; the handler validates it, and
+/// answers 404 for one that is not a key the caller's tenant owns.
+fn budget_route(path: &str) -> Option<(&str, bool)> {
+    let rest = path.strip_prefix("/admin/v1/keys/")?;
+    let (id, credit) = match rest.strip_suffix("/budget:credit") {
+        Some(id) => (id, true),
+        None => (rest.strip_suffix("/budget")?, false),
+    };
+    (!id.is_empty() && !id.contains('/') && id.len() <= 256).then_some((id, credit))
 }
 
 fn suffix(path: &str, prefix: &str) -> Result<String, ApiError> {

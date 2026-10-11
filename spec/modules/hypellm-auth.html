@@ -1,0 +1,561 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: hypellm-auth.">
+  <title>hypellm-auth · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="../assets/wiki.css">
+  <script defer src="../assets/search-index.js"></script>
+  <script defer src="../assets/wiki.js"></script>
+</head>
+<body data-wiki-root="../" data-page-title="hypellm-auth" data-page-group="Module contracts">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="../index.html">Wiki home</a></li>
+<li><a href="../overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="../router-specification.html">Router specification</a></li>
+<li><a href="../threat-model.html">Threat model</a></li>
+<li><a href="../orchestration.html">Fleet orchestration</a></li>
+<li><a href="../deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="../using-the-router.html">Using the router</a></li>
+<li><a href="../deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="../runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="../components/fleet-agent.html">Fleet agent</a></li>
+<li><a href="../components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="../components/container-init.html">Container init</a></li>
+<li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="hypellm-auth.html" aria-current="page">hypellm-auth</a></li>
+<li><a href="hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="hypellm-config.html">hypellm-config</a></li>
+<li><a href="hypellm-core.html">hypellm-core</a></li>
+<li><a href="hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="hypellm-net.html">hypellm-net</a></li>
+<li><a href="hypellm-router.html">hypellm-router</a></li>
+<li><a href="hypellm-store.html">hypellm-store</a></li>
+<li><a href="hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="wire-http1.html">wire-http1</a></li>
+<li><a href="wire-json.html">wire-json</a></li>
+<li><a href="wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="../index.html">Wiki</a><span aria-hidden="true">/</span>Module contracts</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="module-hypellm-auth">Module: hypellm-auth</h1>
+<p>Specification 4.1 requires every in-repository module to declare an owner, threat
+notes, public API, unsafe-code declaration, fuzz targets, and maximum
+input/resource limits.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Owner</td>
+<td>Security (primary), Platform (secondary)</td>
+</tr>
+<tr>
+<td>Unsafe code</td>
+<td>None. <code>#![forbid(unsafe_code)]</code> declared in <code>lib.rs</code> and inherited from the workspace.</td>
+</tr>
+<tr>
+<td>External dependencies</td>
+<td>None. Rust standard library plus workspace path dependencies: <code>hypellm-core</code>, <code>hypellm-crypto</code>, <code>wire-json</code>.</td>
+</tr>
+<tr>
+<td>Fuzz targets</td>
+<td><strong>None for this crate yet.</strong> Required targets are listed under <a href="#fuzz-targets">Fuzz targets</a>.</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>wire-json</code> is declared in <code>Cargo.toml</code> but is not referenced by any source file
+in this crate today. It is a dependency on paper only; either the OIDC token
+exchange body parsing lands here and uses it, or the declaration should be
+dropped.</p>
+<h2 id="scope-and-the-no-verification-no-transport-rule">Scope, and the &quot;no verification, no transport&quot; rule</h2>
+<p>This crate establishes <strong>who a caller is</strong> and <strong>what that identity is permitted
+to do</strong>. Specification 18.1: &quot;auth — API keys, sessions, OIDC verifier boundary
+client, RBAC.&quot; Specification 9.2 lists four ways a principal is established and
+each has a home here:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Module</th>
+<th>What is authoritative</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Router API key</td>
+<td><code>apikey</code></td>
+<td><code>HMAC(server_key, &quot;hypellm.apikey.v1&quot; ‖ key_id ‖ secret)</code> against a stored verifier</td>
+</tr>
+<tr>
+<td>Google OIDC session</td>
+<td><code>oidc</code>, <code>session</code></td>
+<td>Claims of an already-verified token, plus a server-side session digest</td>
+</tr>
+<tr>
+<td>Local peer credentials</td>
+<td><code>peer</code></td>
+<td>An administrator-declared uid → principal mapping</td>
+</tr>
+<tr>
+<td>Break-glass</td>
+<td><code>session::AuthMethod::BreakGlass</code></td>
+<td>A preprovisioned local credential handled exactly as an API key</td>
+</tr>
+</tbody>
+</table></div>
+<p>A fifth method exists and is <strong>not</strong> one of the four: <code>AuthMethod::Password</code>, for
+<code>local_user</code> accounts. It is a recorded deviation (<code>spec/deferred-issues.html</code>)
+that lets a deployment be operated before an identity provider is configured. Its
+hashing is <code>hypellm_crypto::pbkdf2</code> and its handler, throttling and audit are in
+<code>hypellm-admin-api</code>; this crate contributes only the session method, so that an
+investigation is never told the identity provider vouched for someone it has
+never seen.</p>
+<p>What this crate deliberately does <strong>not</strong> do:</p>
+<ul>
+<li><strong>No signature verification.</strong> Specification 9.1's dependency boundary: &quot;JWT
+signature verification and HTTPS are cryptographic security functions… Never
+write novel signature or TLS code merely to satisfy 'no dependencies'.&quot; The
+<code>oidc::TokenVerifier</code> trait is the seam. Its implementation lives in
+<code>hypellm-net</code> as a client of the platform verifier socket. Nothing in this crate
+parses a JWT, inspects a <code>kid</code>, or touches issuer keys.</li>
+<li><strong>No transport, no I/O, no sockets.</strong> The crate never opens a connection,
+never performs the authorization-code exchange, and never reads a file. It
+produces a URL string and consumes claims; someone else moves the bytes.</li>
+<li><strong>No credential storage or resolution.</strong> Provider credentials are the
+adapters' business (specification 10). The only key material here is the
+server-side HMAC key each store is constructed with.</li>
+<li><strong>No password hashing.</strong> The router has no passwords.</li>
+<li><strong>No throttling.</strong> There is no lockout, backoff, or attempt counter on key or
+session verification. Rate limiting for the auth surface belongs to the
+listener; this crate assumes it exists and does not provide it.</li>
+<li><strong>No claim checking inside the verifier.</strong> <code>TokenVerifier::verify</code> is
+documented as forbidden from validating <code>iss</code>, <code>aud</code>, <code>exp</code>, or <code>nonce</code>;
+<code>oidc::validate_claims</code> is the single place those are checked. Splitting the
+checks across two components is how one gets skipped.</li>
+</ul>
+<h2 id="threat-notes">Threat notes</h2>
+<h3 id="secret-bearing-values-redact-diagnostic-output">Secret-bearing values redact diagnostic output</h3>
+<p><code>NewKey</code>, <code>KeyStore</code>, <code>IssuedSession</code>, <code>SessionStore</code>, OIDC transactions and
+transaction stores use hand-written <code>Debug</code> implementations that redact
+one-time tokens and derivation keys. Digest records expose only a shortened
+digest representation. Tests assert that API keys, session/CSRF tokens, PKCE
+values and store keys do not appear in diagnostic output.</p>
+<h3 id="credential-oracle-leakage-through-error-differentiation">Credential-oracle leakage through error differentiation</h3>
+<p>Verification distinguishes <code>UnknownKey</code>, <code>BadSecret</code>, <code>Revoked</code>, <code>Expired</code>, and
+<code>SourceNotPermitted</code> internally, and <code>AuthFailure::to_router_error</code> collapses
+all of them to one <code>unauthenticated</code> response with an identical detail string
+(tested in <code>lib.rs::failures_do_not_disclose_which_check_failed</code>). Only
+<code>ScopeNotPermitted</code> and the session's CSRF/origin/permission/reauth rejections
+report <code>forbidden</code>, which is correct — those callers are already authenticated.
+The internal codes are distinct and are intended for audit and metrics. <strong>They
+must not reach a client response body, a header, or a metric label keyed by
+anything the caller controls.</strong> Specification 8.2 gives <code>unauthenticated</code> no
+sub-codes precisely because the distinction is an oracle.</p>
+<h3 id="timing-side-channels-on-credential-comparison">Timing side channels on credential comparison</h3>
+<p>All secret-vs-candidate comparisons route through <code>hypellm_crypto::ct::eq</code>: the
+key verifier, the session CSRF token, the OIDC <code>state</code>, and the <code>nonce</code>. Two
+consequences to preserve:</p>
+<ul>
+<li><code>KeyStore::verify</code> computes the candidate digest <strong>before</strong> checking whether
+the record exists, and compares against a zero dummy on the miss path, so an
+unknown prefix and a wrong secret cost approximately the same. Reordering
+those lines reintroduces a &quot;does this key id exist&quot; oracle.</li>
+<li><code>Digest: PartialEq</code> is constant-time but <code>Digest: Ord</code> is deliberately not.
+Ordering is used only for <code>BTreeMap</code> placement over one-way digests. Do not
+&quot;fix&quot; the inconsistency by making <code>cmp</code> constant-time, and do not authenticate
+with <code>cmp</code>.</li>
+</ul>
+<p>The lookup is not fully constant-time in aggregate: <code>BTreeMap</code> probe depth
+varies with the stored key set. The digests are HMAC outputs the caller cannot
+shape, so this is accepted.</p>
+<h3 id="forced-eviction-of-in-flight-sign-ins">Forced eviction of in-flight sign-ins</h3>
+<p><code>TransactionStore::begin</code> evicts the oldest transaction once <code>MAX_TRANSACTIONS</code>
+(4096) is reached rather than refusing to start a sign-in. <code>begin</code> is reachable
+<strong>before</strong> authentication, so anyone able to hit the sign-in start endpoint can
+issue 4096 requests and evict every legitimate in-flight transaction, turning
+every concurrent sign-in into <code>oidc_unknown_transaction</code>. This fails closed, not
+open, but it is a usable denial of service against management access. The
+mitigation must be a rate limit on the sign-in start endpoint at the listener;
+this crate does not provide one.</p>
+<p><code>SessionStore::issue</code> has the same eviction shape at <code>max_sessions</code> (10 000),
+but <code>issue</code> is reachable only after successful authentication, so the exposure
+is far smaller. Both eviction paths are an O(n) <code>min_by_key</code> scan performed
+while holding the write lock, at every insert once the table is at capacity —
+4096 and 10 000 entries respectively. <code>invalidate_principal</code> and <code>sessions_for</code>
+are also O(n) under the lock.</p>
+<h3 id="silent-failure-on-lock-poisoning">Silent failure on lock poisoning</h3>
+<p>Every store maps a poisoned <code>RwLock</code> to a benign-looking value rather than
+propagating an error, because specification 18.2 forbids panics on data-plane
+input. The failure modes are not uniform:</p>
+<ul>
+<li><code>KeyStore::insert</code> and <code>TransactionStore::begin</code> <strong>silently discard</strong> the
+record. Subsequent verification fails closed.</li>
+<li><code>KeyStore::revoke</code> returns <code>false</code>. Specification 22.3 requires revocation to
+take effect &quot;immediately&quot;; a caller that ignores this return value believes a
+compromised key was revoked when it was not. <strong>The return value is
+load-bearing and must be checked.</strong></li>
+<li><code>SessionStore::validate</code> returns <code>SessionRejection::Unknown</code>, and <code>sweep</code> /
+<code>invalidate_principal</code> return 0.</li>
+</ul>
+<p>A poisoned lock requires a panic while the lock was held, which the coding rules
+already forbid — but the degraded behaviour should be surfaced as a health
+signal rather than absorbed.</p>
+<h3 id="identity-header-spoofing">Identity-header spoofing</h3>
+<p><code>peer::TrustedEdge::resolve</code> returns an identity only when the peer address is
+in <code>trusted_peers</code> <strong>and</strong> the forwarded value is a workload the administrator
+declared. The default (<code>TrustedEdge::none()</code>) trusts nothing, and an unknown
+peer address (<code>None</code>) is never trusted. This is the control for specification 3's
+&quot;never trusts inbound forwarding headers except from configured peers&quot;. The
+danger is at the call site, not here: the header must be read only on a listener
+marked edge-facing, and the peer address passed in must be the real socket peer,
+never a value parsed out of <code>X-Forwarded-For</code>.</p>
+<p><code>PeerMap</code> has no implicit rules — uid 0 is not special, and an empty map
+authenticates nobody.</p>
+<h3 id="open-redirect-and-parameter-injection-on-the-sign-in-path">Open redirect and parameter injection on the sign-in path</h3>
+<p>An open redirect on an OIDC redirect URI is a token-theft primitive.
+<code>sanitize_return_path</code> reduces anything that is not a single in-application
+absolute path to <code>/</code>: absolute URLs, protocol-relative <code>//host</code>, backslash forms
+some browsers normalise, <code>://</code> anywhere, control characters (which would
+otherwise permit header injection), and anything over 512 bytes.
+<code>percent_encode</code> passes only RFC 3986 unreserved characters, so a hostile
+<code>client_id</code> or <code>redirect_uri</code> from configuration cannot inject a second
+<code>redirect_uri</code> parameter into the authorization URL.</p>
+<p>Every endpoint in the authorization URL comes from <code>OidcConfig</code>. There is no
+code path that reads an issuer, token endpoint, or redirect URI from a request —
+specification 9.1: &quot;No discovery URL or redirect is supplied by the browser.&quot;</p>
+<h3 id="session-fixation-replay-and-csrf">Session fixation, replay, and CSRF</h3>
+<ul>
+<li>Session tokens are 256-bit random values; only <code>HMAC(digest_key, token)</code> is
+stored. A leaked session table yields verifiers, not cookies.</li>
+<li>The CSRF token is <code>HMAC(digest_key, &quot;hypellm.csrf.v1&quot; ‖ session_digest)</code> —
+derived, so it cannot drift out of sync, and keyed, so a script that can read
+the cookie still cannot compute it. It rotates with the session.</li>
+<li><code>rotate</code> removes the old digest and inserts the new one, so a token fixed
+before sign-in is dead after it (specification 9.1: &quot;Rotate on authentication
+and privilege change&quot;).</li>
+<li><code>TransactionStore::take</code> removes the transaction <strong>before</strong> validating state
+or expiry, so a sign-in attempt is strictly single-use and a probed
+transaction cannot be completed afterwards.</li>
+<li><code>origin_permitted(None, …)</code> returns <code>true</code>, because browsers omit <code>Origin</code> on
+same-origin safe methods. <strong>This means origin checking alone never authorizes
+a mutation.</strong> A state-changing handler must call <code>verify_csrf</code> as well;
+specification 9.1 requires both, and the origin check is the weaker half.</li>
+<li><code>cookie_value</code> compares names exactly, rejects values containing whitespace or
+<code>;</code>, and returns only the first occurrence — a lenient parser is how an
+attacker-set sibling cookie gets picked up instead of the real one.</li>
+</ul>
+<h3 id="roles-and-accountability-on-a-session">Roles and accountability on a session</h3>
+<ul>
+<li><code>Session::roles_version</code> is the configuration version the roles were
+resolved against; <code>None</code> means never resolved. <code>SessionStore</code> does not
+interpret it: the management API re-resolves a session whose version differs
+from the active configuration and stores the result with
+<code>SessionStore::refresh_roles</code>, which changes only roles and version — never
+identity, lifetime or authentication time. <code>SessionStore::invalidate_digest</code>
+ends a session whose authenticating record was withdrawn.</li>
+<li><code>Session::accountable</code> is, for a key-authenticated caller, the principal that
+minted the key. <code>Session::actors</code> returns the session principal and the
+accountable one, and is what separation-of-duty checks compare.</li>
+<li><code>KeyRecord::created_by</code> records who minted a key (<code>KeyStore::create_by</code>). It
+is persisted in the durable key record; a record written before the field
+existed decodes with <code>None</code>, and a present but unreadable value drops the
+record like any other damaged one. <code>KeyStore::create</code> leaves it <code>None</code>.</li>
+</ul>
+<h3 id="audit-trail-fidelity">Audit-trail fidelity</h3>
+<p><code>Principal::from_key</code> sets <code>method: AuthMethod::LocalPeer</code> for every
+key-authenticated principal. A caller that authenticated with a router API key
+is recorded and exported as having used Unix socket peer credentials. This is
+not an authentication bypass — scopes, roles, tenant, and <code>key_id</code> are all
+correct — but it corrupts the audit and metrics view of <em>how</em> a principal
+authenticated, and specification 22.3's incident workflow (&quot;search authorized
+audit/usage by key pseudonym&quot;) depends on that field being right. <code>AuthMethod</code>
+has no <code>ApiKey</code> variant to assign; adding one is the fix.</p>
+<p>Separately, <code>Principal::from_session</code> correctly yields an empty scope set: a
+browser session authorizes management actions, never inference. A session that
+could also drive the inference API would let a CSRF on the admin UI spend a
+tenant's token budget.</p>
+<h3 id="identity-mapping">Identity mapping</h3>
+<p><code>IdTokenClaims::identity_key</code> is <code>iss|sub</code>. Specification 9.1: &quot;Email is an
+attribute, not the stable identity key.&quot; An email address can be reassigned
+within a domain; a subject cannot. <code>hd</code> is an authorization input and &quot;not proof
+of group membership&quot; — groups on <code>Principal</code> come from local role bindings or a
+provisioned directory sync, never inferred from an email domain.</p>
+<h2 id="limits">Limits</h2>
+<p>Enforced in this crate:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Input / resource</th>
+<th>Limit</th>
+<th>Enforced by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Presented API key string</td>
+<td>256 bytes</td>
+<td><code>apikey::parse_key</code> (bare literal — no named constant)</td>
+</tr>
+<tr>
+<td>API key identifier field</td>
+<td>exactly 16 chars, lowercase hex only</td>
+<td><code>apikey::KEY_ID_LEN</code>, alphabet check in <code>parse_key</code></td>
+</tr>
+<tr>
+<td>Generated key secret</td>
+<td>32 bytes → 43 base64url chars</td>
+<td><code>apikey::SECRET_BYTES</code></td>
+</tr>
+<tr>
+<td>Principal / tenant / key identifiers</td>
+<td>128 bytes</td>
+<td><code>hypellm_core::ids::MAX_ID_LEN</code></td>
+</tr>
+<tr>
+<td>Session cookie token</td>
+<td>1–128 bytes before lookup</td>
+<td><code>session::SessionStore::validate</code> (bare literal)</td>
+</tr>
+<tr>
+<td>Generated session token</td>
+<td>32 bytes → 43 base64url chars</td>
+<td><code>session::TOKEN_BYTES</code></td>
+</tr>
+<tr>
+<td>Session idle lifetime</td>
+<td>30 min</td>
+<td><code>session::SessionPolicy::DEFAULT.idle_millis</code></td>
+</tr>
+<tr>
+<td>Session absolute lifetime</td>
+<td>12 h</td>
+<td><code>SessionPolicy::DEFAULT.absolute_millis</code></td>
+</tr>
+<tr>
+<td>Reauthentication window</td>
+<td>5 min</td>
+<td><code>SessionPolicy::DEFAULT.reauthentication_millis</code></td>
+</tr>
+<tr>
+<td>Concurrent sessions</td>
+<td>10 000, oldest-by-activity evicted</td>
+<td><code>SessionPolicy::max_sessions</code>, <code>SessionStore::issue</code></td>
+</tr>
+<tr>
+<td>OIDC transaction handle</td>
+<td>1–128 bytes before lookup</td>
+<td><code>oidc::TransactionStore::take</code> (bare literal)</td>
+</tr>
+<tr>
+<td>Open OIDC transactions</td>
+<td>4096, oldest evicted</td>
+<td><code>oidc::MAX_TRANSACTIONS</code></td>
+</tr>
+<tr>
+<td>OIDC transaction lifetime</td>
+<td>10 min</td>
+<td><code>oidc::TRANSACTION_TTL_MILLIS</code></td>
+</tr>
+<tr>
+<td>Post-sign-in return path</td>
+<td>512 bytes, single absolute path</td>
+<td><code>oidc::sanitize_return_path</code></td>
+</tr>
+<tr>
+<td>Forwarded workload identity</td>
+<td>1–256 bytes</td>
+<td><code>peer::TrustedEdge::resolve</code></td>
+</tr>
+<tr>
+<td>CIDR prefix length</td>
+<td>&gt; 32 (v4) / &gt; 128 (v6) matches nothing</td>
+<td><code>apikey::in_network</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>Not enforced here — stated plainly rather than implied:</p>
+<ul>
+<li><strong>Secret field length in a presented key is not pinned.</strong> <code>parse_key</code> requires
+only that the secret be non-empty; a well-formed prefix followed by ~230 bytes
+of arbitrary data is accepted into the HMAC. Total work stays under the
+256-byte cap, so this is bounded, not unbounded — but it is not the 43
+characters a genuine key carries.</li>
+<li><strong><code>bearer_token</code> applies no length bound.</strong> It is safe to call only after the
+HTTP layer has bounded the header (specification 3.2); <code>parse_key</code> is the
+first place a size check happens.</li>
+<li><strong><code>KeyStore</code> record count is unbounded.</strong> Records arrive from administrator
+action and from store recovery; nothing here caps the map.</li>
+<li><strong><code>IdTokenClaims</code> field sizes are unbounded.</strong> <code>sub</code>, <code>email</code>, <code>hd</code>, <code>name</code>,
+and the <code>aud</code> vector are whatever the <code>TokenVerifier</code> implementation returns.
+The bound must be imposed by that implementation, in <code>hypellm-net</code>.</li>
+<li><strong>Configuration-derived collections are unbounded here</strong>: <code>hosted_domains</code>,
+<code>trusted_peers</code>, <code>workloads</code>, the CORS allowlist passed to <code>origin_permitted</code>,
+and the <code>scopes</code> / <code>roles</code> vectors on a record. The configuration layer owns
+those maxima.</li>
+<li><strong>No attempt-rate limit, lockout, or replay cache.</strong> Specification 9.2's
+&quot;signed workload assertion&quot; method, which requires a replay cache, is not
+implemented in this crate at all.</li>
+<li><strong>No wall-clock source.</strong> Every expiry check takes <code>now_*_millis</code> as a
+parameter. Clock skew and monotonicity are the caller's problem; the crate is
+deterministic and testable as a result, and <code>saturating_sub</code> / <code>saturating_add</code>
+are used throughout so a skewed clock cannot wrap a lifetime.</li>
+</ul>
+<h2 id="fuzz-targets">Fuzz targets</h2>
+<p>The workspace has no <code>fuzz/</code> directory and no libFuzzer harness — specification
+4 admits no such dependency. Fuzzing is a seeded, deterministic mutation engine
+in <code>hypellm-test-corpus::fuzz</code>, driven from ordinary <code>tests/fuzz.rs</code> targets so
+that <code>cargo test</code> runs it and a failing seed is reproducible by number rather
+than by corpus file. All seven areas specification 21 names have a suite; see
+<code>spec/deferred-issues.html</code>, <code>DI-002</code>, for the table. <code>hypellm-core</code> carries the
+property layer in <code>tests/properties.rs</code>.</p>
+<p>None cover this crate yet; nothing below is implemented. This is the required
+set under specification 21 (&quot;Fuzz: HTTP, JSON, SSE, configuration, provider events,
+management API, state recovery&quot;) and 18.2 (&quot;Configuration and protocol parsers
+are fuzzed&quot;).</p>
+<p>Required, not yet implemented:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Target</th>
+<th>Surface</th>
+<th>Property to assert</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>auth_apikey_parse</code> (§21)</td>
+<td><code>apikey::parse_key</code> over arbitrary bytes</td>
+<td>Never panics; accepts only <code>hypellmk_&lt;16 hex&gt;_&lt;non-empty&gt;</code>; rejects ≥ 256 bytes before any lookup</td>
+</tr>
+<tr>
+<td><code>auth_bearer_token</code> (§21)</td>
+<td><code>apikey::bearer_token</code></td>
+<td>Never panics on arbitrary header bytes; never returns an empty token</td>
+</tr>
+<tr>
+<td><code>auth_cookie_value</code> (§21)</td>
+<td><code>session::cookie_value</code></td>
+<td>Never panics; never returns a value for a name that is not an exact match; never returns a value containing <code>;</code> or whitespace</td>
+</tr>
+<tr>
+<td><code>auth_return_path</code> (§21)</td>
+<td><code>oidc::sanitize_return_path</code></td>
+<td>Output is always <code>/</code> or a single absolute in-application path; never contains <code>\</code>, <code>://</code>, a control character, or a leading <code>//</code></td>
+</tr>
+<tr>
+<td><code>auth_percent_encode</code> (§21)</td>
+<td><code>oidc::percent_encode</code></td>
+<td>Output contains none of <code>&amp; = ? # % /</code> except as <code>%XX</code> escapes; round-trips under a reference decoder</td>
+</tr>
+<tr>
+<td><code>auth_oidc_claims</code> (§21)</td>
+<td><code>oidc::validate_claims</code> over arbitrary claims and configs</td>
+<td>Never panics; never returns <code>Ok</code> when <code>iss</code>, <code>aud</code>, <code>nonce</code>, <code>exp</code>, <code>email_verified</code>, or <code>hd</code> fails its rule; arithmetic saturates rather than wrapping</td>
+</tr>
+<tr>
+<td><code>auth_session_lifecycle</code> (§21, state recovery)</td>
+<td>Stateful sequence of <code>issue</code>/<code>validate</code>/<code>rotate</code>/<code>invalidate</code>/<code>sweep</code></td>
+<td>Table never exceeds <code>max_sessions</code>; an invalidated or rotated-away token never validates again; a CSRF token never verifies against a different session</td>
+</tr>
+<tr>
+<td><code>auth_key_lifecycle</code> (§21, state recovery)</td>
+<td>Stateful sequence of <code>create</code>/<code>verify</code>/<code>revoke</code>/<code>insert</code></td>
+<td>A revoked key never verifies; a verifier never authenticates a different <code>key_id</code>; no generated key string ever contains an ambiguous separator</td>
+</tr>
+</tbody>
+</table></div>
+<p>Specification 21.1 additionally requires that every change to this crate go
+through two-person security review, and that its secret-bearing types pass
+log/error/crash redaction tests — see the derived-<code>Debug</code> gap above, which such
+a test would currently fail.</p>
+<h2 id="public-api">Public API</h2>
+<p><code>SessionStore::issue_for</code> takes an explicit absolute lifetime and is what
+specification 22.4's time-limited break-glass session is built on. It only ever
+<em>shortens</em>: the lifetime is clamped to the policy's, so a misconfigured caller
+cannot mint a session that outlives the one every other session obeys.</p>
+<p>See <code>lib.rs</code>. The crate root re-exports <code>Principal</code>, <code>AuthFailure</code>, and the
+principal types from each module. Several items are reachable only by module
+path and are the ones most likely to be missed when wiring a listener:</p>
+<ul>
+<li><code>apikey::bearer_token</code> — <code>Authorization</code> header extraction.</li>
+<li><code>session::cookie_value</code>, <code>session::origin_permitted</code> — cookie and CORS
+helpers; <code>origin_permitted</code> must be paired with <code>SessionStore::verify_csrf</code>.</li>
+<li><code>oidc::validate_claims</code>, <code>oidc::code_challenge_s256</code>,
+<code>oidc::sanitize_return_path</code>, <code>oidc::percent_encode</code>.</li>
+<li><code>peer::PeerMap</code>, <code>peer::PeerSource</code> — the uid mapping is not re-exported at
+the root, only <code>PeerIdentity</code> and <code>TrustedEdge</code> are.</li>
+</ul>
+<p><code>oidc::TokenVerifier</code> is the crate's one outward-facing trait and the boundary
+described in specification 9.1. It is implemented outside this crate. Nothing in
+the public surface accepts a caller-supplied endpoint, host, or key handle:
+every destination is a field of <code>OidcConfig</code>, and every HMAC key is supplied
+once at store construction from the platform secret facility.</p>
+
+      </article>
+      <footer class="page-footer"><a href="../index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#scope-and-the-no-verification-no-transport-rule">Scope, and the &quot;no verification, no transport&quot; rule</a></li>
+<li class="toc-level-2"><a href="#threat-notes">Threat notes</a></li>
+<li class="toc-level-3"><a href="#secret-bearing-values-redact-diagnostic-output">Secret-bearing values redact diagnostic output</a></li>
+<li class="toc-level-3"><a href="#credential-oracle-leakage-through-error-differentiation">Credential-oracle leakage through error differentiation</a></li>
+<li class="toc-level-3"><a href="#timing-side-channels-on-credential-comparison">Timing side channels on credential comparison</a></li>
+<li class="toc-level-3"><a href="#forced-eviction-of-in-flight-sign-ins">Forced eviction of in-flight sign-ins</a></li>
+<li class="toc-level-3"><a href="#silent-failure-on-lock-poisoning">Silent failure on lock poisoning</a></li>
+<li class="toc-level-3"><a href="#identity-header-spoofing">Identity-header spoofing</a></li>
+<li class="toc-level-3"><a href="#open-redirect-and-parameter-injection-on-the-sign-in-path">Open redirect and parameter injection on the sign-in path</a></li>
+<li class="toc-level-3"><a href="#session-fixation-replay-and-csrf">Session fixation, replay, and CSRF</a></li>
+<li class="toc-level-3"><a href="#roles-and-accountability-on-a-session">Roles and accountability on a session</a></li>
+<li class="toc-level-3"><a href="#audit-trail-fidelity">Audit-trail fidelity</a></li>
+<li class="toc-level-3"><a href="#identity-mapping">Identity mapping</a></li>
+<li class="toc-level-2"><a href="#limits">Limits</a></li>
+<li class="toc-level-2"><a href="#fuzz-targets">Fuzz targets</a></li>
+<li class="toc-level-2"><a href="#public-api">Public API</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

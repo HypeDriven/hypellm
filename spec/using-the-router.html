@@ -1,0 +1,841 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: Using the router.">
+  <title>Using the router · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="./assets/wiki.css">
+  <script defer src="./assets/search-index.js"></script>
+  <script defer src="./assets/wiki.js"></script>
+</head>
+<body data-wiki-root="./" data-page-title="Using the router" data-page-group="Operator guides">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="index.html">Wiki home</a></li>
+<li><a href="overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="router-specification.html">Router specification</a></li>
+<li><a href="threat-model.html">Threat model</a></li>
+<li><a href="orchestration.html">Fleet orchestration</a></li>
+<li><a href="deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="using-the-router.html" aria-current="page">Using the router</a></li>
+<li><a href="deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="components/fleet-agent.html">Fleet agent</a></li>
+<li><a href="components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="components/container-init.html">Container init</a></li>
+<li><a href="components/tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="modules/hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="modules/hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="modules/hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="modules/hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="modules/hypellm-config.html">hypellm-config</a></li>
+<li><a href="modules/hypellm-core.html">hypellm-core</a></li>
+<li><a href="modules/hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="modules/hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="modules/hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="modules/hypellm-net.html">hypellm-net</a></li>
+<li><a href="modules/hypellm-router.html">hypellm-router</a></li>
+<li><a href="modules/hypellm-store.html">hypellm-store</a></li>
+<li><a href="modules/hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="modules/hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="modules/wire-http1.html">wire-http1</a></li>
+<li><a href="modules/wire-json.html">wire-json</a></li>
+<li><a href="modules/wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="index.html">Wiki</a><span aria-hidden="true">/</span>Operator guides</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="using-hypellm-router">Using HypeLLM Router</h1>
+<p>How to point a project at a running router and send inference through it. For
+standing one up, see <a href="deployment.html">deployment</a>; for what it does internally,
+<a href="router-specification.html">the specification</a>.</p>
+<p>Written to be followed literally, by a person or by an agent. Every request and
+response below was run against a live router.</p>
+<p>Contents: <a href="#what-you-need">What you need</a> · <a href="#getting-an-api-key">Getting an API
+key</a> · <a href="#base-url">Base URL</a> · <a href="#openai-compatible-clients">OpenAI-compatible
+clients</a> · <a href="#anthropic-compatible-clients">Anthropic-compatible
+clients</a> · <a href="#endpoints">Endpoints</a> ·
+<a href="#discovering-aliases">Discovering aliases</a> · <a href="#sending-an-image">Sending an
+image</a> · <a href="#streaming">Streaming</a> · <a href="#errors">Errors</a> ·
+<a href="#router-extensions">Router extensions</a> · <a href="#limits">Limits</a> · <a href="#when-something-is-wrong">When something
+is wrong</a></p>
+<hr />
+<h2 id="what-you-need">What you need</h2>
+<ol>
+<li><strong>The base URL</strong> of the inference listener.</li>
+<li><strong>An API key</strong>, which is not the same thing as network access — reaching the
+router authenticates nothing.</li>
+<li><strong>A model alias</strong> the key is permitted to use. You ask for an <em>alias</em>, not a
+provider's model name; the router picks the target.</li>
+</ol>
+<hr />
+<h2 id="getting-an-api-key">Getting an API key</h2>
+<p>Keys are minted through the management API, which needs an operator session.
+There is no bootstrap key and no way to mint one from the inference listener.</p>
+<p>If you already have a key, skip to <a href="#base-url">base URL</a>. It looks like
+<code>hypellmk_&lt;id&gt;_&lt;secret&gt;</code> and is shown exactly once when created.</p>
+<h3 id="the-short-way">The short way</h3>
+<p>For the containerised setup in this repository, <code>just</code> does all of it:</p>
+<pre><code class="language-bash">just bootstrap          # first run: secret bundle, router, and the first key
+just key agent          # any key after that
+just keys               # what is outstanding
+just revoke &lt;id&gt;        # immediately
+</code></pre>
+<p><code>bootstrap</code> is the only one that does not need the break-glass token: it
+captures the token from <code>--generate-secrets</code>, spends it on the sign-in, and
+prints it at the end to be stored offline. The others prompt for it, or read
+<code>HYPELLM_BREAK_GLASS_TOKEN</code>. No secret is passed as a command-line argument.</p>
+<p>If the token is already lost, <code>just bootstrap-fresh</code> discards the router's key
+bundle and <code>run/state</code> and starts over. It keeps <code>run/secrets/credentials</code>,
+because provider credentials are the operator's rather than the router's.</p>
+<p>The rest of this section is what those recipes do, for a deployment without
+them.</p>
+<h3 id="1-sign-in">1. Sign in</h3>
+<p>With Google OIDC configured, sign in through the admin SPA and read the CSRF
+token from <code>GET /admin/v1/session</code>. Without it — the local and air-gapped
+profiles — use break-glass, whose token was printed once by
+<code>--generate-secrets</code>:</p>
+<pre><code class="language-bash">curl -sS -D headers.txt -X POST http://127.0.0.1:18001/admin/v1/auth/break-glass \
+  -H 'Content-Type: application/json' \
+  -d '{&quot;token&quot;:&quot;&lt;break-glass token&gt;&quot;,&quot;reason&quot;:&quot;minting the first API key&quot;}'
+</code></pre>
+<pre><code class="language-json">{&quot;csrf_token&quot;:&quot;EXAMPLEcsrf0000000000000000000000000000000d&quot;,&quot;expires_in_seconds&quot;:3600}
+</code></pre>
+<p>The session cookie is in the response headers. Two things about it:</p>
+<ul>
+<li>Every break-glass sign-in emits a <code>critical</code> log event and an audit record.
+It is an emergency path used deliberately, not a login.</li>
+<li>The cookie is <code>__Host-hypellm_session</code> with <code>Secure</code>, so a browser will not
+store it over plain HTTP except on <code>localhost</code>. <code>curl</code> does not care.</li>
+</ul>
+<pre><code class="language-bash">SESSION=$(grep -i '^set-cookie' headers.txt \
+          | sed 's/.*__Host-hypellm_session=\([^;]*\).*/\1/' | tr -d '\r')
+</code></pre>
+<h3 id="2-mint-the-key">2. Mint the key</h3>
+<p>The CSRF token goes in <code>X-Hypellm-Csrf</code> — not <code>X-CSRF-Token</code>. Every mutating
+management request needs it.</p>
+<pre><code class="language-bash">curl -sS -X POST http://127.0.0.1:18001/admin/v1/keys \
+  -H &quot;Cookie: __Host-hypellm_session=$SESSION&quot; \
+  -H &quot;X-Hypellm-Csrf: &lt;csrf_token&gt;&quot; \
+  -H 'Content-Type: application/json' \
+  -d '{
+        &quot;principal&quot;: &quot;agent&quot;,
+        &quot;scopes&quot;: [&quot;inference&quot;, &quot;models&quot;, &quot;embeddings&quot;, &quot;tokenize&quot;],
+        &quot;description&quot;: &quot;project agent&quot;
+      }'
+</code></pre>
+<pre><code class="language-json">{
+  &quot;id&quot;: &quot;e75e4806c274423b&quot;,
+  &quot;principal&quot;: &quot;agent&quot;,
+  &quot;secret&quot;: &quot;hypellmk_e75e4806c274423b_EXAMPLEsecret000000000000000000000000000000&quot;,
+  &quot;notice&quot;: &quot;this secret is shown once and cannot be retrieved again&quot;
+}
+</code></pre>
+<p>Scopes are <code>inference</code> (chat and responses), <code>embeddings</code>, <code>models</code>,
+<code>tokenize</code>, <code>management:read</code>, <code>management:write</code>. Ask for the ones the project
+uses and no more — a key without <code>embeddings</code> gets <code>403</code> from
+<code>/v1/embeddings</code> rather than a routing decision.</p>
+<p>The two management scopes let a key call <code>/admin/v1</code> as well, for automation
+that has no browser session: <code>management:read</code> to read, <code>management:write</code> for
+anything that changes something. What the key may <em>do</em> there comes from the
+<code>role_binding</code> records for its principal, not from the key, so a key whose
+principal is unbound is refused. No key may mint keys or open break-glass,
+whatever its principal's roles say. See
+<a href="deferred-issues.html#management-access-with-an-api-key">management access with an API key</a>.</p>
+<p>Optional fields: <code>expires_at</code> (epoch milliseconds) and a source restriction.
+A source-restricted key fails closed where the peer address is unknown, which
+includes every caller arriving over a Unix-socket listener.</p>
+<hr />
+<h2 id="base-url">Base URL</h2>
+<p>The inference listener. Everything in this document is relative to it.</p>
+<pre><code>http://&lt;host&gt;:18000
+</code></pre>
+<p>Its address depends on the deployment. For the containerised setup in this
+repository, <code>just up</code> prints it; the management and metrics listeners are
+deliberately somewhere else and are not part of this document.</p>
+<p>Confirm it before configuring anything — both of these answer without a key:</p>
+<pre><code class="language-bash">curl -sS http://&lt;host&gt;:18000/health/live     # {&quot;status&quot;:&quot;ok&quot;}
+curl -sS http://&lt;host&gt;:18000/health/ready    # {&quot;status&quot;:&quot;ready&quot;}
+</code></pre>
+<p><code>not_ready</code> means the router is up but will refuse requests.</p>
+<hr />
+<h2 id="openai-compatible-clients">OpenAI-compatible clients</h2>
+<p>Set the base URL to <code>http://&lt;host&gt;:18000/v1</code> and the API key to the router key.
+Nothing else changes. The <code>model</code> is an <strong>alias</strong>, from <code>GET /v1/models</code>.</p>
+<pre><code class="language-python">from openai import OpenAI
+
+client = OpenAI(base_url=&quot;http://&lt;host&gt;:18000/v1&quot;, api_key=&quot;hypellmk_...&quot;)
+
+response = client.chat.completions.create(
+    model=&quot;chat-standard&quot;,
+    messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;ping&quot;}],
+)
+</code></pre>
+<p>Environment-variable form, which most coding tools accept:</p>
+<pre><code class="language-bash">export OPENAI_BASE_URL=&quot;http://&lt;host&gt;:18000/v1&quot;
+export OPENAI_API_KEY=&quot;hypellmk_...&quot;
+</code></pre>
+<p>Do not point a client at the provider's model name
+(<code>qwen3.8-27b-obliterated-q5-k-m</code>, <code>gpt-4o</code>). Aliases are what policy is
+written against; a native model name is not routable and returns
+<code>model_not_found</code>.</p>
+<h2 id="anthropic-compatible-clients">Anthropic-compatible clients</h2>
+<p><code>POST /v1/messages</code> speaks the Anthropic dialect, including <code>x-api-key</code>:</p>
+<pre><code class="language-bash">curl -sS -X POST http://&lt;host&gt;:18000/v1/messages \
+  -H &quot;x-api-key: hypellmk_...&quot; \
+  -H 'Content-Type: application/json' \
+  -d '{&quot;model&quot;:&quot;chat-standard&quot;,&quot;max_tokens&quot;:64,
+       &quot;messages&quot;:[{&quot;role&quot;:&quot;user&quot;,&quot;content&quot;:&quot;ping&quot;}]}'
+</code></pre>
+<pre><code class="language-json">{
+  &quot;id&quot;: &quot;msg_4ac5df86ac95d65f8080935c25dbec03&quot;,
+  &quot;type&quot;: &quot;message&quot;,
+  &quot;role&quot;: &quot;assistant&quot;,
+  &quot;model&quot;: &quot;chat-standard&quot;,
+  &quot;content&quot;: [{&quot;type&quot;: &quot;text&quot;, &quot;text&quot;: &quot;pong&quot;}],
+  &quot;stop_reason&quot;: &quot;end_turn&quot;,
+  &quot;usage&quot;: {&quot;input_tokens&quot;: 9, &quot;output_tokens&quot;: 6}
+}
+</code></pre>
+<p><code>Authorization: Bearer</code> works here too. The router accepts either header on
+every endpoint.</p>
+<hr />
+<h2 id="endpoints">Endpoints</h2>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Path</th>
+<th>Scope</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET</code></td>
+<td><code>/v1/models</code></td>
+<td><code>models</code></td>
+<td>Aliases this key may use</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/v1/chat/completions</code></td>
+<td><code>inference</code></td>
+<td>OpenAI Chat Completions</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/v1/responses</code></td>
+<td><code>inference</code></td>
+<td>OpenAI Responses</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/v1/embeddings</code></td>
+<td><code>embeddings</code></td>
+<td>OpenAI embeddings</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/v1/messages</code></td>
+<td><code>inference</code></td>
+<td>Anthropic Messages</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/v1/rerank</code></td>
+<td><code>inference</code></td>
+<td>Score candidates against a query</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/v1/tokenize</code></td>
+<td><code>tokenize</code></td>
+<td>Token count for a request</td>
+</tr>
+<tr>
+<td><code>GET</code></td>
+<td><code>/health/live</code></td>
+<td>—</td>
+<td>Process is up</td>
+</tr>
+<tr>
+<td><code>GET</code></td>
+<td><code>/health/ready</code></td>
+<td>—</td>
+<td>Will accept requests</td>
+</tr>
+</tbody>
+</table></div>
+<p>The path set is exact and undecoded. There is no prefix matching: anything else
+is <code>404</code>, including <code>/v1/chat/completions/</code>.</p>
+<h3 id="discovering-aliases">Discovering aliases</h3>
+<pre><code class="language-bash">curl -sS -H &quot;Authorization: Bearer $KEY&quot; http://&lt;host&gt;:18000/v1/models
+</code></pre>
+<pre><code class="language-json">{
+  &quot;object&quot;: &quot;list&quot;,
+  &quot;data&quot;: [
+    {&quot;id&quot;: &quot;chat-standard&quot;,   &quot;object&quot;: &quot;model&quot;, &quot;owned_by&quot;: &quot;hypellm&quot;, &quot;description&quot;: &quot;the default chat model&quot;},
+    {&quot;id&quot;: &quot;qwen-any&quot;,        &quot;object&quot;: &quot;model&quot;, &quot;owned_by&quot;: &quot;hypellm&quot;, &quot;description&quot;: &quot;text or images, routed by modality&quot;},
+    {&quot;id&quot;: &quot;qwen3.8-27b&quot;,     &quot;object&quot;: &quot;model&quot;, &quot;owned_by&quot;: &quot;hypellm&quot;, &quot;description&quot;: &quot;Qwen3.8 27B, whichever Spark is warm&quot;},
+    {&quot;id&quot;: &quot;vision-standard&quot;, &quot;object&quot;: &quot;model&quot;, &quot;owned_by&quot;: &quot;hypellm&quot;, &quot;description&quot;: &quot;images&quot;}
+  ]
+}
+</code></pre>
+<p>This lists what <em>this key's tenant and permissions</em> allow, not everything
+configured. An alias missing here is a policy fact, not a bug.</p>
+<p>Which one to send:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Alias</th>
+<th>Use it for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>chat-standard</code></td>
+<td>The default. Text chat; pick this unless you have a reason not to.</td>
+</tr>
+<tr>
+<td><code>qwen3.8-27b</code></td>
+<td>The same models, named after the weights rather than the role.</td>
+</tr>
+<tr>
+<td><code>vision-standard</code></td>
+<td>Images. Declares the <code>vision</code> verb explicitly.</td>
+</tr>
+<tr>
+<td><code>qwen-any</code></td>
+<td>Text or images through one name, sorted out by what you send.</td>
+</tr>
+</tbody>
+</table></div>
+<p>All four currently resolve to the same pair of DGX Sparks; the router picks
+whichever ranks higher, and <code>hypellm.native_model</code> in the response says which
+answered. They are separate names because policy is written against them — an
+operator can point <code>vision-standard</code> somewhere else without touching a client.</p>
+<h3 id="sending-an-image">Sending an image</h3>
+<p>Both Sparks load the vision projector, so images work on any alias declaring
+the <code>image</code> modality. Standard OpenAI content parts — a <code>data:</code> URI or an
+<code>https://</code> URL:</p>
+<pre><code class="language-bash">curl -sS -X POST http://&lt;host&gt;:18000/v1/chat/completions \
+  -H &quot;Authorization: Bearer $KEY&quot; -H 'Content-Type: application/json' \
+  -d '{
+        &quot;model&quot;: &quot;vision-standard&quot;,
+        &quot;max_tokens&quot;: 300,
+        &quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: [
+          {&quot;type&quot;: &quot;text&quot;, &quot;text&quot;: &quot;What colour fills this image? One word.&quot;},
+          {&quot;type&quot;: &quot;image_url&quot;, &quot;image_url&quot;: {&quot;url&quot;: &quot;data:image/png;base64,iVBORw0KG...&quot;}}
+        ]}]
+      }'
+</code></pre>
+<pre><code class="language-json">{&quot;choices&quot;: [{&quot;message&quot;: {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: &quot;Red&quot;}}],
+ &quot;hypellm&quot;: {&quot;native_model&quot;: &quot;qwen3.8-27b-obliterated-q5-k-m&quot;}}
+</code></pre>
+<p>Two things this will not do:</p>
+<ul>
+<li><strong>Documents are refused.</strong> A <code>file</code> / <code>input_file</code> part returns
+<code>no_eligible_target</code>, and the decision trace says <code>modality_unsupported</code> on
+every target. That is deliberate — a document is forwarded opaquely and these
+servers have no path for one, so the request is refused before anything is
+dialled rather than failing at the provider.</li>
+<li><strong>Budget tokens for thinking.</strong> One Spark runs a reasoning build and emits
+<code>reasoning_content</code> before its answer. <code>&quot;max_tokens&quot;: 40</code> can be consumed
+entirely by reasoning and return empty <code>content</code> with <code>finish_reason: &quot;stop&quot;</code>
+— which looks like a broken model and is not one. Give it a few hundred.</li>
+</ul>
+<h3 id="streaming">Streaming</h3>
+<p>Set <code>&quot;stream&quot;: true</code>. Server-sent events, <code>data:</code> per line, terminated by
+<code>data: [DONE]</code>.</p>
+<pre><code>data: {&quot;id&quot;:&quot;chatcmpl-ce24...&quot;,&quot;object&quot;:&quot;chat.completion.chunk&quot;,&quot;choices&quot;:[{&quot;index&quot;:0,&quot;delta&quot;:{&quot;role&quot;:&quot;assistant&quot;},&quot;finish_reason&quot;:null}]}
+
+data: {&quot;id&quot;:&quot;chatcmpl-ce24...&quot;,&quot;object&quot;:&quot;chat.completion.chunk&quot;,&quot;choices&quot;:[{&quot;index&quot;:0,&quot;delta&quot;:{&quot;content&quot;:&quot;pong&quot;},&quot;finish_reason&quot;:null}]}
+
+data: {&quot;id&quot;:&quot;chatcmpl-ce24...&quot;,&quot;object&quot;:&quot;chat.completion.chunk&quot;,&quot;choices&quot;:[{&quot;index&quot;:0,&quot;delta&quot;:{},&quot;finish_reason&quot;:&quot;stop&quot;}]}
+
+data: {&quot;id&quot;:&quot;chatcmpl-ce24...&quot;,&quot;object&quot;:&quot;chat.completion.chunk&quot;,&quot;choices&quot;:[{&quot;index&quot;:0,&quot;delta&quot;:{}}],&quot;usage&quot;:{&quot;prompt_tokens&quot;:9,&quot;completion_tokens&quot;:6,&quot;total_tokens&quot;:15}}
+
+data: [DONE]
+</code></pre>
+<p>Two things worth knowing:</p>
+<ul>
+<li><strong>A stream can fail mid-flight, and it will not be retried.</strong> The router fails
+over freely before a provider has been committed to and never after the first
+content or tool delta has reached you — splicing a second provider's output
+into a half-delivered answer would be worse than an error. After that point a
+failure is a normalized error event and a closed connection.</li>
+<li><strong>Backpressure is real.</strong> A client that stops reading blocks the router's
+connection worker, which stops it reading from the provider. Consume the
+stream.</li>
+</ul>
+<p>Comment lines (<code>: keepalive</code>) may appear at intervals to keep an idle
+connection open. Ignore them; every SSE client already does.</p>
+<h3 id="scoring-candidates-post-v1rerank">Scoring candidates: <code>POST /v1/rerank</code></h3>
+<p>Reranking asks one question — <em>given this, which of these?</em> — and the answer is
+a score per candidate rather than generated text. The request follows the
+convention reranking services settled on, so an existing rerank client works
+unchanged:</p>
+<pre><code class="language-bash">curl -sS http://&lt;host&gt;:18000/v1/rerank \
+  -H &quot;Authorization: Bearer $KEY&quot; -H 'Content-Type: application/json' \
+  -d '{
+    &quot;model&quot;: &quot;decide&quot;,
+    &quot;query&quot;: &quot;What should the support agent do?&quot;,
+    &quot;documents&quot;: [
+      &quot;Issue a full refund&quot;,
+      &quot;Deny the request politely&quot;,
+      &quot;Escalate to a supervisor&quot;
+    ],
+    &quot;return_documents&quot;: true
+  }'
+</code></pre>
+<pre><code class="language-json">{
+  &quot;object&quot;: &quot;list&quot;,
+  &quot;results&quot;: [
+    {&quot;index&quot;: 1, &quot;relevance_score&quot;: 0.974, &quot;document&quot;: {&quot;text&quot;: &quot;Deny the request politely&quot;}},
+    {&quot;index&quot;: 0, &quot;relevance_score&quot;: 0.021, &quot;document&quot;: {&quot;text&quot;: &quot;Issue a full refund&quot;}},
+    {&quot;index&quot;: 2, &quot;relevance_score&quot;: 0.005, &quot;document&quot;: {&quot;text&quot;: &quot;Escalate to a supervisor&quot;}}
+  ],
+  &quot;model&quot;: &quot;decide&quot;,
+  &quot;usage&quot;: {&quot;prompt_tokens&quot;: 133, &quot;completion_tokens&quot;: 0, &quot;total_tokens&quot;: 133,
+            &quot;hypellm&quot;: {&quot;usage_source&quot;: &quot;provider_reported&quot;}},
+  &quot;hypellm&quot;: {&quot;native_model&quot;: &quot;Qwen_Qwen3.5-4B-Q4_K_M.gguf&quot;,
+              &quot;documents&quot;: 3, &quot;scored_documents&quot;: 3,
+              &quot;score_scale&quot;: &quot;provider_reported&quot;}
+}
+</code></pre>
+<p><code>index</code> points into the <code>documents</code> array you sent, and results are ordered by
+score, highest first, with the candidate's own position breaking a tie.</p>
+<p>Fields:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Required</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>model</code></td>
+<td>yes</td>
+<td>An alias whose targets declare the <code>rerank</code> capability</td>
+</tr>
+<tr>
+<td><code>query</code></td>
+<td>yes</td>
+<td>The criterion the candidates are scored against</td>
+</tr>
+<tr>
+<td><code>documents</code></td>
+<td>yes</td>
+<td>The candidates, as strings or <code>{&quot;text&quot;: &quot;…&quot;}</code> objects</td>
+</tr>
+<tr>
+<td><code>context</code></td>
+<td>no</td>
+<td>Evidence the criterion applies to (see below)</td>
+</tr>
+<tr>
+<td><code>top_n</code></td>
+<td>no</td>
+<td>How many results to print. Every candidate is still scored</td>
+</tr>
+<tr>
+<td><code>return_documents</code></td>
+<td>no</td>
+<td>Echo each candidate's text in the result. Default <code>false</code></td>
+</tr>
+</tbody>
+</table></div>
+<p><strong><code>context</code> is the addition worth knowing about.</strong> A decision scorer is asked
+&quot;given this state, which action?&quot;, and a request with nowhere to put the state
+can only ask half the question. Supply <code>context</code> and it becomes the evidence
+while <code>query</code> stays the criterion; omit it and the query serves as both. The
+router composes no prompt text of its own in either case — every string the
+model reads is one you sent.</p>
+<p><strong>Reranking does not stream.</strong> There is no partial ranking to send, so
+<code>&quot;stream&quot;: true</code> is a <code>400</code> rather than a body pretending to be frames.</p>
+<p><strong>Scores mean what the target's scale means.</strong> They are comparable within one
+response and between no two of them; nothing rescales them. Where a scorer calls
+its own numbers uncalibrated — SemIf does — they are a ranking signal, not a
+confidence. <code>hypellm.scored_documents</code> says how many candidates came back
+scored, so a short answer is visible rather than looking complete.</p>
+<p><strong>Limits.</strong> A request carries at most 1,024 candidates; each target declares its
+own narrower bound, and a SemIf scorer takes 2 to 16. Asking for more is a <code>400</code>
+before anything is sent upstream.</p>
+<h3 id="counting-tokens">Counting tokens</h3>
+<p><code>POST /v1/tokenize</code> takes a request body of the same shape and returns a count
+without running inference. Admission uses a conservative byte-based estimate
+rather than this number, so a request may still be rejected as too large after
+<code>/v1/tokenize</code> said it fit.</p>
+<hr />
+<h2 id="errors">Errors</h2>
+<p>One shape everywhere, OpenAI-compatible, plus a <code>request_id</code>:</p>
+<pre><code class="language-json">{
+  &quot;error&quot;: {
+    &quot;message&quot;: &quot;the requested model is not available&quot;,
+    &quot;type&quot;: &quot;invalid_request_error&quot;,
+    &quot;code&quot;: &quot;model_not_found&quot;,
+    &quot;param&quot;: &quot;model&quot;
+  },
+  &quot;request_id&quot;: &quot;d5f7600c2372debef33a97b291ca6fe2&quot;
+}
+</code></pre>
+<p><code>/v1/messages</code> returns the Anthropic error shape instead. Every response — good
+or bad — carries <code>x-request-id</code>, which is the same value.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Status</th>
+<th><code>code</code></th>
+<th>What it means</th>
+<th>What to do</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>400</td>
+<td><code>invalid_request</code></td>
+<td>Malformed body, bad field, unknown value</td>
+<td>Fix the request; <code>param</code> names the field</td>
+</tr>
+<tr>
+<td>401</td>
+<td><code>unauthenticated</code></td>
+<td>Missing, malformed, revoked or expired key</td>
+<td>Check the key; do not retry</td>
+</tr>
+<tr>
+<td>402</td>
+<td><code>token_budget_exhausted</code></td>
+<td>The key's token budget cannot fund this request — it is spent, or what is left is less than this request reserves</td>
+<td>Top up. Waiting does not help: the budget does not refill</td>
+</tr>
+<tr>
+<td>403</td>
+<td><code>permission_denied</code></td>
+<td>Key lacks the scope, or policy denies the alias</td>
+<td>Ask for the scope or the grant</td>
+</tr>
+<tr>
+<td>404</td>
+<td><code>model_not_found</code></td>
+<td>No such alias, or not visible to this key</td>
+<td><code>GET /v1/models</code></td>
+</tr>
+<tr>
+<td>404</td>
+<td><code>not_found</code></td>
+<td>No such endpoint</td>
+<td>Check the path</td>
+</tr>
+<tr>
+<td>413</td>
+<td>—</td>
+<td>Body over the configured maximum</td>
+<td>Send less</td>
+</tr>
+<tr>
+<td>429</td>
+<td><code>rate_limited</code></td>
+<td>Concurrency, queue, request-rate or token-rate limit</td>
+<td>Honour <code>Retry-After</code>; back off</td>
+</tr>
+<tr>
+<td>503</td>
+<td><code>no_eligible_target</code></td>
+<td>No target passed policy, health and capability filters</td>
+<td>See below</td>
+</tr>
+<tr>
+<td>504</td>
+<td><code>deadline_exceeded</code></td>
+<td>Deadline passed</td>
+<td>Retry idempotent work only</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>no_eligible_target</code> is the one that needs interpreting. It means every target
+was excluded, and the reason is per-target: policy denial, residency, a
+capability the request needed and no target declared, an open circuit breaker,
+or a target that simply is not running. <strong>Ask an operator for the decision
+trace</strong> — <code>GET /admin/v1/decisions/&lt;request_id&gt;</code> names every excluded target
+and why:</p>
+<pre><code class="language-json">{
+  &quot;request_id&quot;: &quot;696cf77f92f86fd51a9058c5710bb9a2&quot;,
+  &quot;explanation&quot;: &quot;policy a388be7bf84d; candidates=0; excluded=1; chosen=none&quot;,
+  &quot;candidates&quot;: [],
+  &quot;exclusions&quot;: [{&quot;target&quot;: &quot;spark2:qwen38-q5&quot;, &quot;reason&quot;: &quot;modality_unsupported&quot;}]
+}
+</code></pre>
+<p>That is faster than guessing, and it is why <code>request_id</code> is on every response.</p>
+<h3 id="retrying">Retrying</h3>
+<p>Retry <code>429</code>, <code>503</code> and <code>504</code>. Do not retry <code>400</code>, <code>401</code>, <code>402</code>, <code>403</code> or <code>404</code> —
+they are deterministic and will fail identically.</p>
+<p><code>402</code> is the one that is not a rate limit. A key may carry a cumulative token
+budget — input plus output, across everything it has ever sent — and when a
+request cannot be funded the router answers before calling a provider, with no
+<code>Retry-After</code>, because no amount of waiting changes the answer. The router
+reserves the request's worst case before it runs (its input, plus the output
+limit), so a request can be refused while some budget remains; sending a
+smaller <code>max_tokens</code> reserves less. If the operator configured payment
+directions they arrive as data in the error, never as a redirect:</p>
+<pre><code class="language-json">{
+  &quot;error&quot;: {
+    &quot;type&quot;: &quot;payment_required&quot;,
+    &quot;code&quot;: &quot;token_budget_exhausted&quot;,
+    &quot;message&quot;: &quot;The API key's token budget is exhausted or insufficient for this request.&quot;,
+    &quot;payment_required&quot;: {
+      &quot;message&quot;: &quot;Purchase more tokens in the customer portal.&quot;,
+      &quot;payment_url&quot;: &quot;https://billing.example/tokens&quot;
+    }
+  }
+}
+</code></pre>
+<p>A streamed request that cannot be funded gets the same <code>402</code> and JSON body, not
+an event stream. The same key works again as soon as it is credited; nothing
+needs to be reissued.</p>
+<p>The router already fails over between eligible targets, applies its own
+deadlines and runs circuit breakers. A client that retries aggressively on top
+of that adds load to a router that is already shedding it. Exponential backoff,
+and honour <code>Retry-After</code> when present.</p>
+<hr />
+<h2 id="router-extensions">Router extensions</h2>
+<p>Standard clients need none of this and can ignore the section. All of it is
+additive: the request bodies stay valid OpenAI and Anthropic documents.</p>
+<h3 id="response-metadata">Response metadata</h3>
+<p>Responses carry a <code>hypellm</code> object naming the target actually reached — the
+router may have chosen a different provider than a previous identical request.</p>
+<pre><code class="language-json">&quot;hypellm&quot;: {&quot;native_model&quot;: &quot;qwen3-27b&quot;, &quot;upstream_id&quot;: &quot;chatcmpl-verify&quot;}
+</code></pre>
+<p><code>usage</code> carries <code>&quot;hypellm&quot;: {&quot;usage_source&quot;: …}</code>, one of:</p>
+<ul>
+<li><code>provider_reported</code>: the provider reported both input and output tokens.</li>
+<li><code>provider_reported_partial</code>: the provider reported output only; the input
+count is <code>null</code>, not <code>0</code>.</li>
+<li><code>router_estimated</code>: the counts are the router's own estimate.</li>
+<li><code>unreported</code>: no usage arrived at all; the counts are <code>null</code>.</li>
+</ul>
+<p>Do not bill from an estimate, and do not read a <code>null</code> count as zero.</p>
+<h3 id="asking-for-a-reasoning-tier">Asking for a reasoning tier</h3>
+<p><code>reasoning_effort</code> (<code>minimal</code>, <code>low</code>, <code>medium</code>, <code>high</code>), or <code>reasoning.effort</code>
+in the Responses dialect. An unrecognised value is an error rather than a
+silent downgrade.</p>
+<p>This is an <strong>eligibility filter, not a hint</strong>: a tier no target declares yields
+<code>no_eligible_target</code> rather than a quietly cheaper answer.</p>
+<h3 id="asking-for-a-quality-floor">Asking for a quality floor</h3>
+<p><code>min_quality</code>, an integer. Targets below it are excluded. Policy may already
+impose a floor; the higher of the two applies, so this can narrow the candidate
+set and never widens it.</p>
+<h3 id="routing-hints">Routing hints</h3>
+<p>An optional <code>hypellm_routing</code> object, honoured only if the key is permitted to
+send hints — otherwise silently ignored, by design.</p>
+<pre><code class="language-json">{
+  &quot;model&quot;: &quot;chat-standard&quot;,
+  &quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;ping&quot;}],
+  &quot;hypellm_routing&quot;: {
+    &quot;prefer_target&quot;: &quot;spark:qwen38-q5&quot;,
+    &quot;require_local&quot;: true,
+    &quot;idempotency_key&quot;: &quot;...&quot;
+  }
+}
+</code></pre>
+<ul>
+<li><code>prefer_target</code> reorders eligible targets within a bounded slice of the
+score. It cannot make an ineligible target eligible, beat a warmer one, or
+outrank a policy binding. Express hard preference through aliases and
+bindings instead.</li>
+<li><code>require_local</code> excludes targets not marked local — inference that would
+leave the deployment.</li>
+<li><code>idempotency_key</code> marks the request safe to fail over after a provider has
+accepted it.</li>
+</ul>
+<p>Prompt content is never configuration. Nothing written in a message can change
+a destination, a credential, or a routing decision.</p>
+<hr />
+<h2 id="long-running-work-v1jobs">Long-running work: <code>/v1/jobs</code></h2>
+<p>First-party, not OpenAI-compatible, and announced as such because no
+OpenAI-compatible shape fits. Off unless the deployment set <code>job_workers</code>; a
+router that does not run jobs answers <code>404</code>.</p>
+<p>Post the same body you would post to <code>/v1/chat/completions</code>:</p>
+<pre><code class="language-bash">curl -sS $BASE/v1/jobs -H &quot;Authorization: Bearer $KEY&quot; \
+  -H 'Content-Type: application/json' \
+  -d '{&quot;model&quot;:&quot;long-generation&quot;,&quot;messages&quot;:[{&quot;role&quot;:&quot;user&quot;,&quot;content&quot;:&quot;...&quot;}]}'
+</code></pre>
+<pre><code class="language-json">{&quot;job_id&quot;:&quot;job_5f3a…&quot;,&quot;state&quot;:&quot;queued&quot;,&quot;progress_permille&quot;:0,&quot;eta_ms&quot;:0}
+</code></pre>
+<p>Then:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Request</th>
+<th>Answer</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET /v1/jobs/{id}</code></td>
+<td>state, progress, and the error once failed</td>
+</tr>
+<tr>
+<td><code>GET /v1/jobs/{id}/events</code></td>
+<td>SSE, one <code>state</code> event per change, then <code>done</code></td>
+</tr>
+<tr>
+<td><code>GET /v1/jobs/{id}/result</code></td>
+<td>the completed response, in the dialect you submitted; <code>409 job_not_ready</code> until then</td>
+</tr>
+<tr>
+<td><code>DELETE /v1/jobs/{id}</code></td>
+<td>cancel; a queued job stops at once, a running one at its next cancellation point</td>
+</tr>
+<tr>
+<td><code>GET /v1/jobs</code></td>
+<td>your tenant's jobs, newest first</td>
+</tr>
+</tbody>
+</table></div>
+<p>Three things to know before building on it:</p>
+<ul>
+<li><strong>A job identifier is valid for one router lifetime.</strong> Jobs are held in
+memory, so a restart loses them and their results, and the identifier then
+answers <code>job_not_found</code>. Resubmit rather than poll indefinitely.</li>
+<li><strong>Results expire.</strong> <code>job_retention_ms</code> (15 minutes by default) is how long a
+finished job stays readable. Collect the result, do not treat the router as
+storage.</li>
+<li><strong><code>stream: true</code> is ignored.</strong> The connection is released at <code>202</code>; there is
+nothing to stream it to. Use <code>/events</code> for progress and <code>/result</code> for the
+answer.</li>
+</ul>
+<hr />
+<h2 id="limits">Limits</h2>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Limit</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Request body</td>
+<td>16 MiB</td>
+</tr>
+<tr>
+<td>Request head</td>
+<td>32 KiB</td>
+</tr>
+<tr>
+<td>Request headers</td>
+<td>100</td>
+</tr>
+<tr>
+<td>Concurrent connections</td>
+<td>4096</td>
+</tr>
+<tr>
+<td>Requests per connection</td>
+<td>1000</td>
+</tr>
+<tr>
+<td>Read/write timeout</td>
+<td>30 s</td>
+</tr>
+<tr>
+<td>Keep-alive idle</td>
+<td>75 s</td>
+</tr>
+</tbody>
+</table></div>
+<p>Per-tenant and per-key concurrency, queue depth, request rate, token rate, byte
+rate and spend are configured separately and surface as <code>429</code>. Ask your
+operator what applies to your key rather than discovering it under load.</p>
+<p>HTTP/1.1 only. There is no HTTP/2 and no inbound TLS — a production deployment
+puts a TLS edge in front, so the URL you are given may well be <code>https://</code> even
+though the router itself speaks cleartext.</p>
+<p>Long generations are ordinary synchronous requests held open for their
+deadline. There is no jobs API and no polling endpoint.</p>
+<hr />
+<h2 id="when-something-is-wrong">When something is wrong</h2>
+<p>Work down this list; each step rules out the one above it.</p>
+<ol>
+<li><strong><code>curl http://&lt;host&gt;:18000/health/live</code>.</strong> No answer means a network or
+address problem, not a router problem. On the containerised setup, <code>just status</code> says whether it is running and <code>just tailnet</code> whether it is
+reachable.</li>
+<li><strong><code>curl -H &quot;Authorization: Bearer $KEY&quot; .../v1/models</code>.</strong> <code>401</code> means the key
+is wrong, revoked or expired. <code>200</code> with fewer aliases than expected is a
+policy fact — the endpoint shows only what this key's tenant may use.</li>
+<li><strong>Check you are asking for an alias</strong>, not a provider's model name.</li>
+<li><strong>On <code>no_eligible_target</code>, get the decision trace</strong> for the <code>request_id</code>.
+Guessing at which filter excluded which target is slower than reading it.</li>
+<li><strong>On <code>429</code>, back off</strong> and ask which quota you are hitting.</li>
+<li><strong>Keep the <code>request_id</code>.</strong> Every operator-side record — audit entries, decision
+traces, metrics correlation — is keyed by it, and prompts are not logged by
+default, so it is often the only thread back to what happened.</li>
+</ol>
+
+      </article>
+      <footer class="page-footer"><a href="index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#what-you-need">What you need</a></li>
+<li class="toc-level-2"><a href="#getting-an-api-key">Getting an API key</a></li>
+<li class="toc-level-3"><a href="#the-short-way">The short way</a></li>
+<li class="toc-level-3"><a href="#1-sign-in">1. Sign in</a></li>
+<li class="toc-level-3"><a href="#2-mint-the-key">2. Mint the key</a></li>
+<li class="toc-level-2"><a href="#base-url">Base URL</a></li>
+<li class="toc-level-2"><a href="#openai-compatible-clients">OpenAI-compatible clients</a></li>
+<li class="toc-level-2"><a href="#anthropic-compatible-clients">Anthropic-compatible clients</a></li>
+<li class="toc-level-2"><a href="#endpoints">Endpoints</a></li>
+<li class="toc-level-3"><a href="#discovering-aliases">Discovering aliases</a></li>
+<li class="toc-level-3"><a href="#sending-an-image">Sending an image</a></li>
+<li class="toc-level-3"><a href="#streaming">Streaming</a></li>
+<li class="toc-level-3"><a href="#scoring-candidates-post-v1rerank">Scoring candidates: POST /v1/rerank</a></li>
+<li class="toc-level-3"><a href="#counting-tokens">Counting tokens</a></li>
+<li class="toc-level-2"><a href="#errors">Errors</a></li>
+<li class="toc-level-3"><a href="#retrying">Retrying</a></li>
+<li class="toc-level-2"><a href="#router-extensions">Router extensions</a></li>
+<li class="toc-level-3"><a href="#response-metadata">Response metadata</a></li>
+<li class="toc-level-3"><a href="#asking-for-a-reasoning-tier">Asking for a reasoning tier</a></li>
+<li class="toc-level-3"><a href="#asking-for-a-quality-floor">Asking for a quality floor</a></li>
+<li class="toc-level-3"><a href="#routing-hints">Routing hints</a></li>
+<li class="toc-level-2"><a href="#long-running-work-v1jobs">Long-running work: /v1/jobs</a></li>
+<li class="toc-level-2"><a href="#limits">Limits</a></li>
+<li class="toc-level-2"><a href="#when-something-is-wrong">When something is wrong</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

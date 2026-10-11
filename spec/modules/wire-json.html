@@ -1,0 +1,495 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: wire-json.">
+  <title>wire-json · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="../assets/wiki.css">
+  <script defer src="../assets/search-index.js"></script>
+  <script defer src="../assets/wiki.js"></script>
+</head>
+<body data-wiki-root="../" data-page-title="wire-json" data-page-group="Module contracts">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="../index.html">Wiki home</a></li>
+<li><a href="../overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="../router-specification.html">Router specification</a></li>
+<li><a href="../threat-model.html">Threat model</a></li>
+<li><a href="../orchestration.html">Fleet orchestration</a></li>
+<li><a href="../deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="../using-the-router.html">Using the router</a></li>
+<li><a href="../deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="../runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="../components/fleet-agent.html">Fleet agent</a></li>
+<li><a href="../components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="../components/container-init.html">Container init</a></li>
+<li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="hypellm-config.html">hypellm-config</a></li>
+<li><a href="hypellm-core.html">hypellm-core</a></li>
+<li><a href="hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="hypellm-net.html">hypellm-net</a></li>
+<li><a href="hypellm-router.html">hypellm-router</a></li>
+<li><a href="hypellm-store.html">hypellm-store</a></li>
+<li><a href="hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="wire-http1.html">wire-http1</a></li>
+<li><a href="wire-json.html" aria-current="page">wire-json</a></li>
+<li><a href="wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="../index.html">Wiki</a><span aria-hidden="true">/</span>Module contracts</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="module-wire-json">Module: wire-json</h1>
+<p>Specification 4.1 requires every in-repository module to declare an owner, threat
+notes, public API, unsafe-code declaration, fuzz targets, and maximum
+input/resource limits.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Owner</td>
+<td>Security (primary), Platform (secondary)</td>
+</tr>
+<tr>
+<td>Unsafe code</td>
+<td>None. <code>#![forbid(unsafe_code)]</code> declared in <code>lib.rs</code> and inherited from the workspace.</td>
+</tr>
+<tr>
+<td>External dependencies</td>
+<td>None. <code>Cargo.toml</code> has no <code>[dependencies]</code> section at all — not even a workspace path dependency. Rust standard library only.</td>
+</tr>
+<tr>
+<td>Fuzz targets</td>
+<td>None implemented. Required targets are listed under &quot;Fuzz targets&quot; below.</td>
+</tr>
+</tbody>
+</table></div>
+<p>This crate is a leaf of the dependency graph and is depended on by
+<code>hypellm-adapters</code>, <code>hypellm-admin-api</code>, <code>hypellm-auth</code>, <code>hypellm-net</code>, <code>hypellm-router</code>,
+<code>hypellm-store</code>, and <code>hypellm-telemetry</code>. Every JSON byte that crosses a trust
+boundary — client request bodies, provider responses, streaming event payloads,
+OIDC token responses, structured log lines, stored records — passes through this
+parser. A defect here is reachable from every ingress in the system.</p>
+<h2 id="scope-and-the-one-strict-grammar-no-accommodation-rule">Scope and the &quot;one strict grammar, no accommodation&quot; rule</h2>
+<p>Specification 18.1 asks for a &quot;small strict JSON tokenizer/parser/serializer with
+depth and size limits&quot;. Specification 3.1 requires the request lifecycle to
+reject ambiguous input rather than normalise it. This module is the single
+implementation of RFC 8259 in the workspace; there is deliberately no second,
+more permissive path for &quot;difficult&quot; upstreams.</p>
+<p>What it does:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Concern</th>
+<th>Reference</th>
+<th>Why the router needs it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Strict RFC 8259 parsing</td>
+<td>RFC 8259</td>
+<td>Client bodies, provider responses, management payloads</td>
+</tr>
+<tr>
+<td>Explicit per-call-site limits</td>
+<td>Specification 3.2</td>
+<td>Bounded work on adversarial input</td>
+</tr>
+<tr>
+<td>Ordered value tree</td>
+<td>Specification 6, 11.1</td>
+<td>Determinism; never infer ordering from map iteration</td>
+</tr>
+<tr>
+<td>Compact serialization</td>
+<td>Specification 7.1, 14</td>
+<td>Provider requests and streaming frames</td>
+</tr>
+<tr>
+<td>Key-sorted canonical serialization</td>
+<td>Specification 11.1</td>
+<td>Configuration digests, audit records</td>
+</tr>
+<tr>
+<td>Content-free errors</td>
+<td>Specification 10, 8.2</td>
+<td>Prompts are sensitive; error codes are a stable client contract</td>
+</tr>
+</tbody>
+</table></div>
+<p>What it deliberately does <strong>not</strong> do:</p>
+<ul>
+<li><strong>No incremental or streaming parse.</strong> <code>parse</code> consumes one complete document
+and rejects trailing content. Specification 14 assigns frame boundary
+detection to <code>wire-sse</code>; this crate then parses each delimited event whole
+under <code>Limits::STREAM_EVENT</code>. There is no resumable reader, and callers must
+not treat <code>UnexpectedEnd</code> as &quot;read more bytes&quot; without their own framing.</li>
+<li><strong>No schema validation.</strong> <code>field_str</code>, <code>field_i64</code> and friends check one field
+at a time. Tool-call argument schemas (specification 5.1, 14) are the
+adapters' problem, and the router never executes them.</li>
+<li><strong>No dialect support.</strong> No JSON5, NDJSON, JSON Pointer, JSON Patch, JSONPath,
+comments, or BSON. Each is a grammar an attacker could aim at a component that
+understands it while another does not.</li>
+<li><strong>No byte-preserving passthrough.</strong> The parser decodes into a <code>Value</code>; the
+serializer re-encodes. Input bytes are not retained. A document that goes in
+and comes out is semantically equal but not necessarily byte-equal (see the
+number-fidelity threat below). Anything that must be compared or digested is
+compared over <code>to_canonical_vec</code>, never over reserialized-and-diffed bytes.</li>
+<li><strong>No cryptography and no digesting.</strong> Canonical bytes are produced here;
+hashing them is <code>hypellm-crypto</code>'s job.</li>
+<li><strong>Not RFC 8785 (JCS).</strong> &quot;Canonical&quot; here means: recursively key-sorted, UTF-8,
+compact, with Rust's shortest-round-trip float formatting. That is stable
+across processes and builds of this workspace, which is what a configuration
+digest needs, but it is <em>not</em> JCS — JCS would render <code>1.0</code> as <code>1</code>. Do not
+assume a digest computed here matches one computed by an external tool.</li>
+</ul>
+<h2 id="threat-notes">Threat notes</h2>
+<ul>
+<li><strong>Parser differentials are the primary threat, not memory safety.</strong> The router
+reads a document to make an authorization and routing decision; an upstream
+reads the same document to produce output. If the two disagree about what the
+bytes mean, the attacker picks the interpretation. <code>parse</code> therefore rejects
+every lenient extension rather than normalising it: comments, trailing commas,
+single-quoted strings, unquoted keys, <code>NaN</code>/<code>Infinity</code>, leading <code>+</code>, leading
+zeros, bare <code>.5</code>, <code>1.</code>, <code>1e</code>, hex literals, a UTF-8 BOM, form feed / vertical
+tab / NBSP as whitespace, raw C0 control characters inside strings, invalid
+UTF-8, lone surrogates, and trailing content after the top-level value. Each
+has a test in <code>parse.rs</code>. <strong>Adding an accommodation for a misbehaving provider
+reopens this class and is a two-person-review change (specification 21.1).</strong></li>
+<li><strong>Duplicate keys are refused, not resolved.</strong> <code>{&quot;model&quot;:&quot;cheap&quot;,&quot;model&quot;:&quot;expensive&quot;}</code>
+is a routing-decision attack: this parser takes the first occurrence, most
+JavaScript upstreams take the last. <code>reject_duplicate_keys</code> is <code>true</code> in all
+three presets and the document is rejected outright rather than the router
+picking a side. The <code>false</code> setting exists for callers parsing documents this
+workspace itself produced; <strong>setting it on a data-plane path silently restores
+first-wins semantics and the differential with it.</strong></li>
+<li><strong>Number fidelity is a semantic hazard the type system only half prevents.</strong>
+Integers that fit <code>i64</code> are kept exact (token counts and budgets are money —
+see <code>value.rs</code>). An integer larger than <code>i64::MAX</code> is <em>not</em> rejected; RFC 8259
+permits it, so it degrades to <code>f64</code>. <code>as_i64</code>/<code>field_i64</code> then fail with a
+<code>TypeError</code>, which is the intended fail-closed path — but <code>opt_field_f64</code> will
+hand back a silently rounded value, and re-serializing that value emits
+<code>1.2345678901234567e19</code> where the input said <code>12345678901234567890</code>. Any code
+that compares a normalized request digest, or forwards a numeric field it did
+not itself validate, must go through the integer accessors.</li>
+<li><strong>Quadratic work in duplicate-key detection.</strong> <code>Object</code> is a <code>Vec</code> of pairs and
+<code>contains_key</code> is a linear scan, so parsing an object costs O(n²) key
+comparisons. Per object this is capped by <code>max_object_entries</code>, but a single
+16 MiB body can carry a few hundred maximally-sized objects, and the total
+comparison count reaches the order of 10^10. String comparison rejects on
+length first, so this is slow rather than fatal, and the HTTP layer's
+endpoint-specific body cap (specification 3.2) is the real mitigation — but on
+the default 16 MiB limit this is the cheapest known way to burn router CPU
+with one request. It is the first thing a <code>json_parse_arbitrary</code> fuzz target
+with a work budget should find, and it is why the adversarial-corpus
+requirement in specification 19.1 names deep JSON explicitly.</li>
+<li><strong>Recursion depth is bounded on the way in, not on the way out.</strong>
+<code>parse_value</code> recurses, and <code>max_depth</code> (64 by default) bounds it. Nothing
+bounds the recursion in <code>write_value</code>, <code>Value::sort_keys_recursive</code>, or the
+compiler-generated <code>Drop</code> glue for a nested <code>Value</code>. For values that came from
+<code>parse</code> this is safe by construction. For values assembled programmatically it
+is not: a caller that builds a deeply nested tree in a loop can overflow the
+stack during serialization or drop. With <code>panic = &quot;abort&quot;</code> in the release
+profile, that is a process abort, not a request failure.</li>
+<li><strong><code>with_max_depth</code> has no ceiling.</strong> It accepts any <code>u32</code>. A caller that
+derives a limit from configuration rather than naming a preset can configure a
+depth that overflows the parser's stack before <code>DepthExceeded</code> ever fires.
+Callers must use <code>Limits::DEFAULT</code>, <code>SMALL</code>, or <code>STREAM_EVENT</code>, narrowing only.</li>
+<li><strong>Errors must stay content-free.</strong> Specification 10 makes prompts, tool
+arguments, and provider bodies sensitive by default. <code>JsonError</code> carries an
+<code>ErrorKind</code> and a byte offset and nothing else; <code>Display</code> never quotes the
+input; <code>ErrorKind::code()</code> returns a stable string for the specification 8.2
+error contract. <code>TypeError</code> names a field path and the expected and found
+<em>type names</em> — never the value. The <code>error_never_echoes_input</code> and
+<code>type_error_names_field_without_echoing_value</code> tests guard this. <strong>A caller
+that passes an attacker-supplied key name into <code>field_str</code> puts that name into
+<code>TypeError::path</code>; field names in accessor calls must be code literals.</strong></li>
+<li><strong>The serializer fails soft on non-finite floats.</strong> A <code>Number::Float</code> holding
+NaN or an infinity is written as <code>null</code>, because JSON cannot express it and
+emitting <code>NaN</code> would produce a document this very parser rejects. Parsed input
+can never reach that state (<code>NumberOutOfRange</code>), so this only fires for values
+built in-process — but it means an arithmetic bug upstream of serialization
+becomes a <code>null</code> field at a provider rather than a loud error.</li>
+<li><strong>Output is not HTML- or script-safe.</strong> <code>write_string</code> escapes the C0 range
+and, defensively, U+2028/U+2029 — but not <code>&lt;</code>, <code>&gt;</code>, <code>&amp;</code>, or <code>/</code>. Output must
+never be interpolated into an HTML or <code>&lt;script&gt;</code> context. Specification 15.1
+already forbids HTML string injection in the SPA (build DOM nodes); this crate
+does not provide a second line of defence for code that ignores that.</li>
+<li><strong><code>max_input_bytes</code> is a check on an already-materialized slice.</strong> <code>parse</code>
+takes <code>&amp;[u8]</code>, so by the time the limit is enforced the caller has the bytes in
+memory. Memory bounding is the HTTP body reader's responsibility
+(specification 3.2, default 16 MiB, endpoint-specific); this limit is a
+second, in-depth check and a bound on parsing work, not an allocation guard.</li>
+<li><strong>Panics.</strong> No <code>unwrap</code>, <code>expect</code>, <code>panic!</code>, <code>unreachable!</code>, or integer
+division appears outside <code>#[cfg(test)]</code>. Slice indexing is used in five places
+in <code>parse.rs</code> and <code>write.rs</code>, each immediately preceded by the bounds check
+that makes it total. All arithmetic on <code>pos</code> is bounded by <code>max_input_bytes</code>,
+well under <code>usize</code> range; <code>overflow-checks</code> is on in the release profile, so a
+regression here aborts rather than wraps.</li>
+</ul>
+<h2 id="limits">Limits</h2>
+<p>Enforced. Every parse call names a <code>Limits</code> value; the three presets are the
+only ones a data-plane caller should use.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Bound</th>
+<th>Field</th>
+<th>DEFAULT</th>
+<th>SMALL</th>
+<th>STREAM_EVENT</th>
+<th>Enforced by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Total input</td>
+<td><code>max_input_bytes</code></td>
+<td>16 MiB</td>
+<td>1 MiB</td>
+<td>2 MiB</td>
+<td><code>parse()</code> length check before the BOM, UTF-8, and grammar passes → <code>InputTooLarge</code></td>
+</tr>
+<tr>
+<td>Nesting depth</td>
+<td><code>max_depth</code></td>
+<td>64</td>
+<td>32</td>
+<td>32</td>
+<td>depth counter entering <code>parse_array</code> / <code>parse_object</code> → <code>DepthExceeded</code></td>
+</tr>
+<tr>
+<td>Decoded string</td>
+<td><code>max_string_bytes</code></td>
+<td>8 MiB</td>
+<td>64 KiB</td>
+<td>1 MiB</td>
+<td><code>parse_string</code>: authoritative check on the decoded <code>String</code> at the closing quote, plus incremental checks per escape and per literal run → <code>StringTooLong</code></td>
+</tr>
+<tr>
+<td>Elements per array</td>
+<td><code>max_array_items</code></td>
+<td>100 000</td>
+<td>10 000</td>
+<td>4 096</td>
+<td><code>parse_array</code> before each element → <code>ArrayTooLong</code></td>
+</tr>
+<tr>
+<td>Entries per object</td>
+<td><code>max_object_entries</code></td>
+<td>10 000</td>
+<td>2 000</td>
+<td>512</td>
+<td><code>parse_object</code> before each entry → <code>ObjectTooLarge</code></td>
+</tr>
+<tr>
+<td>Duplicate keys</td>
+<td><code>reject_duplicate_keys</code></td>
+<td>reject</td>
+<td>reject</td>
+<td>reject</td>
+<td><code>parse_object</code> linear <code>contains_key</code> → <code>DuplicateKey</code></td>
+</tr>
+</tbody>
+</table></div>
+<p><code>DEFAULT</code> matches the specification 3.2 row &quot;JSON depth / string length — 64
+levels / 8 MiB default&quot; and the 16 MiB inbound-body default. <code>STREAM_EVENT</code> is
+the bounded-event-size requirement of specification 14. <code>with_max_input_bytes</code>
+and <code>with_max_depth</code> narrow a preset; nothing in the type prevents them widening
+one.</p>
+<p>Not enforced — stated here because a false assurance is worse than a known gap:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Not bounded</th>
+<th>Consequence</th>
+<th>Mitigation today</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Numeric token length</td>
+<td>A 16 MiB run of digits is scanned and handed to <code>f64::from_str</code></td>
+<td>Bounded transitively by <code>max_input_bytes</code> only</td>
+</tr>
+<tr>
+<td>Serialization / sort / drop depth</td>
+<td>Stack overflow on a programmatically built deep tree</td>
+<td>Parsed values are bounded by <code>max_depth</code>; built values are the caller's responsibility</td>
+</tr>
+<tr>
+<td>Ceiling on <code>max_depth</code></td>
+<td>A configured depth can exceed the usable stack</td>
+<td>Use the presets; narrow only</td>
+</tr>
+<tr>
+<td>Total node count / allocated bytes of the value tree</td>
+<td>Peak memory is a multiple of input size, not a fixed cap</td>
+<td>Bounded transitively by <code>max_input_bytes</code></td>
+</tr>
+<tr>
+<td>Output size of <code>to_string</code> / <code>write_to</code></td>
+<td>Escaping expands up to 6x (one control byte becomes a six-byte unicode escape)</td>
+<td>Per-stream watermark (specification 3.2, 256 KiB) is enforced by the caller</td>
+</tr>
+<tr>
+<td><code>to_canonical_string</code> working set</td>
+<td>Clones the whole value before sorting: ~2× peak</td>
+<td>Canonical form is a control-plane path, under <code>Limits::SMALL</code></td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="fuzz-targets">Fuzz targets</h2>
+<p><code>tests/fuzz.rs</code> — six targets, run by <code>cargo test -p wire-json</code>, driven by the
+seeded mutation engine in <code>hypellm-test-corpus::fuzz</code> over <code>hypellm-test-corpus::json</code>.
+There is no <code>fuzz/</code> directory and no libFuzzer harness, because specification 4
+admits no such dependency; a failing case is reproducible by seed number.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Target</th>
+<th>Property asserted</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>no_mutation_of_the_corpus_panics_the_parser</code></td>
+<td>Termination and no panic</td>
+</tr>
+<tr>
+<td><code>the_depth_limit_holds_on_mutated_input</code></td>
+<td><code>max_depth</code> is exact</td>
+</tr>
+<tr>
+<td><code>deeply_nested_input_is_refused_rather_than_overflowing_the_stack</code></td>
+<td>The recursion bound is a refusal, not a crash</td>
+</tr>
+<tr>
+<td><code>an_oversize_document_is_refused_without_being_buffered_whole</code></td>
+<td>Size is checked before allocation</td>
+</tr>
+<tr>
+<td><code>truncation_at_every_offset_is_handled</code></td>
+<td>Every prefix of a valid document is a clean error</td>
+</tr>
+<tr>
+<td><code>random_bytes_are_rejected_without_panicking</code></td>
+<td>Unstructured input</td>
+</tr>
+</tbody>
+</table></div>
+<p>Still outstanding:</p>
+<p>Specification 21 requires a JSON fuzz layer and specification 18.2 requires
+protocol parsers to be fuzzed. The targets this module needs, in priority order:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Target</th>
+<th>Property asserted</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Arbitrary parsing</td>
+<td>Mutated corpus values terminate with bounded work under every parser profile</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Limits</td>
+<td>Every accepted mutation remains within depth, string, array and object bounds</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Round trip</td>
+<td>Parse, serialize and parse preserves accepted values</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Canonical stability</td>
+<td>Object key order does not alter canonical output</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Strictness</td>
+<td>Mutations cannot enable duplicate keys or unsupported grammar extensions</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Prefixes and escapes</td>
+<td>Truncated prefixes terminate safely and escaped strings round-trip</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>Until these exist, the adversarial-corpus gate in specification 19.1 and the
+&quot;known attack corpus produces bounded work&quot; gate in 21.1 are unmet for JSON.</p>
+<h2 id="public-api">Public API</h2>
+<p>See <code>lib.rs</code>. Four modules, re-exported flat: <code>Limits</code>; <code>parse</code> / <code>parse_str</code> /
+<code>JsonError</code> / <code>ErrorKind</code>; <code>Value</code> / <code>Number</code> / <code>Object</code> / <code>TypeError</code> with
+<code>object</code> and <code>array</code> constructors; <code>to_string</code> / <code>to_vec</code> / <code>write_to</code> /
+<code>to_canonical_string</code> / <code>to_canonical_vec</code> / <code>write_string</code> / <code>escape_string</code>.</p>
+<p>The surface is intentionally narrow. There is no derive macro and no
+serde-style typed mapping (specification 4.1 forbids proc macros outright), no
+streaming reader, no mutation API beyond <code>Object::push</code> / <code>push_opt</code> /
+<code>sort_keys</code>, and no pretty-printer. <code>Object::push_opt</code> exists because
+specification 5.1 distinguishes an unset sampling parameter from a null one, and
+omitting a key is a different message to a provider than sending <code>null</code>.</p>
+
+      </article>
+      <footer class="page-footer"><a href="../index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#scope-and-the-one-strict-grammar-no-accommodation-rule">Scope and the &quot;one strict grammar, no accommodation&quot; rule</a></li>
+<li class="toc-level-2"><a href="#threat-notes">Threat notes</a></li>
+<li class="toc-level-2"><a href="#limits">Limits</a></li>
+<li class="toc-level-2"><a href="#fuzz-targets">Fuzz targets</a></li>
+<li class="toc-level-2"><a href="#public-api">Public API</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

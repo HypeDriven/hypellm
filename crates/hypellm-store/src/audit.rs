@@ -44,6 +44,10 @@ pub enum AuditAction {
     KeyCreated,
     /// A router API key was revoked.
     KeyRevoked,
+    /// A key's token limit or payment override was set (specification 12.3).
+    KeyBudgetSet,
+    /// Tokens were credited to a key's budget (specification 12.3).
+    KeyBudgetCredited,
     /// A provider credential reference was created.
     CredentialCreated,
     /// A provider credential was rotated.
@@ -136,6 +140,8 @@ impl AuditAction {
             Self::LoginFailed => "login_failed",
             Self::KeyCreated => "key_created",
             Self::KeyRevoked => "key_revoked",
+            Self::KeyBudgetSet => "key_budget_set",
+            Self::KeyBudgetCredited => "key_budget_credited",
             Self::CredentialCreated => "credential_created",
             Self::CredentialRotated => "credential_rotated",
             Self::CredentialProbed => "credential_probed",
@@ -192,6 +198,8 @@ impl AuditAction {
             Self::LoginFailed,
             Self::KeyCreated,
             Self::KeyRevoked,
+            Self::KeyBudgetSet,
+            Self::KeyBudgetCredited,
             Self::CredentialCreated,
             Self::CredentialRotated,
             Self::CredentialProbed,

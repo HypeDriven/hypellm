@@ -1,0 +1,544 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: hypellm-test-corpus.">
+  <title>hypellm-test-corpus · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="../assets/wiki.css">
+  <script defer src="../assets/search-index.js"></script>
+  <script defer src="../assets/wiki.js"></script>
+</head>
+<body data-wiki-root="../" data-page-title="hypellm-test-corpus" data-page-group="Module contracts">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="../index.html">Wiki home</a></li>
+<li><a href="../overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="../router-specification.html">Router specification</a></li>
+<li><a href="../threat-model.html">Threat model</a></li>
+<li><a href="../orchestration.html">Fleet orchestration</a></li>
+<li><a href="../deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="../using-the-router.html">Using the router</a></li>
+<li><a href="../deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="../runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="../components/fleet-agent.html">Fleet agent</a></li>
+<li><a href="../components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="../components/container-init.html">Container init</a></li>
+<li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="hypellm-config.html">hypellm-config</a></li>
+<li><a href="hypellm-core.html">hypellm-core</a></li>
+<li><a href="hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="hypellm-net.html">hypellm-net</a></li>
+<li><a href="hypellm-router.html">hypellm-router</a></li>
+<li><a href="hypellm-store.html">hypellm-store</a></li>
+<li><a href="hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="hypellm-test-corpus.html" aria-current="page">hypellm-test-corpus</a></li>
+<li><a href="wire-http1.html">wire-http1</a></li>
+<li><a href="wire-json.html">wire-json</a></li>
+<li><a href="wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="../index.html">Wiki</a><span aria-hidden="true">/</span>Module contracts</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="module-hypellm-test-corpus">Module: hypellm-test-corpus</h1>
+<p>Specification 4.1 requires every in-repository module to declare an owner, threat
+notes, public API, unsafe-code declaration, fuzz targets, and maximum
+input/resource limits.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Owner</td>
+<td>Security (primary), Platform (secondary)</td>
+</tr>
+<tr>
+<td>Unsafe code</td>
+<td>None. <code>#![forbid(unsafe_code)]</code> declared in <code>src/lib.rs</code>; <code>unsafe_code = &quot;forbid&quot;</code> inherited from the workspace lints.</td>
+</tr>
+<tr>
+<td>External dependencies</td>
+<td>None. <code>Cargo.toml</code> declares no <code>[dependencies]</code> and no <code>[dev-dependencies]</code> — not even workspace path dependencies. Rust standard library only.</td>
+</tr>
+<tr>
+<td>Fuzz targets</td>
+<td><code>src/fuzz.rs</code> provides the deterministic mutation engine used by ordinary test targets in eight workspace crates.</td>
+</tr>
+</tbody>
+</table></div>
+<p>Security owns this crate — not because it is test code, but because its contents
+are the <em>oracle</em> for the security suite (specification 21: SSRF, smuggling,
+CSRF/CORS, tenant isolation, secret leakage). A weakened expectation here is
+indistinguishable from a passing test. Platform owns the CI wiring and the
+recording tooling.</p>
+<h2 id="current-state">Current state</h2>
+<p>The crate holds six data modules, one expectation type and the deterministic
+mutation engine in <code>fuzz</code>. Nothing in it performs I/O; corpus self-checks and
+consumer suites own the assertions.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Module</th>
+<th>Contents</th>
+<th>Specification</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>outcome</code></td>
+<td><code>Outcome</code>: accept / incomplete / reject-with-one-of-these-codes</td>
+<td>21</td>
+</tr>
+<tr>
+<td><code>http1</code></td>
+<td>45 request-head vectors, including the request-smuggling corpus</td>
+<td>10.1, 21</td>
+</tr>
+<tr>
+<td><code>json</code></td>
+<td>44 document vectors: grammar, extensions, escapes, duplicate keys</td>
+<td>3.1, 21</td>
+</tr>
+<tr>
+<td><code>sse</code></td>
+<td>22 stream vectors with the events each must dispatch</td>
+<td>14, 21</td>
+</tr>
+<tr>
+<td><code>limits</code></td>
+<td>11 boundary inputs generated at the specification 3.2 bounds</td>
+<td>3.2</td>
+</tr>
+<tr>
+<td><code>golden</code></td>
+<td>11 responses, 6 streams, 1 embeddings body, 15 failures, in 3 dialects</td>
+<td>7, 21</td>
+</tr>
+<tr>
+<td><code>harness</code></td>
+<td>5 versioned harness-compatibility profiles</td>
+<td>8.1</td>
+</tr>
+</tbody>
+</table></div>
+<p>Every vector carries a stable name, the raw bytes, the required outcome, a
+rationale, and the specification clause it derives from. A corpus whose entries
+do not say what should happen can only find panics; it cannot find a parser that
+accepts something it must refuse.</p>
+<p>Expectations are spelled as the stable <em>error code strings</em> the parser crates
+publish (<code>HttpErrorKind::code</code>, <code>wire_json::ErrorKind::code</code>,
+<code>SseError::code</code>, <code>UpstreamErrorClass::as_str</code>) rather than as enum values.
+Specification 8.2 makes those codes part of the client contract, so pinning the
+code catches a rename that changes what a client sees — and it is what allows
+this crate to stay dependency-free.</p>
+<h3 id="consumers">Consumers</h3>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Crate</th>
+<th>Test file</th>
+<th>What it checks</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>wire-http1</code></td>
+<td><code>tests/corpus.rs</code></td>
+<td>Every vector's outcome and code; smuggling vectors additionally force a connection close; boundary cases; every prefix of an accepted vector reports incomplete</td>
+</tr>
+<tr>
+<td><code>wire-json</code></td>
+<td><code>tests/corpus.rs</code></td>
+<td>Every vector's outcome and code; errors do not echo the document; depth boundaries</td>
+</tr>
+<tr>
+<td><code>wire-sse</code></td>
+<td><code>tests/corpus.rs</code></td>
+<td>Every vector's outcome and dispatched events; byte-at-a-time delivery produces identical events; buffer boundaries; failures are sticky</td>
+</tr>
+<tr>
+<td><code>hypellm-adapters</code></td>
+<td><code>tests/golden_corpus.rs</code></td>
+<td>Every golden response, stream, embedding, and failure decodes as recorded; no provider text reaches the client detail</td>
+</tr>
+</tbody>
+</table></div>
+<p>Each of those crates takes this one as a <code>[dev-dependencies]</code> path dependency.
+Because this crate declares no dependencies of its own, that is possible from
+<code>wire-json</code> and <code>wire-http1</code> as well, with no dependency cycle anywhere.</p>
+<h3 id="not-migrated">Not migrated</h3>
+<p>The parser crates still carry their own inline copies of most of these vectors
+(<code>wire-http1/src/request.rs</code> and its <code>smuggling_tests</code> module,
+<code>wire-json/src/parse.rs</code>, <code>wire-sse/src/parse.rs</code>). They are deliberately left
+in place: deleting working coverage in exchange for a refactor is not an
+improvement, and specification 21.1 requires two-person review for parser
+changes. Consolidating those suites onto this corpus is follow-up work that has
+<strong>not</strong> been done.</p>
+<p><code>hypellm-adapters::testing</code> remains the source of canonical request fixtures and
+is deliberately <code>pub</code> rather than <code>#[cfg(test)]</code>. This crate does not duplicate
+it.</p>
+<h2 id="scope-and-the-the-corpus-is-not-a-harness-rule">Scope, and the &quot;the corpus is not a harness&quot; rule</h2>
+<p>Specification 18.1 assigns this crate &quot;golden requests/responses, malformed
+input, provider stream fixtures&quot;. Specification 21 requires integration tests to
+run against <em>recorded</em> golden servers, and specification 8.1 requires versioned
+harness-compatibility profiles rather than a claim of universal compatibility.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Holds</th>
+<th>Why here</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Golden client requests and expected canonical forms</td>
+<td>One definition shared by adapter, wire, and compatibility suites (specification 21, <code>Integration</code>)</td>
+</tr>
+<tr>
+<td>Recorded provider responses and SSE event streams</td>
+<td>Deterministic replay without network egress (specification 21, <code>Integration</code>)</td>
+</tr>
+<tr>
+<td>Malformed/adversarial input corpora</td>
+<td>Smuggling, header fragmentation, deep JSON, oversized SSE (specification 19.1)</td>
+</tr>
+<tr>
+<td>Harness-compatibility profile fixtures</td>
+<td>Per-profile endpoints, headers, SSE detail, tool-call and cancellation behavior (specification 8.1)</td>
+</tr>
+</tbody>
+</table></div>
+<p>This module deliberately does <strong>not</strong>:</p>
+<ul>
+<li><strong>Perform I/O.</strong> It opens no sockets, resolves no hosts, spawns no server, and
+reads no files at runtime. Fixtures are compile-time constants, and the
+boundary inputs of <code>limits</code> are built in memory by the test that asked for
+them — specification 4.1 forbids implicit file discovery, and a corpus that
+resolves paths at runtime is a path-traversal surface inside the test harness.</li>
+<li><strong>Assert.</strong> It supplies inputs and expected outputs; the comparison lives in
+the crate under test. A corpus that also owns the assertion can silently
+redefine what &quot;correct&quot; means for every consumer at once. The tests inside
+this crate check the corpus against <em>itself</em> — unique names, non-empty codes,
+a rationale on every entry, boundary generators producing the sizes they
+claim — and never against a parser.</li>
+<li><strong>Replay against live providers.</strong> The opt-in live-sandbox tests of
+specification 21 are not driven from here; this crate has no credentials, no
+endpoints, and no transport.</li>
+<li><strong>Ship into the router binary.</strong> It is a <code>[dev-dependencies]</code>-only member.
+<code>hypellm-router</code> must never depend on it.</li>
+</ul>
+<h2 id="threat-notes">Threat notes</h2>
+<ul>
+<li><strong>The corpus is a permanent, greppable plaintext log.</strong> A recorded golden
+response originates from a real provider exchange, which carries
+<code>Authorization</code> headers, API keys, organization and account identifiers,
+cookies, and real prompt/completion text. Specification 10 keeps credentials
+behind opaque handles and specification 17 keeps prompt bodies out of logs by
+default — a fixture committed unredacted defeats both, permanently and in
+version history. <strong>Every fixture in <code>golden</code> is synthetic and hand-written for
+this reason</strong>; the only key-shaped string in the crate is
+<code>sk-hypellm-golden-not-a-real-key</code>, and a unit test fails if a fixture grows a
+string that looks like a live credential. If a recording tool is ever built,
+redaction MUST happen at capture time, not at review time; a reviewer scanning
+a 4 MiB SSE transcript is not a control.</li>
+<li><strong>Goldens are a trust anchor, and updating them is a security change.</strong> The
+assertion that a smuggling vector yields <code>conflicting_framing</code> lives in this
+crate as data. A routine &quot;refresh the goldens&quot; commit that turns an expected
+rejection into an expected acceptance disables a security test while leaving
+the suite green. Changes to attack-corpus expectations require the same
+two-person review specification 21.1 mandates for parser changes. <code>http1</code>
+exposes <code>smuggling()</code> precisely so that selection is reviewable as a unit.</li>
+<li><strong>Fixture drift produces false assurance.</strong> If this crate built its own
+<code>CanonicalRequest</code> instead of using <code>hypellm_adapters::testing</code>, the golden
+suite would validate a request the router never sends. It does not build one.</li>
+<li><strong>A self-confirming corpus proves nothing.</strong> A malformed-input corpus
+populated by sampling what the in-repo parser already rejects cannot surface a
+parser differential. Vectors here are derived from the specification and from
+external references (smuggling variants, RFC 8259 extensions, SSE framing
+edge cases), and several are inputs where two plausible readings disagree —
+that disagreement is the finding.</li>
+<li><strong>Attack fixtures are inert data and must stay that way.</strong> The corpus contains
+byte sequences engineered to be misinterpreted. None of them may be fed to the
+configuration parser as configuration, used to construct a destination, or
+interpolated into an endpoint. Specification 11.1 admits no includes and no
+environment expansion precisely so that data cannot become directives; the
+same rule binds test data.</li>
+<li><strong>Unbounded corpus growth is a build-time denial of service.</strong> Fuzz corpora
+and recorded streams grow monotonically unless minimized. The bounded-work
+discipline of specification 3.2 applies to the repository too, which is why
+the 32 KiB, 64 KiB, and 256 KiB boundary inputs are <em>generated</em> rather than
+committed.</li>
+<li><strong>Test-only code reaching the data plane.</strong> Fixtures name plausible endpoints
+and model identifiers. If this crate ever became a normal dependency of
+<code>hypellm-router</code>, those values would be linked into the production binary. The
+dependency direction is the control.</li>
+</ul>
+<h2 id="limits">Limits</h2>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Input / resource</th>
+<th>Required bound</th>
+<th>Enforced by</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Single committed fixture</td>
+<td>Small enough to review inline; the largest is under 1 KiB</td>
+<td>Review</td>
+<td><strong>Not mechanically enforced</strong> — no size constant exists</td>
+</tr>
+<tr>
+<td>Total corpus on disk</td>
+<td>Bounded and reviewable; generated mutations are not persisted</td>
+<td>Static source fixtures only</td>
+<td><strong>Enforced by construction</strong> for generated cases; fixture growth remains a review concern</td>
+</tr>
+<tr>
+<td>HTTP head fixtures</td>
+<td>Must span the 32 KiB default and its <code>+1</code> rejection case (specification 3.2)</td>
+<td><code>limits::http_head_size_cases</code></td>
+<td><strong>Enforced</strong>, and <code>wire-http1/tests/corpus.rs</code> asserts the constant still equals <code>Limits::DEFAULT.max_head_bytes</code></td>
+</tr>
+<tr>
+<td>HTTP header count</td>
+<td>Must span the 100-field default and its <code>+1</code> rejection case</td>
+<td><code>limits::http_header_count_cases</code></td>
+<td><strong>Enforced</strong>, constant cross-checked in the consumer test</td>
+</tr>
+<tr>
+<td>JSON depth fixtures</td>
+<td>Must span the 64-level bound in both array and object form</td>
+<td><code>limits::json_depth_cases</code></td>
+<td><strong>Enforced</strong>, constant cross-checked in the consumer test</td>
+</tr>
+<tr>
+<td>SSE stream fixtures</td>
+<td>Must span the 256 KiB per-stream buffered-data bound (specification 3.2, 14)</td>
+<td><code>limits::sse_line_length_cases</code></td>
+<td><strong>Enforced</strong>, constant cross-checked in the consumer test</td>
+</tr>
+<tr>
+<td>JSON body size</td>
+<td>Must span the 16 MiB body bound and the 8 MiB string bound</td>
+<td>none</td>
+<td><strong>Not covered</strong> — a 16 MiB generated input would dominate the suite's runtime; the smaller bounds stand in for it</td>
+</tr>
+<tr>
+<td>SSE per-event size</td>
+<td>Must span the 1 MiB accumulated-event bound</td>
+<td>none</td>
+<td><strong>Not covered</strong></td>
+</tr>
+<tr>
+<td>Runtime allocation</td>
+<td>Zero for the static vectors; the <code>limits</code> generators allocate their input and nothing else</td>
+<td>Construction</td>
+<td><strong>Enforced by construction</strong></td>
+</tr>
+<tr>
+<td>Runtime file reads</td>
+<td>Zero (specification 4.1, no implicit file discovery)</td>
+<td>Construction</td>
+<td><strong>Enforced by construction</strong> — the crate has no <code>std::fs</code> use</td>
+</tr>
+</tbody>
+</table></div>
+<p>Fixtures that <em>exceed</em> a production limit are expected and required — they are
+how rejection at the boundary is tested. The bound in this table is on the
+artifact committed to the repository, not on the value the parser is asked to
+accept.</p>
+<h3 id="the-limits-are-restated-not-linked">The limits are restated, not linked</h3>
+<p><code>limits.rs</code> declares <code>HTTP_DEFAULT_MAX_HEAD_BYTES</code>, <code>JSON_DEFAULT_MAX_DEPTH</code>
+and friends as its own constants, because a dependency-free crate cannot read
+<code>wire_http1::Limits::DEFAULT</code>. Nothing at compile time keeps the two in step.
+The consumer tests assert equality at runtime, so a bound changed in one place
+and not the other fails the suite rather than silently producing a &quot;boundary&quot;
+case that no longer sits on the boundary — but the check exists only where a
+consumer test was written.</p>
+<h2 id="fuzz-targets">Fuzz targets</h2>
+<p>This crate is the fuzz engine as well as the corpus home. <code>src/fuzz.rs</code> is a
+seeded, deterministic mutator — there is no <code>fuzz/</code> directory and no libFuzzer
+harness, because specification 4 admits no such dependency — and consumers drive
+it from ordinary <code>tests/fuzz.rs</code> targets so that <code>cargo test</code> runs them and a
+failing case is reproducible by seed number rather than by corpus file.</p>
+<p>Targets written against it today: <code>wire-json</code> (6), <code>wire-http1</code> (7), <code>wire-sse</code>
+(8), <code>hypellm-config</code> (7), <code>hypellm-store</code> (7), <code>hypellm-adapters</code> (9),
+<code>hypellm-admin-api</code> (9), and <code>hypellm-router</code> (9). Together they cover all seven
+fuzz areas required by specification 21 plus the client protocol translators.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Target</th>
+<th>Corpus</th>
+<th>Seeds available</th>
+<th>Specification</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>http1_request</code></td>
+<td>Header fragmentation, smuggling, chunked framing</td>
+<td><code>http1::all</code>, <code>limits::http_head_size_cases</code></td>
+<td>21 (<code>Fuzz</code>), 19.1</td>
+</tr>
+<tr>
+<td><code>json_value</code></td>
+<td>Depth, string length, number edge cases, bounded work</td>
+<td><code>json::all</code>, <code>limits::json_depth_cases</code></td>
+<td>21 (<code>Fuzz</code>), 3.2</td>
+</tr>
+<tr>
+<td><code>sse_events</code></td>
+<td>CRLF/LF mixing, multi-line <code>data</code>, comments, oversized events, terminal markers</td>
+<td><code>sse::all</code>, <code>limits::sse_line_length_cases</code></td>
+<td>21 (<code>Fuzz</code>), 14</td>
+</tr>
+<tr>
+<td><code>config_grammar</code></td>
+<td>Native line-oriented records, unknown fields, quoting</td>
+<td>Seeds are local to <code>hypellm-config/tests/fuzz.rs</code></td>
+<td>21 (<code>Fuzz</code>), 11.1</td>
+</tr>
+<tr>
+<td><code>provider_events</code></td>
+<td>Per-provider-family stream decoding and error mapping</td>
+<td><code>golden::streams</code>, <code>golden::failures</code></td>
+<td>21 (<code>Fuzz</code>), 7.1</td>
+</tr>
+<tr>
+<td><code>admin_api</code></td>
+<td>Management request bodies and schema validation</td>
+<td>Seeds are local to <code>hypellm-admin-api/tests/fuzz.rs</code></td>
+<td>21 (<code>Fuzz</code>), 16</td>
+</tr>
+<tr>
+<td><code>state_recovery</code></td>
+<td>Framed-log replay, corrupt and truncated tails</td>
+<td>Seeds are local to <code>hypellm-store/tests/fuzz.rs</code></td>
+<td>21 (<code>Fuzz</code>), 11.2</td>
+</tr>
+</tbody>
+</table></div>
+<p>These are deterministic mutation suites, not coverage-guided fuzzing. They do
+not shrink failures; a failing test reports the reproducible seed and generated
+case.</p>
+<h2 id="honest-gaps">Honest gaps</h2>
+<p>Stated plainly, because a reader who trusts this corpus needs them before they
+trust a passing suite.</p>
+<ol>
+<li><strong>Nothing was recorded from a live provider.</strong> Every fixture in <code>golden</code> is
+synthetic. A passing run proves the decoders handle the documented shapes; it
+cannot prove a provider still sends them. Closing this needs a recording tool
+with capture-time redaction, which does not exist.</li>
+<li><strong>No coding harness has been run against the router.</strong> The profiles in
+<code>harness</code> are the specification 8.1 <em>classes</em> written out as data. No named
+third-party tool has been measured, and the three profiles describing
+third-party tooling each carry that statement in their
+<code>known_limitations</code> — a unit test fails if one drops it. Specification 8.1's
+requirement to include &quot;representative popular coding harnesses selected at
+release time&quot; is unmet.</li>
+<li><strong>Nothing binds the harness profiles to the router's route table.</strong> The
+profile tests confirm each endpoint is one specification 8 defines; no test
+starts a listener and confirms the router answers it.</li>
+<li><strong>Four of specification 21's seven fuzz rows have no target.</strong> Provider
+events, the management API, and the two corpora marked &quot;none&quot; above are
+still unfuzzed; see the table.</li>
+<li><strong>The parser crates' inline vectors are not migrated.</strong> See &quot;Not migrated&quot;.</li>
+<li><strong>The <code>/v1/responses</code> fixtures cover only the documented event sequence.</strong>
+Specification 8 marks that surface MUST for new integrations and requires
+&quot;streaming event normalization&quot;; the corpus now records it in both framings,
+including the <code>.done</code> events that repeat delivered content and the absence of
+a <code>[DONE]</code> sentinel. What it still cannot cover is the rest of the event
+vocabulary — reasoning, web-search, and file-search items — which the decoder
+ignores by design and no fixture exercises.</li>
+<li><strong>Reasoning content has no golden fixture.</strong> Both adapters decode
+<code>reasoning_content</code> and <code>thinking</code> blocks; no recorded fixture exercises
+them, so <code>ExpectedCompletion::reasoning</code> is empty everywhere.</li>
+<li><strong>Config-grammar, admin-API, and state-recovery corpora do not exist.</strong>
+Specification 11.1, 16, and 11.2 respectively.</li>
+</ol>
+<h2 id="public-api">Public API</h2>
+<p>Data and lookups only. No trait for &quot;run a golden test&quot;, no comparison helpers,
+no configurable recording — those belong to the consuming crate or to a separate
+recording tool outside the workspace test path.</p>
+<pre><code class="language-text">outcome::Outcome                       accept / incomplete / reject(codes)
+http1::{HttpVector, HttpCategory}      all(), in_category(), smuggling(), by_name()
+json::{JsonVector, JsonCategory}       all(), in_category(), by_name()
+sse::{SseVector, SseCategory,          all(), in_category(), by_name()
+      ExpectedEvent}
+limits::BoundaryCase                   http_head_size_cases(), http_header_count_cases(),
+                                       json_depth_cases(), sse_line_length_cases(), all()
+golden::{GoldenResponse, GoldenStream, responses(), streams(), embeddings(), failures(),
+         GoldenEmbeddings, GoldenFailure,   response_by_name(), stream_by_name()
+         ExpectedCompletion, ExpectedFinish,
+         ExpectedToolCall, ExpectedEmbedding,
+         StreamFrame, FailurePath, GoldenFamily,
+         GoldenDialect}
+harness::{HarnessProfile, HarnessEndpoint,  all(), by_id()
+          Requirement, StreamingProfile,
+          ToolCallingProfile, ModelListing,
+          Cancellation}
+</code></pre>
+
+      </article>
+      <footer class="page-footer"><a href="../index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#current-state">Current state</a></li>
+<li class="toc-level-3"><a href="#consumers">Consumers</a></li>
+<li class="toc-level-3"><a href="#not-migrated">Not migrated</a></li>
+<li class="toc-level-2"><a href="#scope-and-the-the-corpus-is-not-a-harness-rule">Scope, and the &quot;the corpus is not a harness&quot; rule</a></li>
+<li class="toc-level-2"><a href="#threat-notes">Threat notes</a></li>
+<li class="toc-level-2"><a href="#limits">Limits</a></li>
+<li class="toc-level-3"><a href="#the-limits-are-restated-not-linked">The limits are restated, not linked</a></li>
+<li class="toc-level-2"><a href="#fuzz-targets">Fuzz targets</a></li>
+<li class="toc-level-2"><a href="#honest-gaps">Honest gaps</a></li>
+<li class="toc-level-2"><a href="#public-api">Public API</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

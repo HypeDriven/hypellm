@@ -41,6 +41,8 @@ const MUTATING_ROUTES: &[(Method, &str)] = &[
     (Method::Post, "/admin/v1/credentials/provider-secret:rotate"),
     (Method::Patch, "/admin/v1/targets/local:model"),
     (Method::Delete, "/admin/v1/keys/some-key"),
+    (Method::Put, "/admin/v1/keys/some-key/budget"),
+    (Method::Post, "/admin/v1/keys/some-key/budget:credit"),
     (Method::Post, "/admin/v1/there-is-no-such-endpoint"),
 ];
 

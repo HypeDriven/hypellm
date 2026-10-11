@@ -44,7 +44,7 @@ pub(crate) struct Sbom {
 /// Deliberately explicit: a glob over the repository would silently start
 /// covering new top-level directories, and the point of the manifest is that
 /// its scope is a reviewed decision.
-const INPUT_ROOTS: &[&str] = &["crates", "web"];
+const INPUT_ROOTS: &[&str] = &["crates", "web", "spec"];
 
 /// Individual files at the repository root that affect the build.
 const INPUT_FILES: &[&str] = &["Cargo.toml", "Cargo.lock", ".cargo/config.toml"];
@@ -208,6 +208,7 @@ mod tests {
             .to_path_buf();
         let sbom = build(&root).expect("build the repository manifest");
         assert!(sbom.entries.len() > 50, "expected the whole workspace, got {}", sbom.entries.len());
+        assert!(sbom.entries.iter().any(|entry| entry.path == Path::new("spec/modules/hypellm-devtools.html")), "module contracts must remain content-addressed release inputs");
         assert_eq!(sbom.root.len(), 64);
     }
 }

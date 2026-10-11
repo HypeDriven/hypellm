@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: Wiki home.">
+  <title>Wiki home · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="./assets/wiki.css">
+  <script defer src="./assets/search-index.js"></script>
+  <script defer src="./assets/wiki.js"></script>
+</head>
+<body data-wiki-root="./" data-page-title="Wiki home" data-page-group="Start here">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="index.html" aria-current="page">Wiki home</a></li>
+<li><a href="overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="router-specification.html">Router specification</a></li>
+<li><a href="threat-model.html">Threat model</a></li>
+<li><a href="orchestration.html">Fleet orchestration</a></li>
+<li><a href="deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="using-the-router.html">Using the router</a></li>
+<li><a href="deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="components/fleet-agent.html">Fleet agent</a></li>
+<li><a href="components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="components/container-init.html">Container init</a></li>
+<li><a href="components/tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="modules/hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="modules/hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="modules/hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="modules/hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="modules/hypellm-config.html">hypellm-config</a></li>
+<li><a href="modules/hypellm-core.html">hypellm-core</a></li>
+<li><a href="modules/hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="modules/hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="modules/hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="modules/hypellm-net.html">hypellm-net</a></li>
+<li><a href="modules/hypellm-router.html">hypellm-router</a></li>
+<li><a href="modules/hypellm-store.html">hypellm-store</a></li>
+<li><a href="modules/hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="modules/hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="modules/wire-http1.html">wire-http1</a></li>
+<li><a href="modules/wire-json.html">wire-json</a></li>
+<li><a href="modules/wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="index.html">Wiki</a><span aria-hidden="true">/</span>Start here</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="hypellm-router-documentation">HypeLLM Router wiki</h1>
+<p>HypeLLM Router is a self-hosted policy and routing gateway between coding tools and LLM providers. Start with the <a href="overview.html">project overview</a> for the feature overview and a local quick start.</p>
+<h2 id="guides">Guides</h2>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Document</th>
+<th>Audience</th>
+<th>Contents</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="using-the-router.html">Using the router</a></td>
+<td>Application and agent developers</td>
+<td>Pointing a project at a running router: getting an API key, base URL, the OpenAI and Anthropic endpoints, streaming, errors, limits and what to do when a request is refused.</td>
+</tr>
+<tr>
+<td><a href="deployment.html">Deployment</a></td>
+<td>Platform engineers</td>
+<td>Runtime profiles, TLS boundaries, secrets, state, listeners, configuration, startup, shutdown and system hardening.</td>
+</tr>
+<tr>
+<td><a href="runbooks.html">Operational runbooks</a></td>
+<td>On-call operators</td>
+<td>Provider outages, provider credential rotation, compromised client API keys, identity-provider outages and fleet incidents.</td>
+</tr>
+<tr>
+<td><a href="orchestration.html">Fleet orchestration</a></td>
+<td>Platform engineers, reviewers</td>
+<td>How the router decides what a fleet of accelerator hosts must become to serve a request, and starts and stops containers to get there. The reasoning behind specification §26.</td>
+</tr>
+<tr>
+<td><a href="components/fleet-agent.html">Fleet agent</a></td>
+<td>Platform engineers</td>
+<td>The out-of-process component that reaches the slaves: its obligations, its allowlist, and what it deliberately does not do.</td>
+</tr>
+<tr>
+<td><a href="examples/fleet.conf">Example fleet configuration</a></td>
+<td>Platform engineers</td>
+<td>A working two-host declaration, annotated, paired with the agent allowlist it must agree with.</td>
+</tr>
+<tr>
+<td><a href="threat-model.html">Threat model</a></td>
+<td>Security and design reviewers</td>
+<td>Trust boundaries, protected assets, attacker capabilities, controls and abuse cases.</td>
+</tr>
+<tr>
+<td><a href="deferred-issues.html">Current limitations</a></td>
+<td>Evaluators and operators</td>
+<td>Capabilities and deployment properties that are not currently provided, with their operational impact.</td>
+</tr>
+<tr>
+<td><a href="router-specification.html">Specification</a></td>
+<td>Implementers and reviewers</td>
+<td>The complete normative design and protocol contract.</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="recommended-reading-paths">Recommended reading paths</h2>
+<ul>
+<li><strong>Sending inference to a router someone else runs:</strong> <a href="using-the-router.html">using the router</a>. Nothing else is needed.</li>
+<li><strong>Evaluating the project:</strong> <a href="overview.html">project overview</a> → <a href="deferred-issues.html">current limitations</a> → <a href="threat-model.html">threat model</a>.</li>
+<li><strong>Deploying a node:</strong> <a href="deployment.html">deployment</a> → <a href="deferred-issues.html">current limitations</a> → <a href="runbooks.html">runbooks</a>.</li>
+<li><strong>Deploying a fleet:</strong> <a href="orchestration.html">fleet orchestration</a> → <a href="components/fleet-agent.html">fleet agent</a> → <a href="examples/fleet.conf">example configuration</a> → the fleet section of <a href="deferred-issues.html">current limitations</a>.</li>
+<li><strong>Joining on call:</strong> read <a href="runbooks.html">runbooks</a> and verify that break-glass access, audit export and graceful shutdown have been tested in your environment.</li>
+<li><strong>Changing security-sensitive code:</strong> read the <a href="router-specification.html">specification</a>, the relevant crate's module contract in <code>spec/modules/</code>, and the <a href="threat-model.html">threat model</a>.</li>
+</ul>
+<h2 id="source-level-documentation">Source-level documentation</h2>
+<p>Each workspace crate has a module contract in <code>spec/modules/</code> describing ownership, public API, trust assumptions, resource limits and test obligations. These files are aimed at maintainers; the documents in this directory are the public operator-facing material.</p>
+<p>Every document under <strong>Guides</strong> describes the current implementation. Where a described capability is partly built — fleet orchestration has four named exceptions — the document says so on its first page and <a href="deferred-issues.html">current limitations</a> carries the detail. Closed defects and superseded implementation history are intentionally omitted; version control is the record for historical changes.</p>
+<h2 id="reference-components-and-modules">Reference components and modules</h2>
+<p>The navigation links to all 17 crate contracts and the fleet agent, identity verifier, container init and Windows tray monitor. Each contract records ownership, public API, trust assumptions, resource limits and test obligations.</p>
+<h2 id="reading-and-maintaining-this-wiki">Reading and maintaining this wiki</h2>
+<p>Open <code>spec/index.html</code> directly in a browser. Navigation and section links work offline; search covers every document and works without a server. All styles and scripts are local assets.</p>
+<p>The HTML files are the authoritative documentation sources. Edit the relevant page, then run <code>python3 spec/wiki.py update</code> to refresh the search index and <code>python3 spec/wiki.py check</code> to verify local links, section anchors and index freshness. Run repository commands shown in the guides from the repository root.</p>
+
+      </article>
+      <footer class="page-footer"><a href="index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#guides">Guides</a></li>
+<li class="toc-level-2"><a href="#recommended-reading-paths">Recommended reading paths</a></li>
+<li class="toc-level-2"><a href="#source-level-documentation">Source-level documentation</a></li>
+<li class="toc-level-2"><a href="#reference-components-and-modules">Reference components and modules</a></li>
+<li class="toc-level-2"><a href="#reading-and-maintaining-this-wiki">Reading and maintaining this wiki</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

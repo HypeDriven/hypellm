@@ -1,0 +1,469 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: hypellm-devtools.">
+  <title>hypellm-devtools · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="../assets/wiki.css">
+  <script defer src="../assets/search-index.js"></script>
+  <script defer src="../assets/wiki.js"></script>
+</head>
+<body data-wiki-root="../" data-page-title="hypellm-devtools" data-page-group="Module contracts">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="../index.html">Wiki home</a></li>
+<li><a href="../overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="../router-specification.html">Router specification</a></li>
+<li><a href="../threat-model.html">Threat model</a></li>
+<li><a href="../orchestration.html">Fleet orchestration</a></li>
+<li><a href="../deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="../using-the-router.html">Using the router</a></li>
+<li><a href="../deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="../runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="../components/fleet-agent.html">Fleet agent</a></li>
+<li><a href="../components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="../components/container-init.html">Container init</a></li>
+<li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="hypellm-config.html">hypellm-config</a></li>
+<li><a href="hypellm-core.html">hypellm-core</a></li>
+<li><a href="hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="hypellm-devtools.html" aria-current="page">hypellm-devtools</a></li>
+<li><a href="hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="hypellm-net.html">hypellm-net</a></li>
+<li><a href="hypellm-router.html">hypellm-router</a></li>
+<li><a href="hypellm-store.html">hypellm-store</a></li>
+<li><a href="hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="wire-http1.html">wire-http1</a></li>
+<li><a href="wire-json.html">wire-json</a></li>
+<li><a href="wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="../index.html">Wiki</a><span aria-hidden="true">/</span>Module contracts</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="module-hypellm-devtools">Module: hypellm-devtools</h1>
+<p>Specification 4.1 requires every in-repository module to declare an owner, threat
+notes, public API, unsafe-code declaration, fuzz targets, and maximum
+input/resource limits.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Owner</td>
+<td>Security (primary), Platform (secondary)</td>
+</tr>
+<tr>
+<td>Unsafe code</td>
+<td>None. <code>#![forbid(unsafe_code)]</code> is declared in <code>src/main.rs</code> and inherited from the workspace lint table.</td>
+</tr>
+<tr>
+<td>External dependencies</td>
+<td>None. Rust standard library plus one workspace path dependency: <code>hypellm-crypto</code> (SHA-256 and hex for the build manifest).</td>
+</tr>
+<tr>
+<td>Fuzz targets</td>
+<td><strong>None for this crate yet.</strong> Required targets are listed under <a href="#fuzz-targets">Fuzz targets</a>.</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="scope-a-gate-not-a-guarantee">Scope: a gate, not a guarantee</h2>
+<p>This crate builds one binary, <code>depscan</code>. It is <strong>build and CI tooling</strong>. Nothing
+here is linked into <code>hypellm-router</code>; no other crate depends on it. It is a
+workspace member so that it is itself subject to every rule it enforces — its own
+<code>spec/modules/hypellm-devtools.html</code> requirement included — and so that
+<code>rust_scan::tests::scanning_this_repository_is_clean</code> turns the policy into a
+regression test that fails the build when the tree drifts.</p>
+<p>It enforces two specification clauses mechanically:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Concern</th>
+<th>Reference</th>
+<th>What <code>depscan</code> does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>No third-party packages</td>
+<td>§4</td>
+<td>Every dependency in every workspace manifest must be a workspace-local <code>path</code> dependency that resolves inside the repository</td>
+</tr>
+<tr>
+<td>No build scripts, proc macros, dynamic loading, shell execution, env interpolation in config</td>
+<td>§4.1</td>
+<td>Textual and manifest-level rules over <code>crates/</code></td>
+</tr>
+<tr>
+<td>Per-module declarations</td>
+<td>§4.1</td>
+<td>Every workspace member has a contract at <code>spec/modules/&lt;crate&gt;.html</code> declaring <code>Owner</code>, <code>Threat notes</code>, <code>Public API</code>, <code>Unsafe code</code>, <code>Fuzz targets</code> and <code>Limits</code></td>
+</tr>
+<tr>
+<td><code>#![forbid(unsafe_code)]</code> at every crate root</td>
+<td>§18.2</td>
+<td>Checked at <code>src/lib.rs</code> and <code>src/main.rs</code> of each crate</td>
+</tr>
+<tr>
+<td>Panic-adjacent lint escalations exempt <code>cfg(test)</code></td>
+<td>§18.2</td>
+<td>A crate-root <code>#![deny(clippy::…)]</code> must be scoped <code>cfg_attr(not(test), …)</code> or paired with a <code>cfg_attr(test, warn/allow(…))</code> covering <strong>every</strong> denied lint. §18.2 permits these constructs &quot;outside startup invariants and tests&quot;; an escalation that also governs assertions makes <code>cargo clippy --all-targets</code> fail, and a gate that always fails is a gate nobody runs</td>
+</tr>
+<tr>
+<td>First-party static web app only</td>
+<td>§15, §15.1</td>
+<td>No <code>vendor/</code>, no remote origins, no <code>eval</code>/<code>Function</code>/<code>innerHTML</code>/service worker/WebAssembly, no inline handlers, no inline script bodies, every referenced module resolves</td>
+</tr>
+<tr>
+<td>Accessible form controls</td>
+<td>Appendix C</td>
+<td>Every named <code>el('input'|'select'|'textarea')</code> reaches <code>field</code>/<code>inlineField</code>, carries <code>aria-label</code>, or is paired with a <code>&lt;label for&gt;</code> naming its own id. Appendix C requires the SPA to pass accessibility tests and there were none; the application was already correct, so this prevents regression rather than fixing a defect. Colour contrast, focus order, and whether a label reads meaningfully are outside what a static rule can judge</td>
+</tr>
+<tr>
+<td>Content-addressed release inputs</td>
+<td>§4.1</td>
+<td><code>--manifest</code> emits the SBOM-like internal manifest</td>
+</tr>
+<tr>
+<td>Definition of done</td>
+<td>Appendix C</td>
+<td>&quot;Strict dependency scan reports only workspace-owned Rust and static web sources&quot;</td>
+</tr>
+</tbody>
+</table></div>
+<p>The enforced set is printed by <code>--list-rules</code>, and two tests
+(<code>every_rule_that_runs_is_documented_in_the_rule_list</code>,
+<code>every_documented_rule_actually_runs</code>) keep that statement and the executed set
+in agreement, so the auditable claim cannot silently diverge from behaviour.</p>
+<h3 id="what-this-module-deliberately-does-not-do">What this module deliberately does not do</h3>
+<p>The single most important boundary here is that <strong><code>depscan</code> is not a compiler,
+and it is not a defence against a hostile author with commit access.</strong> It detects
+accident and drift. The control against deliberate evasion is two-person review
+of auth, parser, adapter-credential, policy-activation, and storage changes
+(§21.1); <code>depscan</code> narrows what such a review must look for, it does not replace
+it. Reading a clean scan as &quot;this tree is safe&quot; is a misuse of the tool.</p>
+<p>Concretely, it is not:</p>
+<ul>
+<li><strong>A TOML parser, and it must not become one.</strong> <code>manifest.rs</code> recognises exactly
+the constructs the HypeLLM manifests are permitted to contain and classifies
+everything else as <code>DepSpec::Unrecognized</code> or <code>Manifest::unparsed</code>, both of
+which are reported as violations. A general parser that silently accepted an
+unfamiliar dependency form would defeat the one thing §4 exists to prevent, so
+the reader fails closed on ambiguity by construction.</li>
+<li><strong>A JavaScript, HTML, or CSS parser.</strong> <code>web_scan.rs</code> strips comments per file
+type and then matches text. It reasons about tokens no further than that.</li>
+<li><strong>A linter or a formatter.</strong> Style, complexity, and correctness are <code>clippy</code>'s
+and review's business.</li>
+<li><strong>Suppressible.</strong> There is no severity, no warning level, no allowlist file,
+and no command-line escape. A construct that must be permitted is permitted by
+editing the rule in a reviewed commit. The one exemption in the source —
+<code>FORBIDDEN_SELF_EXEMPT</code> — names exactly one file and a test asserts that it
+stays one file.</li>
+<li><strong>A signer.</strong> The build manifest is a plain SHA-256 tree digest. §4.1 puts
+signing and provenance retention outside this repository, and they stay there.</li>
+<li><strong>Networked or process-spawning.</strong> <code>depscan</code> reads files. It opens no sockets,
+spawns no processes, and reads no environment variables to decide anything.</li>
+</ul>
+<h2 id="threat-notes">Threat notes</h2>
+<p><code>depscan</code> reads a working tree that may contain content nobody has reviewed yet —
+a contributor branch, a merge in flight. Its inputs are therefore untrusted, and
+its output is a security claim that other people rely on. Both directions matter:
+a crash on malformed input is an availability problem, but a <em>false clean</em> is the
+real hazard.</p>
+<p><strong>Fail-closed behaviour that holds.</strong> Any I/O or decoding error aborts the scan
+and exits non-zero (<code>main::run</code> → <code>fail</code>); a scan never partially succeeds.
+Symbolic links anywhere in the walked tree are a hard error rather than a skip,
+because a link could otherwise redirect the scan out of the repository or hide a
+linked-in source tree (<code>walk::descend</code>). Non-UTF-8 source is an error, not a
+skip, because a file the rules cannot read is a file the rules cannot certify
+(<code>walk::read_text</code>). Manifest ambiguity resolves to a violation, never to
+acceptance (<code>manifest::classify</code>). Traversal is depth-bounded and order-stable,
+so the result is the same on every machine.</p>
+<p><strong>Known blind spots in the manifest reader.</strong> These are the differentials between
+what <code>depscan</code> inspects and what Cargo actually resolves, and each is a way a
+registry source could enter without a finding:</p>
+<ul>
+<li><code>[patch.*]</code> and <code>[replace]</code> tables are not inspected.
+<code>manifest::is_dependency_section</code> matches only sections whose last component is
+<code>dependencies</code>, <code>dev-dependencies</code>, or <code>build-dependencies</code>, so
+<code>[patch.crates-io] x = { git = &quot;…&quot; }</code> parses cleanly and is silently ignored.</li>
+<li><code>.cargo/config.toml</code> is hashed into the build manifest but never
+policy-parsed. A <code>[source.crates-io] replace-with = …</code> entry, an added
+<code>[registries]</code> table, or the removal of the <code>[net] offline = true</code> line that
+currently backs the whole policy would all pass the scan.</li>
+<li><code>Cargo.lock</code> is likewise hashed but not read. §4 says the lockfile is
+insufficient evidence; <code>depscan</code> does not use it as evidence either, in either
+direction.</li>
+<li>Build-script inspection skips an unreadable member manifest.
+<code>check_build_scripts</code> uses <code>if let Ok(text) = walk::read_text(…)</code>, but
+<code>rust_scan::member_manifests</code> reports unreadable manifests, and
+<code>check_module_documentation</code> reports missing or unreadable HTML contracts
+and verifies all six required declarations in their article headings and summary-table rows. Note the asymmetry: the same
+condition on a <code>.rs</code> file under <code>crates/</code> <em>is</em> a hard error, because
+<code>check_sources</code> propagates it.</li>
+<li>Members declared in the workspace but absent from disk produce no finding, and
+<code>check_workspace_membership</code> only inspects <code>crates/</code>; a crate directory
+elsewhere in the tree is neither required to be a member nor scanned.</li>
+</ul>
+<p><strong>Evasion surface in the textual rules.</strong> <code>rust_scan::FORBIDDEN</code> matches
+substrings on lines with <code>//</code> comments removed; block comments are left in
+deliberately, so a forbidden construct hidden in one still gets flagged.
+Rewriting a call to avoid the literal pattern defeats it trivially — that is
+accepted, given the boundary stated above. Two related notes: <code>rust_scan.rs</code> is
+exempt from its own pattern table (it contains the table), which makes it the one
+file where a forbidden API could land unnoticed and is a reason changes to it
+belong in the two-person-review set; and the <code>no-config-env-interpolation</code> rule
+is scoped by path prefix to <code>crates/hypellm-config</code>, so configuration logic that
+migrates out of that crate leaves the rule's coverage with it.</p>
+<p><strong>Skipped directories are unexamined, not proven absent.</strong> <code>walk::SKIP_DIRS</code>
+covers <code>target</code>, <code>dist</code>, <code>run</code>, <code>.git</code>, and <code>node_modules</code>. The last is the sharp
+edge: §15 forbids npm packages outright, and a <code>web/vendor/</code> directory <em>is</em>
+reported, but a <code>web/node_modules/</code> directory is silently walked past. The
+asymmetry is worth closing.</p>
+<p><strong>Gaps in the web rules.</strong></p>
+<ul>
+<li><code>check_inline_script</code> reports a <code>&lt;script&gt;</code> element with a non-empty body, but
+despite its doc comment it does not verify that a <code>src</code> attribute is present,
+and an unterminated <code>&lt;script&gt;</code> with no matching <code>&lt;/script&gt;</code> produces no finding
+at all — the search simply advances past it.</li>
+<li><code>FORBIDDEN_JS</code> is applied only to files with a <code>.js</code> extension. <code>innerHTML</code>
+inside an <code>.svg</code> file, or an <code>eval(</code> inside an HTML inline script body, is
+caught only indirectly, by the inline-script rule.</li>
+<li>The remote-origin rule matches scheme prefixes with a fixed allowlist of XML
+namespace URIs (<code>NAMESPACE_URIS</code>). A protocol-relative <code>//cdn.example/x.js</code>
+reference carries no scheme and is not matched.</li>
+<li><code>web_scan::resolve</code> proves containment <em>lexically</em> — it normalises <code>..</code> and
+<code>.</code> without touching the filesystem and then checks <code>starts_with(web_root)</code>.
+That is sound only because <code>walk::files</code> has already rejected every symbolic
+link in the tree. If the no-symlink rule is ever relaxed, this containment
+check stops proving containment and must be replaced with a canonicalising one.</li>
+</ul>
+<p><strong>Build manifest integrity.</strong> <code>sbom::root_digest</code> hashes <code>path\0digest\n</code> per
+entry over a sorted list, so a rename or a swap of two identical-content files
+changes the root — hashing contents alone would miss both, and there are tests
+for each. Two limits on what that root proves. First, paths are folded through
+<code>Path::to_string_lossy</code>, so two distinct filenames containing invalid UTF-8 map
+to the same replacement-character string and could collide in the root digest;
+this is a latent weakness even though no such path exists in the tree today.
+Second, the manifest is an unkeyed digest, not a signature: it detects drift when
+compared against a value retained elsewhere, and detects nothing at all against
+someone who can edit the tree and re-run <code>depscan --manifest</code>. Its scope is also
+narrower than §4.1's &quot;release inputs&quot; — <code>INPUT_ROOTS</code> and <code>INPUT_FILES</code> cover
+<code>crates/</code>, <code>web/</code>, <code>Cargo.toml</code>, <code>Cargo.lock</code>, and <code>.cargo/config.toml</code>, but
+nothing pins the compiler and linker versions that §4.1 also requires to be
+reproducible. That scope is deliberately an explicit list rather than a glob, so
+widening it is a reviewed decision.</p>
+<p><strong>Resource exhaustion.</strong> The tool is memory-bounded only by the tree it is
+pointed at. See the limits table: file sizes, file counts, and finding counts are
+all unbounded. A repository containing one enormous file will make <code>depscan</code>
+allocate it whole. This is tolerable because the input is a checked-out
+repository under review and <code>depscan</code> runs in CI rather than on the data plane —
+but it means <code>depscan</code> must never be exposed as a service or pointed at an
+arbitrary path on request.</p>
+<p><strong>Panic safety.</strong> All slicing goes through <code>str::get</code>/<code>Path</code> APIs, all arithmetic
+on offsets uses <code>saturating_add</code>, and directory recursion is depth-bounded, so
+malformed input produces findings or errors rather than panics. <code>unwrap</code>/<code>expect</code>
+appear only in <code>#[cfg(test)]</code> code, consistent with §18.2.</p>
+<h2 id="limits">Limits</h2>
+<p>Enforced today:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Input / resource</th>
+<th>Limit</th>
+<th>Enforced by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Directory nesting depth</td>
+<td>32; exceeding it is an error that aborts the scan</td>
+<td><code>walk::MAX_DEPTH</code>, checked in <code>walk::descend</code></td>
+</tr>
+<tr>
+<td>Symbolic links in the scanned tree</td>
+<td>Zero permitted; any link is an error</td>
+<td><code>walk::descend</code> via <code>symlink_metadata</code></td>
+</tr>
+<tr>
+<td>Directories traversed</td>
+<td><code>target</code>, <code>dist</code>, <code>run</code>, <code>.git</code>, <code>node_modules</code> are never descended into</td>
+<td><code>walk::SKIP_DIRS</code></td>
+</tr>
+<tr>
+<td>Source encoding</td>
+<td>UTF-8 only; anything else is an error, not a skip</td>
+<td><code>walk::read_text</code></td>
+</tr>
+<tr>
+<td>Self-exemption from the forbidden-API table</td>
+<td>Exactly one file, asserted by test</td>
+<td><code>rust_scan::FORBIDDEN_SELF_EXEMPT</code>, <code>the_self_exemption_is_exactly_one_file</code></td>
+</tr>
+<tr>
+<td>Remote-origin excerpt in a finding</td>
+<td>60 characters</td>
+<td><code>web_scan::check_remote_origins</code> (<code>chars().take(60)</code>)</td>
+</tr>
+<tr>
+<td>Build-manifest scope</td>
+<td><code>crates/</code>, <code>web/</code>, <code>Cargo.toml</code>, <code>Cargo.lock</code>, <code>.cargo/config.toml</code> — an explicit list, not a glob</td>
+<td><code>sbom::INPUT_ROOTS</code>, <code>sbom::INPUT_FILES</code></td>
+</tr>
+<tr>
+<td>Command-line arguments</td>
+<td>Fixed set; an unrecognised argument exits non-zero without scanning</td>
+<td><code>main::main</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>Not enforced — stated plainly so no one reads a bound into this table that the
+code does not provide:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Input / resource</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Individual file size</td>
+<td><strong>Unbounded.</strong> <code>walk::read_text</code> and <code>sbom::build</code> read whole files into memory via <code>std::fs::read</code>; <code>strip_js_comments</code> allocates a second copy.</td>
+</tr>
+<tr>
+<td>Total files or total bytes scanned</td>
+<td><strong>Unbounded.</strong> <code>walk::files</code> accumulates every path in the tree into one <code>Vec</code>.</td>
+</tr>
+<tr>
+<td>Number of findings, and finding length</td>
+<td><strong>Unbounded.</strong> <code>findings::Report</code> grows without a cap, and <code>manifest-understood</code> findings embed the offending manifest line verbatim.</td>
+</tr>
+<tr>
+<td>Wall-clock deadline</td>
+<td><strong>None.</strong> Termination rests on the depth bound and the no-symlink rule; there is no timeout or cancellation path. §18.2's deadline requirement governs the data plane, and <code>depscan</code> is not on it.</td>
+</tr>
+<tr>
+<td>Line length and per-line scan cost</td>
+<td><strong>Unbounded</strong>, and <code>check_inline_handler</code> scans each HTML line once per entry in an 87-name event-attribute table.</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="public-api">Public API</h2>
+<p>There is no library target and no <code>lib.rs</code>. Every module is <code>pub(crate)</code>; the
+only surface is the <code>depscan</code> binary:</p>
+<pre><code class="language-text">depscan [--root DIR]        enforce the policy; exit 1 on any violation
+depscan --manifest [--root DIR]   emit the content-addressed build manifest
+depscan --list-rules        list the rules this build enforces
+depscan --help
+</code></pre>
+<p>The contract callers may depend on is the exit status — <code>0</code> clean, non-zero for
+any violation, malformed argument, or I/O failure — plus the stability of the
+rule identifiers in <code>main::RULES</code>. Finding text is human-readable and not a
+machine interface. Adding a rule is a policy change; removing or renaming one
+breaks anything keyed on the identifier and belongs in a reviewed commit.</p>
+<h2 id="fuzz-targets">Fuzz targets</h2>
+<p>The workspace has no <code>fuzz/</code> directory and no libFuzzer harness — specification
+4 admits no such dependency. Fuzzing is a seeded, deterministic mutation engine
+in <code>hypellm-test-corpus::fuzz</code>, driven from ordinary <code>tests/fuzz.rs</code> targets so
+that <code>cargo test</code> runs it and a failing seed is reproducible by number rather
+than by corpus file. All seven areas specification 21 names have a suite; see
+<code>spec/deferred-issues.html</code>, <code>DI-002</code>, for the table. <code>hypellm-core</code> carries the
+property layer in <code>tests/properties.rs</code>.</p>
+<p>None cover this crate yet. The following are required by §21 (Fuzz: configuration, management API) and §18.2
+(&quot;configuration and protocol parsers are fuzzed&quot;), because each of these
+functions is a hand-written recogniser over untrusted text where a false-accept
+is a policy bypass:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Target</th>
+<th>Entry point</th>
+<th>Property</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>manifest_parse</code></td>
+<td><code>manifest::parse</code></td>
+<td>Required, not yet implemented. No panic on arbitrary bytes; every dependency entry is either <code>DepSpec::Path</code> or reported, never silently dropped.</td>
+</tr>
+<tr>
+<td><code>manifest_classify</code></td>
+<td><code>manifest::classify</code></td>
+<td>Required, not yet implemented. Any value carrying <code>version</code>, <code>git</code>, <code>registry</code>, <code>branch</code>, <code>tag</code>, or <code>rev</code> classifies as <code>Unrecognized</code>.</td>
+</tr>
+<tr>
+<td><code>js_comment_strip</code></td>
+<td><code>web_scan::strip_js_comments</code></td>
+<td>Required, not yet implemented. Line count is preserved; no substring inside a string literal is ever removed.</td>
+</tr>
+<tr>
+<td><code>web_reference_resolve</code></td>
+<td><code>web_scan::resolve</code></td>
+<td>Required, not yet implemented. Every <code>Some(path)</code> result is lexically contained in <code>web_root</code>.</td>
+</tr>
+<tr>
+<td><code>inline_script_scan</code></td>
+<td><code>web_scan::check_inline_script</code></td>
+<td>Required, not yet implemented. Terminates on arbitrary markup, including unbalanced tags.</td>
+</tr>
+</tbody>
+</table></div>
+<p>Until these land, the corresponding assurance rests on the unit tests in each
+module and on review.</p>
+
+      </article>
+      <footer class="page-footer"><a href="../index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#scope-a-gate-not-a-guarantee">Scope: a gate, not a guarantee</a></li>
+<li class="toc-level-3"><a href="#what-this-module-deliberately-does-not-do">What this module deliberately does not do</a></li>
+<li class="toc-level-2"><a href="#threat-notes">Threat notes</a></li>
+<li class="toc-level-2"><a href="#limits">Limits</a></li>
+<li class="toc-level-2"><a href="#public-api">Public API</a></li>
+<li class="toc-level-2"><a href="#fuzz-targets">Fuzz targets</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

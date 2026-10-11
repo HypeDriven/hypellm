@@ -450,6 +450,12 @@ pub struct RouterState {
     pub config: Arc<Activatable<ValidatedConfig>>,
     /// API keys.
     pub keys: Arc<KeyStore>,
+    /// Per-key cumulative token budgets (specification 12.1).
+    ///
+    /// Reserved against before every upstream attempt made with a key, and
+    /// shared with the management API, which is the only thing that changes a
+    /// limit.
+    pub budgets: Arc<hypellm_core::budget::BudgetLedger>,
     /// Management sessions.
     pub sessions: Arc<SessionStore>,
     /// Provider credentials.

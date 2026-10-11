@@ -523,6 +523,7 @@ pub fn render_error(error: &RouterError, request_id: Option<RequestId>) -> Strin
     let mut inner = Object::new();
     inner.push("type", Value::from(error.code.anthropic_type()));
     inner.push("message", Value::from(error.detail.as_str()));
+    push_budget_details(&mut inner, error);
 
     let mut root = Object::new();
     root.push("type", Value::from("error"));
@@ -960,10 +961,22 @@ fn message_stop() -> Frame {
     }
 }
 
+/// Specification 12.2: other protocol profiles "MUST preserve HTTP 402 and the
+/// same code/details in their compatible error envelope". Anthropic's envelope
+/// has no `code`, so a budget refusal — and only that — carries one, beside
+/// the payment directions.
+fn push_budget_details(inner: &mut Object, error: &RouterError) {
+    if error.code == hypellm_core::ErrorCode::TokenBudgetExhausted {
+        inner.push("code", Value::from(error.code.as_str()));
+        inner.push_opt("payment_required", super::openai::payment_required(error));
+    }
+}
+
 fn error_frame(error: &RouterError) -> Frame {
     let mut inner = Object::new();
     inner.push("type", Value::from(error.code.anthropic_type()));
     inner.push("message", Value::from(error.detail.as_str()));
+    push_budget_details(&mut inner, error);
     let mut root = Object::new();
     root.push("type", Value::from("error"));
     root.push("error", Value::Object(inner));

@@ -45,6 +45,7 @@ const ROUTES: &[(&str, &str)] = &[
     ("/admin/v1/credentials/provider-secret:rotate", r#"{"secret":"sk-new"}"#),
     ("/admin/v1/targets/local:model", r#"{"state":"draining"}"#),
     ("/admin/v1/auth/break-glass", r#"{"token":"t","reason":"an incident happened"}"#),
+    ("/admin/v1/keys/0123456789abcdef/budget:credit", r#"{"tokens":500,"reason":"invoice 7"}"#),
 ];
 
 fn seeds() -> Vec<&'static [u8]> {
@@ -296,4 +297,96 @@ fn random_bytes_on_every_route_are_handled() {
             .send();
         assert!((200..600).contains(&response.status));
     }
+}
+
+// -- Key budgets -------------------------------------------------------------
+
+/// A durable budget record: a finite limit, a mark, payment instructions and
+/// a credit receipt.
+const BUDGET_RECORD: &[u8] = br#"{"key":"0123456789abcdef","tenant":"acme","limit":1500000,"drawn":1000000,"revision":3,"payment_message":"Top up.","payment_url":"https://billing.example/tokens","receipt":{"idempotency_key":"pay-7","request_digest":"abc","tokens":500000,"limit_after":1500000,"revision_after":3,"at_millis":42,"actor":"svc:pay","reason":"invoice 7"}}"#;
+
+#[test]
+fn no_damaged_budget_record_is_restored_as_a_more_generous_one() {
+    // The record is what a restart believes about a purchased allowance. The
+    // failure that matters is not a crash but a quiet widening: a limit that
+    // cannot be read being taken as "no limit", or a mark as "nothing spent".
+    use hypellm_admin_api::budget::{decode_record, encode_record};
+    use hypellm_core::budget::MAX_TOKENS;
+
+    let (accepted, rejected) = fuzz::sweep(&[BUDGET_RECORD], 20_000, 0x00ad_b001, |case| {
+        let Some(record) = decode_record(case) else {
+            return false;
+        };
+        let json = wire_json::parse(case, &wire_json::Limits::SMALL).expect("decoded, so it parsed");
+        if record.limit.is_none() {
+            assert!(
+                json.get("limit").is_none_or(wire_json::Value::is_null),
+                "an unreadable limit was restored as unlimited: {}",
+                String::from_utf8_lossy(case)
+            );
+        }
+        assert_eq!(json.get("drawn").and_then(wire_json::Value::as_u64), Some(record.drawn));
+        assert!(record.drawn <= MAX_TOKENS && record.limit.is_none_or(|limit| limit <= MAX_TOKENS));
+        // What was decoded is exactly what would be written back.
+        assert_eq!(decode_record(&encode_record(&record)), Some(record));
+        true
+    });
+    assert!(accepted > 0, "no mutated record ever decoded; the seed is wrong");
+    assert_eq!(accepted + rejected, 20_000);
+}
+
+#[test]
+fn a_credit_moves_the_limit_by_the_amount_it_named_or_not_at_all() {
+    // Every mutated body is a credit request from an authorized caller, each
+    // under its own operation identifier. Whatever the body says, the limit
+    // afterwards is the limit before plus exactly the positive integer the
+    // body's `tokens` field holds — or unchanged.
+    let admin = Harness::new();
+    let session = admin.session(
+        "user:finance",
+        harness::TENANT_A,
+        &[hypellm_core::rbac::Role::KeyBudgetManager],
+    );
+    let (key, _) = admin.issue_api_key(harness::TENANT_A, "svc:build");
+    let tenant = hypellm_core::ids::TenantId::new(harness::TENANT_A).unwrap();
+    admin.state.budgets.set(&key, &tenant, None, Some(0), None).unwrap();
+    let path = format!("/admin/v1/keys/{}/budget:credit", key.as_str());
+
+    let seeds: &[&[u8]] = &[
+        br#"{"tokens":500,"reason":"invoice 7"}"#,
+        br#"{"tokens":9223372036854775000}"#,
+        br#"{"tokens":1}"#,
+    ];
+    // Fewer cases than the other targets: every applied credit is two
+    // `fsync`s, an audit record and a ledger frame.
+    let mut applied = 0_u32;
+    for n in 0..1_500 {
+        let body = fuzz::case_at(seeds, 0x00ad_b002, n);
+        let before = admin.state.budgets.view(&key).limit.expect("still finite");
+        let response = admin
+            .request(Method::Post, &path)
+            .as_session(&session)
+            .if_match(harness::ANY_ETAG)
+            .header("idempotency-key", &format!("operation-{n}"))
+            .body(&body)
+            .send();
+        let after = admin.state.budgets.view(&key).limit.expect("a credit removed the limit");
+        if response.status == 200 {
+            let named = wire_json::parse(&body, &wire_json::Limits::SMALL)
+                .ok()
+                .and_then(|json| json.get("tokens").and_then(wire_json::Value::as_u64))
+                .filter(|tokens| *tokens > 0);
+            assert_eq!(
+                named.and_then(|tokens| before.checked_add(tokens)),
+                Some(after),
+                "case {n}: {} moved the limit from {before} to {after}",
+                String::from_utf8_lossy(&body)
+            );
+            applied += 1;
+        } else {
+            assert_eq!(after, before, "case {n}: a refused credit changed the limit");
+        }
+        assert!(after <= hypellm_core::budget::MAX_TOKENS, "case {n}: the limit overflowed");
+    }
+    assert!(applied > 0, "no mutated credit was ever applied; the seeds are wrong");
 }

@@ -510,31 +510,46 @@ fn check_build_scripts(root: &Path, workspace: &Manifest, report: &mut Report) {
     }
 }
 
-/// Whether a `MODULE.md` *declares* a field, rather than merely mentioning it.
-///
-/// Two forms are in use and both are legitimate: a row in the summary table at
-/// the top (`| Owner | … |`) and a section heading (`## Threat notes`). What is
-/// not accepted is the word appearing in prose — this rule used to be a bare
-/// `contains`, which meant a file discussing its "Limits" in a sentence
-/// satisfied the requirement to declare them, and the check for that field
-/// could never fail.
+/// Plain text of an HTML heading or table cell, with optional attributes.
+/// The wiki uses plain field labels; nested markup is not a declaration.
+fn element_text<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix('<')?.strip_prefix(tag)?;
+    if !rest.starts_with('>') && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let (_, content) = rest.split_once('>')?;
+    let (value, _) = content.split_once(&format!("</{tag}>"))?;
+    Some(value.trim())
+}
+
+/// Whether an HTML module contract declares a field in its article.
+/// Headings and first cells of summary-table rows count; prose, navigation,
+/// escaped examples, and second-column mentions do not.
 fn declares(text: &str, field: &str) -> bool {
-    text.lines().any(|line| {
-        let trimmed = line.trim();
-        // `## Field`, at any heading depth.
-        let heading = trimmed
-            .trim_start_matches('#')
-            .trim_start()
-            .eq_ignore_ascii_case(field);
-        let is_heading = trimmed.starts_with('#') && heading;
-        // `| Field | value |`, the summary-table form.
-        let is_row = trimmed.starts_with('|')
-            && trimmed
-                .split('|')
-                .nth(1)
-                .is_some_and(|cell| cell.trim().eq_ignore_ascii_case(field));
-        is_heading || is_row
-    })
+    let Some((_, article)) = text.split_once("<article") else {
+        return false;
+    };
+    let Some((_, article)) = article.split_once('>') else {
+        return false;
+    };
+    let Some((article, _)) = article.split_once("</article>") else {
+        return false;
+    };
+    let heading = article.lines().any(|line| {
+        ["h1", "h2", "h3", "h4", "h5", "h6"].iter().any(|tag| {
+            element_text(line.trim(), tag).is_some_and(|value| value.eq_ignore_ascii_case(field))
+        })
+    });
+    let row = article.split("<tr>").skip(1).any(|row| {
+        let Some((row, _)) = row.split_once("</tr>") else {
+            return false;
+        };
+        ["td", "th"].iter().any(|tag| {
+            element_text(row.trim_start(), tag)
+                .is_some_and(|value| value.eq_ignore_ascii_case(field))
+        })
+    });
+    heading || row
 }
 
 /// Rule `module-documentation`: specification 4.1 requires every in-repository
@@ -559,26 +574,37 @@ fn check_module_documentation(root: &Path, workspace: &Manifest, report: &mut Re
     ];
 
     for member in &workspace.workspace_members {
-        let doc = root.join(member).join("MODULE.md");
+        let name = Path::new(member)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let doc = root.join("spec/modules").join(format!("{name}.html"));
         if !doc.is_file() {
             report.push(Finding::file(
                 "module-documentation",
-                format!("{member}/MODULE.md"),
+                relative(root, &doc),
                 "specification 4.1 requires each module to declare an owner, threat notes, \
                  public API, unsafe-code status, fuzz targets, and resource limits",
             ));
             continue;
         }
-        if let Ok(text) = walk::read_text(&doc) {
-            for heading in REQUIRED_HEADINGS {
-                if !declares(&text, heading) {
-                    report.push(Finding::file(
-                        "module-documentation",
-                        format!("{member}/MODULE.md"),
-                        format!("does not declare `{heading}` (specification 4.1)"),
-                    ));
+        match walk::read_text(&doc) {
+            Ok(text) => {
+                for heading in REQUIRED_HEADINGS {
+                    if !declares(&text, heading) {
+                        report.push(Finding::file(
+                            "module-documentation",
+                            relative(root, &doc),
+                            format!("does not declare `{heading}` (specification 4.1)"),
+                        ));
+                    }
                 }
             }
+            Err(error) => report.push(Finding::file(
+                "module-documentation",
+                relative(root, &doc),
+                format!("module contract could not be read ({error}); it cannot be certified"),
+            )),
         }
     }
 }
@@ -696,6 +722,70 @@ fn strip_line_comment(line: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn module_fields_must_be_headings_or_first_cells_in_the_article() {
+        let text = "<nav><h2>Public API</h2></nav><article class=\"document\">\n\
+                    <table><tr>\n<td>Owner</td><td>Security</td></tr></table>\n\
+                    <h2 id=\"threat-notes\">Threat notes</h2>\n\
+                    <h3>Limits</h3>\n\
+                    <p>Unsafe code and Fuzz targets are discussed.</p>\n\
+                    <table><tr><td>Other</td><td>Public API</td></tr></table>\n\
+                    <pre>&lt;h2&gt;Fuzz targets&lt;/h2&gt;</pre>\n</article>";
+        assert!(declares(text, "Owner"));
+        assert!(declares(text, "threat notes"));
+        assert!(declares(text, "Limits"));
+        assert!(!declares(text, "Public API"));
+        assert!(!declares(text, "Unsafe code"));
+        assert!(!declares(text, "Fuzz targets"));
+        assert!(!declares("<h2>Owner</h2>", "Owner"));
+    }
+
+    #[test]
+    fn missing_and_incomplete_module_contracts_are_reported_in_the_wiki() {
+        let dir = std::env::temp_dir().join(format!("hypellm-module-docs-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("spec/modules")).expect("create wiki");
+        let workspace = Manifest {
+            workspace_members: vec!["crates/missing".into(), "crates/incomplete".into()],
+            ..Manifest::default()
+        };
+        let path = dir.join("spec/modules/incomplete.html");
+        std::fs::write(&path, "<article>\n<h2>Owner</h2>\n</article>").expect("write contract");
+        let mut report = Report::new();
+        check_module_documentation(&dir, &workspace, &mut report);
+        let findings = report
+            .findings()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            findings.len(),
+            6,
+            "one absent contract and five missing fields"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("spec/modules/missing.html"))
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("`Threat notes`"))
+        );
+        assert!(!findings.iter().any(|finding| finding.contains("`Owner`")));
+
+        std::fs::write(&path, [0xff]).expect("write invalid UTF-8");
+        let mut report = Report::new();
+        check_module_documentation(&dir, &workspace, &mut report);
+        assert!(
+            report
+                .findings()
+                .iter()
+                .any(|finding| finding.to_string().contains("cannot be certified"))
+        );
+        std::fs::remove_dir_all(&dir).expect("remove scratch wiki");
+    }
 
     #[test]
     fn lint_extraction_handles_both_attribute_spellings() {

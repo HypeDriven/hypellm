@@ -1,4 +1,4 @@
-# The identity verifier (verifier/README.md). Applied by `just oidc`, not by `just up`.
+# The identity verifier (spec/components/identity-verifier.html). Applied by `just oidc`, not by `just up`.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: hypellm

@@ -1,6 +1,6 @@
 {
   "_comment": [
-    "The fleet agent's own allowlist, matching docs/examples/fleet.conf.",
+    "The fleet agent's own allowlist, matching spec/examples/fleet.conf.",
     "",
     "This file is the trust boundary. The router names an identifier; the agent",
     "looks it up here and runs what *this* file says. Nothing the router sends",
@@ -15,7 +15,7 @@
     "ones that are still in both. Compare them before enabling:",
     "",
     "    agent/fleet-agent --config agent/fleet.example.json --print-digest",
-    "    cargo run -q -p hypellm-router -- --check --config docs/examples/fleet.conf"
+    "    cargo run -q -p hypellm-router -- --check --config spec/examples/fleet.conf"
   ],
 
   "hosts": [

@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: Fleet agent.">
+  <title>Fleet agent · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="../assets/wiki.css">
+  <script defer src="../assets/search-index.js"></script>
+  <script defer src="../assets/wiki.js"></script>
+</head>
+<body data-wiki-root="../" data-page-title="Fleet agent" data-page-group="Components">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="../index.html">Wiki home</a></li>
+<li><a href="../overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="../router-specification.html">Router specification</a></li>
+<li><a href="../threat-model.html">Threat model</a></li>
+<li><a href="../orchestration.html">Fleet orchestration</a></li>
+<li><a href="../deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="../using-the-router.html">Using the router</a></li>
+<li><a href="../deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="../runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="fleet-agent.html" aria-current="page">Fleet agent</a></li>
+<li><a href="identity-verifier.html">Identity verifier</a></li>
+<li><a href="container-init.html">Container init</a></li>
+<li><a href="tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="../modules/hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="../modules/hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="../modules/hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="../modules/hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="../modules/hypellm-config.html">hypellm-config</a></li>
+<li><a href="../modules/hypellm-core.html">hypellm-core</a></li>
+<li><a href="../modules/hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="../modules/hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="../modules/hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="../modules/hypellm-net.html">hypellm-net</a></li>
+<li><a href="../modules/hypellm-router.html">hypellm-router</a></li>
+<li><a href="../modules/hypellm-store.html">hypellm-store</a></li>
+<li><a href="../modules/hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="../modules/hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="../modules/wire-http1.html">wire-http1</a></li>
+<li><a href="../modules/wire-json.html">wire-json</a></li>
+<li><a href="../modules/wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="../index.html">Wiki</a><span aria-hidden="true">/</span>Components</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="the-hypellm-fleet-agent">The HypeLLM fleet agent</h1>
+<p>This directory holds the reference <strong>fleet agent</strong>: the process that actually
+starts and stops containers on slave machines.</p>
+<p>It is deliberately outside the Rust workspace. It is not a workspace member, not
+built by <code>cargo build --workspace</code>, and not scanned by <code>depscan</code> as router
+source. That is not an oversight — it is the whole point.</p>
+<h2 id="why-it-is-a-separate-process">Why it is a separate process</h2>
+<p>Starting a container on <code>10.0.0.105</code> means running <code>ssh</code> and <code>docker</code>. The
+router cannot do this and must not be changed so that it can: specification 4.1
+forbids subprocess execution, <code>depscan</code>'s <code>forbidden-api</code> rule fails the build on
+<code>process::Command</code>, and a router that can spawn a shell is a different security
+proposition from one that cannot.</p>
+<p>The specification already solves this shape twice — specification 4 delegates
+outbound TLS to a platform helper with a narrow CONNECT-like API, and 9.1
+delegates JWT verification to a local verifier over a narrow authenticated
+interface. This is the third member of that family and follows the same rules.</p>
+<p><strong>This is an honest cost, not a free win.</strong> The agent holds SSH keys to every
+slave and can stop production models on all of them. It is in the trusted
+computing base and should be reviewed as such.</p>
+<h2 id="what-the-router-may-tell-it">What the router may tell it</h2>
+<p>Identifiers and bounded integers. The socket carries no image name, no host
+address, no file path, no container name, no Docker flag, no shell fragment, and
+no URL — only opaque <code>deployment-id</code>, <code>artifact-id</code>, <code>host-id</code>, and <code>lease-id</code>
+tokens both sides hold from their own configuration.</p>
+<p>The agent maintains <strong>its own</strong> allowlist (<code>fleet.example.json</code>) mapping each
+identifier to a host, an SSH destination, and a command. The router cannot extend
+it. The goal is specific: <strong>a fully compromised router cannot cause arbitrary
+code to run on a slave.</strong> It can reorder declared deployments; it cannot
+introduce one.</p>
+<p>An unrecognised identifier is refused with <code>ERR unknown_deployment</code>.</p>
+<h2 id="obligations">Obligations</h2>
+<p>These are normative. An agent that does not keep them is not this agent.</p>
+<ul>
+<li><strong>Runs as its own unprivileged user</strong>, separate from the router.</li>
+<li><strong>Per-host SSH keys restricted by a forced <code>command=</code></strong> in the slave's
+<code>authorized_keys</code>, with <code>no-pty</code>, <code>no-port-forwarding</code>, <code>no-agent-forwarding</code>,
+and <code>no-X11-forwarding</code>. The agent's key must not grant an interactive shell.</li>
+<li><strong>Never interpolates a router-supplied value into a command line.</strong> Router
+input selects a row in the agent's own table; the row's fields become the
+argument vector, and <code>subprocess</code> is called with <code>shell=False</code>. Because <code>ssh</code>
+joins its command into one string for the remote shell, that vector is quoted
+once with <code>shlex.join</code> and passed after <code>--</code>, so each argument arrives intact.</li>
+<li><strong>Bounds its own background work.</strong> At most <code>MAX_INFLIGHT_OPERATIONS</code>
+<code>ACTIVATE</code>/<code>DEACTIVATE</code>/<code>FETCH</code> operations run at once (further ones are
+refused <code>busy</code>), at most <code>MAX_CONCURRENT_COMMANDS</code> remote commands run at
+once, and finished activations are pruned past <code>MAX_RETAINED_ACTIVATIONS</code>.</li>
+<li><strong>Applies its own per-host activation rate limit.</strong> A router bug must not be
+able to exhaust the fleet through the agent.</li>
+<li><strong>Verifies artifact digests before an artifact becomes activatable</strong>, and
+refuses to activate an unverified one.</li>
+<li><strong>Reports memory as observed from the accelerator</strong>, not as configured, so the
+router can detect drift between the declaration and the machine.</li>
+<li><strong>Bounds and truncates every reported field.</strong></li>
+</ul>
+<h2 id="setting-it-up">Setting it up</h2>
+<h3 id="1-write-the-allowlist">1. Write the allowlist</h3>
+<p>Copy <code>fleet.example.json</code> and edit it to match your machines. Every deployment
+needs a host, an accelerator, a start command, a stop command, and a readiness
+probe.</p>
+<p>The probe matters more than it looks. A TCP connect is not readiness: a
+llama.cpp server accepts connections long before it has finished mapping twenty
+gigabytes of weights, and a router that believes otherwise sends the first
+request into a timeout and opens a circuit breaker on a model that was working.
+Probe something that only answers when the model is loaded.</p>
+<p>The file is reloaded when it changes. The agent checks its size and
+modification time at most once a second. A new version is adopted only if it
+validates completely, and then the whole table is swapped at once. An invalid
+edit is reported once on stderr and the previous table stays in force.
+Operations already running keep the rows they started with. <code>ssh</code> takes a
+hostname as readily as an address (<code>&quot;ssh&quot;: &quot;hypellm@gpu3.lan&quot;</code>).</p>
+<p>A reload that changes the digest ends every session authenticated under the
+old one: the next request gets <code>ERR fleet_configuration_changed</code> and the
+connection is closed. The router's next handshake then compares the new digest.</p>
+<p>To add a machine:</p>
+<ol>
+<li>Add its host, accelerators, and deployments to this file. Orchestration
+pauses at this point with <code>fleet_configuration_mismatch</code>, because the
+router does not know the machine yet. Targets that are already warm keep
+serving.</li>
+<li>Publish the matching router-side <code>host</code>, <code>accelerator</code>, and <code>deployment</code>
+records, from the dashboard's fleet screen or the configuration file.
+Orchestration resumes once the two digests agree again.</li>
+</ol>
+<p>The router cannot add a row here. The reload reads only this file on disk, so
+§26.2's boundary is unchanged.</p>
+<h3 id="2-confirm-both-sides-agree">2. Confirm both sides agree</h3>
+<pre><code class="language-bash">agent/fleet-agent --config agent/fleet.example.json --print-digest
+cargo run -q -p hypellm-router -- --check --config spec/examples/fleet.conf
+</code></pre>
+<p>The two digests are computed independently, from two different files, by two
+different programs. <strong>They must match.</strong> When they do not, the router issues no
+mutating verb, marks every orchestrated target ineligible with
+<code>fleet_configuration_mismatch</code>, and audits it — a router and an agent that
+disagree about what an identifier means must not act on that disagreement.</p>
+<p>The digest deliberately covers only identifiers, placement, and architecture.
+Retuning a dwell floor or an activation budget is the router's business and does
+not force an agent restart; moving a deployment to a different accelerator is
+not, and does.</p>
+<h3 id="3-share-the-key">3. Share the key</h3>
+<p>The router generates <code>fleet.key</code> alongside its other secrets:</p>
+<pre><code class="language-bash">cargo run -p hypellm-router -- --generate-secrets /var/lib/hypellm/secrets
+</code></pre>
+<p>Copy <code>&lt;secrets&gt;/fleet.key</code> to the agent's own directory, owner-readable only.
+The handshake carries <code>HMAC-SHA-256(fleet.key, version ‖ nonce ‖ fleet-digest)</code>,
+so it binds both the protocol version and the fleet each side claims, and the
+agent rejects a nonce it has already accepted.</p>
+<p>This is deliberately <strong>stronger than the control socket's <code>control.key</code></strong>, and
+does not reuse it. That one sends the hex-encoded key itself as a bearer line;
+adequate for a local stop command and inadequate for verbs that stop production
+models.</p>
+<h3 id="4-run-it">4. Run it</h3>
+<pre><code class="language-bash">agent/fleet-agent \
+    --config /etc/hypellm/fleet.json \
+    --socket /run/hypellm/fleet.sock \
+    --key /etc/hypellm/fleet.key \
+    --agent-id local
+</code></pre>
+<p>The socket is created owner-only. Point the router at it with:</p>
+<pre><code class="language-text">fleet_agent id=local socket=&quot;/run/hypellm/fleet.sock&quot; \
+    observation_interval_ms=5000 observation_max_age_ms=30000
+</code></pre>
+<p>and set <code>fleet_enabled=true</code> in the <code>settings</code> record.</p>
+<h2 id="what-this-reference-implementation-does-not-do">What this reference implementation does not do</h2>
+<p>Stated so the gaps are not mistaken for controls:</p>
+<ul>
+<li><strong>Fetch resumption is at layer granularity, not byte granularity.</strong> <code>FETCH</code>
+retries within the router's deadline, and <code>docker pull</code> skips layers already
+in the host's content store — so each attempt resumes from what the last one
+finished. A layer interrupted mid-transfer is re-fetched. An artifact
+published as one enormous layer therefore gains nothing from this, which is a
+property of how it was built rather than of this agent.</li>
+<li><strong>No Windows-host support.</strong> Four of the six machines are Windows hosts whose
+SSH lands in WSL, where <code>powershell.exe</code> interop reaches the Windows side.
+Driving that is entirely the agent's concern — the router must never learn
+that some hosts need it — but this reference agent does not implement it.</li>
+<li><strong>No forced <code>command=</code> enforcement.</strong> It is documented above as an obligation
+and configured on the slave, not by this program. An agent deployed without it
+has a much larger blast radius than one with it.</li>
+<li><strong>Observation is serial.</strong> Each host is probed in turn on the observing
+thread. With five hosts and a five-second interval this is comfortable; with
+fifty it would not be.</li>
+</ul>
+<h2 id="protocol">Protocol</h2>
+<pre><code class="language-text">→ HELLO 1 &lt;nonce&gt; &lt;fleet-digest&gt; &lt;hmac&gt;\n
+← OK &lt;agent-version&gt; &lt;fleet-digest&gt;\n | ERR &lt;code&gt;\n
+
+→ OBSERVE\n
+← OK &lt;length&gt;\n&lt;inventory JSON, at most 256 KiB&gt;
+
+→ ACTIVATE &lt;deployment-id&gt; &lt;lease-id&gt; &lt;deadline-ms&gt;\n
+← ACCEPTED &lt;activation-id&gt;\n | ERR &lt;code&gt;\n
+
+→ DEACTIVATE &lt;deployment-id&gt; &lt;lease-id&gt; &lt;drain-ms&gt;\n
+← ACCEPTED &lt;activation-id&gt;\n | ERR &lt;code&gt;\n
+
+→ FETCH &lt;artifact-id&gt; &lt;host-id&gt; &lt;deadline-ms&gt;\n
+← ACCEPTED &lt;activation-id&gt;\n | ERR &lt;code&gt;\n
+
+→ STATUS &lt;activation-id&gt;\n
+← OK &lt;state&gt; &lt;detail-code&gt; &lt;progress-permille&gt;\n
+
+→ CANCEL &lt;activation-id&gt;\n
+← OK\n | ERR &lt;code&gt;\n
+</code></pre>
+<p><code>ACTIVATE</code>, <code>DEACTIVATE</code>, and <code>FETCH</code> are asynchronous, and re-sending one
+returns the same <code>activation-id</code> rather than starting a second one — which is
+what makes the router's crash recovery tractable. <code>ACTIVATE</code> and <code>DEACTIVATE</code>
+are idempotent per <strong><code>lease-id</code></strong>; <code>FETCH</code> carries no lease, so it is idempotent
+per <strong>(artifact, host)</strong> while the fetch is in flight. A <code>FETCH</code> for a
+<em>different</em> artifact on a host already pulling is refused <code>host_busy</code>:
+specification-extension 12 allows one fetch per host, and two pulls against one
+disk and one link make each other slower.</p>
+<p><code>FETCH</code> runs under the router's <code>deadline-ms</code>, clamped here to
+<code>MAX_FETCH_SECONDS</code>, and <strong>not</strong> under <code>--command-timeout</code> — 120 seconds would
+kill every pull worth making and report it as a transport failure. Within that
+budget it retries a failed pull up to <code>MAX_FETCH_ATTEMPTS</code> times with capped
+backoff, checking for cancellation before each attempt and during each wait. A
+pull that exits zero but produces an image whose digest does not match is
+<strong>not</strong> retried: it would produce the same image again, and the refusal is the
+control.</p>
+<p>A fetch's <code>progress-permille</code> is <code>0</code> until the digest verifies and <code>1000</code>
+afterwards. It is not a percentage: the pull reports nothing this agent can read
+incrementally, and a figure derived from elapsed time would read as bytes
+transferred and be wrong exactly when someone was relying on it.</p>
+<p>States are a closed vocabulary: <code>pending</code>, <code>draining</code>, <code>stopping</code>, <code>fetching</code>,
+<code>starting</code>, <code>probing</code>, <code>ready</code>, <code>failed</code>, <code>stopped</code>, <code>cancelled</code>. An
+unrecognised state fails the router's whole observation rather than being mapped
+to something plausible.</p>
+<p><code>agent/test_fleet_agent.py</code> covers the fetch path — retry and resumption, the
+attempt cap, the deadline, per-host exclusion, cancellation during backoff, and
+the digest refusal — plus remote argument quoting (checked against a local
+<code>sh -c</code>), the line-length bound, the background-work cap and pruning, and a
+cancel during probing, with <code>run_on</code> replaced by a scripted stub, so no <code>ssh</code>, no
+<code>docker</code>, and no network. Run it with <code>python3 agent/test_fleet_agent.py</code>. It is
+not part of <code>cargo test --workspace</code>, because this agent is deliberately outside
+the Rust workspace.</p>
+<p>The normative definition lives in <code>crates/hypellm-fleet/src/protocol.rs</code>, and
+<code>crates/hypellm-net/src/fleet_sim.rs</code> is a conformant simulator used by the
+integration suite — so <code>cargo test --workspace --offline</code> exercises the full
+activation path with no SSH, no Docker, and no network.</p>
+
+      </article>
+      <footer class="page-footer"><a href="../index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#why-it-is-a-separate-process">Why it is a separate process</a></li>
+<li class="toc-level-2"><a href="#what-the-router-may-tell-it">What the router may tell it</a></li>
+<li class="toc-level-2"><a href="#obligations">Obligations</a></li>
+<li class="toc-level-2"><a href="#setting-it-up">Setting it up</a></li>
+<li class="toc-level-3"><a href="#1-write-the-allowlist">1. Write the allowlist</a></li>
+<li class="toc-level-3"><a href="#2-confirm-both-sides-agree">2. Confirm both sides agree</a></li>
+<li class="toc-level-3"><a href="#3-share-the-key">3. Share the key</a></li>
+<li class="toc-level-3"><a href="#4-run-it">4. Run it</a></li>
+<li class="toc-level-2"><a href="#what-this-reference-implementation-does-not-do">What this reference implementation does not do</a></li>
+<li class="toc-level-2"><a href="#protocol">Protocol</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

@@ -1,0 +1,698 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: hypellm-admin-api.">
+  <title>hypellm-admin-api · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="../assets/wiki.css">
+  <script defer src="../assets/search-index.js"></script>
+  <script defer src="../assets/wiki.js"></script>
+</head>
+<body data-wiki-root="../" data-page-title="hypellm-admin-api" data-page-group="Module contracts">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="../index.html">Wiki home</a></li>
+<li><a href="../overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="../router-specification.html">Router specification</a></li>
+<li><a href="../threat-model.html">Threat model</a></li>
+<li><a href="../orchestration.html">Fleet orchestration</a></li>
+<li><a href="../deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="../using-the-router.html">Using the router</a></li>
+<li><a href="../deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="../runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="../components/fleet-agent.html">Fleet agent</a></li>
+<li><a href="../components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="../components/container-init.html">Container init</a></li>
+<li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="hypellm-admin-api.html" aria-current="page">hypellm-admin-api</a></li>
+<li><a href="hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="hypellm-config.html">hypellm-config</a></li>
+<li><a href="hypellm-core.html">hypellm-core</a></li>
+<li><a href="hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="hypellm-net.html">hypellm-net</a></li>
+<li><a href="hypellm-router.html">hypellm-router</a></li>
+<li><a href="hypellm-store.html">hypellm-store</a></li>
+<li><a href="hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="wire-http1.html">wire-http1</a></li>
+<li><a href="wire-json.html">wire-json</a></li>
+<li><a href="wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="../index.html">Wiki</a><span aria-hidden="true">/</span>Module contracts</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="module-hypellm-admin-api">Module: hypellm-admin-api</h1>
+<p>Specification 4.1 requires every in-repository module to declare an owner, threat
+notes, public API, unsafe-code declaration, fuzz targets, and maximum
+input/resource limits.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Owner</td>
+<td>Security (primary), Platform (secondary)</td>
+</tr>
+<tr>
+<td>Unsafe code</td>
+<td>None. <code>#![forbid(unsafe_code)]</code> declared in <code>lib.rs</code> and inherited from the workspace.</td>
+</tr>
+<tr>
+<td>External dependencies</td>
+<td>None. Rust standard library plus the workspace path dependencies <code>hypellm-auth</code>, <code>hypellm-config</code>, <code>hypellm-core</code>, <code>hypellm-crypto</code>, <code>hypellm-fleet</code>, <code>hypellm-store</code>, <code>hypellm-telemetry</code>, <code>wire-http1</code>, <code>wire-json</code>.</td>
+</tr>
+<tr>
+<td>Fuzz targets</td>
+<td>Implemented in <code>tests/fuzz.rs</code>: nine seeded mutation properties over authentication, authorization, CSRF, tenant isolation, error redaction and bounded request handling.</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="scope-and-the-control-plane-boundary">Scope and the control-plane boundary</h2>
+<p>This module is the <code>/admin/v1</code> surface of specification 16, and the enforcement
+point for specification 15.4's API behaviour: explicit JSON schemas, ETags,
+<code>If-Match</code> on mutation, pagination cursors, stable error codes, and request IDs.
+It owns the authorization gate for management actions and five bounded
+in-memory views (<code>DecisionCache</code>, <code>AuditIndex</code>, <code>UsageAggregate</code>,
+<code>TrafficWindow</code>, <code>DraftStore</code>) that the admin screens of specification 15.3
+read.</p>
+<p>What it deliberately does <strong>not</strong> do is at least as important, because the crate
+sits at the point where an operator's browser meets the router's most privileged
+operations:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Not done here</th>
+<th>Where it belongs</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HTTP framing, TLS, sockets</td>
+<td><code>wire-http1</code>, <code>hypellm-router</code>, platform boundary (4, 20)</td>
+<td>The crate receives an already-parsed <code>AdminRequest</code> and returns an <code>ApiResponse</code>; it never touches a file descriptor.</td>
+</tr>
+<tr>
+<td>JWT signature verification, code exchange</td>
+<td><code>oidc::TokenVerifier</code> behind the approved boundary (9.1)</td>
+<td>Specification 4 forbids novel signature or TLS code. <code>oidc_callback</code> hands the code to the verifier and validates the <em>claims</em> it returns; it speaks no HTTPS.</td>
+</tr>
+<tr>
+<td>Reading a credential secret</td>
+<td>Nowhere — no handler, no permission (9.3)</td>
+<td>A credential manager &quot;cannot read secret back&quot;. <code>list_credentials</code> renders no <code>secret</code> field, and <code>create_credential</code>/<code>rotate_credential</code> accept the value write-only.</td>
+</tr>
+<tr>
+<td>Routing decisions</td>
+<td><code>hypellm-core</code>'s <code>PolicySnapshot::route</code> (6)</td>
+<td><code>simulate_draft</code> calls the production routing function over <code>IdealLiveState</code>, so a simulation cannot drift from what the router would actually decide.</td>
+</tr>
+<tr>
+<td>Configuration parsing and validation</td>
+<td><code>hypellm-config</code> (11.1)</td>
+<td>Draft validation is <code>hypellm_config::load</code>; this crate stores text and reports the outcome.</td>
+</tr>
+<tr>
+<td>Being the audit record</td>
+<td><code>hypellm-store</code>'s hash chain (17)</td>
+<td><code>AuditIndex</code> is a lossy display view. The chain is authoritative and export reads from there.</td>
+</tr>
+<tr>
+<td>Anything on the inference path</td>
+<td><code>hypellm-router::pipeline</code> (3)</td>
+<td>The management path is separated &quot;in code, scheduling, rate limits, authentication scopes, and listener configuration&quot;. This crate is that separation; it has no handle to the inference pipeline, and <code>AdminHandler</code> is mounted on its own listener with <code>wire_http1::Limits::ADMIN</code>.</td>
+</tr>
+</tbody>
+</table></div>
+<p>Specification 16 also lists <code>POST /admin/v1/targets</code>. It exists, and it does not
+create a target — it creates a <strong>policy draft</strong> containing one. Targets still
+come into existence only by publishing a validated draft, which keeps every
+routing-relevant object under the draft → validate → approve → atomic-activate
+discipline of 15.4 rather than admitting a second, unreviewed mutation path. The
+response says <code>target_created: false</code> so a client cannot read it otherwise.</p>
+<p>Because the handler writes caller-supplied values into configuration <em>text</em>, it
+refuses anything outside an identifier alphabet (<code>is_configuration_token</code>)
+rather than escaping it. The grammar is line-oriented and space-separated, so an
+unchecked value adds records rather than a field — and a draft is approved by a
+second person who reads what they were shown (<code>DI-047</code>).</p>
+<p><code>POST /admin/v1/policies:edit</code> is the structured sibling: a batch of record
+<code>set</code>/<code>remove</code> edits, rendered by <code>hypellm_config::edit</code> against the active
+configuration into a draft that is validated at once and still published
+through <code>:publish</code>. It needs <code>EditPolicy</code>, and cannot reach keys, credentials,
+local users, role bindings, quotas or any <code>settings</code> field but <code>fleet_enabled</code>.
+<code>GET /admin/v1/policies/active</code> returns the records alongside the canonical
+text for the forms, without <code>local_user</code> records.</p>
+<p><strong>Key budgets</strong> (specification 12.3) are three endpoints under
+<code>/admin/v1/keys/{id}/budget</code>: <code>GET</code> reads the limit, consumption, reservations
+and remainder; <code>PUT</code> sets the absolute limit and the per-key payment override;
+<code>POST …/budget:credit</code> adds tokens to a finite limit once per
+<code>Idempotency-Key</code>. All three need <code>ManageKeyBudgets</code> — held by the
+<code>key_budget_manager</code> role, and one of the permissions an API key <em>may</em> hold, so
+a payment system credits with a management-scoped key and no browser session.
+The permission reaches budgets and nothing else: it does not list, mint or
+revoke keys. Both mutations require <code>If-Match</code>; the tag covers the limit and the
+override and not consumption, so a key in use can still be edited. A replayed
+credit is recognised <em>before</em> the tag is compared, because the caller retrying a
+payment notification holds the tag it had the first time, and it returns the
+original receipt; the same identifier with different content is
+<code>409 idempotency_conflict</code>. The audit record precedes the change and names the
+old and new limit and the external operation. The ledger is
+<code>hypellm_core::budget</code>, shared with the data path by <code>Arc</code>; <code>budget.rs</code> here is
+its durable codec and its store-backed journal.</p>
+<h3 id="the-fleet-surface">The fleet surface</h3>
+<p>Seven endpoints under <code>/admin/v1/fleet</code> (specification 26). The live fleet is
+reached through the <code>FleetControl</code> trait, the same shape <code>CredentialSink</code>
+already uses and for the same reason: the router depends on this crate rather
+than the other way round, so the management API knows <em>what</em> it may ask for and
+the router knows <em>how</em>.</p>
+<p>Three properties are worth naming, because each is easy to lose:</p>
+<ul>
+<li><strong>No sentence an operator reads is authored by the router or the agent.</strong>
+<code>FleetControl</code> returns a <code>&amp;'static str</code> code; <code>fleet::control_error</code> maps it to
+the one message, written in this crate. An implementation that could return
+prose would be a path for agent-supplied strings to reach a browser.</li>
+<li><strong>An absent fleet answers &quot;not configured on this router&quot;, not an empty list.</strong>
+Per the honesty rule, a screen with no backing endpoint says so; a plausible
+empty fleet is exactly what stops an operator going to look.</li>
+<li><strong>An action is reported as successful only if it was also recorded.</strong> A fleet
+action is decided by the agent, so it cannot be audited first: it is recorded
+through <code>record_audit_after_effect</code>, whose failure answers that the action
+<em>was</em> applied and must not be retried, and logs <code>audit.append_failed_after_effect</code>
+critically.</li>
+<li><strong>Tenant-scoped, reads and writes alike.</strong> A deployment is visible only when
+its target is in <code>visible_targets</code> for the caller's tenant (Appendix B,
+specification 26). <code>GET /fleet</code> renders only those deployments and the
+accelerators and hosts they sit on; <code>GET /fleet/activations</code> only their
+activations, with evicted deployments of other tenants counted in
+<code>evicted_hidden</code> rather than named; <code>fleet:simulate</code> refuses an unreachable
+target with 404 and renders an eviction of an invisible deployment with
+<code>&quot;deployment&quot;: null</code>. Activate, deactivate and patch answer 404 for an
+invisible deployment before the fleet is asked, identical to an undeclared
+one. No role is router-scoped, so there is no unfiltered view. Pool figures
+on a shown accelerator remain whole-pool figures.</li>
+<li><strong>A deployment patch needs <code>If-Match</code>.</strong> Each deployment in <code>GET /fleet</code>
+carries an <code>etag</code> over its patchable fields (<code>fleet::deployment_etag</code>).</li>
+</ul>
+<p><code>fleet_activate</code> and <code>fleet_fetch</code> are separate permissions, and <code>fleet_fetch</code>
+requires a fresh authentication: it is the one action on which a single request
+can cost the fleet hours of bandwidth and hundreds of gigabytes of disk.</p>
+<h2 id="threat-notes">Threat notes</h2>
+<ul>
+<li><strong>A management API key as a route around the session controls.</strong> <code>/admin/v1</code>
+accepts a key carrying <code>management:read</code> (and <code>management:write</code> for anything
+mutating) as well as a session cookie. <code>AdminApi::key_caller</code> is reached
+<em>only</em> when no session cookie was sent, so a request that is
+cookie-authenticated cannot divert itself to a path with no CSRF check by
+adding an <code>Authorization</code> header. The key carries no roles of its own — they
+are resolved from the active configuration's bindings for its principal, in
+the key's tenant, on every request — and <code>require</code> refuses <code>BreakGlass</code> and
+<code>ManageKeys</code> to any key whatever those bindings say, so a key that publishes
+a policy granting itself <code>break_glass_admin</code> still cannot use either.</li>
+<li><strong>Roles are tenant-scoped.</strong> <code>role_binding</code> names no tenant, so
+<code>management_roles_for(config, principal, tenant)</code> takes the tenant from where
+the configuration places the principal (<code>identity</code>, <code>local_user</code>, group
+membership). A principal placed in some tenant holds its roles only there; a
+principal placed nowhere (a service principal known only by its bindings) is
+not narrowed, and the key's own tenant bounds what it can see.</li>
+<li><strong>Session roles follow the active configuration.</strong> A session records the
+configuration version its roles were resolved against (<code>roles_version</code>).
+<code>current_roles</code> re-resolves them whenever the active version differs: an OIDC
+session must still match an <code>identity</code> record, a password session a
+<code>local_user</code>, with the same principal and tenant, or the session is
+invalidated with 401; otherwise its roles become exactly what the bindings
+now grant. Break-glass sessions are not re-resolved: their authority is the
+offline token and a short lifetime, and a recovery path a bad publication
+could revoke would fail when it is needed.</li>
+<li><strong>A minted key cannot exceed its minter.</strong> <code>ManageKeys</code> belongs to
+<code>break_glass_admin</code> alone. <code>create_key</code> refuses a management-scoped key whose
+principal's roles (resolved in the caller's tenant) are not a subset of the
+caller's roles other than <code>break_glass_admin</code>. A key minted by a break-glass
+caller expires no later than the minting session: an absent <code>expires_at</code>
+takes that bound, a later one is refused with 400. Every minted key records
+its creator (<code>KeyRecord::created_by</code>), which a key-authenticated session
+carries as <code>Session::accountable</code>.</li>
+<li><strong>Cross-site request forgery against a privileged session.</strong> The gate in
+<code>AdminApi::handle</code> runs origin → session → CSRF → permission → freshness →
+<code>If-Match</code>, and the order is load-bearing: a caller from a hostile origin is
+refused before their session cookie is consulted, and an unauthenticated
+caller learns nothing about whether a resource exists. The CSRF token is
+returned in the <code>GET /admin/v1/session</code> <em>body</em>, never in a cookie, so a page
+that cannot read the response cannot forge a request with it. Note that the
+origin check fires only when an <code>Origin</code> header is present; for a request
+without one, the whole defence is the session-bound CSRF header, which a
+simple-request forgery cannot set.</li>
+<li><strong>Reflected-origin CORS.</strong> <code>CorsPolicy::permits</code> is exact string equality with
+no suffix matching, scheme coercion, case folding, or trailing-slash
+tolerance, and no wildcard is ever emitted for any origin. The dangerous
+failure mode is not <code>*</code> with credentials — browsers already reject that — but
+reflecting an unchecked <code>Origin</code>, which works and hands any site the operator
+visits an authenticated channel to the control plane.</li>
+<li><strong>Cross-tenant disclosure through management views.</strong> <code>DecisionCache::get</code>
+requires a tenant match and reports another tenant's trace as <em>absent</em> rather
+than forbidden, so the response does not confirm that a request with that
+identifier exists. <code>UsageAggregate::rows</code> never crosses a tenant boundary and
+refuses to attribute an overflow row to any principal, so <code>ReadOwnUsage</code> can
+never surface another principal's tokens. <code>list_keys</code> filters by
+<code>session.tenant</code>, and <code>list_audit</code> reads only the caller's tenant's records.
+<code>patch_target</code> (including quarantine) answers 404 for a target outside
+<code>visible_targets</code> before the <code>If-Match</code> check, so a stale tag is not an
+existence oracle. The overview includes the router-wide <code>audit_records</code> and
+<code>audit_head</code> only for a caller holding <code>ReadAudit</code>, since both move with
+every tenant's actions.</li>
+<li><strong>Durable audit paging.</strong> <code>scan_audit</code> advances the cursor record by record
+and, when its batch budget (<code>MAX_AUDIT_SCAN_PAGES</code>) runs out before a page
+fills, still returns a cursor, so a filtered search is never reported as
+complete when it was truncated.</li>
+<li><strong>A misleading audit view.</strong> <code>AuditIndex::record</code> reconstructs the indexed
+event from the session rather than from what was written, and synthesizes
+<code>AuditAction::SettingsChanged</code> with timestamp <code>0</code> for every action. The
+durable chain in <code>hypellm-store</code> is correct and is what an integrity check
+reads, but the audit <em>screen</em> currently reports the wrong action and epoch
+time for every management mutation routed through <code>record_audit</code>. A wrong
+action label in an audit UI is worse than a missing one.</li>
+<li><strong>Fail-closed audit, audit first.</strong> <code>record_audit</code> propagates an append
+failure as <code>internal_fault</code> reporting the action as not applied (18.3), and
+every caller applies its change only after it returns. <code>patch_target</code>,
+<code>publish_draft</code>, <code>rollback_policy</code>, <code>set_anonymous_access</code>,
+<code>rotate_credential</code> and <code>create_key</code> write the audit record, then the durable
+state frame (<code>ConfigActivation</code>, <code>AnonymousAccess</code>, <code>ApiKey</code>, the credential
+sink), then apply the change. If the state write fails after the audit
+record, <code>record_abandoned</code> appends a best-effort record of the same action
+with outcome <code>failed</code> and reason <code>not applied: …</code>, so the chain never reads
+as though an abandoned change took effect; <code>create_key</code> also revokes the
+in-memory key and <code>publish_draft</code> returns the reserved version number. Fleet
+actions are the exception, described above.</li>
+<li><strong>Separation of duties on publication.</strong> The self-approval refusal lives in
+<code>DraftStore::prepare_publish_by</code>, a property of the draft, not of the
+request. A draft records its author and, when the author was a key, the key's
+creator (<code>Draft::author_accountable</code>); the publisher is compared as every
+principal it acts as (<code>Session::actors</code>: its own and, for a key, the key's
+creator). Minting a key for another principal is therefore not a way to
+become a second person in either direction.</li>
+<li><strong>Secret exposure surface.</strong> A key secret is returned exactly once, from
+<code>create_key</code>, via <code>NewKey::into_secret()</code> (9.2, 15.3). <code>list_keys</code> returns no
+verifier material even though it is not the secret. Provider credential
+secrets have no read path at all.</li>
+<li><strong>Prompts must not reach the control plane.</strong> <code>build_scenario</code> accepts a
+<em>size</em> (<code>input_tokens</code>), never prompt text, and synthesizes filler — 15.4's
+&quot;sanitized request descriptor&quot;. A simulation endpoint that took real prompts
+would be a route for prompt content into management logs.</li>
+<li><strong>ETag correctness as a safety property.</strong> <code>etag_for</code> digests the resource's
+<em>canonical</em> JSON (<code>wire_json::to_canonical_vec</code> + SHA-256), so key ordering
+cannot change the tag and the tag changes exactly when the resource does. A
+timestamp- or counter-derived tag would either churn — defeating the
+optimistic concurrency <code>If-Match</code> exists for — or fail to change when it must.</li>
+<li><strong>Panic-on-input reachability.</strong> The release profile sets
+<code>overflow-checks = true</code> and <code>panic = &quot;abort&quot;</code>, so an arithmetic overflow or
+an allocation failure on this path terminates the process. Two inputs reach
+such a computation unbounded; see <a href="#unbounded-inputs">Unbounded inputs</a>.</li>
+<li><strong><code>percent_decode</code> relies on a cross-crate invariant.</strong> It slices
+<code>&amp;value[i + 1..i + 3]</code> by byte index, which is panic-free only because the
+query string is guaranteed ASCII by <code>wire_http1::parse_target</code> (visible-ASCII
+only). Nothing in <em>this</em> crate enforces that, and <code>AdminRequest</code> is a public
+type any caller can construct: a non-ASCII query with a <code>%</code> before a multibyte
+character would slice across a character boundary and panic.</li>
+<li><strong>Parser differentials.</strong> Management bodies are parsed by <code>wire-json</code> with
+<code>reject_duplicate_keys: true</code>, so <code>{&quot;state&quot;:&quot;enabled&quot;,&quot;state&quot;:&quot;quarantined&quot;}</code>
+is refused rather than resolved to whichever occurrence this crate happens to
+read.</li>
+<li><strong>Credential endpoints are stubs that report success.</strong>
+<code>create_credential</code> and <code>rotate_credential</code> validate the request, write an
+audit record, and return <code>{&quot;stored&quot;: true}</code> / <code>{&quot;rotated&quot;: true}</code> — but the
+secret is bound to <code>let _secret</code> and discarded. Nothing is handed to a secret
+facility. An operator who rotates a credential here is told it worked and it
+did not. Until a secret backend exists, this is a false assurance rather than
+an unimplemented feature, and it should fail closed instead.</li>
+<li><strong>Tenant assignment at sign-in is arbitrary.</strong> <code>resolve_identity</code> binds a
+principal by role bindings (correctly refusing to key on email, per 9.1) but
+then takes <code>config.tenants.keys().next()</code> as the tenant. In a multi-tenant
+deployment every OIDC principal lands in the first tenant by map order.</li>
+</ul>
+<h3 id="password-sign-in-is-the-weakest-way-in-and-is-bounded-accordingly">Password sign-in is the weakest way in, and is bounded accordingly</h3>
+<p><code>POST /admin/v1/auth/password</code> authenticates a <code>local_user</code> against a PBKDF2
+verifier. It is a deviation from specification 9.2, recorded in
+<code>spec/deferred-issues.html</code>, and it runs <em>before</em> any session — so an
+unauthenticated caller who can reach the management listener decides how often
+it runs. Three bounds follow, and each has a test:</p>
+<ul>
+<li><strong>A locked account is refused before the hash is computed.</strong> Five failures in
+a minute lock one account for the rest of that window. Checking after the
+verification would still refuse the right password, so the ordering is what
+makes the lockout a bound on <em>work</em> rather than on outcomes — a verification
+is ~100 ms of CPU.</li>
+<li><strong>At most two verifications run at once.</strong> The lockout alone does not bound
+total CPU: with enough configured accounts a caller could start one expensive
+verification per account simultaneously.</li>
+<li><strong>The failure map is keyed by a configured username.</strong> An unknown name never
+enters it, so a caller cannot grow it; <code>hypellm_config::MAX_LOCAL_USERS</code> caps
+what a configuration can.</li>
+</ul>
+<p>Not hidden, deliberately: an unknown username is refused without hashing, so it
+is refused faster than a known one with a wrong password. Hashing a dummy
+verifier to level the timing would hand an unauthenticated caller a CPU
+amplifier. The trade is stated in <code>spec/deferred-issues.html</code>.</p>
+<h2 id="limits">Limits</h2>
+<p>Enforced in this crate:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Input / resource</th>
+<th>Limit</th>
+<th>Enforced by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Management request bodies (most handlers)</td>
+<td>1 MiB input, depth 32, 64 KiB per string, 10 000 array items, 2 000 object entries, duplicate keys rejected</td>
+<td><code>wire_json::Limits::SMALL</code> via <code>AdminRequest::json</code></td>
+</tr>
+<tr>
+<td><code>POST /admin/v1/policies</code> body</td>
+<td><code>wire_json::Limits::DEFAULT</code> (16 MiB, depth 64, 8 MiB per string) — in practice capped at 1 MiB by the listener</td>
+<td><code>create_draft</code></td>
+</tr>
+<tr>
+<td>Page size</td>
+<td>default 50, maximum 500, clamped rather than refused</td>
+<td><code>Pagination::DEFAULT_LIMIT</code>, <code>Pagination::MAX_LIMIT</code></td>
+</tr>
+<tr>
+<td>Pagination cursor</td>
+<td>256 bytes; a longer <code>after</code> is ignored, not stored</td>
+<td><code>Pagination::from_query</code></td>
+</tr>
+<tr>
+<td>Path segment after a route prefix</td>
+<td>256 bytes, must be non-empty and contain no <code>/</code></td>
+<td><code>handlers::suffix</code></td>
+</tr>
+<tr>
+<td>Audit rows per response</td>
+<td><code>min(page.limit, 500)</code></td>
+<td><code>list_audit</code></td>
+</tr>
+<tr>
+<td>Audit index depth</td>
+<td>2 048 records, oldest evicted</td>
+<td><code>AuditIndex::default()</code></td>
+</tr>
+<tr>
+<td>Decision traces retained</td>
+<td>4 096, oldest evicted</td>
+<td><code>DecisionCache::default()</code></td>
+</tr>
+<tr>
+<td>Distinct usage rows</td>
+<td><code>MAX_SERIES</code> = 4 096; further tuples fold into a per-tenant overflow row and <code>truncated</code> is reported</td>
+<td><code>UsageAggregate::record</code></td>
+</tr>
+<tr>
+<td>Traffic windows tracked</td>
+<td><code>traffic::MAX_TENANTS</code> = 64 tenants, each a fixed ring of <code>SLOTS</code> = 30 slots of <code>SLOT_MILLIS</code> = 10 s. Nothing is allocated per request; a slot is recycled by overwriting. A tenant past the cap is counted in <code>unattributed_samples</code> and reported as <code>attributed: false</code> rather than as zero traffic</td>
+<td><code>TrafficWindow::record</code></td>
+</tr>
+<tr>
+<td>Usage counters</td>
+<td>saturating <code>u64</code> addition throughout</td>
+<td><code>UsageTotals::add</code>, <code>UsageAggregate::summary</code></td>
+</tr>
+<tr>
+<td>Drafts retained</td>
+<td>256; the oldest by <code>created_at_millis</code> is evicted on overflow</td>
+<td><code>DraftStore::capacity</code></td>
+</tr>
+<tr>
+<td>Preflight cache lifetime</td>
+<td>600 s</td>
+<td><code>CorsPolicy::max_age_secs</code></td>
+</tr>
+<tr>
+<td>Break-glass reason</td>
+<td>8–256 characters, required</td>
+<td><code>MIN_BREAK_GLASS_REASON</code> / <code>MAX_BREAK_GLASS_REASON</code> in <code>break_glass</code></td>
+</tr>
+<tr>
+<td>Break-glass session lifetime</td>
+<td><code>settings break_glass_ttl_secs</code> (default 900 s), clamped to the ordinary absolute lifetime</td>
+<td><code>SessionStore::issue_for</code></td>
+</tr>
+<tr>
+<td>Password failures before lockout</td>
+<td>5 per account per 60 s window</td>
+<td><code>MAX_PASSWORD_FAILURES</code>, <code>PASSWORD_LOCKOUT_WINDOW_MILLIS</code></td>
+</tr>
+<tr>
+<td>Concurrent password verifications</td>
+<td>2</td>
+<td><code>MAX_CONCURRENT_PASSWORD_CHECKS</code></td>
+</tr>
+<tr>
+<td>Tracked password-failure accounts</td>
+<td><code>hypellm_config::MAX_LOCAL_USERS</code> (64), and only configured names</td>
+<td><code>PasswordThrottle</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>Enforced by the management listener before this crate is entered
+(<code>hypellm_router::server::ServerConfig::management</code>, <code>wire_http1::Limits::ADMIN</code>),
+and relied upon here:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Input</th>
+<th>Limit</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Request head</td>
+<td>16 KiB, 64 headers, 2 KiB request target</td>
+</tr>
+<tr>
+<td>Request body</td>
+<td>1 MiB</td>
+</tr>
+<tr>
+<td>Concurrent connections / requests per connection</td>
+<td>256 / 200</td>
+</tr>
+<tr>
+<td>Read and write deadlines</td>
+<td>15 s each; 30 s keep-alive</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="unbounded-inputs">Unbounded inputs</h3>
+<p>These are inputs that specification 3.2 requires to be bounded and that the code
+does <strong>not</strong> currently bound. They are listed as gaps, not as limits.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Input</th>
+<th>Consequence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>input_tokens</code> in <code>POST /admin/v1/policies/{id}:simulate</code></td>
+<td><code>build_scenario</code> accepts any value that fits <code>u32</code> and evaluates <code>&quot;x&quot;.repeat(n * 2)</code>, so a single request from a caller holding <code>SimulatePolicy</code> can request an ~8.6 GiB allocation. It needs a ceiling at or below the largest declared <code>max_context_tokens</code>.</td>
+</tr>
+<tr>
+<td><code>duration_seconds</code> in <code>PATCH /admin/v1/targets/{id}</code> (quarantine)</td>
+<td><code>patch_target</code> computes <code>wall_millis() + duration * 1000</code> on a <code>u64</code> derived from an unbounded <code>i64</code>. Values above ~1.8 × 10¹⁶ overflow; with <code>overflow-checks = true</code> and <code>panic = &quot;abort&quot;</code> that terminates the router. A quarantine also has no maximum duration.</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="fuzz-targets">Fuzz targets</h2>
+<p>Specification 21 lists the management API as a required fuzz surface, and
+<code>tests/fuzz.rs</code> is that suite: eleven targets driving the real <code>AdminApi::handle</code>
+through the behavioural harness, so a mutation passes the gate, the session
+check, and the CSRF check exactly as a request would. The engine is
+<code>hypellm-test-corpus::fuzz</code>; there is no <code>fuzz/</code> directory and no libFuzzer,
+because specification 4 admits no such dependency.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Target</th>
+<th>Property asserted</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>no_mutated_body_panics_a_handler</code></td>
+<td>Every mutated body on every mutating route produces a status</td>
+</tr>
+<tr>
+<td><code>no_body_makes_an_unauthenticated_caller_succeed</code></td>
+<td>The gate is a property of the surface, not of a handler</td>
+</tr>
+<tr>
+<td><code>no_body_makes_an_unprivileged_session_succeed</code></td>
+<td>Authenticated ≠ authorized, whatever the body says</td>
+</tr>
+<tr>
+<td><code>a_missing_csrf_header_is_refused_however_the_body_is_shaped</code></td>
+<td>Cross-site POSTs are refused before a handler acts</td>
+</tr>
+<tr>
+<td><code>an_error_never_echoes_the_request_body</code></td>
+<td>A malformed management body is often a mis-pasted secret</td>
+</tr>
+<tr>
+<td><code>a_mutated_query_string_never_widens_a_listing</code></td>
+<td>Appendix B: visibility never exceeds the caller's tenant</td>
+</tr>
+<tr>
+<td><code>an_oversize_body_is_refused_rather_than_buffered</code></td>
+<td>Specification 3.2</td>
+</tr>
+<tr>
+<td><code>deeply_nested_input_is_refused_rather_than_overflowing_the_stack</code></td>
+<td>The recursion bound is a refusal</td>
+</tr>
+<tr>
+<td><code>random_bytes_on_every_route_are_handled</code></td>
+<td>Unstructured input</td>
+</tr>
+<tr>
+<td><code>no_damaged_budget_record_is_restored_as_a_more_generous_one</code></td>
+<td>A budget record that cannot be read is never restored as unlimited or unspent</td>
+</tr>
+<tr>
+<td><code>a_credit_moves_the_limit_by_the_amount_it_named_or_not_at_all</code></td>
+<td>No credit body changes a limit by anything but its stated positive integer</td>
+</tr>
+</tbody>
+</table></div>
+<p>The fifth found a real leak on its first run: <code>unknown scope '{text}'</code> echoed an
+unbounded caller string into a 400. Echoed values now go through <code>echo</code>, which
+caps at 32 characters and narrows to an identifier alphabet — a typo still comes
+back readable, a pasted key does not.</p>
+<p>Still outstanding:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Target</th>
+<th>Surface</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Management request handling</td>
+<td>Mutated bodies traverse the real handler with bounded responses and no panics</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Authentication and authorization</td>
+<td>Mutated requests cannot create unauthenticated or unprivileged success</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>CSRF</td>
+<td>Mutated bodies cannot bypass a missing CSRF header</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Query and tenant isolation</td>
+<td>Mutated query strings cannot widen tenant-scoped listings</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Error redaction</td>
+<td>Planted request secrets do not appear in error responses</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Draft and input bounds</td>
+<td>Oversized and malformed management inputs fail within configured limits</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>The security tests of 21.1 also apply and are not yet written: positive and
+negative authorization cases for every privileged endpoint, tenant-isolation
+cases for <code>decisions</code>, <code>usage</code>, <code>keys</code>, and <code>audit</code>, and redaction cases proving
+no secret or credential value appears in any response body or error.</p>
+<h2 id="public-api">Public API</h2>
+<p>See <code>lib.rs</code>. The surface is <code>AdminApi::handle(&amp;AdminRequest) -&gt; Result&lt;ApiResponse, ApiError&gt;</code>
+plus the state it is constructed over (<code>AdminState</code>) and the four bounded views
+that both planes share by <code>Arc</code>. <code>ApiErrorCode</code> is a closed enumeration with a
+fixed status mapping, so a handler cannot invent an error code or a status at a
+call site; <code>ApiResponse</code> carries the ETag rather than leaving it to the caller
+to remember.</p>
+<p><code>BreakGlassPolicy</code> is <code>None</code> in a deployment that has not preprovisioned a
+token, and the endpoint then returns 404 rather than &quot;wrong token&quot; — an endpoint
+that exists but cannot succeed is an oracle. The policy carries a <em>verifier</em>,
+never a token: specification 22.4 requires the token to be held offline, so a
+copy anywhere the router can read would make reading the secrets directory
+itself a way in.</p>
+<p><strong>Every audit write must go through <code>record_audit</code>, not <code>store.append_audit</code>.</strong>
+The wrapper appends durably <em>and</em> indexes the event it appended; appending
+directly leaves the durable chain correct and the audit view blank. That is
+<code>DI-051</code>, and it has now happened three times — once through a synthesised
+placeholder, once on the OIDC login path, once on break-glass. A test that
+asserts only <code>audit_count()</code> will not catch it; read back through
+<code>GET /admin/v1/audit</code>.</p>
+<p>Specification 21.1 requires two-person review for changes to authentication,
+parsers, policy activation, and storage integrity. Every one of those touches
+this crate: the gate in <code>AdminApi::handle</code>, <code>break_glass</code>, <code>build_scenario</code>,
+<code>publish_draft</code>, and <code>record_audit</code> respectively.</p>
+
+      </article>
+      <footer class="page-footer"><a href="../index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#scope-and-the-control-plane-boundary">Scope and the control-plane boundary</a></li>
+<li class="toc-level-3"><a href="#the-fleet-surface">The fleet surface</a></li>
+<li class="toc-level-2"><a href="#threat-notes">Threat notes</a></li>
+<li class="toc-level-3"><a href="#password-sign-in-is-the-weakest-way-in-and-is-bounded-accordingly">Password sign-in is the weakest way in, and is bounded accordingly</a></li>
+<li class="toc-level-2"><a href="#limits">Limits</a></li>
+<li class="toc-level-3"><a href="#unbounded-inputs">Unbounded inputs</a></li>
+<li class="toc-level-2"><a href="#fuzz-targets">Fuzz targets</a></li>
+<li class="toc-level-2"><a href="#public-api">Public API</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

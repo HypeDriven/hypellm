@@ -384,6 +384,7 @@ pub fn admin_state_from(
         config: Arc::clone(&router.config),
         anonymous_access: Arc::clone(&router.anonymous_access),
         keys: Arc::clone(&router.keys),
+        budgets: Arc::clone(&router.budgets),
         sessions: Arc::clone(&router.sessions),
         oidc: Arc::new(hypellm_auth::oidc::TransactionStore::new(oidc_key)),
         oidc_config,

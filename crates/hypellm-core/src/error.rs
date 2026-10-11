@@ -10,6 +10,7 @@
 //!   (specification 10).
 //! - Retryability is a property of the error, not a guess by the caller.
 
+use crate::budget::PaymentInstructions;
 use crate::sensitive::Capped;
 use core::fmt;
 
@@ -20,6 +21,12 @@ pub enum ErrorCode {
     InvalidRequest,
     /// 401 — missing or invalid client authentication.
     Unauthenticated,
+    /// 402 — the key's finite token budget cannot fund the request
+    /// (specification 12.2).
+    ///
+    /// Not a 429: a rate limit refills with time and this does not, so a
+    /// client that backs off and retries would wait forever.
+    TokenBudgetExhausted,
     /// 403 — authenticated but denied by policy.
     Forbidden,
     /// 404 — alias absent or hidden from this caller.
@@ -65,6 +72,7 @@ impl ErrorCode {
         match self {
             Self::InvalidRequest => "invalid_request",
             Self::Unauthenticated => "unauthenticated",
+            Self::TokenBudgetExhausted => "token_budget_exhausted",
             Self::Forbidden => "forbidden",
             Self::ModelNotFound => "model_not_found",
             Self::IdempotencyConflict => "idempotency_conflict",
@@ -85,6 +93,7 @@ impl ErrorCode {
         match self {
             Self::InvalidRequest => 400,
             Self::Unauthenticated => 401,
+            Self::TokenBudgetExhausted => 402,
             Self::Forbidden => 403,
             Self::ModelNotFound | Self::JobNotFound => 404,
             Self::IdempotencyConflict | Self::JobNotReady => 409,
@@ -118,6 +127,7 @@ impl ErrorCode {
             | Self::JobNotFound
             | Self::JobNotReady => "invalid_request_error",
             Self::Unauthenticated => "authentication_error",
+            Self::TokenBudgetExhausted => "payment_required",
             Self::Forbidden => "permission_error",
             Self::RateLimited | Self::CapacityExhausted => "rate_limit_error",
             Self::UpstreamInvalidResponse
@@ -135,6 +145,7 @@ impl ErrorCode {
                 "invalid_request_error"
             }
             Self::Unauthenticated => "authentication_error",
+            Self::TokenBudgetExhausted => "payment_required",
             Self::Forbidden => "permission_error",
             Self::ModelNotFound | Self::JobNotFound => "not_found_error",
             Self::RateLimited | Self::CapacityExhausted => "rate_limit_error",
@@ -150,6 +161,7 @@ impl ErrorCode {
         &[
             Self::InvalidRequest,
             Self::Unauthenticated,
+            Self::TokenBudgetExhausted,
             Self::Forbidden,
             Self::ModelNotFound,
             Self::IdempotencyConflict,
@@ -182,6 +194,12 @@ pub struct RouterError {
     pub retry_after_secs: Option<u32>,
     /// The parameter at fault, for `invalid_request` only.
     pub param: Option<Capped>,
+    /// Operator-configured payment directions, for `token_budget_exhausted`
+    /// only (specification 12.2). Absent when none are configured.
+    ///
+    /// Boxed: almost no error carries it, and every `Result` in the request
+    /// path would otherwise be sized for the one that does.
+    pub payment_required: Option<Box<PaymentInstructions>>,
 }
 
 impl RouterError {
@@ -196,7 +214,24 @@ impl RouterError {
             detail: Capped::log_field(detail),
             retry_after_secs: None,
             param: None,
+            payment_required: None,
         }
+    }
+
+    /// The 402 of specification 12.2, with the operator's payment directions
+    /// when there are any.
+    ///
+    /// The message is the same whether the budget is empty or merely too
+    /// small for this request: the caller's remedy is identical, and the
+    /// balance is the key owner's to read through the management API.
+    #[must_use]
+    pub fn token_budget_exhausted(payment: Option<PaymentInstructions>) -> Self {
+        let mut error = Self::new(
+            ErrorCode::TokenBudgetExhausted,
+            "The API key's token budget is exhausted or insufficient for this request.",
+        );
+        error.payment_required = payment.map(Box::new);
+        error
     }
 
     /// Attach a `Retry-After` hint.
@@ -266,6 +301,7 @@ mod tests {
         let expected: &[(ErrorCode, u16, &str)] = &[
             (ErrorCode::InvalidRequest, 400, "invalid_request"),
             (ErrorCode::Unauthenticated, 401, "unauthenticated"),
+            (ErrorCode::TokenBudgetExhausted, 402, "token_budget_exhausted"),
             (ErrorCode::Forbidden, 403, "forbidden"),
             (ErrorCode::ModelNotFound, 404, "model_not_found"),
             (ErrorCode::IdempotencyConflict, 409, "idempotency_conflict"),
@@ -301,6 +337,9 @@ mod tests {
         for code in [
             ErrorCode::InvalidRequest,
             ErrorCode::Unauthenticated,
+            // Specification 12.2: a budget refusal must not "fail over to
+            // bypass the key budget".
+            ErrorCode::TokenBudgetExhausted,
             ErrorCode::Forbidden,
             ErrorCode::ModelNotFound,
             ErrorCode::IdempotencyConflict,

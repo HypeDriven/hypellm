@@ -21,7 +21,7 @@
 //!
 //! The password row is a **deviation**, not a fifth method the specification
 //! names: specification 9.2 lists four, and a local account is none of them. It
-//! is recorded in `docs/deferred-issues.md`, it exists so that a deployment can
+//! is recorded in `spec/deferred-issues.html`, it exists so that a deployment can
 //! be operated before an identity provider is configured, and it is the weakest
 //! way into the management plane. The hashing it needs is
 //! `hypellm_crypto::pbkdf2`; the sign-in handler is in `hypellm-admin-api`.

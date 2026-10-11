@@ -189,7 +189,7 @@ impl Adapter for SemIfAdapter {
         // No authentication header, and no place to put one: `serve.py` reads
         // none. A credential configured for this provider is therefore not
         // silently sent somewhere it would not be checked — it is not sent at
-        // all, and `docs/deferred-issues.md` says so.
+        // all, and `spec/deferred-issues.html` says so.
         let mut headers = SensitiveHeaders::new();
         headers.push("content-type", "application/json");
         headers.push("accept", "application/json");

@@ -25,7 +25,7 @@
 //! reproduces from `(seed, iteration)` alone, with no corpus file to lose.
 //!
 //! Coverage-guided fuzzing under the specification 4 exception profile is
-//! recorded as outstanding in `docs/deferred-issues.md`.
+//! recorded as outstanding in `spec/deferred-issues.html`.
 
 /// A seeded xorshift64* generator.
 ///

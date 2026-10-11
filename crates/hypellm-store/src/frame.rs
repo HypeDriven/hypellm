@@ -104,6 +104,12 @@ pub enum RecordKind {
     /// would permit a fresh burst of exactly the thrash the backoff exists to
     /// stop.
     FleetFlap,
+    /// One API key's token budget: its limit, payment override, revision and
+    /// durable high-water mark, with the receipt of the credit that produced
+    /// the record when a credit did (specification 12.1, 12.3).
+    ///
+    /// Last frame per key wins on replay; receipts accumulate.
+    KeyBudget,
     /// An unrecognised kind, preserved so that a newer writer's records survive
     /// a rollback to an older reader rather than being dropped.
     Unknown(u16),
@@ -129,6 +135,7 @@ impl RecordKind {
             Self::FleetActivation => 13,
             Self::FleetFlap => 14,
             Self::AnonymousAccess => 15,
+            Self::KeyBudget => 16,
             Self::Unknown(v) => v,
         }
     }
@@ -152,6 +159,7 @@ impl RecordKind {
             13 => Self::FleetActivation,
             14 => Self::FleetFlap,
             15 => Self::AnonymousAccess,
+            16 => Self::KeyBudget,
             other => Self::Unknown(other),
         }
     }
@@ -191,6 +199,9 @@ impl RecordKind {
                 // directory, and the router would open itself on the next
                 // start believing an operator had asked for it.
                 | Self::AnonymousAccess
+                // A purchased allowance. An unprotected record could be
+                // rewritten on disk to raise a limit or forget consumption.
+                | Self::KeyBudget
         )
     }
 
@@ -213,6 +224,7 @@ impl RecordKind {
             Self::FleetActivation => "fleet_activation",
             Self::FleetFlap => "fleet_flap",
             Self::AnonymousAccess => "anonymous_access",
+            Self::KeyBudget => "key_budget",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -236,6 +248,7 @@ impl RecordKind {
             Self::FleetActivation,
             Self::FleetFlap,
             Self::AnonymousAccess,
+            Self::KeyBudget,
         ]
     }
 }
@@ -706,6 +719,7 @@ mod tests {
             RecordKind::ApiKeyRevocation,
             RecordKind::CredentialMeta,
             RecordKind::Session,
+            RecordKind::KeyBudget,
         ] {
             assert!(kind.is_protected(), "{kind:?} must be protected");
         }

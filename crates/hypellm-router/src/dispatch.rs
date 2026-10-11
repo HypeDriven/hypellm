@@ -185,6 +185,14 @@ pub trait EventSink {
     fn keepalive(&mut self) -> Result<(), SinkClosed> {
         Ok(())
     }
+
+    /// The request has been admitted: every reservation an attempt needs is
+    /// held, and nothing has been sent upstream yet.
+    ///
+    /// A sink that withheld its response head until the request could no
+    /// longer be refused for want of budget sends it now. Specification 12.1:
+    /// "Streaming MUST reserve before HTTP headers are sent."
+    fn admitted(&mut self) {}
 }
 
 /// The sink refused further events: the client is gone or too slow.

@@ -8,7 +8,7 @@
 //! time, against `hypellm_router::testing::FakeUpstream`, over loopback. Nothing
 //! here leaves 127.0.0.1, resolves a name, reads a credential, or depends on
 //! wall-clock time, so a run is reproducible on any machine — the *behaviour*
-//! is, at least. The *numbers* depend on the hardware; see `MODULE.md`.
+//! is, at least. The *numbers* depend on the hardware; see `spec/modules/hypellm-bench.html`.
 //!
 //! # What "router overhead" means here
 //!

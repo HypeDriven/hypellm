@@ -10,7 +10,7 @@ narrow authenticated local socket — the same shape specification 4 uses for th
 TLS helper and 9.1 for the identity verifier.
 
 It is in the trusted computing base, and it is the most privileged component in
-the system: it holds SSH keys to every slave. Read `agent/README.md` before
+the system: it holds SSH keys to every slave. Read `spec/components/fleet-agent.html` before
 deploying it.
 
 The design rules it exists to keep

@@ -15,7 +15,7 @@
 # then `SIGKILL`s it mid-stream. `supervisor/hypellm-init` is PID 1 instead and
 # turns the signal into `hypellm-router --shutdown` — the same authenticated
 # command every other documented stop path already uses. See
-# `supervisor/README.md`.
+# `spec/components/container-init.html`.
 
 # ---------------------------------------------------------------------------
 # Build
@@ -33,6 +33,7 @@ COPY .cargo ./.cargo
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY web ./web
+COPY spec ./spec
 
 # The supply-chain and static-web gate (specification 4/4.1/15). It is not
 # advisory: a finding fails the image build, which is the point of running it

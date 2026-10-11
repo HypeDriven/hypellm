@@ -1664,6 +1664,7 @@ fn self_approving_api(admin: &Harness) -> AdminApi {
         // listener requires a credential.
         anonymous_access: Arc::clone(&admin.state.anonymous_access),
         keys: Arc::clone(&admin.state.keys),
+        budgets: Arc::clone(&admin.state.budgets),
         sessions: Arc::clone(&admin.state.sessions),
         oidc: Arc::clone(&admin.state.oidc),
         oidc_config: None,

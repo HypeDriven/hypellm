@@ -75,6 +75,7 @@
 pub const OVERLAP_HINT_MILLIS: u64 = 5 * 60 * 1000;
 
 pub mod admission;
+pub mod budget;
 pub mod canonical;
 pub mod decision;
 pub mod error;

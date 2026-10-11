@@ -35,6 +35,7 @@
 #![cfg_attr(not(test), deny(clippy::indexing_slicing, clippy::integer_division))]
 
 pub mod audit_index;
+pub mod budget;
 pub mod cors;
 pub mod decisions;
 pub mod drafts;

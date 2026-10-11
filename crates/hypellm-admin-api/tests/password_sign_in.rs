@@ -2,7 +2,7 @@
 //!
 //! **This path is a deviation, not a specification requirement.**
 //! Specification 9.2 lists four ways a principal is established and a local
-//! password is none of them; `docs/deferred-issues.md` records why it exists
+//! password is none of them; `spec/deferred-issues.html` records why it exists
 //! anyway. That makes the tests here more important rather than less: nothing
 //! in the specification describes what this endpoint must refuse, so the
 //! refusals have to be written down somewhere, and this is where.

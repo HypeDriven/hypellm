@@ -37,7 +37,7 @@ secrets_dir   := justfile_directory() / "run" / "secrets"
 tailscale_dir := justfile_directory() / "run" / "tailscale"
 
 # The identity verifier's two directories, created empty and used only by the
-# verifier `just oidc` starts (see verifier/README.md). `verify` is the socket
+# verifier `just oidc` starts (see spec/components/identity-verifier.html). `verify` is the socket
 # the router reaches it on and is mounted into both pods; `verifier` holds
 # verifier.json and the OAuth client secret, so it is 0700 and never committed.
 verify_dir    := justfile_directory() / "run" / "verify"
@@ -364,7 +364,7 @@ oidc: _dirs _verifier_secret
         echo >&2
         echo "  then set client_id and redirect_uri to match oidc_client_id and" >&2
         echo "  oidc_redirect_uri in {{config}}, and the authorized redirect URI" >&2
-        echo "  on the OAuth client. See verifier/README.md." >&2
+        echo "  on the OAuth client. See spec/components/identity-verifier.html." >&2
         exit 1
     fi
     # A one-shot container with the verifier pod's mounts, as the same user.
@@ -591,7 +591,7 @@ _secrets:
     echo "  The break-glass token above is printed once and stored nowhere."
     echo "  Save it now: with no OIDC configured it is the only way into the"
     echo "  management plane, and therefore the only way to mint the API key"
-    echo "  that inference requires. See docs/using-the-router.md."
+    echo "  that inference requires. See spec/using-the-router.html."
 
 # Tailscale authenticates once and persists its node identity in
 # run/tailscale. A key is needed only for that first login; after it, the file
@@ -629,7 +629,7 @@ _authkey:
 # arbitrary code running as the invoking user.
 #
 # Absent `.env` is not an error when the secret file already exists — that is
-# the operator who wrote it by hand, as verifier/README.md describes, and
+# the operator who wrote it by hand, as spec/components/identity-verifier.html describes, and
 # overwriting or complaining would both be wrong.
 _verifier_secret:
     #!/usr/bin/env bash

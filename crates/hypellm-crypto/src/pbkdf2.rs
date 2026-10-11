@@ -6,7 +6,7 @@
 //! Specification 9.2 lists four ways a principal is established and a password
 //! is not among them: humans arrive through the identity provider, and the
 //! recovery path is a high-entropy break-glass token. A password is therefore a
-//! deviation, recorded as such in `docs/deferred-issues.md`, and it exists so a
+//! deviation, recorded as such in `spec/deferred-issues.html`, and it exists so a
 //! deployment can be operated before an OAuth client and a verifier process
 //! have been set up.
 //!
@@ -24,7 +24,7 @@
 //! either would be the better choice for a password store facing the internet.
 //! Both are also considerably more code than an HMAC loop, and neither is
 //! "fully specified, deterministic, test-vector-verifiable" in the narrow sense
-//! this crate's `MODULE.md` demands of an in-repository implementation. The
+//! this crate's `spec/modules/hypellm-crypto.html` demands of an in-repository implementation. The
 //! honest summary: this is adequate for a management plane that is not exposed
 //! to the internet, behind an administrator-chosen password, and it is the
 //! weakest authentication path the router has.

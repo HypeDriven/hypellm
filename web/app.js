@@ -476,7 +476,7 @@ const PASSWORD_MAX = 1024;
  * principal is established and a local password is none of them; it exists so a
  * deployment can be operated before an identity provider and a verifier process
  * have been set up, and it is recorded as a deviation in
- * `docs/deferred-issues.md`.
+ * `spec/deferred-issues.html`.
  *
  * Two decisions worth stating, both the same as the break-glass panel's:
  *

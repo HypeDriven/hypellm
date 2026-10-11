@@ -843,6 +843,26 @@ impl Router {
             );
         }
 
+        // Specification 12.1: budgets "MUST be durable". Each key resumes at
+        // its durable high-water mark, so whatever had been drawn and not
+        // flushed before an unclean stop counts as spent.
+        let store = Arc::new(store);
+        let (budgets, unreadable_budgets) = hypellm_admin_api::budget::restore(
+            &store,
+            &recovery,
+            config.settings.budget_draw_tokens,
+        );
+        if unreadable_budgets > 0 {
+            // Louder than an unreadable key: the key still works, and the
+            // record that would have limited it is the one that was skipped.
+            telemetry.log(
+                &hypellm_telemetry::Event::critical("store.budget_records_unreadable").int_field(
+                    hypellm_telemetry::Field::Count,
+                    u64::try_from(unreadable_budgets).unwrap_or(u64::MAX),
+                ),
+            );
+        }
+
         let sessions = Arc::new(SessionStore::new(
             &secrets.session,
             SessionPolicy {
@@ -901,13 +921,14 @@ impl Router {
             anonymous_access,
             config: Arc::new(Activatable::new(config)),
             keys,
+            budgets,
             sessions,
             credentials,
             health,
             admission: Arc::new(admission),
             egress,
             telemetry: Arc::clone(&telemetry),
-            store: Arc::new(store),
+            store,
             clock: Arc::clone(&clock),
             trusted_edge: TrustedEdge::none(),
             decisions: Arc::new(DecisionCache::default()),
@@ -1180,6 +1201,24 @@ impl Router {
         // on integrity failure". A failed sync means audit records and state
         // may not have reached disk — reporting success would tell an operator
         // the router stopped cleanly when its last records are missing.
+        // Before the sync, so the exact marks are part of what it flushes: a
+        // clean stop charges a key for what it used, not for the headroom it
+        // had drawn.
+        let unflushed = state.budgets.flush();
+        if unflushed > 0 {
+            state.telemetry.log(
+                &hypellm_telemetry::Event::warn("budget.flush_incomplete")
+                    .int_field(
+                        hypellm_telemetry::Field::Count,
+                        u64::try_from(unflushed).unwrap_or(u64::MAX),
+                    )
+                    .str_field(
+                        hypellm_telemetry::Field::Detail,
+                        "these keys keep their drawn headroom as consumption",
+                    ),
+            );
+        }
+
         let flushed = state.store.sync();
         if let Err(error) = &flushed {
             state.telemetry.log(

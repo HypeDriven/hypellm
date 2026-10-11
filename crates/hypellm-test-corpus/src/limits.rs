@@ -17,7 +17,7 @@
 //! Each generator states the limit it was written against. When a limit changes
 //! in the parser crate, the corresponding constant here must change with it —
 //! there is no compile-time link between the two, and that is a known weakness
-//! recorded in `MODULE.md` rather than papered over.
+//! recorded in `spec/modules/hypellm-test-corpus.html` rather than papered over.
 
 use crate::outcome::Outcome;
 

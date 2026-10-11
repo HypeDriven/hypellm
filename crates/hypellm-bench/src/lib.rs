@@ -35,7 +35,7 @@
 //! # What this harness does not do
 //!
 //! Specification 19.1 lists a larger suite than this crate implements. The gaps
-//! are named rather than papered over, here and in `MODULE.md`:
+//! are named rather than papered over, here and in `spec/modules/hypellm-bench.html`:
 //!
 //! - **Open-loop load.** Every scenario is closed-loop and single-threaded. The
 //!   "70% rated load" qualifier on specification 19's target is therefore *not*

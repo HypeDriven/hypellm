@@ -38,6 +38,13 @@ pub enum Permission {
     ManageCredentials,
     /// Create and revoke router API keys.
     ManageKeys,
+    /// Read and change a key's cumulative token budget and its payment
+    /// instructions (specification 12.3).
+    ///
+    /// Distinct from [`Permission::ManageKeys`] so that payment automation can
+    /// credit a key without being able to mint or revoke one. It moves an
+    /// allowance; it never produces a credential.
+    ManageKeyBudgets,
     /// Read the immutable audit view.
     ReadAudit,
     /// Export audit records.
@@ -85,6 +92,7 @@ impl Permission {
             Self::PublishPolicy => "publish_policy",
             Self::ManageCredentials => "manage_credentials",
             Self::ManageKeys => "manage_keys",
+            Self::ManageKeyBudgets => "manage_key_budgets",
             Self::ReadAudit => "read_audit",
             Self::ExportAudit => "export_audit",
             Self::ManagePrincipals => "manage_principals",
@@ -132,6 +140,7 @@ impl Permission {
             Self::PublishPolicy,
             Self::ManageCredentials,
             Self::ManageKeys,
+            Self::ManageKeyBudgets,
             Self::ReadAudit,
             Self::ExportAudit,
             Self::ManagePrincipals,
@@ -163,6 +172,9 @@ pub enum Role {
     PolicyApprover,
     /// Create, rotate, and revoke credential references; cannot read a secret.
     CredentialManager,
+    /// Read and update key token budgets and payment instructions; cannot
+    /// create or revoke a key. Assignable to payment automation.
+    KeyBudgetManager,
     /// Read immutable audit and export views.
     Auditor,
     /// Time-limited full access with reauthentication, reason, and alert.
@@ -179,6 +191,7 @@ impl Role {
             Self::PolicyEditor => "policy_editor",
             Self::PolicyApprover => "policy_approver",
             Self::CredentialManager => "credential_manager",
+            Self::KeyBudgetManager => "key_budget_manager",
             Self::Auditor => "auditor",
             Self::BreakGlassAdmin => "break_glass_admin",
         }
@@ -193,6 +206,7 @@ impl Role {
             "policy_editor" => Self::PolicyEditor,
             "policy_approver" => Self::PolicyApprover,
             "credential_manager" => Self::CredentialManager,
+            "key_budget_manager" => Self::KeyBudgetManager,
             "auditor" => Self::Auditor,
             "break_glass_admin" => Self::BreakGlassAdmin,
             _ => return None,
@@ -238,6 +252,11 @@ impl Role {
                 P::PublishPolicy,
             ],
             Self::CredentialManager => &[P::ReadSummary, P::ReadOwnUsage, P::ManageCredentials],
+            // Specification 12.3: "This permission does not grant key
+            // creation/revocation, credential access, policy publication".
+            // The role is that permission and nothing a payment system has
+            // no use for.
+            Self::KeyBudgetManager => &[P::ReadSummary, P::ManageKeyBudgets],
             Self::Auditor => &[P::ReadSummary, P::ReadAudit, P::ExportAudit],
             Self::BreakGlassAdmin => &[
                 P::ReadSummary,
@@ -251,6 +270,7 @@ impl Role {
                 P::PublishPolicy,
                 P::ManageCredentials,
                 P::ManageKeys,
+                P::ManageKeyBudgets,
                 P::ReadAudit,
                 P::ExportAudit,
                 P::ManagePrincipals,
@@ -284,6 +304,7 @@ impl Role {
             Self::PolicyEditor,
             Self::PolicyApprover,
             Self::CredentialManager,
+            Self::KeyBudgetManager,
             Self::Auditor,
             Self::BreakGlassAdmin,
         ]
@@ -380,6 +401,23 @@ mod tests {
             "no permission may exist that reads a credential secret"
         );
         assert!(Role::CredentialManager.grants(Permission::ManageCredentials));
+    }
+
+    #[test]
+    fn a_key_budget_manager_can_move_an_allowance_and_nothing_else() {
+        // Specification 12.3. The holder is typically a payment system's
+        // service key, so anything beyond the budget is excess authority.
+        assert!(Role::KeyBudgetManager.grants(Permission::ManageKeyBudgets));
+        for p in Permission::all() {
+            if Role::KeyBudgetManager.grants(*p) {
+                assert!(
+                    matches!(p, Permission::ReadSummary | Permission::ManageKeyBudgets),
+                    "key budget manager unexpectedly holds {p}"
+                );
+            }
+        }
+        // Automation holds no session to refresh.
+        assert!(!Permission::ManageKeyBudgets.requires_reauthentication());
     }
 
     #[test]

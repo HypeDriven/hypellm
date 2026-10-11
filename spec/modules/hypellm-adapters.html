@@ -1,0 +1,500 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: hypellm-adapters.">
+  <title>hypellm-adapters · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="../assets/wiki.css">
+  <script defer src="../assets/search-index.js"></script>
+  <script defer src="../assets/wiki.js"></script>
+</head>
+<body data-wiki-root="../" data-page-title="hypellm-adapters" data-page-group="Module contracts">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="../index.html">Wiki home</a></li>
+<li><a href="../overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="../router-specification.html">Router specification</a></li>
+<li><a href="../threat-model.html">Threat model</a></li>
+<li><a href="../orchestration.html">Fleet orchestration</a></li>
+<li><a href="../deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="../using-the-router.html">Using the router</a></li>
+<li><a href="../deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="../runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="../components/fleet-agent.html">Fleet agent</a></li>
+<li><a href="../components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="../components/container-init.html">Container init</a></li>
+<li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="hypellm-adapters.html" aria-current="page">hypellm-adapters</a></li>
+<li><a href="hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="hypellm-config.html">hypellm-config</a></li>
+<li><a href="hypellm-core.html">hypellm-core</a></li>
+<li><a href="hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="hypellm-net.html">hypellm-net</a></li>
+<li><a href="hypellm-router.html">hypellm-router</a></li>
+<li><a href="hypellm-store.html">hypellm-store</a></li>
+<li><a href="hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="wire-http1.html">wire-http1</a></li>
+<li><a href="wire-json.html">wire-json</a></li>
+<li><a href="wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="../index.html">Wiki</a><span aria-hidden="true">/</span>Module contracts</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="module-hypellm-adapters">Module: hypellm-adapters</h1>
+<p>Specification 4.1 requires every in-repository module to declare an owner, threat
+notes, public API, unsafe-code declaration, fuzz targets, and maximum
+input/resource limits.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Owner</td>
+<td>Security (primary), Platform (secondary)</td>
+</tr>
+<tr>
+<td>Unsafe code</td>
+<td>None. <code>#![forbid(unsafe_code)]</code> declared in <code>lib.rs</code> and inherited from the workspace.</td>
+</tr>
+<tr>
+<td>External dependencies</td>
+<td>None. Rust standard library plus the workspace path dependencies <code>hypellm-core</code>, <code>wire-json</code>, <code>wire-sse</code>.</td>
+</tr>
+<tr>
+<td>Fuzz targets</td>
+<td><code>tests/fuzz.rs</code> — 10 targets over recorded provider events, driven by <code>hypellm-test-corpus::fuzz</code>. See <a href="#fuzz-targets">Fuzz targets</a>.</td>
+</tr>
+</tbody>
+</table></div>
+<p>Specification 21.1 requires two-person review for &quot;adapter credential handling&quot;.
+That gate applies to <code>contract.rs</code> and to any adapter's <code>encode_headers</code>.</p>
+<h2 id="scope-and-the-adapters-decide-nothing-rule">Scope and the &quot;adapters decide nothing&quot; rule</h2>
+<p>This module is the only code in the router that touches provider credentials and
+the only code that speaks a provider-native wire format. Specification 7 draws
+the boundary and the trait in <code>contract.rs</code> is shaped to make it structural
+rather than advisory:</p>
+<blockquote>
+<p>They contain only typed conversion, strict parsing, endpoint paths,
+authentication header construction, stream decoding, and error mapping. They
+cannot make routing decisions, read arbitrary files, resolve arbitrary hosts,
+or expose credentials in errors.</p>
+</blockquote>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Concern</th>
+<th>Where it lives</th>
+<th>Why not here</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Target selection, failover, retry budget</td>
+<td><code>hypellm-core</code> routing, caller</td>
+<td>No <code>Adapter</code> method receives a <code>PolicySnapshot</code> or a candidate list</td>
+</tr>
+<tr>
+<td>Sockets, TLS, DNS, deadlines, cancellation</td>
+<td><code>hypellm-net</code>, <code>wire-http1</code></td>
+<td>Every <code>Adapter</code> method is pure and performs no I/O</td>
+</tr>
+<tr>
+<td>HTTP framing and header-value validation</td>
+<td><code>wire-http1</code> (<code>Headers::append_unchecked</code>)</td>
+<td><code>SensitiveHeaders</code> is a name/value list, not a serializer</td>
+</tr>
+<tr>
+<td>SSE framing, event size, terminal marker</td>
+<td><code>wire-sse</code></td>
+<td>This module decodes one already-framed event's payload</td>
+</tr>
+<tr>
+<td>Credential storage, rotation, resolution</td>
+<td>credential store, <code>hypellm-store</code></td>
+<td>The adapter borrows a <code>CredentialHandle</code> for the length of one header build</td>
+</tr>
+<tr>
+<td>Choosing a provider family at runtime</td>
+<td>configuration → <code>ProviderFamily</code></td>
+<td><code>adapter_for</code> is a total <code>match</code> over a closed enum; specification 2.2 forbids dynamic plugins</td>
+</tr>
+</tbody>
+</table></div>
+<p>Two further boundaries the code holds deliberately:</p>
+<ul>
+<li><strong>No schema repair.</strong> A tool's <code>parameters_json</code> and a JSON-schema response
+format are parsed to confirm they are JSON and re-serialized unchanged. An
+unsupported schema is <em>rejected</em> (<code>invalid_tool_schema</code>,
+<code>invalid_response_schema</code>), never rewritten — the model was prompted against
+the client's schema.</li>
+<li><strong>No capability inference.</strong> Nothing is deduced from a model name
+(specification 7, Moonshot row). <code>validate</code> reads only the target's declared
+<code>Capabilities</code>; the five OpenAI-compatible families share one encoder and
+differ solely in what their targets declare.</li>
+<li><strong>No prompt authorship.</strong> <code>semif.rs</code> maps a rerank request onto a scorer that
+requires both an evidence and a criterion field. Where the caller supplied one
+string, it is sent as both rather than padded with text the adapter composed:
+an adapter that wrote &quot;which option best answers the question?&quot; would be
+supplying part of the prompt that decides the answer, and the score returned
+would be partly the router's opinion. Asserted by
+<code>every_word_the_scorer_reads_came_from_the_caller</code>.</li>
+</ul>
+<p>Prompt content is inert throughout: decoded provider text becomes
+<code>CanonicalEvent</code> payloads and is never consulted for a destination, a path, or a
+credential. <code>path_for</code> returns a <code>&amp;'static str</code> from a closed match, and the
+host/port/base path come from the administrator-configured <code>Endpoint</code> in
+<code>RequestMeta</code> (specification 10).</p>
+<h2 id="threat-notes">Threat notes</h2>
+<p><strong>Provider messages are the primary leak vector, and they are dropped.</strong>
+<code>safe_detail</code> is always one of the fixed strings in <code>safe_detail_for</code>; the
+provider's <code>message</code> field is never copied into it. Those messages routinely
+echo the prompt (<code>&quot;Invalid prompt: '…'&quot;</code>) or an internal hostname. Only the
+provider's <code>type</code>/<code>code</code> token survives, through <code>sanitize_provider_code</code>, which
+narrows to <code>[A-Za-z0-9_.-]</code> and 64 bytes so it cannot carry newlines or ANSI
+escapes into a log. Tests in both adapters and in <code>lib.rs</code> assert this for every
+family; treat those tests as the specification-10 control, not as coverage.</p>
+<p><strong>A hostile or compromised upstream can steer classification.</strong>
+<code>classify_error_object</code> derives <code>UpstreamErrorClass</code> from provider-controlled
+strings, and the class drives both retriability (specification 6.5) and health
+accounting. An upstream that labels a genuine failure <code>authentication_error</code>
+suppresses circuit-breaker input, because <code>Authentication.affects_health()</code> is
+<code>false</code>; one that labels a permanent failure <code>rate_limit_error</code> makes the router
+retry and fail over. The Anthropic adapter additionally substring-matches the
+provider's <em>message</em> (<code>&quot;max_tokens&quot;</code>, <code>&quot;context&quot;</code>) to reach <code>ContextOverflow</code> —
+the message is not forwarded, but it does influence routing. The provider type
+takes precedence over the HTTP status here, so status is not a floor.</p>
+<p><strong>A truncated response can decode as a clean stop.</strong> Decoding is total and
+tolerant: unknown content-block types and unrecognised event names are ignored,
+absent fields default. Both adapters then synthesise a terminal event —
+<code>OpenAiAdapter::decode_response</code> appends <code>Finish { Stop }</code> when no terminal event
+was produced, and <code>AnthropicAdapter::decode_response</code> always appends one,
+defaulting an absent or unparsable <code>stop_reason</code> to <code>Stop</code>. A response that was
+actually cut short upstream is therefore presentable to the client as a normal
+completion. This is the response-confusion risk for this crate and the reason
+<code>decode_response</code> must not be the only integrity check on a non-streaming
+exchange.</p>
+<p><strong>Credential handling fails open in one place.</strong> <code>encode_headers</code> writes the
+authorization header only inside <code>if let Some(secret) = credential.expose_str()</code>.
+A credential whose bytes are not valid UTF-8 yields <em>no</em> header and the request
+is dispatched unauthenticated; the resulting 401 classifies as <code>Authentication</code>,
+which does not affect health, so the misconfiguration presents as a quiet
+per-request failure. Refusing to encode would be the fail-closed behaviour.</p>
+<p><strong>Redaction covers <code>push_secret</code> only.</strong> <code>SensitiveHeaders::Debug</code> prints values
+in full for headers added with <code>push</code>, by design — <code>content-type</code> and <code>accept</code>
+stay readable in a trace. The consequence is that <code>x-request-id</code> and the
+client-supplied <code>idempotency-key</code> appear verbatim in debug output. Credentials go
+through <code>push_secret</code> in both adapters; any new credential-bearing header must
+too. <code>SensitiveHeaders</code> and <code>CredentialHandle</code> are not <code>Clone</code>, so neither can be
+retained past the header build.</p>
+<p><strong>Header-value hygiene is not enforced here.</strong> <code>meta.request_id</code> and
+<code>meta.idempotency_key</code> are placed into header values verbatim, and the
+idempotency key is client-supplied. CR/LF rejection lives downstream in
+<code>wire-http1::Headers::append_unchecked</code> (<code>is_field_value</code>). This module is not a
+defence against request splitting on its own; a caller that serialises
+<code>SensitiveHeaders</code> by any other path reintroduces the hole.</p>
+<p><strong>Parser differential with the upstream.</strong> Client-supplied JSON (tool schemas,
+response schemas, historical tool-call arguments) is parsed by <code>wire-json</code> and
+re-emitted by <code>wire_json::to_vec</code> rather than passed through as text. Round-trip
+fidelity is therefore load-bearing: any divergence in number formatting, large
+integers, or escape handling changes the document the provider's parser sees
+relative to the one the router validated. <code>Limits::reject_duplicate_keys</code> is
+<code>true</code> on every parse in this crate, which removes the classic first-key/last-key
+differential.</p>
+<p><strong>Tool-call identity can collapse.</strong> Specification 14 requires call identity and
+ordered argument deltas to survive. Both adapters clamp an unrepresentable index
+to <code>0</code> — <code>anthropic::block_index</code> and the OpenAI streaming fallback both end in
+<code>unwrap_or(0)</code> — so a provider emitting indices above <code>u32::MAX</code> would merge two
+calls' argument fragments into one. This needs a buggy or hostile upstream, not a
+client. Relatedly, <code>anthropic::encode_messages</code> substitutes <code>{}</code> for a historical
+tool call whose recorded arguments are not valid JSON, silently altering the
+conversation replayed to the provider rather than failing.</p>
+<p><strong>Embedding values are narrowed lossily.</strong> <code>openai::decode_response</code> maps each
+element through <code>f64 as f32</code>; magnitudes outside the <code>f32</code> range saturate to
+infinity and precision is lost without a diagnostic. The client receives a vector
+that is not exactly what the provider returned. <code>semif::decode_response</code> narrows
+scores the same way, where the loss is immaterial — the scorer labels its own
+numbers uncalibrated — and where saturation cannot mislead, because a non-finite
+score is refused rather than narrowed.</p>
+<p><strong>A misattributed score is worse than a misattributed vector, and is refused.</strong>
+The embeddings decoder reads its position with <code>unwrap_or(0)</code>, which is
+survivable: the caller gets its own vector back under a wrong index. The same
+default in a scorer would hand candidate 0 a relevance the scorer computed for
+somebody else's candidate, and the caller has no way to detect it. <code>semif.rs</code>
+therefore refuses the whole response when an option id is absent, unparsable,
+out of range or repeated, classifying it <code>ProtocolViolation</code> — retriable, so a
+scorer talking nonsense is failed away from rather than believed. Asserted by
+<code>a_mutated_scorer_reply_never_yields_a_misattributed_score</code>.</p>
+<p><strong>Resource shape.</strong> Streaming decode is per-event, so specification 14's
+&quot;MUST NOT buffer an entire completion&quot; holds on the stream path. Non-streaming
+<code>decode_response</code> takes a fully materialised <code>&amp;[u8]</code>, bounded by
+<code>Limits::DEFAULT</code>. The request-size check runs <em>after</em> <code>to_vec</code>, so encoding can
+transiently allocate more than <code>MAX_REQUEST_BYTES</code> before rejecting; the bound is
+a check on the result, not a cap on the work.</p>
+<h2 id="limits">Limits</h2>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Input / resource</th>
+<th>Enforced maximum</th>
+<th>Enforced by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Encoded request body</td>
+<td>32 MiB</td>
+<td><code>contract::MAX_REQUEST_BYTES</code>, checked after serialization in both <code>encode_request</code> implementations</td>
+</tr>
+<tr>
+<td>Non-streaming response body</td>
+<td>16 MiB input, depth 64, 8 MiB per string, 100 000 array items, 10 000 object entries</td>
+<td><code>wire_json::Limits::DEFAULT</code> at <code>parse</code></td>
+</tr>
+<tr>
+<td>One streaming event payload</td>
+<td>2 MiB input, depth 32, 1 MiB per string, 4 096 array items, 512 object entries</td>
+<td><code>wire_json::Limits::STREAM_EVENT</code> at <code>parse_str</code></td>
+</tr>
+<tr>
+<td>Provider error body read for classification</td>
+<td>1 MiB input, depth 32, 64 KiB per string</td>
+<td><code>wire_json::Limits::SMALL</code>; an oversized body simply fails to parse and classification falls back to status alone</td>
+</tr>
+<tr>
+<td>Tool parameter schema, response JSON schema, replayed tool-call arguments</td>
+<td>1 MiB, depth 32</td>
+<td><code>wire_json::Limits::SMALL</code> in <code>encode_tools</code>, <code>encode_response_format</code>, <code>anthropic::encode_messages</code></td>
+</tr>
+<tr>
+<td>Duplicate JSON object keys</td>
+<td>Rejected</td>
+<td><code>Limits::reject_duplicate_keys = true</code> on every profile used here</td>
+</tr>
+<tr>
+<td>Recorded provider error code</td>
+<td>64 characters, then 64 bytes</td>
+<td><code>contract::sanitize_provider_code</code></td>
+</tr>
+<tr>
+<td>Client-visible error detail</td>
+<td>200 bytes</td>
+<td><code>Capped::new(_, 200)</code> in <code>ErrorClassification::safe_detail</code> and <code>ValidationFailure::new</code></td>
+</tr>
+<tr>
+<td>Requested output tokens</td>
+<td>Target's declared <code>capabilities.max_output_tokens</code></td>
+<td><code>validate</code>, code <code>max_tokens_too_large</code></td>
+</tr>
+<tr>
+<td>Anthropic <code>max_tokens</code> when the client omits one</td>
+<td>Target's declared <code>capabilities.max_output_tokens</code>; a target declaring <code>0</code> is refused</td>
+<td><code>anthropic::encode_request</code>, <code>validate</code> code <code>max_tokens_undeclared</code></td>
+</tr>
+<tr>
+<td>Candidates in one scoring request</td>
+<td>2 to 16</td>
+<td><code>semif::MIN_OPTIONS</code>/<code>MAX_OPTIONS</code> in <code>validate</code> and <code>encode_request</code>, matching the scorer's own <code>validate_row</code></td>
+</tr>
+<tr>
+<td>Scores decoded from one scoring reply</td>
+<td>16, and each index distinct and in range</td>
+<td><code>semif::decode_response</code>; anything else is a <code>ProtocolViolation</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>Bounds this module does <strong>not</strong> enforce, stated plainly so no one reads the table
+as complete:</p>
+<ul>
+<li><strong>No cap on message count, content parts per message, tool count, or embedding
+input count.</strong> These are bounded only upstream by the inbound body limit
+(specification 3.2) and afterwards by the 32 MiB check on the encoded result.</li>
+<li><strong>No cap on canonical events produced from one response.</strong> A body at the
+<code>Limits::DEFAULT</code> array ceiling can yield up to 100 000 <code>Embedding</code> events.</li>
+<li><strong>No SSE-level bound.</strong> Event framing and <code>max_event_bytes</code> (1 MiB default)
+belong to <code>wire-sse</code>; <code>decode_stream_event</code> trusts that its <code>data</code> argument was
+already bounded.</li>
+<li><strong><code>retry_after_secs</code> is never populated.</strong> All four construction sites set it
+to <code>None</code>. <code>Adapter::classify_error</code> receives only <code>(status, body)</code>, so the
+<code>Retry-After</code> header specification 7.1 lists in <code>decode_response(status, headers, body_stream)</code> is not reachable from inside an adapter; specification
+6.5's &quot;Retry-After is capped by the remaining deadline&quot; must therefore be
+satisfied by the caller reading the header itself. This is a known gap in the
+trait shape, not an oversight in the implementations.</li>
+<li><strong>No timing-side-channel control.</strong> Nothing here compares secrets;
+<code>SensitiveHeaders</code> lookups are ordinary string comparisons over header names.</li>
+</ul>
+<h2 id="fuzz-targets">Fuzz targets</h2>
+<p>The workspace has no <code>fuzz/</code> directory and no libFuzzer harness — specification
+4 admits no such dependency. Fuzzing is instead a seeded, deterministic
+mutation engine in <code>hypellm-test-corpus::fuzz</code>, driven from ordinary
+<code>tests/fuzz.rs</code> targets so that <code>cargo test</code> runs it and a failing seed is
+reproducible by number rather than by corpus file.</p>
+<p>All seven areas specification 21 names have a suite; see
+<code>spec/deferred-issues.html</code>, <code>DI-002</code>, for the table.</p>
+<p>Specification 21 requires fuzzing of &quot;provider events&quot;, and <code>tests/fuzz.rs</code> is
+that suite: ten targets seeded from every recorded fixture in
+<code>hypellm-test-corpus::golden</code>, so each mutation starts from bytes a real provider
+sent.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Target</th>
+<th>Property asserted</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>no_mutation_of_a_recorded_stream_frame_panics_a_decoder</code></td>
+<td>Termination over both families and every event-name shape</td>
+</tr>
+<tr>
+<td><code>no_mutation_of_a_recorded_body_panics_a_decoder</code></td>
+<td>The same for bodies, across the status range</td>
+</tr>
+<tr>
+<td><code>a_non_success_status_never_decodes_to_a_completion</code></td>
+<td>The silent-success failure: a 500 whose body parses must not be handed to the caller as a completion</td>
+</tr>
+<tr>
+<td><code>a_classified_error_never_carries_the_provider_body_to_the_client</code></td>
+<td>Specification 10: a planted marker never reaches <code>safe_detail</code>; <code>provider_code</code> stays bounded and alphabet-narrowed</td>
+</tr>
+<tr>
+<td><code>a_classification_is_deterministic</code></td>
+<td>A retry decision that varied between reads would make specification 6.5 unprovable</td>
+</tr>
+<tr>
+<td><code>an_oversize_stream_event_is_refused_rather_than_decoded</code></td>
+<td><code>Limits::STREAM_EVENT</code>, whose length the provider controls entirely</td>
+</tr>
+<tr>
+<td><code>deeply_nested_provider_json_is_refused_rather_than_overflowing_the_stack</code></td>
+<td>The recursion bound is a refusal, not a crash</td>
+</tr>
+<tr>
+<td><code>random_bytes_are_handled_without_panicking</code></td>
+<td>Unstructured input</td>
+</tr>
+<tr>
+<td><code>a_mutated_scorer_reply_never_yields_a_misattributed_score</code></td>
+<td>Every score a mutated SemIf reply produces carries an index this adapter could have sent: unique, in range, finite. The defect it guards is one <code>unwrap_or(0)</code></td>
+</tr>
+<tr>
+<td><code>every_recorded_fixture_is_reachable_as_a_seed</code></td>
+<td>A seed set that silently shrank would leave the rest fuzzing a fraction of the corpus while still passing</td>
+</tr>
+</tbody>
+</table></div>
+<p>Note what the fourth target does <em>not</em> assert: <code>provider_code</code> deliberately
+carries the provider's own error-type token, so requiring it to be empty would
+be requiring the field not to work. What is required of it is the narrowing.</p>
+<p>Still outstanding:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Target</th>
+<th>Property to assert</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Stream event decoding</td>
+<td>Mutated OpenAI and Anthropic fixture frames terminate without panic and obey event limits</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Response body decoding</td>
+<td>Mutated recorded bodies across success and error statuses terminate without panic</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Error status handling</td>
+<td>A non-success status never decodes as a completion</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Error redaction</td>
+<td>Provider bodies never enter client-safe detail; provider codes stay bounded and narrowed</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Determinism</td>
+<td>Repeated classification of the same status and body is identical</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Oversized events</td>
+<td>Oversized provider stream events are rejected</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="public-api">Public API</h2>
+<p>See <code>lib.rs</code>. The surface is <code>adapter_for(ProviderFamily) -&gt; &amp;'static dyn Adapter</code>, the <code>Adapter</code> trait, and the contract types (<code>CredentialHandle</code>,
+<code>SensitiveHeaders</code>, <code>RequestMeta</code>, <code>ValidationFailure</code>, <code>ErrorClassification</code>).
+There is no registration function, no lookup table an operator can extend, and no
+path by which a request selects an adapter; adding a family is a compile error
+until <code>adapter_for</code> is updated.</p>
+<p><code>testing</code> is deliberately <code>pub</code> rather than <code>#[cfg(test)]</code> so that
+<code>hypellm-test-corpus</code> and the compatibility suite build the same canonical requests
+the unit tests use — two suites with subtly different fixtures is how a golden
+test passes against something the router never sends. The cost is that the
+fixtures compile into the library, and they use <code>.expect(…)</code> on constant inputs,
+which sits outside the startup/test carve-out in specification 18.2. The
+expectations are unreachable from any data-plane input; gating the module behind
+a feature would remove the deviation entirely.</p>
+
+      </article>
+      <footer class="page-footer"><a href="../index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#scope-and-the-adapters-decide-nothing-rule">Scope and the &quot;adapters decide nothing&quot; rule</a></li>
+<li class="toc-level-2"><a href="#threat-notes">Threat notes</a></li>
+<li class="toc-level-2"><a href="#limits">Limits</a></li>
+<li class="toc-level-2"><a href="#fuzz-targets">Fuzz targets</a></li>
+<li class="toc-level-2"><a href="#public-api">Public API</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

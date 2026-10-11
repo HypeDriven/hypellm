@@ -102,12 +102,12 @@ impl CorsPolicy {
         let mut headers = self.response_headers(Some(origin));
         headers.push((
             "Access-Control-Allow-Methods".to_owned(),
-            "GET, POST, PATCH, DELETE, OPTIONS".to_owned(),
+            "GET, POST, PUT, PATCH, DELETE, OPTIONS".to_owned(),
         ));
         headers.push((
             "Access-Control-Allow-Headers".to_owned(),
             format!(
-                "Content-Type, If-Match, {}",
+                "Content-Type, If-Match, Idempotency-Key, {}",
                 hypellm_auth::session::CSRF_HEADER
             ),
         ));

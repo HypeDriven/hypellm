@@ -16,7 +16,7 @@
 //! The router stops when its control socket receives `shutdown`. Signal
 //! handling would need `unsafe` FFI to `sigaction`, which specification 18.2
 //! forbids workspace-wide; the control socket is the dependency-free
-//! equivalent and is documented in `docs/deployment.md`. A supervisor that can
+//! equivalent and is documented in `spec/deployment.html`. A supervisor that can
 //! only send `SIGTERM` should be configured with a `KillSignal` shim that
 //! writes to the socket, or accept that termination is not graceful.
 

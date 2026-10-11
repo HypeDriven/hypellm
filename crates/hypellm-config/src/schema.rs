@@ -68,6 +68,7 @@ pub const SCHEMAS: &[Schema] = &[
             "keepalive_timeout_ms",
             "connection_stack_kib",
             "quota_partitions",
+            "budget_draw_tokens",
             "fleet_enabled",
             "fleet_state_dir",
             "max_documents_per_request",
@@ -102,6 +103,8 @@ pub const SCHEMAS: &[Schema] = &[
             "retention_days",
             "max_cost",
             "min_quality",
+            "payment_message",
+            "payment_url",
         ],
         singleton: false,
     },
@@ -214,7 +217,7 @@ pub const SCHEMAS: &[Schema] = &[
         singleton: false,
     },
     // Local password sign-in. A deviation from specification 9.2's four
-    // authentication methods, recorded in `docs/deferred-issues.md`: it exists
+    // authentication methods, recorded in `spec/deferred-issues.html`: it exists
     // so a deployment can be operated before an identity provider and a
     // verifier process have been set up.
     //

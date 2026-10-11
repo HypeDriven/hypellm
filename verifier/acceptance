@@ -231,7 +231,7 @@ def wire_layer(socket_path: str, fixtures: Fixtures) -> dict[str, str]:
     check(
         "the verifier does not judge the claims it returns",
         # An expired token must come back verified: `validate_claims` is the one
-        # place `exp` is judged (verifier/README.md, rule 4). A verifier that
+        # place `exp` is judged (spec/components/identity-verifier.html, rule 4). A verifier that
         # helpfully refused it here would create the second path.
         router_request(socket_path, "VERIFY", fixtures.token(dict(claims, exp=1)))[0] == "OK",
     )

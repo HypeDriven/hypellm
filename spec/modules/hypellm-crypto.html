@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: hypellm-crypto.">
+  <title>hypellm-crypto · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="../assets/wiki.css">
+  <script defer src="../assets/search-index.js"></script>
+  <script defer src="../assets/wiki.js"></script>
+</head>
+<body data-wiki-root="../" data-page-title="hypellm-crypto" data-page-group="Module contracts">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="../index.html">Wiki home</a></li>
+<li><a href="../overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="../router-specification.html">Router specification</a></li>
+<li><a href="../threat-model.html">Threat model</a></li>
+<li><a href="../orchestration.html">Fleet orchestration</a></li>
+<li><a href="../deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="../using-the-router.html">Using the router</a></li>
+<li><a href="../deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="../runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="../components/fleet-agent.html">Fleet agent</a></li>
+<li><a href="../components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="../components/container-init.html">Container init</a></li>
+<li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="hypellm-config.html">hypellm-config</a></li>
+<li><a href="hypellm-core.html">hypellm-core</a></li>
+<li><a href="hypellm-crypto.html" aria-current="page">hypellm-crypto</a></li>
+<li><a href="hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="hypellm-net.html">hypellm-net</a></li>
+<li><a href="hypellm-router.html">hypellm-router</a></li>
+<li><a href="hypellm-store.html">hypellm-store</a></li>
+<li><a href="hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="wire-http1.html">wire-http1</a></li>
+<li><a href="wire-json.html">wire-json</a></li>
+<li><a href="wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="../index.html">Wiki</a><span aria-hidden="true">/</span>Module contracts</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="module-hypellm-crypto">Module: hypellm-crypto</h1>
+<p>Specification 4.1 requires every in-repository module to declare an owner, threat
+notes, public API, unsafe-code declaration, fuzz targets, and maximum
+input/resource limits.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Owner</td>
+<td>Security (primary), Platform (secondary)</td>
+</tr>
+<tr>
+<td>Unsafe code</td>
+<td>None. <code>#![forbid(unsafe_code)]</code> inherited from the workspace.</td>
+</tr>
+<tr>
+<td>External dependencies</td>
+<td>None. Rust standard library only.</td>
+</tr>
+<tr>
+<td>Fuzz targets</td>
+<td><strong>None for this crate yet.</strong> Required: <code>sha256_stream</code>, <code>base64_roundtrip</code>, <code>hex_roundtrip</code> (§21). The workspace engine is <code>hypellm-test-corpus::fuzz</code>; five other crates use it.</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="scope-and-the-no-novel-cryptography-rule">Scope and the &quot;no novel cryptography&quot; rule</h2>
+<p>Specification 4 (<code>TLS reality</code>) and 9.1 (<code>OIDC dependency boundary</code>) forbid
+writing novel signature or TLS code to satisfy the dependency policy. This module
+does <strong>not</strong> implement TLS, asymmetric signatures, key agreement, JWT signature
+verification, or any AEAD. Those remain delegated to the platform boundary
+(<code>hypellm-net::helper</code>, types <code>TlsHelper</code> and <code>VerifierClient</code>) or to the
+audited-exception profile.</p>
+<p>What this module <em>does</em> implement is the set of fully-specified, deterministic,
+test-vector-verifiable primitives the router cannot function without:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Primitive</th>
+<th>Reference</th>
+<th>Why the router needs it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SHA-256</td>
+<td>FIPS 180-4</td>
+<td>Configuration digests, audit hash chain, credential/session digests</td>
+</tr>
+<tr>
+<td>HMAC-SHA-256</td>
+<td>RFC 2104 / FIPS 198-1</td>
+<td>Keyed API-key digests, protected store frames, CSRF binding, pseudonyms</td>
+</tr>
+<tr>
+<td>CRC-32 (IEEE 802.3)</td>
+<td>ITU-T V.42</td>
+<td>Cheap non-protected store frame checksums (corruption, not tampering)</td>
+</tr>
+<tr>
+<td>Base64 / Base64url</td>
+<td>RFC 4648</td>
+<td>Key material encoding, OIDC PKCE/state, cookie values</td>
+</tr>
+<tr>
+<td>Hex</td>
+<td>RFC 4648 §8</td>
+<td>Digest display in audit records and config digests</td>
+</tr>
+<tr>
+<td>Constant-time compare</td>
+<td>—</td>
+<td>Digest comparison without timing oracle</td>
+</tr>
+<tr>
+<td>PBKDF2-HMAC-SHA-256</td>
+<td>RFC 8018 §5.2</td>
+<td>scrypt's inner and outer passes; reading <code>local_user</code> verifiers written before scrypt</td>
+</tr>
+<tr>
+<td>scrypt</td>
+<td>RFC 7914</td>
+<td><code>local_user</code> password verifiers on the management plane</td>
+</tr>
+</tbody>
+</table></div>
+<p>Every primitive is validated against published vectors in the unit tests. A
+divergence from the reference is a build failure, not a runtime surprise.</p>
+<p>scrypt is the newest entry and the one that needs justifying. It adds one
+non-obvious piece — the Salsa20/8 core — and nothing else: the inner and outer
+passes are the PBKDF2 above, and <code>scryptBlockMix</code> and <code>scryptROMix</code> are index
+arithmetic over it. Salsa20/8 here is a fixed permutation with no key schedule,
+no field arithmetic, and no parsing; it is not used as a cipher and nothing
+depends on its cryptographic properties beyond diffusion. RFC 7914 specifies all
+four in full and publishes vectors for the whole construction, which
+<code>scrypt::tests</code> holds this against — a wrong rotation, a missed shuffle, a
+big-endian <code>Integerify</code>, or a zero-based PBKDF2 block counter each fail there.
+So it meets this module's admission test on the same terms PBKDF2 did.</p>
+<p>It replaced PBKDF2 for password verifiers because PBKDF2 is not memory-hard: an
+iterated SHA-256 is the shape a GPU or an ASIC is good at, so an attacker with
+an offline copy of the configuration got orders of magnitude more guesses per
+second than the router spent deriving. PBKDF2 verifiers still <em>parse</em>, so a
+configuration written before this keeps loading; <code>--hash-password</code> emits scrypt,
+and the router logs <code>startup.password_verifier_legacy</code> for any account still on
+the old form. Memory is bounded at <code>MAX_MEMORY_BYTES</code> and refused at parse time,
+because a verifier is read from a file and <code>ln=30</code> in one must be a
+configuration error rather than an allocation on an unauthenticated endpoint.</p>
+<h2 id="threat-notes">Threat notes</h2>
+<ul>
+<li><strong>Timing side channels.</strong> All secret-vs-candidate comparisons must go through
+<code>ct::eq</code>. Comparing <code>Digest</code> values with <code>==</code> is safe because <code>PartialEq</code> for
+<code>Digest</code> is itself implemented in constant time.</li>
+<li><strong>Secret material in memory.</strong> <code>Secret&lt;N&gt;</code> zeroes its bytes on drop and
+redacts <code>Debug</code>. This is best-effort: the specification (7.1) says &quot;zeroed on
+release where the platform permits&quot;. Rust gives no guarantee against compiler
+copies; do not treat this as a hard boundary.</li>
+<li><strong>Randomness failure.</strong> <code>random::fill</code> reads <code>/dev/urandom</code> and returns an
+error rather than falling back to a weaker source. Callers on the security
+path must fail closed. There is no user-space PRNG in this module by design.</li>
+<li><strong>Length-extension.</strong> Raw SHA-256 is length-extendable. Never authenticate a
+message with <code>sha256(secret || message)</code>; use <code>hmac_sha256</code>.</li>
+<li><strong>Offline attack on a password verifier.</strong> <code>PasswordVerifier</code> is an image of a
+password that survives being copied. Its <code>Debug</code> prints no field and it is
+deliberately not <code>Clone</code> — <code>hypellm_config::LocalUser</code> holds it behind an
+<code>Arc</code> rather than duplicating it — but the file it was read from is the real
+exposure. The iteration count is the only thing making that expensive.</li>
+</ul>
+<h2 id="limits">Limits</h2>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Input</th>
+<th>Limit</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SHA-256 message length</td>
+<td>2^61 - 1 bytes (FIPS bound); enforced by <code>u64</code> bit counter saturation check</td>
+</tr>
+<tr>
+<td>HMAC key length</td>
+<td>Unbounded input, hashed down to 32 bytes when &gt; 64</td>
+</tr>
+<tr>
+<td>Base64 decode input</td>
+<td>Caller-supplied <code>max_output</code> (bytes), default callers use 8 KiB</td>
+</tr>
+<tr>
+<td>Hex decode input</td>
+<td>Caller-supplied buffer size</td>
+</tr>
+<tr>
+<td>Password length</td>
+<td>1 024 bytes; longer is refused without hashing</td>
+</tr>
+<tr>
+<td>scrypt working set</td>
+<td><code>128 · N · r</code>, refused above <code>MAX_MEMORY_BYTES</code> (128 MiB); 32 MiB at the defaults (<code>ln=15, r=8, p=1</code>)</td>
+</tr>
+<tr>
+<td>scrypt cost floor</td>
+<td><code>ln</code> below <code>MIN_LOG_N</code> (8) is a parse error, so <code>ln=1</code> cannot reach production by way of a typo</td>
+</tr>
+<tr>
+<td>PBKDF2 iterations</td>
+<td>1 000 to 10 000 000, for reading verifiers written before scrypt</td>
+</tr>
+<tr>
+<td>Verifier salt</td>
+<td>8 to 64 bytes; 16 when derived here</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="public-api">Public API</h2>
+<p>See <code>lib.rs</code>. The surface is intentionally narrow: no streaming HMAC, no
+configurable digest sizes, no algorithm negotiation.</p>
+
+      </article>
+      <footer class="page-footer"><a href="../index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#scope-and-the-no-novel-cryptography-rule">Scope and the &quot;no novel cryptography&quot; rule</a></li>
+<li class="toc-level-2"><a href="#threat-notes">Threat notes</a></li>
+<li class="toc-level-2"><a href="#limits">Limits</a></li>
+<li class="toc-level-2"><a href="#public-api">Public API</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

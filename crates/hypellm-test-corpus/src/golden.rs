@@ -38,12 +38,12 @@
 //! It also has a cost worth naming: a hand-written fixture cannot surface a
 //! shape the author did not know about. These goldens prove the decoder handles
 //! the documented shapes; they cannot prove it handles what a provider actually
-//! sends today. That gap is recorded in `MODULE.md` and is not closed here.
+//! sends today. That gap is recorded in `spec/modules/hypellm-test-corpus.html` and is not closed here.
 //!
 //! # What the expectations mean
 //!
 //! Expected values are spelled as plain data rather than as `hypellm_core` types,
-//! because this crate takes no dependencies (see `MODULE.md` for why). A
+//! because this crate takes no dependencies (see `spec/modules/hypellm-test-corpus.html` for why). A
 //! consumer maps [`ExpectedFinish`] onto `FinishReason` and the class string
 //! onto `UpstreamErrorClass::as_str` in one match arm.
 

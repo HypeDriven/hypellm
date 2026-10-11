@@ -1,0 +1,457 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: hypellm-config.">
+  <title>hypellm-config · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="../assets/wiki.css">
+  <script defer src="../assets/search-index.js"></script>
+  <script defer src="../assets/wiki.js"></script>
+</head>
+<body data-wiki-root="../" data-page-title="hypellm-config" data-page-group="Module contracts">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="../index.html">Wiki home</a></li>
+<li><a href="../overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="../router-specification.html">Router specification</a></li>
+<li><a href="../threat-model.html">Threat model</a></li>
+<li><a href="../orchestration.html">Fleet orchestration</a></li>
+<li><a href="../deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="../using-the-router.html">Using the router</a></li>
+<li><a href="../deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="../runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="../components/fleet-agent.html">Fleet agent</a></li>
+<li><a href="../components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="../components/container-init.html">Container init</a></li>
+<li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="hypellm-config.html" aria-current="page">hypellm-config</a></li>
+<li><a href="hypellm-core.html">hypellm-core</a></li>
+<li><a href="hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="hypellm-net.html">hypellm-net</a></li>
+<li><a href="hypellm-router.html">hypellm-router</a></li>
+<li><a href="hypellm-store.html">hypellm-store</a></li>
+<li><a href="hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="wire-http1.html">wire-http1</a></li>
+<li><a href="wire-json.html">wire-json</a></li>
+<li><a href="wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="../index.html">Wiki</a><span aria-hidden="true">/</span>Module contracts</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="module-hypellm-config">Module: hypellm-config</h1>
+<p>Specification 4.1 requires every in-repository module to declare an owner, threat
+notes, public API, unsafe-code declaration, fuzz targets, and maximum
+input/resource limits.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Owner</td>
+<td>Security (primary), Platform (secondary)</td>
+</tr>
+<tr>
+<td>Unsafe code</td>
+<td>None. <code>#![forbid(unsafe_code)]</code> declared in <code>lib.rs</code> and inherited from the workspace.</td>
+</tr>
+<tr>
+<td>External dependencies</td>
+<td>None. Workspace path dependencies only: <code>hypellm-core</code>, <code>hypellm-crypto</code>, <code>hypellm-fleet</code>. Rust standard library otherwise.</td>
+</tr>
+<tr>
+<td>Fuzz targets</td>
+<td><code>tests/fuzz.rs</code> — 8 targets over the grammar, driven by <code>hypellm-test-corpus::fuzz</code>. See <a href="#fuzz-targets">Fuzz targets</a>.</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="scope-and-the-no-evaluation-step-rule">Scope and the &quot;no evaluation step&quot; rule</h2>
+<p>This module owns the whole path from configuration <em>text</em> to a validated,
+activatable <code>ValidatedConfig</code> — parse, schema check, typed field extraction,
+reference resolution, invariant verification, canonicalisation, and digest. It
+ends there. <code>hypellm-store</code> performs the durable commit and the pointer swap;
+<code>hypellm-router</code> binds listeners; adapters resolve credentials.</p>
+<p>Specification 11.1 fixes the grammar: <code>type key=value …</code>, JSON-style quoted
+escapes, <code>#</code> comments outside strings, unknown fields are errors, and
+&quot;includes, environment expansion, anchors, expressions, and executable
+templates are forbidden&quot;. The forbidden list is the load-bearing half. Every
+item on it is a way for a configuration file to <em>compute</em> something at load
+time, and each has been a real vulnerability class: <code>!!python/object</code> in YAML,
+<code>${ENV}</code> leaking a secret into a log line, an <code>!include</code> reading <code>/etc/shadow</code>,
+a billion-laughs anchor expansion.</p>
+<p>The defence is structural rather than a blocklist: <strong>this module has no
+evaluation step at all.</strong> There is no code path in <code>parse.rs</code> that opens a file,
+reads an environment variable, expands a reference, or re-enters the parser on
+derived text. <code>${SECRET}</code>, <code>*anchor</code>, <code>{{ 1 + 1 }}</code> and <code>!!python/object</code> are
+all simply literal string values, and unit tests pin that behaviour precisely so
+that a future &quot;convenience&quot; that expands one of them fails the suite instead of
+shipping an exfiltration primitive.</p>
+<p>What this module deliberately does <strong>not</strong> do:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Not done here</th>
+<th>Where it belongs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Read files, resolve paths, or discover configuration implicitly</td>
+<td><code>hypellm-router</code> startup; specification 4.1 forbids implicit discovery</td>
+</tr>
+<tr>
+<td>Durably commit, activate, or swap a snapshot</td>
+<td><code>hypellm-store</code> (specification 11, 11.2)</td>
+</tr>
+<tr>
+<td>Hold, decrypt, or validate secret values</td>
+<td>Adapter boundary; <code>credential</code> records carry metadata and an opaque <code>CredentialRef</code> only (specification 10)</td>
+</tr>
+<tr>
+<td>Resolve DNS, pin addresses, or enforce egress at connect time</td>
+<td><code>hypellm-core::netaddr</code> plus the connect-time egress guard; this module classifies only what is statically knowable</td>
+</tr>
+<tr>
+<td>Make routing decisions</td>
+<td><code>hypellm-core::PolicySnapshot::route</code> (specification 18.3)</td>
+</tr>
+<tr>
+<td>Authorise the caller submitting a draft</td>
+<td><code>hypellm-admin-api</code> / <code>hypellm-auth</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>One further boundary worth stating: the digest computed here is an <strong>unkeyed</strong>
+SHA-256 over the canonical text (<code>hypellm_crypto::digest</code>). It detects drift and
+lets nodes compare &quot;which configuration am I running&quot; (specification 11.2), and
+it is <em>not</em> a tamper seal. Authenticity of an activated configuration comes from
+the store's protected frames and the audit chain.</p>
+<h2 id="threat-notes">Threat notes</h2>
+<ul>
+<li><strong>Model selectors fail closed.</strong> <code>parse_model_selector</code> distinguishes an
+omitted selector (the explicit wildcard default) from an empty or malformed
+identifier. Invalid <code>binding model=</code> and <code>grant model=</code> values produce
+<code>invalid_identifier</code> rather than widening to every alias.</li>
+<li><strong>Error messages echo raw field values.</strong> <code>Fields::bool_field</code>,
+<code>u64_field</code>/<code>i64_field</code>, <code>parsed</code>/<code>opt_parsed</code>, and most <code>build_*</code> helpers
+format the offending value into <code>ConfigError::message</code> (up to
+<code>max_value_bytes</code>, 8 KiB), and those messages are surfaced by the validation
+endpoint and written to logs. The type's doc comment asserts no field here
+holds key material — that holds only while the grammar keeps credentials as
+references. Any future record type carrying a secret <em>value</em> must suppress the
+value in its error text first. Note also that <code>unknown_field</code> prints only the
+key, so a secret pasted into a misspelled field is not echoed; a secret pasted
+into a <em>known</em> field with the wrong type is.</li>
+<li><strong>Parser differentials against the canonical emitter.</strong> The digest is only
+meaningful if <code>parse ∘ to_canonical_string</code> is the identity on meaning.
+Two mechanisms protect that: <code>quote_if_needed</code> escapes <code>&quot;</code>, <code>\</code>, <code>#</code>,
+whitespace and every control character, so no value can forge a record
+boundary or a comment; and because every emitted value ends in either a bare
+token character or a closing quote, canonical output can never end a line in a
+bare backslash, which the reader would take as a continuation. Both properties
+are currently defended by unit tests only — this is exactly what the
+round-trip fuzz target below exists to attack.</li>
+<li><strong>Continuation joining precedes tokenisation.</strong> A trailing <code>\</code> is consumed as
+a line continuation before any string state is considered, so a quoted string
+may span lines and a value's final backslash cannot be written as a line-final
+character. The failure mode is a hard <code>InvalidEscape</code>, not a misread value, but
+it means the continuation rule is lexically outside the string grammar and
+must be fuzzed as such.</li>
+<li><strong>Resource amplification in the tokeniser.</strong> <code>parse_logical_line</code> materialises
+the entire logical line as a <code>Vec&lt;char&gt;</code> — four bytes per character — so peak
+transient allocation is roughly 4× the largest logical line, and a 4 MiB
+single-line document costs about 16 MiB. Bounded, but not proportional to
+input; do not lower <code>max_bytes</code> expectations on that basis.</li>
+<li><strong>Superlinear validation in <code>build</code>.</strong> The reachability check is <code>for each target { for each alias { permitted_targets.contains(…) } }</code> — a linear scan
+inside a nested loop. At the record ceiling that is on the order of 10⁴ × 10⁴
+identifier comparisons. Configuration is administrator-supplied and validated
+off the request path (specification 11), so this is a management-plane CPU
+cost, not a data-plane one; it still needs an authenticated, rate-limited
+validation endpoint in front of it.</li>
+<li><strong>Unbounded error accumulation.</strong> <code>build</code> deliberately collects every error
+rather than stopping at the first, so an operator sees the whole list. There is
+no cap on the error vector and no truncation of individual messages. The bound
+is indirect — one error per bad record plus one per unreachable target, each
+embedding values up to 8 KiB — which permits a pathological 4 MiB document to
+produce tens of thousands of formatted strings in one response. An explicit cap
+belongs here.</li>
+<li><strong>SSRF surface is split, by necessity.</strong> <code>validate_endpoint</code> rejects at load
+time what is statically decidable: cleartext <code>http</code> to anything but a loopback
+literal or the name <code>localhost</code>; an IP literal whose class the declared egress
+profile does not permit; the cloud metadata address under <em>every</em> profile; a
+relative <code>unix</code> socket path. A DNS name cannot be classified at load time, so
+it is syntax-checked here and must be classified and pinned at connect time
+(specification 10). Weakening either half silently re-opens the other.</li>
+<li><strong>Silent clamping on numeric fields.</strong> <code>cost</code> is clamped with <code>cost.min(9)</code>
+rather than rejected out of range, and preference <code>rank</code> saturates at
+<code>u16::MAX</code>. Neither can currently be reached maliciously (the 8 KiB value limit
+caps a preference list well below 65 535 entries), but clamping is a weaker
+contract than the rest of the module and should not be extended to new fields.</li>
+<li><strong>Prompts are not an input here.</strong> Nothing in this crate is reachable from
+request data. That is what makes &quot;prompts are inert data — never interpreted
+as configuration&quot; (specification 10.1) enforceable by construction, and it is
+an invariant to preserve: no request-derived string may ever be fed to <code>parse</code>.</li>
+</ul>
+<h2 id="limits">Limits</h2>
+<p>Enforced by <code>ParseLimits::DEFAULT</code> (<code>parse.rs</code>), which <code>load</code> always uses:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Input</th>
+<th>Limit</th>
+<th>Enforced by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Total document size</td>
+<td>4 MiB</td>
+<td><code>ParseLimits::max_bytes</code>, checked before any scanning</td>
+</tr>
+<tr>
+<td>Records per document</td>
+<td>20 000</td>
+<td><code>ParseLimits::max_records</code></td>
+</tr>
+<tr>
+<td>Fields per record</td>
+<td>64</td>
+<td><code>ParseLimits::max_fields_per_record</code></td>
+</tr>
+<tr>
+<td>Single value length</td>
+<td>8 KiB</td>
+<td><code>ParseLimits::max_value_bytes</code>, checked per quoted segment and per assembled token</td>
+</tr>
+<tr>
+<td>Continuation lines per logical record</td>
+<td>32</td>
+<td><code>ParseLimits::max_continuations</code></td>
+</tr>
+<tr>
+<td>Record type / field name</td>
+<td>64 bytes, <code>[a-z][a-z0-9_]*</code></td>
+<td><code>parse::is_identifier</code></td>
+</tr>
+<tr>
+<td>Identifier values (<code>id</code>, <code>provider</code>, <code>targets</code>, pins, scopes)</td>
+<td>128 bytes, <code>[A-Za-z0-9._:-]</code></td>
+<td><code>hypellm_core::ids::MAX_ID_LEN</code> via <code>Id::new</code></td>
+</tr>
+<tr>
+<td>Endpoint host</td>
+<td>253 bytes total, labels ≤ 63</td>
+<td><code>hypellm_core::netaddr::is_valid_host</code></td>
+</tr>
+<tr>
+<td>Endpoint port</td>
+<td>0–65 535</td>
+<td><code>u16::try_from</code>, <code>invalid_port</code></td>
+</tr>
+<tr>
+<td>Integer fields</td>
+<td>32- or 64-bit range, checked conversion</td>
+<td><code>Fields::u32_field</code> / <code>i32_field</code>, <code>integer_out_of_range</code></td>
+</tr>
+<tr>
+<td>Record types accepted</td>
+<td>13, closed set</td>
+<td><code>schema::SCHEMAS</code>; anything else is <code>unknown_record_type</code></td>
+</tr>
+<tr>
+<td>Field names accepted</td>
+<td>Closed per record type</td>
+<td><code>schema::validate_record</code>; anything else is <code>unknown_field</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>Limits and validations that are <strong>not</strong> enforced here, and must not be assumed:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Gap</th>
+<th>Consequence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>provider base_path</code> is stored verbatim — no absoluteness, traversal, or length check beyond <code>max_value_bytes</code></td>
+<td>Path composition safety is entirely the adapter's responsibility</td>
+</tr>
+<tr>
+<td><code>settings</code> string fields (<code>inference_listen</code>, <code>admin_listen</code>, <code>metrics_listen</code>, <code>cors_origins</code>, <code>state_dir</code>, <code>tls_helper_socket</code>, <code>oidc_*</code>, <code>control_socket</code>) are accepted as free-form strings</td>
+<td>A malformed listen address or CORS origin fails at bind/compare time, not at load; specification 15.2 exact-origin matching is enforced elsewhere</td>
+</tr>
+<tr>
+<td><code>residency</code> tokens are free-form and lowercased, never checked against a known set or cross-checked between tenant and target</td>
+<td>A typo makes a target permanently ineligible and surfaces as <code>no_eligible_target</code> at request time rather than as a config error (fail-closed, but silent)</td>
+</tr>
+<tr>
+<td>No cap on the number or total size of accumulated <code>ConfigError</code>s</td>
+<td>See threat notes</td>
+</tr>
+<tr>
+<td>No limit on lines, blank lines, or comments independent of <code>max_bytes</code></td>
+<td>Bounded only transitively by document size</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="fuzz-targets">Fuzz targets</h2>
+<p><code>tests/fuzz.rs</code> — eight targets, run by <code>cargo test -p hypellm-config</code>. The
+engine is <code>hypellm-test-corpus::fuzz</code>; there is no <code>fuzz/</code> directory and no
+libFuzzer harness, because specification 4 admits no such dependency.</p>
+<p>Configuration is not attacker-controlled the way a request body is, so the
+threat these assert against is not memory corruption but a <strong>fail-open</strong>: a
+malformed record silently ignored, or a field quietly defaulting to something
+permissive, widens access with no error. That is not hypothetical here — this
+suite found exactly that defect, an explicitly empty <code>model=</code> in a <code>grant</code>
+widening it from one alias to every alias.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Target</th>
+<th>Property under attack</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>no_mutation_of_a_configuration_panics_the_loader</code></td>
+<td>Every input either loads or reports errors; nothing is half-applied</td>
+</tr>
+<tr>
+<td><code>a_loaded_configuration_never_grants_more_than_its_text_says</code></td>
+<td>No silent widening: a grant naming one alias never becomes a grant over all</td>
+</tr>
+<tr>
+<td><code>an_unknown_field_is_always_an_error</code></td>
+<td>Specification 11.1's &quot;unknown fields are errors&quot;, against mutations that rename one</td>
+</tr>
+<tr>
+<td><code>the_loader_is_deterministic</code></td>
+<td>Two loads of one text agree on digest, or on error codes</td>
+</tr>
+<tr>
+<td><code>a_very_long_line_is_refused_rather_than_consuming_the_process</code></td>
+<td>The line-oriented grammar's natural unbounded input</td>
+</tr>
+<tr>
+<td><code>deeply_repeated_records_are_bounded</code></td>
+<td>The many-records shape of the same</td>
+</tr>
+<tr>
+<td><code>random_text_is_rejected_without_panicking</code></td>
+<td>Unstructured input over the grammar's delimiters</td>
+</tr>
+<tr>
+<td><code>no_mutated_verifier_ever_accepts_a_password_it_was_not_built_from</code></td>
+<td>The fail-open specific to <code>local_user</code>: a corrupted verifier must refuse, never default into a guessable credential</td>
+</tr>
+</tbody>
+</table></div>
+<p>Still outstanding (§21, §18.2):</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Target</th>
+<th>Property under attack</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>config_parse</code></td>
+<td>Arbitrary bytes into <code>parse(text, &amp;ParseLimits::DEFAULT)</code> never panics, never exceeds a declared limit, and always terminates</td>
+</tr>
+<tr>
+<td><code>config_canonical_roundtrip</code></td>
+<td>For any document that parses, <code>parse(to_canonical_string(d)) == d</code> and <code>to_canonical_string</code> is idempotent — the parser-differential and digest-stability property</td>
+</tr>
+<tr>
+<td><code>config_build</code></td>
+<td><code>build</code> on any parseable document never panics, and error count and total message size stay within a stated bound</td>
+</tr>
+<tr>
+<td><code>config_endpoint_guard</code></td>
+<td>Generated <code>(scheme, host, port, egress)</code> tuples never yield an accepted endpoint that is non-loopback cleartext, of a class the profile forbids, or the metadata address</td>
+</tr>
+<tr>
+<td><code>config_limits</code></td>
+<td>Randomised <code>ParseLimits</code> are respected exactly — no off-by-one admits <code>max_records + 1</code> records or an oversized value</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="public-api">Public API</h2>
+<p>See <code>lib.rs</code>. Three layers, deliberately separable so that the management API
+can report a parse failure differently from a validation failure:</p>
+<ul>
+<li><code>parse::{parse, ParseLimits, Document, Record, ParseError, quote_if_needed, split_list}</code> — text to records, no semantics.</li>
+<li><code>schema::{SCHEMAS, validate_record, Fields, ConfigError}</code> — the closed record
+set and strict typed field access. Booleans accept only <code>true</code>/<code>false</code>; <code>yes</code>,
+<code>on</code>, and <code>1</code> are errors, so <code>enabled=yse</code> cannot silently read as false.</li>
+<li><code>build::{build, ValidatedConfig, Settings, …}</code> — reference resolution,
+invariants, canonical text, digest.</li>
+<li><code>edit::{apply, Edit, Identity}</code> — structured record edits over a document,
+for the management API's <code>policies:edit</code>. Field names are checked against
+the schema (they are written bare) and values are quoted on rendering, so an
+edit changes fields and never adds a record; only routing and fleet kinds are
+editable, and of <code>settings</code> only <code>fleet_enabled</code>. At most 64 edits a batch,
+applied all or nothing.</li>
+</ul>
+<p><code>load(text, version)</code> composes all three. The surface is intentionally narrow:
+no partial builds, no lenient mode, no merge or overlay of documents, and no
+way to construct a <code>ValidatedConfig</code> that skipped validation.</p>
+
+      </article>
+      <footer class="page-footer"><a href="../index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#scope-and-the-no-evaluation-step-rule">Scope and the &quot;no evaluation step&quot; rule</a></li>
+<li class="toc-level-2"><a href="#threat-notes">Threat notes</a></li>
+<li class="toc-level-2"><a href="#limits">Limits</a></li>
+<li class="toc-level-2"><a href="#fuzz-targets">Fuzz targets</a></li>
+<li class="toc-level-2"><a href="#public-api">Public API</a></li>
+      </ol></details>
+    </aside>
+  </div>
+</body>
+</html>

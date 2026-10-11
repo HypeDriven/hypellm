@@ -1,7 +1,7 @@
 //! In-repository reviewed cryptographic and encoding primitives for HypeLLM
 //! Router.
 //!
-//! Scope is deliberately narrow — see `MODULE.md` for the security decision
+//! Scope is deliberately narrow — see `spec/modules/hypellm-crypto.html` for the security decision
 //! record. This crate implements only fully-specified, deterministic,
 //! test-vector-verifiable primitives:
 //!
