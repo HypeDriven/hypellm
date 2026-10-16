@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: Outbound TLS helper.">
+  <title>Outbound TLS helper · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="../assets/wiki.css">
+  <script defer src="../assets/search-index.js"></script>
+  <script defer src="../assets/wiki.js"></script>
+</head>
+<body data-wiki-root="../" data-page-title="Outbound TLS helper" data-page-group="Components">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="../index.html">Wiki home</a></li>
+<li><a href="../overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="../router-specification.html">Router specification</a></li>
+<li><a href="../threat-model.html">Threat model</a></li>
+<li><a href="../orchestration.html">Fleet orchestration</a></li>
+<li><a href="../deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="../using-the-router.html">Using the router</a></li>
+<li><a href="../deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="../runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="fleet-agent.html">Fleet agent</a></li>
+<li><a href="identity-verifier.html">Identity verifier</a></li>
+<li><a href="tls-helper.html" aria-current="page">Outbound TLS helper</a></li>
+<li><a href="container-init.html">Container init</a></li>
+<li><a href="tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="../modules/hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="../modules/hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="../modules/hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="../modules/hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="../modules/hypellm-config.html">hypellm-config</a></li>
+<li><a href="../modules/hypellm-core.html">hypellm-core</a></li>
+<li><a href="../modules/hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="../modules/hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="../modules/hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="../modules/hypellm-net.html">hypellm-net</a></li>
+<li><a href="../modules/hypellm-router.html">hypellm-router</a></li>
+<li><a href="../modules/hypellm-store.html">hypellm-store</a></li>
+<li><a href="../modules/hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="../modules/hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="../modules/wire-http1.html">wire-http1</a></li>
+<li><a href="../modules/wire-json.html">wire-json</a></li>
+<li><a href="../modules/wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="../index.html">Wiki</a><span aria-hidden="true">/</span>Components</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="the-hypellm-outbound-tls-helper">The HypeLLM outbound TLS helper</h1>
+<p><code>tls-helper/</code> holds the reference <strong>outbound TLS helper</strong>: the process
+that turns the router's cleartext HTTP into HTTPS to a remote provider —
+DeepSeek, OpenAI, Anthropic, Moonshot, or any <code>scheme=https</code> endpoint.</p>
+<p>It is deliberately outside the Rust workspace, like <code>verifier/</code> and <code>agent/</code>:
+not a workspace member, not built by <code>cargo build --workspace</code>, and not
+scanned by <code>depscan</code> as router source. Owner: the deployment's operator, who
+also owns its allowlist.</p>
+<h2 id="why-it-is-a-separate-process">Why it is a separate process</h2>
+<p>Specification 4 draws the line:</p>
+<blockquote>
+<p><strong>TLS reality:</strong> Do not implement TLS or modern cryptography ad hoc. … For
+outbound HTTPS, use a platform-provided audited TLS helper/sidecar with a narrow
+CONNECT-like API and destination allowlist.</p>
+</blockquote>
+<p>The router therefore ships a <em>client</em> — <code>TlsHelper</code> in
+<code>crates/hypellm-net/src/helper.rs</code> — and no TLS. Without a helper, a provider
+declaring <code>scheme=https</code> is a startup failure (<a href="../deployment.html#outbound">Outbound</a>).
+This is that helper.</p>
+<p><strong>It is in the trusted computing base.</strong> It sees every prompt, completion and
+provider credential sent to a remote provider in plaintext, and it decides which
+certificates are authentic. Review it as such.</p>
+<h2 id="what-it-does-and-what-it-deliberately-does-not">What it does, and what it deliberately does not</h2>
+<p>It performs <strong>no cryptography of its own</strong>. The TLS session is the standard
+library's <code>ssl</code> module — the platform's OpenSSL — against the system CA store,
+with <code>CERT_REQUIRED</code>, hostname checking against the SNI and TLS 1.2 as the
+floor, asserted in code rather than assumed. There is no path that disables
+verification and none that falls back to cleartext.</p>
+<p>It reads no URL, path or header: the router's HTTP is opaque bytes relayed in
+both directions on one thread, because an OpenSSL connection must not be read
+and written from two threads at once. It negotiates ALPN <code>http/1.1</code>, which is
+what the router speaks.</p>
+<h2 id="what-the-router-may-tell-it">What the router may tell it</h2>
+<pre><code class="language-text">→ CONNECT &lt;host&gt; &lt;port&gt; &lt;sni&gt;\n
+← OK\n              then the socket carries the TLS session's plaintext
+← ERR &lt;code&gt;\n      and the socket closes
+</code></pre>
+<p><code>&lt;host&gt;</code> is the address the router resolved and validated itself, so a DNS
+answer cannot change between the router's egress check and this connect. The
+helper honours that pin — it connects to exactly that address — and checks it
+again:</p>
+<ul>
+<li><strong><code>(sni, port)</code> must be a row of the helper's allowlist.</strong> Deny by default. A
+compromised router cannot use the helper to reach an arbitrary TLS endpoint
+with the platform's trust.</li>
+<li><strong>The address must be globally routable</strong> — not private, loopback,
+link-local (where cloud metadata lives), shared address space, multicast or
+reserved, including the same addresses spelled as IPv4-mapped IPv6 — unless the
+row says <code>"local": true</code>. A row may also list <code>prefixes</code> the address must fall
+inside.</li>
+<li><strong>A name in place of an address</strong> is accepted only when it equals the SNI;
+the helper then resolves it once, keeps only permitted answers, and tries them
+in order within one connect deadline.</li>
+</ul>
+<p>Refusal codes: <code>destination_not_allowlisted</code>, <code>address_not_permitted</code>,
+<code>host_mismatch</code>, <code>resolution_failed</code>, <code>malformed_request</code>, <code>invalid_port</code>,
+<code>invalid_sni</code> (including the empty SNI the router sends for a destination with
+none), <code>line_too_long</code>, <code>line_timeout</code>, <code>connect_failed</code>, <code>connect_timeout</code>,
+<code>certificate_invalid</code>, <code>handshake_timeout</code>, <code>tls_handshake_failed</code>, <code>busy</code>.</p>
+<h2 id="obligations">Obligations</h2>
+<p>These are normative. A helper that does not keep them is not this helper.</p>
+<ul>
+<li><strong>Runs as its own unprivileged user.</strong> It refuses to start as root. In
+<code>k8s/hypellm.yaml</code> it is uid 1001 in the router's group 1000.</li>
+<li><strong>Its access control is the filesystem.</strong> The socket is created <code>0660</code>;
+the directory holding it decides who can reach it. In the pod it is a
+memory-backed <code>emptyDir</code> mounted only by the router and the helper. Anything
+that can connect can ask for any allowlisted destination, so keep the
+directory to those two.</li>
+<li><strong>Never treats a router-supplied value as a destination it chose.</strong> The
+allowlist is the helper's own file; the router's request selects a row.</li>
+<li><strong>Ignores proxy environment variables</strong>, and logs that they were present so
+nobody believes they took effect.</li>
+<li><strong>Bounds everything</strong>: the request line (512 bytes), the time to send it,
+concurrent sessions (refused with <code>busy</code> rather than queued), connect and
+handshake deadlines, idle time, a session's lifetime, and the bytes buffered in
+each direction.</li>
+<li><strong>Logs no plaintext</strong> — a line names the SNI, port, peer address, TLS
+version, outcome and byte counts, never a header, body or key.</li>
+</ul>
+<h2 id="configuration">Configuration</h2>
+<p>A JSON file; <code>tls-helper/tls-helper.json</code> is the one the pod uses. Unknown keys
+are refused, so a misspelt limit fails rather than leaving the default in
+force.</p>
+<pre><code class="language-text">{
+  "socket": "/run/hypellm-tls/tls.sock",
+  "max_sessions": 64,
+  "line_timeout_ms": 5000,
+  "connect_timeout_ms": 10000,
+  "handshake_timeout_ms": 10000,
+  "idle_timeout_ms": 900000,
+  "max_session_ms": 3600000,
+  "buffer_bytes": 262144,
+  "destinations": [
+    {"sni": "api.deepseek.com", "port": 443},
+    {"sni": "llm.lan.example", "port": 8443, "local": true, "prefixes": ["192.168.8.0/24"]}
+  ]
+}
+</code></pre>
+<p><code>idle_timeout_ms</code> is generous on purpose: a non-streaming completion can run for
+minutes without a byte in either direction, and the router's own deadline
+(<code>default_deadline_ms</code>) is the tighter bound. <code>ca_file</code> replaces the system store
+with one PEM file — for a private CA in front of a LAN slave, and for the
+tests. <code>hypellm-tls-helper --config &lt;file&gt; --check</code> validates a file without
+starting.</p>
+<p>A row with <code>"local": true</code> is how a LAN slave gets TLS: terminate TLS in front
+of it, list it here, and declare it <code>scheme=https</code> — the alternative to
+<a href="../deferred-issues.html#summary">cleartext to slaves</a>.</p>
+<h2 id="setting-it-up">Setting it up</h2>
+<p>The pod already runs it: <code>k8s/hypellm.yaml</code> has a <code>tls-helper</code> sidecar
+(<code>python:3.13-slim</code>, pinned by digest, the script mounted read-only from
+<code>tls-helper/</code>), sharing <code>/run/hypellm-tls</code> with the router. It is idle until the
+router is told to use it.</p>
+<ol>
+<li>Allowlist the destination in <code>tls-helper/tls-helper.json</code>. The shipped file
+lists DeepSeek, OpenAI, Anthropic and Moonshot on 443.</li>
+<li>Point the router at the socket in <code>docker/hypellm.conf</code>'s <code>settings</code> record:
+<pre><code class="language-text">tls_helper_socket=/run/hypellm-tls/tls.sock
+</code></pre>
+</li>
+<li>Declare the provider. For DeepSeek, with its API key in
+<code>run/secrets/credentials/deepseek</code> (a declared credential with no file is a
+startup failure):
+<pre><code class="language-text">credential id=deepseek description="DeepSeek API key"
+provider id=deepseek family=deepseek scheme=https host=api.deepseek.com port=443 base_path=/v1 \
+         credential=deepseek egress=remote
+target id=deepseek:chat provider=deepseek model=deepseek-chat aliases=deepseek-chat \
+       capabilities=chat operations=chat modalities=text \
+       streaming=true tools=true json_mode=true \
+       context=65536 max_output=8192 quality_class=7 cost=5 concurrency=8
+alias id=deepseek-chat capability=chat targets=deepseek:chat \
+      description="DeepSeek's hosted chat model, over the TLS helper"
+</code></pre>
+Take <code>model</code>, <code>context</code> and <code>max_output</code> from the provider's current model page;
+the figures above are placeholders that validate, not DeepSeek's limits. Listing
+the target in an existing alias as well makes it a fallback behind the local
+models.</li>
+<li><code>just up</code>.</li>
+</ol>
+<h2 id="checking-it-works">Checking it works</h2>
+<ul>
+<li><code>just logs tls-helper</code> shows <code>helper.listening</code>, then one
+<code>session.closed</code> (or <code>session.refused</code> with its code) per upstream connection.</li>
+<li>A request to the new alias that fails with a refusal names the helper's code
+in the router's error, sanitised to <code>[A-Za-z0-9_-]</code>.</li>
+<li><code>python3 tls-helper/test_tls_helper.py</code> runs the suite: offline, with a CA and
+certificates minted for the run by the <code>openssl</code> CLI and discarded after it. It
+covers the allowlist, certificate and hostname refusal, every non-global address
+class, prefixes, malformed and oversized requests, the line deadline, the
+session cap and slot release, the idle timeout, a byte-exact relay in both
+directions at once, proxy variables, and that no plaintext reaches the log.</li>
+</ul>
+<h2 id="when-it-stops-working">When it stops working</h2>
+<ul>
+<li><code>destination_not_allowlisted</code>: the provider's host and port are not a row of
+<code>tls-helper.json</code>. The row is the pair; another port is another row.</li>
+<li><code>certificate_invalid</code>: the server's certificate did not verify for the SNI
+against the store in use — an expired or misissued certificate, an interception
+proxy, or a private CA with no <code>ca_file</code>.</li>
+<li><code>address_not_permitted</code>: the name resolved to a non-global address and the row
+is not <code>local</code>, or the address is outside the row's <code>prefixes</code>.</li>
+<li><code>busy</code>: <code>max_sessions</code> are open. The router pools connections, so this is
+sustained concurrency, not a leak — raise it or lower provider concurrency.</li>
+</ul>
+<p>The limitations that remain are in <a href="../deferred-issues.html#summary">Current limitations</a>
+under "Outbound TLS helper".</p>
+
+      </article>
+      <footer class="page-footer"><a href="../index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#why-it-is-a-separate-process">Why it is a separate process</a></li>
+<li class="toc-level-2"><a href="#what-it-does-and-what-it-deliberately-does-not">What it does, and what it deliberately does not</a></li>
+<li class="toc-level-2"><a href="#what-the-router-may-tell-it">What the router may tell it</a></li>
+<li class="toc-level-2"><a href="#obligations">Obligations</a></li>
+<li class="toc-level-2"><a href="#configuration">Configuration</a></li>
+<li class="toc-level-2"><a href="#setting-it-up">Setting it up</a></li>
+<li class="toc-level-2"><a href="#checking-it-works">Checking it works</a></li>
+<li class="toc-level-2"><a href="#when-it-stops-working">When it stops working</a></li>
+</ol></details>
+    </aside>
+  </div>
+</body>
+</html>

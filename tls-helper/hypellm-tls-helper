@@ -1,0 +1,739 @@
+#!/usr/bin/env python3
+"""The HypeLLM reference outbound TLS helper.
+
+This is the process that turns the router's cleartext HTTP into HTTPS to a
+remote provider. It is **not** part of the HypeLLM workspace and is not built by
+`cargo build --workspace`, for the same reason `verifier/` and `agent/` are not:
+specification 4 places this work outside the router.
+
+    > **TLS reality:** Do not implement TLS or modern cryptography ad hoc. …
+    > For outbound HTTPS, use a platform-provided audited TLS helper/sidecar
+    > with a narrow CONNECT-like API and destination allowlist.
+
+**No cryptography is implemented here.** The TLS session is the standard
+library's `ssl` module, which is the platform's OpenSSL, against the system
+trust store, with certificate and hostname verification asserted rather than
+assumed. This file does not implement a handshake, does not disable
+verification, and has no code path that falls back to cleartext.
+
+The wire protocol (crates/hypellm-net/src/helper.rs is the router's side):
+
+    → CONNECT <host> <port> <sni>\\n
+    ← OK\\n              then the socket carries the TLS session's plaintext
+    ← ERR <code>\\n      and the socket closes
+
+The rules it exists to keep
+---------------------------
+
+1. **Deny by default.** A request names a destination; it is served only if
+   `(sni, port)` is a row of this helper's own allowlist. The router's word is
+   not enough: a compromised router must not be able to use this process to
+   reach an arbitrary TLS endpoint with the platform's trust.
+2. **The router's address pin is honoured, and checked.** The router resolves
+   the name itself and sends the address it validated, so a DNS answer cannot
+   change between its check and this connect. This helper connects to exactly
+   that address and no other, and refuses one that is not globally routable —
+   private, loopback, link-local (which is where cloud metadata lives),
+   carrier-grade NAT, multicast, reserved — unless the allowlist row says
+   `"local": true`. A row may also restrict the address to listed prefixes.
+3. **Verification is the platform's, and it is on.** `CERT_REQUIRED`, hostname
+   checking against the SNI, the system CA store (or a configured CA file),
+   TLS 1.2 at least. A failure is a refusal, never a downgrade.
+4. **Everything is bounded.** The request line, the time to send it, the
+   number of concurrent sessions, the connect and handshake deadlines, idle
+   time, a session's total lifetime, and the bytes buffered in each direction.
+5. **No proxy, ever.** Proxy environment variables are ignored, and their
+   presence is logged so nobody believes they took effect. A proxy would be a
+   destination this file did not choose.
+6. **No plaintext is logged.** A log line names the SNI, the port, the
+   outcome and byte counts. Never a header, a body, or a key.
+
+Configuration is a JSON file; see `tls-helper.json` beside this file and
+spec/components/tls-helper.html.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import json
+import os
+import re
+import selectors
+import socket
+import ssl
+import stat
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from typing import Any
+
+# Hard ceilings. A configuration may lower these, never raise them past.
+MAX_LINE_BYTES = 512
+MAX_SESSIONS_CEILING = 1024
+MAX_BUFFER_BYTES = 1024 * 1024
+MAX_DESTINATIONS = 256
+MAX_CONFIG_BYTES = 256 * 1024
+READ_CHUNK = 64 * 1024
+
+PROXY_VARIABLES = (
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+)
+
+# A DNS name as an SNI: labels of letters, digits and hyphens, not starting or
+# ending with a hyphen, at most 253 octets. An IP literal is not a valid SNI.
+LABEL = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+
+# The error-code alphabet the router sanitises to anyway (helper.rs
+# `sanitize_code`); codes here are already inside it.
+CODE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+class Refusal(Exception):
+    """A request this helper declines, with the code the router will see."""
+
+    def __init__(self, code: str) -> None:
+        if not CODE.match(code):
+            code = "internal_error"
+        super().__init__(code)
+        self.code = code
+
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Destination:
+    sni: str
+    port: int
+    local: bool = False
+    # When present, the pinned address must fall inside one of these.
+    prefixes: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = ()
+
+
+@dataclass(frozen=True)
+class Config:
+    socket: str
+    destinations: dict[tuple[str, int], Destination]
+    max_sessions: int = 64
+    line_timeout_ms: int = 5_000
+    connect_timeout_ms: int = 10_000
+    handshake_timeout_ms: int = 10_000
+    # A non-streaming completion can take minutes with no byte in either
+    # direction, so idle is generous; the lifetime cap bounds the rest.
+    idle_timeout_ms: int = 900_000
+    max_session_ms: int = 3_600_000
+    buffer_bytes: int = 256 * 1024
+    ca_file: str | None = None
+    log_level: str = "info"
+
+
+def valid_sni(name: str) -> bool:
+    if not name or len(name) > 253 or name.endswith("."):
+        return False
+    try:
+        ipaddress.ip_address(name)
+        return False
+    except ValueError:
+        pass
+    return all(LABEL.match(label) for label in name.split("."))
+
+
+def bounded_int(document: dict[str, Any], key: str, default: int, low: int, high: int) -> int:
+    value = document.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+        raise ValueError(f"'{key}' must be an integer from {low} to {high}")
+    return value
+
+
+def load_config(path: str, socket_override: str | None = None) -> Config:
+    with open(path, "rb") as handle:
+        raw = handle.read(MAX_CONFIG_BYTES + 1)
+    if len(raw) > MAX_CONFIG_BYTES:
+        raise ValueError("configuration file is too large")
+    document = json.loads(raw)
+    if not isinstance(document, dict):
+        raise ValueError("configuration must be a JSON object")
+    known = {
+        "socket", "destinations", "max_sessions", "line_timeout_ms",
+        "connect_timeout_ms", "handshake_timeout_ms", "idle_timeout_ms",
+        "max_session_ms", "buffer_bytes", "ca_file", "log_level", "comment",
+    }
+    unknown = sorted(set(document) - known)
+    if unknown:
+        # An unknown key is most often a misspelt limit, which would otherwise
+        # silently leave the default in force.
+        raise ValueError(f"unknown configuration keys: {', '.join(unknown)}")
+
+    socket_path = socket_override or document.get("socket")
+    if not isinstance(socket_path, str) or not socket_path.startswith("/"):
+        raise ValueError("'socket' must be an absolute path")
+
+    rows = document.get("destinations", [])
+    if not isinstance(rows, list) or len(rows) > MAX_DESTINATIONS:
+        raise ValueError(f"'destinations' must be a list of at most {MAX_DESTINATIONS}")
+    destinations: dict[tuple[str, int], Destination] = {}
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"destination {index} must be an object")
+        extra = sorted(set(row) - {"sni", "port", "local", "prefixes", "comment"})
+        if extra:
+            raise ValueError(f"destination {index}: unknown keys {', '.join(extra)}")
+        sni = row.get("sni")
+        if not isinstance(sni, str) or not valid_sni(sni.lower()):
+            raise ValueError(f"destination {index}: 'sni' must be a DNS name")
+        sni = sni.lower()
+        port = bounded_int(row, "port", 443, 1, 65535)
+        local = row.get("local", False)
+        if not isinstance(local, bool):
+            raise ValueError(f"destination {index}: 'local' must be true or false")
+        prefixes = row.get("prefixes", [])
+        if not isinstance(prefixes, list) or not all(isinstance(p, str) for p in prefixes):
+            raise ValueError(f"destination {index}: 'prefixes' must be a list of CIDR strings")
+        networks = tuple(ipaddress.ip_network(p, strict=True) for p in prefixes)
+        key = (sni, port)
+        if key in destinations:
+            raise ValueError(f"destination {index}: {sni}:{port} is listed twice")
+        destinations[key] = Destination(sni=sni, port=port, local=local, prefixes=networks)
+
+    ca_file = document.get("ca_file")
+    if ca_file is not None and (not isinstance(ca_file, str) or not ca_file.startswith("/")):
+        raise ValueError("'ca_file' must be an absolute path")
+    log_level = document.get("log_level", "info")
+    if log_level not in ("debug", "info", "warn", "error"):
+        raise ValueError("'log_level' must be debug, info, warn or error")
+
+    return Config(
+        socket=socket_path,
+        destinations=destinations,
+        max_sessions=bounded_int(document, "max_sessions", 64, 1, MAX_SESSIONS_CEILING),
+        line_timeout_ms=bounded_int(document, "line_timeout_ms", 5_000, 100, 60_000),
+        connect_timeout_ms=bounded_int(document, "connect_timeout_ms", 10_000, 100, 60_000),
+        handshake_timeout_ms=bounded_int(document, "handshake_timeout_ms", 10_000, 100, 60_000),
+        idle_timeout_ms=bounded_int(document, "idle_timeout_ms", 900_000, 100, 3_600_000),
+        max_session_ms=bounded_int(document, "max_session_ms", 3_600_000, 100, 86_400_000),
+        buffer_bytes=bounded_int(document, "buffer_bytes", 256 * 1024, 4096, MAX_BUFFER_BYTES),
+        ca_file=ca_file,
+        log_level=log_level,
+    )
+
+
+# --------------------------------------------------------------------------
+# Logging: one JSON object per line, never a byte of plaintext.
+# --------------------------------------------------------------------------
+
+LEVELS = {"debug": 10, "info": 20, "warn": 30, "error": 40}
+
+
+class Log:
+    def __init__(self, level: str, stream: Any = None) -> None:
+        self.threshold = LEVELS[level]
+        self.stream = stream or sys.stderr
+        self.lock = threading.Lock()
+
+    def emit(self, level: str, event: str, **fields: Any) -> None:
+        if LEVELS[level] < self.threshold:
+            return
+        record = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "severity": level, "event": event}
+        record.update(fields)
+        line = json.dumps(record, separators=(",", ":"))
+        with self.lock:
+            self.stream.write(line + "\n")
+            self.stream.flush()
+
+
+# --------------------------------------------------------------------------
+# The request line
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Request:
+    host: str
+    port: int
+    sni: str
+
+
+def read_line(conn: socket.socket, timeout_ms: int) -> bytes:
+    """Read one line of at most MAX_LINE_BYTES within the deadline.
+
+    Byte at a time, so nothing past the newline is consumed: the router sends
+    nothing before it reads `OK`, and anything that did arrive early would be
+    plaintext meant for the TLS session.
+    """
+    deadline = time.monotonic() + timeout_ms / 1000
+    line = bytearray()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise Refusal("line_timeout")
+        conn.settimeout(remaining)
+        try:
+            byte = conn.recv(1)
+        except socket.timeout:
+            raise Refusal("line_timeout") from None
+        if not byte:
+            raise Refusal("closed_before_request")
+        if byte == b"\n":
+            return bytes(line)
+        line += byte
+        if len(line) >= MAX_LINE_BYTES:
+            raise Refusal("line_too_long")
+
+
+def parse_request(line: bytes) -> Request:
+    try:
+        text = line.decode("ascii")
+    except UnicodeDecodeError:
+        raise Refusal("malformed_request") from None
+    parts = text.split(" ")
+    if len(parts) != 4 or parts[0] != "CONNECT":
+        raise Refusal("malformed_request")
+    _, host, port_text, sni = parts
+    if not port_text.isdigit() or len(port_text) > 5 or port_text.startswith("0"):
+        raise Refusal("invalid_port")
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        raise Refusal("invalid_port")
+    sni = sni.lower()
+    if not valid_sni(sni):
+        raise Refusal("invalid_sni")
+    if not host:
+        raise Refusal("malformed_request")
+    return Request(host=host, port=port, sni=sni)
+
+
+def permitted_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address, row: Destination) -> bool:
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        # ::ffff:127.0.0.1 is 127.0.0.1; judge the address it really is.
+        address = address.ipv4_mapped
+    if address.is_unspecified or address.is_multicast:
+        return False
+    if row.prefixes and not any(address in network for network in row.prefixes):
+        return False
+    if row.local:
+        return True
+    # `is_global` is false for private, loopback, link-local (and so the cloud
+    # metadata address), shared address space, documentation and reserved
+    # ranges — every place a CONNECT-shaped SSRF goes.
+    return address.is_global
+
+
+def resolve(host: str, port: int, timeout_ms: int) -> list[str]:
+    """getaddrinfo on a bounded helper thread, because it has no timeout."""
+    result: list[str] = []
+    error: list[BaseException] = []
+
+    def work() -> None:
+        try:
+            for info in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM):
+                result.append(info[4][0])
+        except BaseException as caught:  # noqa: BLE001 - reported as a refusal
+            error.append(caught)
+
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    worker.join(timeout_ms / 1000)
+    if worker.is_alive() or error or not result:
+        raise Refusal("resolution_failed")
+    return result
+
+
+def choose_addresses(request: Request, row: Destination, config: Config) -> list[str]:
+    """The addresses this connection may use, in the order to try them."""
+    try:
+        literal = ipaddress.ip_address(request.host)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        # The router's pin: exactly this address, or nothing.
+        if not permitted_address(literal, row):
+            raise Refusal("address_not_permitted")
+        return [str(literal)]
+    # A name rather than an address. The router always sends its pinned
+    # address; a name is accepted only when it is the SNI itself, so the
+    # destination is still the allowlisted one. It is resolved here once, and
+    # only the permitted answers are tried.
+    if request.host.lower() != request.sni:
+        raise Refusal("host_mismatch")
+    permitted: list[str] = []
+    for candidate in resolve(request.sni, request.port, config.connect_timeout_ms):
+        address = ipaddress.ip_address(candidate.split("%", 1)[0])
+        if permitted_address(address, row) and str(address) not in permitted:
+            permitted.append(str(address))
+    if not permitted:
+        raise Refusal("address_not_permitted")
+    return permitted[:8]
+
+
+# --------------------------------------------------------------------------
+# TLS
+# --------------------------------------------------------------------------
+
+
+def client_context(config: Config) -> ssl.SSLContext:
+    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=config.ca_file)
+    # Asserted, not assumed: create_default_context sets both, and a future
+    # edit that loosened either should fail here rather than ship.
+    context.check_hostname = True
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    # The router speaks HTTP/1.1 over this session and nothing else.
+    context.set_alpn_protocols(["http/1.1"])
+    assert context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname
+    return context
+
+
+def connect_any(addresses: list[str], port: int, timeout_ms: int) -> socket.socket:
+    """TCP to the first address that answers, all within one deadline."""
+    deadline = time.monotonic() + timeout_ms / 1000
+    timed_out = False
+    for address in addresses:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+            break
+        family = socket.AF_INET6 if ":" in address else socket.AF_INET
+        raw = socket.socket(family, socket.SOCK_STREAM)
+        raw.settimeout(remaining)
+        try:
+            raw.connect((address, port))
+        except socket.timeout:
+            raw.close()
+            timed_out = True
+            continue
+        except OSError:
+            raw.close()
+            continue
+        raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        return raw
+    raise Refusal("connect_timeout" if timed_out else "connect_failed")
+
+
+def open_tls(addresses: list[str], request: Request, config: Config, context: ssl.SSLContext) -> ssl.SSLSocket:
+    raw = connect_any(addresses, request.port, config.connect_timeout_ms)
+    try:
+        tls = context.wrap_socket(raw, server_hostname=request.sni, do_handshake_on_connect=False)
+    except BaseException:
+        raw.close()
+        raise
+    try:
+        tls.settimeout(config.handshake_timeout_ms / 1000)
+        try:
+            tls.do_handshake()
+        except ssl.SSLCertVerificationError:
+            raise Refusal("certificate_invalid") from None
+        except socket.timeout:
+            raise Refusal("handshake_timeout") from None
+        except (ssl.SSLError, OSError):
+            raise Refusal("tls_handshake_failed") from None
+        if tls.version() not in ("TLSv1.2", "TLSv1.3"):
+            raise Refusal("tls_version_refused")
+    except BaseException:
+        tls.close()
+        raise
+    return tls
+
+
+# --------------------------------------------------------------------------
+# Relay
+# --------------------------------------------------------------------------
+
+
+def relay(client: socket.socket, tls: ssl.SSLSocket, config: Config) -> tuple[int, int, str]:
+    """Move plaintext both ways on one thread until either side ends.
+
+    One thread, not two: an OpenSSL connection must not be read and written
+    from two threads at once. Each direction's buffer is bounded and a side is
+    not read while its destination's buffer is full, which is the
+    backpressure. Returns (bytes up, bytes down, how it ended).
+    """
+    client.setblocking(False)
+    tls.setblocking(False)
+    up = bytearray()    # client → provider, not yet written
+    down = bytearray()  # provider → client, not yet written
+    sent_up = sent_down = 0
+    client_eof = tls_eof = False
+    tls_wants_read_for_write = False
+    # OpenSSL requires a write that would block to be retried with the same
+    # bytes, so the chunk in flight is held apart from `up` until it is taken.
+    in_flight = b""
+    started = last = time.monotonic()
+    cap = config.buffer_bytes
+    selector = selectors.DefaultSelector()
+    registered: dict[socket.socket, int] = {}
+
+    def want(sock: socket.socket, events: int) -> None:
+        current = registered.get(sock)
+        if not events:
+            if current is not None:
+                selector.unregister(sock)
+                del registered[sock]
+        elif current is None:
+            selector.register(sock, events)
+            registered[sock] = events
+        elif current != events:
+            selector.modify(sock, events)
+            registered[sock] = events
+
+    def read_tls() -> bool:
+        """Drain what the provider has sent; False if the session failed."""
+        nonlocal tls_eof, last
+        while len(down) < cap and not tls_eof:
+            try:
+                data = tls.recv(min(READ_CHUNK, cap - len(down)))
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                return True
+            except (ssl.SSLZeroReturnError, ssl.SSLEOFError):
+                tls_eof = True
+                return True
+            except (ssl.SSLError, OSError):
+                return False
+            if not data:
+                tls_eof = True
+                return True
+            down.extend(data)
+            last = time.monotonic()
+        return True
+
+    try:
+        while True:
+            now = time.monotonic()
+            if (now - last) * 1000 >= config.idle_timeout_ms:
+                return sent_up, sent_down, "idle_timeout"
+            if (now - started) * 1000 >= config.max_session_ms:
+                return sent_up, sent_down, "session_lifetime"
+            # Decrypted bytes OpenSSL already holds never make the raw socket
+            # readable again, so drain them before deciding to wait.
+            if tls.pending() and len(down) < cap and not read_tls():
+                return sent_up, sent_down, "provider_error"
+
+            if client_eof and not up and not in_flight:
+                return sent_up, sent_down, "client_closed"
+            if tls_eof and not down:
+                return sent_up, sent_down, "provider_closed"
+
+            client_events = 0
+            if not client_eof and len(up) < cap:
+                client_events |= selectors.EVENT_READ
+            if down:
+                client_events |= selectors.EVENT_WRITE
+            tls_events = 0
+            if (not tls_eof and len(down) < cap) or tls_wants_read_for_write:
+                tls_events |= selectors.EVENT_READ
+            if (up or in_flight) and not tls_wants_read_for_write:
+                tls_events |= selectors.EVENT_WRITE
+            want(client, client_events)
+            want(tls, tls_events)
+
+            wait = min(
+                config.idle_timeout_ms / 1000 - (now - last),
+                config.max_session_ms / 1000 - (now - started),
+            )
+            ready = selector.select(timeout=max(0.0, wait))
+            for key, mask in ready:
+                if key.fileobj is client:
+                    if mask & selectors.EVENT_READ:
+                        try:
+                            data = client.recv(min(READ_CHUNK, cap - len(up)))
+                        except BlockingIOError:
+                            data = None
+                        except OSError:
+                            return sent_up, sent_down, "client_error"
+                        if data == b"":
+                            client_eof = True
+                        elif data:
+                            up.extend(data)
+                            last = time.monotonic()
+                    if mask & selectors.EVENT_WRITE and down:
+                        try:
+                            written = client.send(down)
+                        except BlockingIOError:
+                            written = 0
+                        except OSError:
+                            return sent_up, sent_down, "client_error"
+                        del down[:written]
+                        sent_down += written
+                        if written:
+                            last = time.monotonic()
+                else:
+                    if mask & selectors.EVENT_READ:
+                        tls_wants_read_for_write = False
+                        if not read_tls():
+                            return sent_up, sent_down, "provider_error"
+                    if mask & selectors.EVENT_WRITE and (up or in_flight):
+                        if not in_flight:
+                            in_flight = bytes(up[:16384])
+                            del up[:len(in_flight)]
+                        try:
+                            written = tls.send(in_flight)
+                        except ssl.SSLWantWriteError:
+                            written = 0
+                        except ssl.SSLWantReadError:
+                            tls_wants_read_for_write = True
+                            written = 0
+                        except (ssl.SSLError, OSError):
+                            return sent_up, sent_down, "provider_error"
+                        in_flight = in_flight[written:]
+                        sent_up += written
+                        if written:
+                            last = time.monotonic()
+    finally:
+        selector.close()
+
+
+# --------------------------------------------------------------------------
+# Server
+# --------------------------------------------------------------------------
+
+
+class Helper:
+    def __init__(self, config: Config, log: Log) -> None:
+        self.config = config
+        self.log = log
+        self.context = client_context(config)
+        self.slots = threading.BoundedSemaphore(config.max_sessions)
+        self.listener: socket.socket | None = None
+        self.stopping = threading.Event()
+
+    def bind(self) -> None:
+        path = self.config.socket
+        try:
+            mode = os.lstat(path).st_mode
+        except FileNotFoundError:
+            mode = None
+        if mode is not None:
+            # Replace a stale socket, never anything else that happens to be
+            # at the path.
+            if not stat.S_ISSOCK(mode):
+                raise SystemExit(f"hypellm-tls-helper: {path} exists and is not a socket")
+            os.unlink(path)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        # 0660: the router's group connects; nobody else. The directory's own
+        # permissions are the real gate (see the component page).
+        previous = os.umask(0o117)
+        try:
+            listener.bind(path)
+        finally:
+            os.umask(previous)
+        listener.listen(min(self.config.max_sessions, 128))
+        self.listener = listener
+
+    def serve_forever(self) -> None:
+        assert self.listener is not None
+        self.log.emit("info", "helper.listening", socket=self.config.socket,
+                      destinations=len(self.config.destinations), max_sessions=self.config.max_sessions)
+        while not self.stopping.is_set():
+            try:
+                conn, _ = self.listener.accept()
+            except OSError:
+                if self.stopping.is_set():
+                    return
+                continue
+            if not self.slots.acquire(blocking=False):
+                # Full: refuse at once rather than queue. A queued session
+                # would hold the router's request thread on a promise.
+                self.refuse(conn, "busy")
+                self.log.emit("warn", "session.refused", code="busy")
+                continue
+            threading.Thread(target=self.session, args=(conn,), daemon=True).start()
+
+    def stop(self) -> None:
+        self.stopping.set()
+        if self.listener is not None:
+            try:
+                self.listener.close()
+            except OSError:
+                pass
+
+    @staticmethod
+    def refuse(conn: socket.socket, code: str) -> None:
+        try:
+            conn.settimeout(1.0)
+            conn.sendall(f"ERR {code}\n".encode("ascii"))
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    def session(self, conn: socket.socket) -> None:
+        started = time.monotonic()
+        request: Request | None = None
+        tls: ssl.SSLSocket | None = None
+        try:
+            try:
+                request = parse_request(read_line(conn, self.config.line_timeout_ms))
+                row = self.config.destinations.get((request.sni, request.port))
+                if row is None:
+                    raise Refusal("destination_not_allowlisted")
+                addresses = choose_addresses(request, row, self.config)
+                tls = open_tls(addresses, request, self.config, self.context)
+            except Refusal as refusal:
+                self.log.emit("info", "session.refused", code=refusal.code,
+                              sni=request.sni if request else None,
+                              port=request.port if request else None)
+                self.refuse(conn, refusal.code)
+                return
+            peer = tls.getpeername()[0]
+            conn.settimeout(5.0)
+            conn.sendall(b"OK\n")
+            up, down, ended = relay(conn, tls, self.config)
+            self.log.emit("info", "session.closed", sni=request.sni, port=request.port,
+                          address=peer, tls=tls.version(), bytes_up=up, bytes_down=down,
+                          ended=ended, duration_ms=int((time.monotonic() - started) * 1000))
+        except Exception as error:  # noqa: BLE001 - one session, never the process
+            self.log.emit("error", "session.failed", kind=type(error).__name__,
+                          sni=request.sni if request else None)
+        finally:
+            if tls is not None:
+                try:
+                    tls.close()
+                except OSError:
+                    pass
+            try:
+                conn.close()
+            except OSError:
+                pass
+            self.slots.release()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="HypeLLM reference outbound TLS helper")
+    parser.add_argument("--config", required=True, help="path to the JSON configuration")
+    parser.add_argument("--socket", help="override the configured socket path")
+    parser.add_argument("--check", action="store_true", help="validate the configuration and exit")
+    args = parser.parse_args(argv)
+
+    try:
+        config = load_config(args.config, args.socket)
+    except (OSError, ValueError) as error:
+        print(f"hypellm-tls-helper: {error}", file=sys.stderr)
+        return 2
+    if args.check:
+        print(f"configuration is valid: {len(config.destinations)} destinations")
+        return 0
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        print("hypellm-tls-helper: refusing to run as root", file=sys.stderr)
+        return 2
+
+    log = Log(config.log_level)
+    present = [name for name in PROXY_VARIABLES if os.environ.get(name)]
+    if present:
+        log.emit("warn", "helper.proxy_environment_ignored", variables=present)
+    helper = Helper(config, log)
+    helper.bind()
+    try:
+        helper.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        helper.stop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

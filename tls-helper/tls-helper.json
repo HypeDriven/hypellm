@@ -1,0 +1,18 @@
+{
+  "comment": "The deployment's outbound allowlist. A provider with scheme=https in docker/hypellm.conf is reachable only if its (sni, port) is a row here. See spec/components/tls-helper.html.",
+  "socket": "/run/hypellm-tls/tls.sock",
+  "max_sessions": 64,
+  "line_timeout_ms": 5000,
+  "connect_timeout_ms": 10000,
+  "handshake_timeout_ms": 10000,
+  "idle_timeout_ms": 900000,
+  "max_session_ms": 3600000,
+  "buffer_bytes": 262144,
+  "log_level": "info",
+  "destinations": [
+    {"sni": "api.deepseek.com", "port": 443},
+    {"sni": "api.openai.com", "port": 443},
+    {"sni": "api.anthropic.com", "port": 443},
+    {"sni": "api.moonshot.ai", "port": 443}
+  ]
+}
