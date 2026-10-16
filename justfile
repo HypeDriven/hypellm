@@ -46,6 +46,10 @@ verifier_dir  := justfile_directory() / "run" / "verifier"
 # The one-shot tools below (`check`, `password`, `shell`, secret generation)
 # run as the invoking user so the bind-mounted files stay readable from the
 # host without sudo. The pod runs as uid/gid 1000 for the same reason.
+# The LAN publisher in k8s/publish.yaml binds this address; keep the two in step.
+lan_addr := "192.168.8.121"
+lan_net  := "192.168.8.0/24"
+
 uid := `id -u`
 gid := `id -g`
 
@@ -478,6 +482,7 @@ endpoints:
     row GET  "/health/live"          "unauthenticated"
     row GET  "/health/ready"         "unauthenticated"
     printf '  \033[2m%s\033[0m\n' "also on http://127.0.0.1:{{inference_port}} from this host"
+    printf '  \033[2m%s\033[0m\n' "and on http://{{lan_addr}}:{{inference_port}} from {{lan_net}} (plain HTTP; \`just lan-firewall\` once)"
     printf '  \033[2m%s\033[0m\n' "a router API key is required; tailnet reachability is not authentication"
 
     head "Management" "$admin — session cookie + CSRF"
@@ -541,6 +546,20 @@ tailnet:
            then "  none advertised on this tailnet — LAN slaves are unreachable"
            else ($r[] | "  \(.DNSName | rtrimstr(".")) advertises \((.PrimaryRoutes // []) | join(", "))")
            end)'
+
+# WSL's mirrored mode puts the LAN address on this distro, but the Hyper-V
+# firewall in front of it blocks inbound by default. One rule, inference only,
+# from the LAN only — the same shape as the k3s rules lan-stage1.ps1 adds.
+# Changes the Windows host, so it asks for elevation (a UAC prompt).
+[doc('Allow LAN peers through the Hyper-V firewall to the inference port')]
+lan-firewall:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    name="HypeLLM-Inference-TCP-{{inference_port}}"
+    ps="if (-not (Get-NetFirewallHyperVRule -Name '$name' -ErrorAction SilentlyContinue)) { New-NetFirewallHyperVRule -Name '$name' -DisplayName '$name' -Direction Inbound -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -Protocol TCP -LocalPorts {{inference_port}} -RemoteAddresses '{{lan_net}}' -Action Allow | Out-Null }"
+    enc=$(printf '%s' "$ps" | iconv -t UTF-16LE | base64 -w0)
+    powershell.exe -NoProfile -Command "Start-Process powershell.exe -Verb RunAs -Wait -ArgumentList '-NoProfile','-EncodedCommand','$enc'"
+    powershell.exe -NoProfile -Command "Get-NetFirewallHyperVRule -Name '$name' | Format-Table Name,Direction,Action,LocalPorts" | tr -d '\r'
 
 # --- internals -------------------------------------------------------------
 

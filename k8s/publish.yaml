@@ -1,5 +1,5 @@
 # Host ports. k8s Service ports are iptables-only and WSL forwards only real sockets to Windows,
-# so each published port is a socat listener on the node. Loopback only, as under Compose.
+# so each published port is a socat listener on the node. Loopback, plus inference on the LAN.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -25,6 +25,15 @@ spec:
         - name: inference
           image: alpine/socat:1.8.0.3
           args: ["TCP-LISTEN:18000,bind=127.0.0.1,fork,reuseaddr", "TCP:hypellm:18000"]
+        # Inference only, on the LAN address (WSL mirrored mode; $ServerLan in
+        # ~/system/k3s/lan-migration/lan-stage1.ps1). Bound to that one address, not 0.0.0.0, so it
+        # is not also published on the Windows host's own tailnet interface. Management is not
+        # published here: its session cookie is `__Host-`/Secure, which a browser drops over plain
+        # HTTP to anything but localhost — use the tailnet HTTPS name. `just lan-firewall` opens the
+        # port in the Hyper-V firewall, which blocks inbound by default.
+        - name: inference-lan
+          image: alpine/socat:1.8.0.3
+          args: ["TCP-LISTEN:18000,bind=192.168.8.121,fork,reuseaddr,range=192.168.8.0/24", "TCP:hypellm:18000"]
         - name: management
           image: alpine/socat:1.8.0.3
           args: ["TCP-LISTEN:18001,bind=127.0.0.1,fork,reuseaddr", "TCP:hypellm:18001"]
