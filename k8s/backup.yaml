@@ -1,0 +1,77 @@
+# A nightly backup of the router's durable state, and a dated copy of each one.
+#
+# `hypellm-router --backup` asks the running router, over its authenticated control socket, to
+# write a consistent snapshot into `settings backup_dir` (run/backups/current on the node). The
+# router overwrites that one directory each time, so this job then copies it to
+# run/backups/archive/<UTC timestamp> and keeps the newest 14. The copy is taken from a finished
+# backup, never from the live state directory, which is what makes it consistent.
+#
+# Everything a backup holds — key verifiers, session digests, the audit chain — is as sensitive
+# as run/state itself; run/backups is 0700 like it (`just _dirs`).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup
+spec:
+  schedule: "17 3 * * *"
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 600
+      template:
+        spec:
+          restartPolicy: Never
+          # hostPath state: the job has to run where the router's directories are.
+          nodeSelector:
+            kubernetes.io/hostname: desktop-oin3g16
+          automountServiceAccountToken: false
+          enableServiceLinks: false
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+          containers:
+            - name: backup
+              image: hypellm-router:local
+              imagePullPolicy: Never
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  ulimit -c 0
+                  /usr/local/bin/hypellm-router --backup \
+                      --config /etc/hypellm/hypellm.conf --secrets /etc/hypellm/secrets
+                  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+                  mkdir -p /var/backups/hypellm/archive
+                  cp -a /var/backups/hypellm/current "/var/backups/hypellm/archive/$stamp.partial"
+                  mv "/var/backups/hypellm/archive/$stamp.partial" "/var/backups/hypellm/archive/$stamp"
+                  # Newest 14 kept; names sort by time. `.partial` leftovers from a killed run go too.
+                  ls -1 /var/backups/hypellm/archive | grep -v '\.partial$' | sort -r | tail -n +15 \
+                      | while read -r old; do rm -rf "/var/backups/hypellm/archive/$old"; done
+                  find /var/backups/hypellm/archive -maxdepth 1 -name '*.partial' -mmin +60 -exec rm -rf {} +
+                  echo "archived as $stamp"
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: [ALL]}
+                seccompProfile: {type: RuntimeDefault}
+              volumeMounts:
+                # The raw configuration: `--backup` reads only `state_dir` (the control socket's
+                # directory) from it, which the pod-IP rendering does not change.
+                - {name: config-src, mountPath: /etc/hypellm/hypellm.conf, subPath: hypellm.conf, readOnly: true}
+                - {name: secrets, mountPath: /etc/hypellm/secrets, readOnly: true}
+                - {name: state, mountPath: /var/lib/hypellm, readOnly: true}
+                - {name: backups, mountPath: /var/backups/hypellm}
+          volumes:
+            - name: config-src
+              configMap: {name: hypellm-config}
+            - name: secrets
+              hostPath: {path: "${PROJECT_DIR}/run/secrets", type: Directory}
+            - name: state
+              hostPath: {path: "${PROJECT_DIR}/run/state", type: Directory}
+            - name: backups
+              hostPath: {path: "${PROJECT_DIR}/run/backups", type: Directory}

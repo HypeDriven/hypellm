@@ -7,6 +7,7 @@ labels:
 resources:
   - hypellm.yaml
   - publish.yaml
+  - backup.yaml
 # Rolled on change through the name hash, so `just up` after editing either file restarts the pod.
 configMapGenerator:
   - name: hypellm-config
