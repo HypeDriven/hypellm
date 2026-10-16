@@ -249,6 +249,19 @@ pub trait LiveState {
         None
     }
 
+    /// Whether the router's liveness probe currently finds this target down.
+    ///
+    /// An eligibility filter, like [`LiveState::circuit_open`], and kept
+    /// separate from it: a breaker is moved by the outcomes of routed
+    /// requests, this by the background probe alone, and neither can move the
+    /// other. `false` — the default — is what every implementor without a
+    /// probe answers, including [`IdealLiveState`], so policy simulation is
+    /// unaffected by what the probe last saw.
+    fn probe_unreachable(&self, target: &TargetId) -> bool {
+        let _ = target;
+        false
+    }
+
     /// The observed failure percentage for a target, 0 to 100.
     ///
     /// Used by the failure-policy filter of specification 6.2. Distinct from
@@ -897,6 +910,11 @@ impl PolicySnapshot {
         }
         if live.circuit_open(&target.id) {
             return Err(ExclusionReason::CircuitOpen);
+        }
+        // After the breaker, so a target both measures have condemned is
+        // reported by the request-driven one, which is the stronger evidence.
+        if live.probe_unreachable(&target.id) {
+            return Err(ExclusionReason::ProbeUnreachable);
         }
         // Specification 6.2: the target must be "healthy enough for the
         // requested failure policy". A filter, not a penalty — a target failing
@@ -2733,6 +2751,84 @@ mod tests {
         assert_eq!(
             excluded_for(&outcome, "openai:gpt"),
             Some(ExclusionReason::CapacityExhausted)
+        );
+    }
+
+    #[test]
+    fn a_target_the_probe_finds_down_is_filtered_however_well_it_ranks() {
+        // The probed-down target is the local, cheap one every other term
+        // favours: if being unreachable were a penalty, it would still win.
+        #[derive(Debug)]
+        struct ProbedDown;
+        impl LiveState for ProbedDown {
+            fn circuit_open(&self, _t: &TargetId) -> bool {
+                false
+            }
+            fn probe_unreachable(&self, t: &TargetId) -> bool {
+                t.as_str() == "local:qwen"
+            }
+            fn health_penalty(&self, _t: &TargetId) -> i64 {
+                0
+            }
+            fn latency_penalty(&self, _t: &TargetId) -> i64 {
+                0
+            }
+            fn queue_penalty(&self, _t: &TargetId) -> i64 {
+                0
+            }
+            fn affinity_bonus(&self, _t: &TargetId) -> i64 {
+                0
+            }
+            fn has_capacity(&self, _t: &TargetId) -> bool {
+                true
+            }
+        }
+
+        let mut s = snapshot();
+        s.bindings.push(Binding {
+            id: bid("all"),
+            scope: BindingScope::Tenant(TenantId::new("acme").unwrap()),
+            model: ModelSelector::Any,
+            preferences: vec![TargetPreference {
+                selector: TargetSelector::Exact(tid("local:qwen")),
+                rank: 0,
+                weight: 0,
+            }, TargetPreference {
+                selector: TargetSelector::Any,
+                rank: 1,
+                weight: 0,
+            }],
+            denies: Vec::new(),
+            allows: Vec::new(),
+            pin: None,
+            emergency_fallback: Vec::new(),
+            priority: 0,
+        });
+
+        let req = request("code-premium");
+        let principal = req.principal.clone();
+        let tenant = req.tenant.clone();
+        let groups: Vec<GroupId> = Vec::new();
+        let attempted: Vec<TargetId> = Vec::new();
+        let c = ctx(&principal, &groups, &tenant, &attempted);
+
+        let healthy = s.route(&c, &req, &IdealLiveState);
+        assert_eq!(chosen(&healthy), Some("local:qwen"), "the fixture must favour it");
+
+        let outcome = s.route(&c, &req, &ProbedDown);
+        assert_eq!(
+            excluded_for(&outcome, "local:qwen"),
+            Some(ExclusionReason::ProbeUnreachable)
+        );
+        assert!(
+            chosen(&outcome).is_some_and(|t| t != "local:qwen"),
+            "the remaining targets must still route"
+        );
+        // Equal inputs, equal output: the probe changes live state, not the
+        // function.
+        assert_eq!(
+            format!("{:?}", s.route(&c, &req, &ProbedDown).candidates),
+            format!("{:?}", outcome.candidates)
         );
     }
 

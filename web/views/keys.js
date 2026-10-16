@@ -984,25 +984,25 @@ function accessEditor(ctx, row, { onClose, onChanged }) {
 }
 
 /**
- * The form inside the access editor, once the ceiling has been read.
+ * The Models, Slaves and Priority controls, built from a principal's ceiling.
  *
- * @param {object} ctx
- * @param {object} row
- * @param {object} data The `GET /keys/{id}/restrictions` body.
- * @param {string} etag
- * @param {() => Promise<void>} onChanged
- * @returns {HTMLElement[]}
+ * Shared by the access editor and the create form, so a key minted narrowed
+ * is offered exactly the choices narrowing it later would be.
+ *
+ * @param {object} ceiling The `ceiling` object of `GET /keys/{id}/restrictions`
+ *   or `GET /keys:ceiling`.
+ * @param {object} current The restrictions to start from; `{}` allows all.
+ * @param {string} prefix Element id prefix, unique on the page.
+ * @returns {{elements: HTMLElement[], principalClass: string, problem: () => string|null, payload: () => object}}
  */
-function accessForm(ctx, row, data, etag, onChanged) {
-  const ceiling = data.ceiling || {};
-  const current = data.restrictions || {};
+function accessControls(ceiling, current, prefix) {
   const models = Array.isArray(ceiling.models) ? ceiling.models : [];
   const targets = Array.isArray(ceiling.targets) ? ceiling.targets : [];
   const hosts = Array.isArray(ceiling.hosts) ? ceiling.hosts : [];
   const principalClass = PRIORITIES.includes(ceiling.priority) ? ceiling.priority : 'standard';
 
   const modelList = allowlist({
-    id: 'key-access-models',
+    id: `${prefix}-models`,
     legend: 'Models',
     allLabel: 'Every model the principal may use',
     choices: models.map((m) => ({
@@ -1013,7 +1013,7 @@ function accessForm(ctx, row, data, etag, onChanged) {
     current: current.models,
   });
   const targetList = allowlist({
-    id: 'key-access-targets',
+    id: `${prefix}-targets`,
     legend: 'Slaves and targets',
     allLabel: 'Every target the principal may be served by',
     choices: targets.map((t) => ({
@@ -1028,7 +1028,7 @@ function accessForm(ctx, row, data, etag, onChanged) {
   const hostList =
     hosts.length > 0 || Array.isArray(current.hosts)
       ? allowlist({
-          id: 'key-access-hosts',
+          id: `${prefix}-hosts`,
           legend: 'Fleet slaves',
           allLabel: 'Every slave the principal may use',
           choices: hosts.map((h) => ({ value: String(h), label: String(h) })),
@@ -1036,7 +1036,7 @@ function accessForm(ctx, row, data, etag, onChanged) {
         })
       : null;
 
-  const priority = el('select', { id: 'key-access-priority' }, [
+  const priority = el('select', { id: `${prefix}-priority` }, [
     el('option', { value: '' }, `As the principal (${principalClass})`),
     ...PRIORITIES.map((name) => {
       const option = el('option', { value: name }, name);
@@ -1050,30 +1050,63 @@ function accessForm(ctx, row, data, etag, onChanged) {
   ]);
   priority.value = typeof current.priority === 'string' ? current.priority : '';
 
+  const offeredModels = new Set(models.map((m) => String(m.id)));
+  const offeredTargets = new Set(targets.map((t) => String(t.id)));
+  const offeredHosts = new Set(hosts.map(String));
+  const keep = (list, offered) => (list === null ? null : list.filter((v) => offered.has(v)));
+
+  return {
+    principalClass,
+    elements: [
+      modelList.element,
+      targetList.element,
+      hostList ? hostList.element : null,
+      field({
+        id: `${prefix}-priority`,
+        label: 'Priority',
+        hint: 'Where this key\u2019s requests queue when a model is busy. A key can queue below its principal, never above.',
+        control: priority,
+      }),
+    ],
+    problem: () =>
+      [modelList, targetList, hostList]
+        .filter(Boolean)
+        .map((l) => l.problem())
+        .find(Boolean) || null,
+    payload: () => ({
+      models: keep(modelList.value(), offeredModels),
+      targets: keep(targetList.value(), offeredTargets),
+      hosts: hostList ? keep(hostList.value(), offeredHosts) : null,
+      priority: priority.value === '' ? null : priority.value,
+    }),
+  };
+}
+
+/**
+ * The form inside the access editor, once the ceiling has been read.
+ *
+ * @param {object} ctx
+ * @param {object} row
+ * @param {object} data The `GET /keys/{id}/restrictions` body.
+ * @param {string} etag
+ * @param {() => Promise<void>} onChanged
+ * @returns {HTMLElement[]}
+ */
+function accessForm(ctx, row, data, etag, onChanged) {
+  const controls = accessControls(data.ceiling || {}, data.restrictions || {}, 'key-access');
   const status = el('p', { class: 'field__hint', role: 'status', 'aria-live': 'polite' });
 
   const save = actionButton(
     'Save access',
     async () => {
       status.textContent = '';
-      const lists = [modelList, targetList, hostList].filter(Boolean);
-      const problem = lists.map((l) => l.problem()).find(Boolean);
+      const problem = controls.problem();
       if (problem) {
         status.textContent = problem;
         return;
       }
-      const offeredModels = new Set(models.map((m) => String(m.id)));
-      const offeredTargets = new Set(targets.map((t) => String(t.id)));
-      const offeredHosts = new Set(hosts.map(String));
-      const keep = (list, offered) => (list === null ? null : list.filter((v) => offered.has(v)));
-      const payload = {
-        models: keep(modelList.value(), offeredModels),
-        targets: keep(targetList.value(), offeredTargets),
-        hosts: hostList ? keep(hostList.value(), offeredHosts) : null,
-        priority: priority.value === '' ? null : priority.value,
-      };
       try {
-        await ctx.api.put(`/keys/${encodeURIComponent(row.id)}/restrictions`, payload, etag);
+        await ctx.api.put(`/keys/${encodeURIComponent(row.id)}/restrictions`, controls.payload(), etag);
       } catch (error) {
         if (error instanceof ApiError && error.needsReauthentication) {
           status.textContent =
@@ -1097,31 +1130,35 @@ function accessForm(ctx, row, data, etag, onChanged) {
     { busyLabel: 'Saving\u2026' },
   );
 
-  const shared = Number(data.keys_sharing_principal) || 0;
   return [
     definitionList([
       ['Principal', String(data.principal || row.principal || '\u2014')],
-      ['Principal\u2019s priority', principalClass],
+      ['Principal\u2019s priority', controls.principalClass],
     ]),
-    shared > 0
-      ? el('p', {
-          class: 'field__hint',
-          role: 'note',
-          text: `${shared} other active ${shared === 1 ? 'key signs' : 'keys sign'} in as this principal. They share its policy, so a change to that reaches them too; what you set here narrows this key only.`,
-        })
-      : null,
-    modelList.element,
-    targetList.element,
-    hostList ? hostList.element : null,
-    field({
-      id: 'key-access-priority',
-      label: 'Priority',
-      hint: 'Where this key\u2019s requests queue when a model is busy. A key can queue below its principal, never above.',
-      control: priority,
-    }),
+    sharedPrincipalNote(data.keys_sharing_principal, 'what you set here narrows this key only'),
+    ...controls.elements,
     buttonRow([save]),
     status,
   ];
+}
+
+/**
+ * A note that other keys sign in as the same principal, or null when none do.
+ *
+ * @param {unknown} count `keys_sharing_principal` from the router.
+ * @param {string} tail What the narrowing on this screen affects.
+ * @returns {HTMLElement|null}
+ */
+function sharedPrincipalNote(count, tail) {
+  const shared = Number(count) || 0;
+  if (shared <= 0) {
+    return null;
+  }
+  return el('p', {
+    class: 'field__hint',
+    role: 'note',
+    text: `${shared} other active ${shared === 1 ? 'key signs' : 'keys sign'} in as this principal. They share its policy, so a change to that reaches them too; ${tail}.`,
+  });
 }
 
 /**
@@ -1171,6 +1208,11 @@ function columns(onRevoke, onExpiry, onAccess, onBudget) {
           : formatTime(row.expires_at),
     },
     { label: 'Access', cell: (row) => accessCell(row.restrictions) },
+    {
+      label: 'Usage',
+      cell: (row) =>
+        el('a', { href: `#/usage?principal=${encodeURIComponent(String(row.principal || ''))}&key=${encodeURIComponent(String(row.id))}` }, 'Usage'),
+    },
     {
       label: 'Action',
       cell: (row) => {
@@ -1338,6 +1380,88 @@ function createForm(ctx, state, { secretRegion, onCreated }) {
   });
   const description = el('input', { type: 'text', autocomplete: 'off' });
   const expiry = el('input', { type: 'date' });
+  const sources = el('input', {
+    type: 'text',
+    autocomplete: 'off',
+    spellcheck: 'false',
+    placeholder: '192.168.8.0/24, 100.64.0.0/10',
+  });
+
+  // Narrowing at creation. The choices are the principal's ceiling, read from
+  // the router for whatever principal is typed, so a key minted narrowed is
+  // offered exactly what narrowing it later would be. Off by default: an
+  // unticked box mints a key with its principal's access, as before.
+  const narrow = el('input', {
+    type: 'checkbox',
+    id: 'key-create-narrow',
+    'aria-label': 'Narrow this key within its principal\u2019s access',
+  });
+  const accessRegion = el('div', { class: 'policy-stack' });
+  /** @type {{principal: string, controls: ReturnType<typeof accessControls>}|null} */
+  let access = null;
+  let accessLoad = 0;
+
+  async function loadAccess() {
+    access = null;
+    accessLoad += 1;
+    const token = accessLoad;
+    if (!narrow.checked) {
+      replace(accessRegion, []);
+      return;
+    }
+    const value = principal.value.trim();
+    if (!PRINCIPAL_PATTERN.test(value)) {
+      replace(accessRegion, [
+        el('p', { class: 'field__hint', text: 'Enter the principal first: the choices are what it may use.' }),
+      ]);
+      return;
+    }
+    replace(accessRegion, [
+      el('p', { class: 'field__hint', text: `Loading what ${value} may use\u2026` }),
+    ]);
+    try {
+      // Shared, so reading the ceiling does not cancel the key list's load.
+      const { data } = await ctx.api.get(`/keys:ceiling?principal=${encodeURIComponent(value)}`, {
+        shared: true,
+      });
+      if (token !== accessLoad || state.disposed) {
+        return;
+      }
+      const controls = accessControls(data.ceiling || {}, {}, 'key-create-access');
+      access = { principal: value, controls };
+      replace(accessRegion, [
+        sharedPrincipalNote(data.keys_sharing_principal, 'what you set here narrows the new key only'),
+        ...controls.elements,
+      ]);
+    } catch (error) {
+      if (token !== accessLoad) {
+        return;
+      }
+      const message =
+        error instanceof ApiError && error.needsReauthentication
+          ? 'Reading what the principal may use needs a recent sign-in. Sign out and back in, then try again.'
+          : `What the principal may use could not be read: ${error && error.message ? error.message : String(error)}`;
+      replace(accessRegion, [el('p', { class: 'field__hint', role: 'alert', text: message })]);
+    }
+  }
+  narrow.addEventListener('change', () => void loadAccess());
+  principal.addEventListener('change', () => {
+    if (narrow.checked) {
+      void loadAccess();
+    }
+  });
+  const accessSet = el('fieldset', { class: 'checkset' }, [
+    el('legend', { class: 'checkset__legend' }, 'Access (optional)'),
+    el('div', { class: 'checkset__item' }, [
+      narrow,
+      el('label', { for: 'key-create-narrow' }, 'Narrow this key within its principal\u2019s access'),
+      el('span', {
+        class: 'checkset__hint',
+        text: 'Some of the principal\u2019s models, slaves and targets, and a lower priority. The key is narrowed from its first request.',
+      }),
+    ]),
+    accessRegion,
+  ]);
 
   const boxes = new Map();
   const scopeItems = SCOPES.map((scope) => {
@@ -1395,6 +1519,13 @@ function createForm(ctx, state, { secretRegion, onCreated }) {
       hint: 'The key stops working at 00:00:00 UTC on this day. Leave it empty for a key that never expires.',
       control: expiry,
     }),
+    field({
+      id: 'key-sources',
+      label: 'Source networks (optional)',
+      hint: 'CIDR blocks the key may be used from, separated by commas or spaces. Leave it empty for a key usable from anywhere.',
+      control: sources,
+    }),
+    accessSet,
     buttonRow([submit]),
     status,
   ]);
@@ -1414,7 +1545,7 @@ function createForm(ctx, state, { secretRegion, onCreated }) {
       form,
       el('p', {
         class: 'field__hint',
-        text: 'Source restriction and management roles are not settable through this API: keys are created usable from any source and with no management role.',
+        text: 'A key carries no management role of its own: its management permissions, if it has a management scope, are its principal\u2019s role bindings.',
       }),
     ],
   });
@@ -1468,7 +1599,44 @@ function createForm(ctx, state, { secretRegion, onCreated }) {
       expiresAt = parsed;
     }
 
+    const networks = sources.value
+      .split(/[\s,]+/)
+      .map((entry) => entry.trim())
+      .filter((entry) => entry !== '');
+    if (networks.some((entry) => !entry.includes('/'))) {
+      status.textContent =
+        'Write each source network as a CIDR block with a prefix length, such as 10.0.0.0/8 or 203.0.113.7/32.';
+      sources.focus();
+      return;
+    }
+
+    /** @type {object|undefined} */
+    let restrictions;
+    if (narrow.checked) {
+      if (!access || access.principal !== principalValue) {
+        status.textContent =
+          'The access choices are not loaded for this principal yet. Wait for them, or untick \u201cNarrow this key\u201d.';
+        return;
+      }
+      const problem = access.controls.problem();
+      if (problem) {
+        status.textContent = problem;
+        return;
+      }
+      const payload = access.controls.payload();
+      // All four "as the principal" narrows nothing; send nothing.
+      if (Object.values(payload).some((value) => value !== null)) {
+        restrictions = payload;
+      }
+    }
+
     const body = { principal: principalValue, scopes };
+    if (networks.length > 0) {
+      body.source_networks = networks;
+    }
+    if (restrictions !== undefined) {
+      body.restrictions = restrictions;
+    }
     const descriptionValue = description.value.trim();
     if (descriptionValue !== '') {
       body.description = descriptionValue;
@@ -1485,6 +1653,10 @@ function createForm(ctx, state, { secretRegion, onCreated }) {
       if (error instanceof ApiError && error.needsReauthentication) {
         status.textContent =
           'Creating a key needs a recent sign-in. Sign out and back in, then try again — no key was created.';
+        return;
+      }
+      if (error instanceof ApiError && [400, 403, 422].includes(error.status)) {
+        status.textContent = `${error.message}. No key was created.`;
         return;
       }
       throw error;
@@ -1511,6 +1683,9 @@ function createForm(ctx, state, { secretRegion, onCreated }) {
     principal.value = '';
     description.value = '';
     expiry.value = '';
+    sources.value = '';
+    narrow.checked = false;
+    void loadAccess();
     for (const box of boxes.values()) {
       box.checked = false;
     }
@@ -1544,6 +1719,7 @@ function createForm(ctx, state, { secretRegion, onCreated }) {
         ['Key id', String(created.id || '—')],
         ['Principal', String(created.principal || '—')],
         ['Scopes', (Array.isArray(created.scopes) ? created.scopes : []).join(', ')],
+        ['Access', accessCell(created.restrictions)],
       ]),
     ]);
 

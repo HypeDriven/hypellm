@@ -41,6 +41,7 @@
 <details open class="nav-group"><summary>Components</summary><ul>
 <li><a href="../components/fleet-agent.html">Fleet agent</a></li>
 <li><a href="../components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="../components/tls-helper.html">Outbound TLS helper</a></li>
 <li><a href="../components/container-init.html">Container init</a></li>
 <li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
 </ul></details>
@@ -242,7 +243,14 @@ too, so an expiry edit and a restriction edit cannot lose each other — and <co
 revoked key, exactly as for expiry. No second person is required, because nothing here can
 widen what the policy allows. The audit record (<code>key_restrictions_changed</code>) precedes the
 change and names both states; the change is <code>RecordKind::ApiKeyRestriction</code>, never a
-re-appended key record. Listed keys carry <code>restrictions</code>. Both endpoints are additions to
+re-appended key record. Listed keys carry <code>restrictions</code>.
+<code>POST /admin/v1/keys</code> takes the same body as an optional <code>restrictions</code> field,
+parsed and checked by the same code before the key exists, so a refused one creates nothing. The
+restriction frame is appended before the key's own record: a crash between them leaves an inert
+restriction (replay holds it for a key it has not seen, and none follows) rather than a durable
+unrestricted key, and embedding it in the key record instead would let a router from before
+restrictions read the key unrestricted. <code>GET /admin/v1/keys:ceiling?principal=…</code> returns
+the same ceiling for a principal with no key yet, for the create form, to <code>ManageKeys</code>. Both endpoints are additions to
 specification 16, recorded in <code>spec/deferred-issues.html</code>.</p>
 <h3 id="the-fleet-surface">The fleet surface</h3>
 <p>Eight endpoints under <code>/admin/v1/fleet</code> (specification 26), the eighth being
@@ -376,9 +384,12 @@ visits an authenticated channel to the control plane.</li>
 <li><strong>Cross-tenant disclosure through management views.</strong> <code>DecisionCache::get</code>
 requires a tenant match and reports another tenant's trace as <em>absent</em> rather
 than forbidden, so the response does not confirm that a request with that
-identifier exists. <code>UsageAggregate::rows</code> never crosses a tenant boundary and
-refuses to attribute an overflow row to any principal, so <code>ReadOwnUsage</code> can
-never surface another principal's tokens. <code>list_keys</code> filters by
+identifier exists. <code>UsageAggregate::rows</code> and <code>UsageAggregate::window</code>
+never cross a tenant boundary and refuse to attribute an overflow row to any
+principal, so <code>ReadOwnUsage</code> can never surface another principal's tokens.
+<code>GET /admin/v1/usage/principals</code> answers a principal-scoped reader with its own
+principal and keys only; a <code>principal=</code> filter naming anyone else returns an
+empty result rather than a refusal, so the endpoint does not confirm the name. <code>list_keys</code> filters by
 <code>session.tenant</code>, and <code>list_audit</code> reads only the caller's tenant's records.
 <code>patch_target</code> (including quarantine) answers 404 for a target outside
 <code>visible_targets</code> before the <code>If-Match</code> check, so a stale tag is not an
@@ -537,6 +548,11 @@ amplifier. The trade is stated in <code>spec/deferred-issues.html</code>.</p>
 <td>Traffic windows tracked</td>
 <td><code>traffic::MAX_TENANTS</code> = 64 tenants, each a fixed ring of <code>SLOTS</code> = 30 slots of <code>SLOT_MILLIS</code> = 10 s. Nothing is allocated per request; a slot is recycled by overwriting. A tenant past the cap is counted in <code>unattributed_samples</code> and reported as <code>attributed: false</code> rather than as zero traffic</td>
 <td><code>TrafficWindow::record</code></td>
+</tr>
+<tr>
+<td>Per-principal usage rollup</td>
+<td>hourly buckets per (tenant, principal, key), at most <code>MAX_ROLLUP_SERIES</code> = 16 384 attributed rows; further rows fold into one unattributed row per (hour, tenant), reported as <code>unattributed</code> and <code>truncated</code>. Buckets older than <code>ROLLUP_RETENTION_BUCKETS</code> = 720 hours are pruned as the clock advances, and a sample older than that is not recorded</td>
+<td><code>UsageAggregate::record</code>, <code>Rollups::prune</code></td>
 </tr>
 <tr>
 <td>Usage counters</td>

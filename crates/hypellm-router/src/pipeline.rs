@@ -215,6 +215,7 @@ fn awaits_recovery(outcome: &Outcome) -> bool {
         matches!(
             reason,
             ExclusionReason::CircuitOpen
+                | ExclusionReason::ProbeUnreachable
                 | ExclusionReason::Unhealthy
                 | ExclusionReason::FleetStateStale
                 | ExclusionReason::FleetAgentUnavailable
@@ -1768,10 +1769,13 @@ fn record_usage(
     let spent = target_of(&outcome.trace)
         .and_then(|id| hypellm_config::price_in_effect(&config.prices, id, state.clock.wall_millis()))
         .map_or(0, |price| {
+            // (input, output, cached input): the order `PriceSchedule`
+            // declares and the usage view uses. Passing the cache second
+            // charged output tokens at the cached rate.
             price.cost_minor_units(
                 usage.input_tokens,
-                usage.cached_input_tokens,
                 usage.output_tokens,
+                usage.cached_input_tokens,
             )
         });
     state.admission.record_spend(

@@ -313,6 +313,16 @@ pub struct Settings {
     pub max_job_result_bytes: u64,
     /// How long a finished job stays readable, in milliseconds.
     pub job_retention_ms: u64,
+    /// How often the liveness probe checks each probed provider endpoint, in
+    /// milliseconds. Zero switches the probe off.
+    ///
+    /// Without it a target's health is learned only from requests routed to
+    /// it, so one that died while idle reads as healthy until a caller finds
+    /// out. One fixed thread probes every endpoint in turn; the interval is
+    /// the pause between rounds.
+    pub target_probe_interval_ms: u64,
+    /// The deadline for one probe — connect, send and response head together.
+    pub target_probe_timeout_ms: u64,
 }
 
 impl Default for Settings {
@@ -384,6 +394,8 @@ impl Default for Settings {
             max_queued_jobs: 64,
             max_job_result_bytes: 8 * 1024 * 1024,
             job_retention_ms: 900_000,
+            target_probe_interval_ms: 10_000,
+            target_probe_timeout_ms: 2_000,
         }
     }
 }
@@ -877,6 +889,7 @@ pub fn build(document: &Document, version: u64) -> Result<ValidatedConfig, Vec<C
     };
 
     check_document_limits(&settings, &mut errors);
+    check_probe_settings(&settings, &mut errors);
 
     let tenants = collect(document, "tenant", &mut errors, build_tenant);
     let mut tenant_map: BTreeMap<TenantId, TenantConfig> = BTreeMap::new();
@@ -1676,6 +1689,10 @@ fn build_settings(document: &Document) -> Result<Settings, ConfigError> {
         max_queued_jobs: f.u32_field("max_queued_jobs", d.max_queued_jobs)?,
         max_job_result_bytes: f.u64_field("max_job_result_bytes", d.max_job_result_bytes)?,
         job_retention_ms: f.u64_field("job_retention_ms", d.job_retention_ms)?,
+        target_probe_interval_ms: f
+            .u64_field("target_probe_interval_ms", d.target_probe_interval_ms)?,
+        target_probe_timeout_ms: f
+            .u64_field("target_probe_timeout_ms", d.target_probe_timeout_ms)?,
     })
 }
 
@@ -1686,6 +1703,55 @@ fn build_settings(document: &Document) -> Result<Settings, ConfigError> {
 /// requests that pass every declared bound and are then refused by the body
 /// reader — a rejection whose reason names the wrong limit, which is the worst
 /// kind for an operator to debug.
+/// The shortest probe interval accepted, in milliseconds.
+///
+/// One round dials every probed endpoint, so the interval bounds the probe's
+/// load on the slaves; a second between rounds is already far more often than
+/// a liveness signal needs.
+pub const MIN_TARGET_PROBE_INTERVAL_MS: u64 = 1_000;
+
+/// The longest single-probe deadline accepted, in milliseconds.
+///
+/// The probe thread finishes the probe in hand before it observes shutdown, so
+/// this is also the most a probe can add to a drain.
+pub const MAX_TARGET_PROBE_TIMEOUT_MS: u64 = 10_000;
+
+/// Reject probe settings that cannot work as written.
+///
+/// A timeout of zero would fail every probe and exclude every probed target;
+/// one at or above the interval would let one hung endpoint stretch every round
+/// past its schedule. Both are refused rather than clamped, so the document
+/// says what the router does.
+fn check_probe_settings(settings: &Settings, errors: &mut Vec<ConfigError>) {
+    let position = Position { line: 1, column: 1 };
+    let interval = settings.target_probe_interval_ms;
+    if interval == 0 {
+        return;
+    }
+    let timeout = settings.target_probe_timeout_ms;
+    if interval < MIN_TARGET_PROBE_INTERVAL_MS {
+        errors.push(ConfigError::new(
+            "invalid_probe_settings",
+            format!(
+                "target_probe_interval_ms must be 0 (off) or at least \
+                 {MIN_TARGET_PROBE_INTERVAL_MS}, not {interval}"
+            ),
+            position,
+        ));
+    }
+    if timeout == 0 || timeout > MAX_TARGET_PROBE_TIMEOUT_MS || timeout >= interval {
+        errors.push(ConfigError::new(
+            "invalid_probe_settings",
+            format!(
+                "target_probe_timeout_ms must be between 1 and \
+                 {MAX_TARGET_PROBE_TIMEOUT_MS} and shorter than \
+                 target_probe_interval_ms ({interval}), not {timeout}"
+            ),
+            position,
+        ));
+    }
+}
+
 fn check_document_limits(settings: &Settings, errors: &mut Vec<ConfigError>) {
     let position = Position { line: 1, column: 1 };
     // Specification 17 admits body capture only as "per-tenant, sampled,

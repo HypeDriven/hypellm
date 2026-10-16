@@ -110,6 +110,35 @@ spec:
             - {name: secrets, mountPath: /etc/hypellm/secrets}
             - {name: state, mountPath: /var/lib/hypellm}
             - {name: verify, mountPath: /run/hypellm}
+            - {name: tls-socket, mountPath: /run/hypellm-tls}
+            # `settings backup_dir` is /var/backups/hypellm/current; the router writes it when the
+            # `backup` CronJob (k8s/backup.yaml) asks over the control socket.
+            - {name: backups, mountPath: /var/backups/hypellm}
+        # Outbound HTTPS for `scheme=https` providers (spec/components/tls-helper.html). The router
+        # speaks cleartext HTTP to the socket; this process does the TLS with the image's OpenSSL
+        # and CA store, to the destinations tls-helper/tls-helper.json allowlists, and nowhere else.
+        # Idle until docker/hypellm.conf sets `tls_helper_socket=/run/hypellm-tls/tls.sock`.
+        # Its own uid in the router's group: the socket is 0660, so the two share it and nothing
+        # else in the pod mounts the volume.
+        - name: tls-helper
+          image: python:3.13-slim@sha256:70729b46c69b4f1e97c4822c1af3df53a1476cf5ddc6c087c0c10bc3a5678c2f
+          command:
+            - python3
+            - /opt/hypellm-tls-helper/hypellm-tls-helper
+            - --config
+            - /opt/hypellm-tls-helper/tls-helper.json
+          env:
+            - {name: PYTHONDONTWRITEBYTECODE, value: "1"}
+          securityContext:
+            runAsUser: 1001
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+            seccompProfile: {type: RuntimeDefault}
+          volumeMounts:
+            - {name: tls-helper, mountPath: /opt/hypellm-tls-helper, readOnly: true}
+            - {name: tls-socket, mountPath: /run/hypellm-tls}
       volumes:
         - name: config-src
           configMap: {name: hypellm-config}
@@ -123,3 +152,9 @@ spec:
           hostPath: {path: "${PROJECT_DIR}/run/state", type: Directory}
         - name: verify
           hostPath: {path: "${PROJECT_DIR}/run/verify", type: Directory}
+        - name: tls-helper
+          hostPath: {path: "${PROJECT_DIR}/tls-helper", type: Directory}
+        - name: tls-socket
+          emptyDir: {medium: Memory, sizeLimit: 1Mi}
+        - name: backups
+          hostPath: {path: "${PROJECT_DIR}/run/backups", type: Directory}

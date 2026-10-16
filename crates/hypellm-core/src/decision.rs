@@ -36,6 +36,12 @@ pub enum ExclusionReason {
     TargetQuarantined,
     /// The target's circuit breaker is open.
     CircuitOpen,
+    /// The router's own liveness probe found the target's endpoint down.
+    ///
+    /// Distinct from [`Self::CircuitOpen`]: a breaker is moved only by the
+    /// requests routed to a target, and this only by the background probe, so
+    /// a decision trace says which of the two saw the problem.
+    ProbeUnreachable,
     /// The target is too unhealthy for the request's failure policy.
     Unhealthy,
     /// The target does not accept a required input modality.
@@ -135,6 +141,7 @@ impl ExclusionReason {
             Self::TargetMaintenance => "target_maintenance",
             Self::TargetQuarantined => "target_quarantined",
             Self::CircuitOpen => "circuit_open",
+            Self::ProbeUnreachable => "probe_unreachable",
             Self::Unhealthy => "unhealthy",
             Self::ModalityUnsupported => "modality_unsupported",
             Self::ToolsUnsupported => "tools_unsupported",
@@ -240,6 +247,7 @@ impl ExclusionReason {
             Self::TargetMaintenance,
             Self::TargetQuarantined,
             Self::CircuitOpen,
+            Self::ProbeUnreachable,
             Self::Unhealthy,
             Self::ModalityUnsupported,
             Self::ToolsUnsupported,

@@ -114,7 +114,7 @@ impl Egress {
             return Ok(connection);
         }
 
-        self.dial(endpoint, profile, key)
+        self.dial(endpoint, profile, key, self.connect_timeout)
     }
 
     /// Open a *new* connection to an endpoint, ignoring the pool.
@@ -144,7 +144,33 @@ impl Egress {
             "http/1.1",
             profile.key(),
         );
-        self.dial(endpoint, profile, key)
+        self.dial(endpoint, profile, key, self.connect_timeout)
+    }
+
+    /// Open a new connection for a liveness probe, waiting at most `timeout`
+    /// to connect.
+    ///
+    /// The same resolve-validate-pin path as every other dial, under the same
+    /// egress profile — a probe has no way to reach an address a request could
+    /// not. Only the connect timeout differs: a probe must give up within its
+    /// own deadline, which is shorter than the one a request waits for. The
+    /// shorter of the two always applies. The connection carries its own pool
+    /// key class, so it is never mistaken for, or returned as, a request's.
+    pub fn dial_probe(
+        &self,
+        endpoint: &Endpoint,
+        profile: EgressProfile,
+        timeout: Duration,
+    ) -> Result<UpstreamConnection, UpstreamError> {
+        let key = pool_key(
+            endpoint.scheme.as_str(),
+            &endpoint.host,
+            endpoint.port,
+            "probe",
+            "http/1.1",
+            profile.key(),
+        );
+        self.dial(endpoint, profile, key, timeout.min(self.connect_timeout))
     }
 
     fn dial(
@@ -152,6 +178,7 @@ impl Egress {
         endpoint: &Endpoint,
         profile: EgressProfile,
         key: String,
+        connect_timeout: Duration,
     ) -> Result<UpstreamConnection, UpstreamError> {
         let destination = self.resolver.resolve(endpoint, profile)?;
 
@@ -172,12 +199,12 @@ impl Egress {
                 )))
             })?;
             transport
-                .set_timeouts(Some(self.connect_timeout))
+                .set_timeouts(Some(connect_timeout))
                 .map_err(UpstreamError::Io)?;
             return Ok(UpstreamConnection::from_transport(transport, key));
         }
 
-        UpstreamConnection::connect(&destination, key, self.connect_timeout)
+        UpstreamConnection::connect(&destination, key, connect_timeout)
     }
 
     /// Return a connection to the pool, or close it if it is not reusable.

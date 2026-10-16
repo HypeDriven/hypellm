@@ -127,11 +127,26 @@ pub struct UsageTotals {
     /// How many of the requests carried router-estimated rather than
     /// provider-reported numbers.
     pub estimated_requests: u64,
+    /// Requests refused for the caller or the policy, or failed by the router
+    /// or a provider: [`UsageStatus::ClientError`] and
+    /// [`UsageStatus::ServerError`].
+    pub failed_requests: u64,
+    /// Requests refused for capacity or a quota: [`UsageStatus::Throttled`].
+    pub throttled_requests: u64,
 }
 
 impl UsageTotals {
-    fn add(&mut self, usage: &CanonicalUsage) {
+    fn add(&mut self, usage: &CanonicalUsage, status: UsageStatus) {
         self.requests = self.requests.saturating_add(1);
+        match status {
+            UsageStatus::Success => {}
+            UsageStatus::Throttled => {
+                self.throttled_requests = self.throttled_requests.saturating_add(1);
+            }
+            UsageStatus::ClientError | UsageStatus::ServerError => {
+                self.failed_requests = self.failed_requests.saturating_add(1);
+            }
+        }
         self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
         self.cached_input_tokens = self
@@ -143,6 +158,24 @@ impl UsageTotals {
         if !usage.is_reported() {
             self.estimated_requests = self.estimated_requests.saturating_add(1);
         }
+    }
+
+    /// Fold another row's counters into this one.
+    pub fn merge_from(&mut self, other: &Self) {
+        self.requests = self.requests.saturating_add(other.requests);
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(other.cached_input_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
+        self.estimated_requests = self
+            .estimated_requests
+            .saturating_add(other.estimated_requests);
+        self.failed_requests = self.failed_requests.saturating_add(other.failed_requests);
+        self.throttled_requests = self
+            .throttled_requests
+            .saturating_add(other.throttled_requests);
     }
 
     /// Total tokens.
@@ -209,8 +242,150 @@ pub struct UsageAggregate {
     /// Bounded by [`MAX_KEY_SERIES`], and separately by reality: a row can only
     /// exist for a key that authenticated a request.
     by_key: RwLock<BTreeMap<(TenantId, hypellm_core::ids::KeyId), UsageTotals>>,
+    /// Hourly totals per (tenant, principal, key), for "what did this
+    /// principal, and each of its keys, use in the last day or week".
+    ///
+    /// The main table answers *what* — which alias, target, operation and
+    /// outcome — since the router started; this one answers *when*, at the
+    /// granularity a limit is set at. Separate for the same reason as
+    /// `by_key`: a time dimension on the main table would multiply its
+    /// cardinality by the retention window. Bounded by
+    /// [`MAX_ROLLUP_SERIES`] attributed rows, folding past it into one
+    /// unattributed row per (hour, tenant), and by [`ROLLUP_RETENTION_BUCKETS`]
+    /// hours, pruned as the clock advances.
+    rollups: RwLock<Rollups>,
     /// When aggregation started or was last reset, in wall-clock milliseconds.
     since_millis: RwLock<u64>,
+}
+
+/// The width of one rollup bucket: an hour, in milliseconds.
+pub const ROLLUP_BUCKET_MILLIS: u64 = 3_600_000;
+
+/// How many hourly buckets a rollup keeps: thirty days.
+pub const ROLLUP_RETENTION_BUCKETS: u64 = 30 * 24;
+
+/// Distinct attributed (hour, tenant, principal, key) rows retained.
+///
+/// A few dozen principals with a handful of keys each, active every hour for
+/// thirty days, is about this many. Past it, new rows fold into the hour's
+/// unattributed row, so the totals stay right while the attribution stops
+/// being complete — the same discipline as [`MAX_SERIES`].
+pub const MAX_ROLLUP_SERIES: usize = 16_384;
+
+/// The hourly bucket a wall-clock instant falls in. The divisor is a nonzero
+/// constant, so the checked form never takes its fallback.
+const fn hour_of(millis: u64) -> u64 {
+    match millis.checked_div(ROLLUP_BUCKET_MILLIS) {
+        Some(hour) => hour,
+        None => 0,
+    }
+}
+
+/// One rollup row's dimensions.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RollupKey {
+    hour: u64,
+    tenant: TenantId,
+    /// `None` only for the hour's folded, unattributed row.
+    principal: Option<PrincipalId>,
+    /// `None` for a principal's requests made without an API key, and for the
+    /// folded row.
+    key: Option<hypellm_core::ids::KeyId>,
+}
+
+impl RollupKey {
+    const fn is_overflow(&self) -> bool {
+        self.principal.is_none()
+    }
+}
+
+#[derive(Debug, Default)]
+struct Rollups {
+    rows: BTreeMap<RollupKey, UsageTotals>,
+    /// Attributed rows held, so the bound is checked without a scan.
+    attributed: usize,
+    /// The newest hour recorded, which retention is measured back from.
+    newest_hour: u64,
+}
+
+impl Rollups {
+    fn record(&mut self, sample: &UsageSample, now_millis: u64) {
+        let hour = hour_of(now_millis);
+        if hour > self.newest_hour {
+            self.newest_hour = hour;
+            self.prune();
+        }
+        // A sample older than the window — a clock stepped backwards — would
+        // create a row that the next prune removes; it is not worth one.
+        if hour.saturating_add(ROLLUP_RETENTION_BUCKETS) <= self.newest_hour {
+            return;
+        }
+        let key = RollupKey {
+            hour,
+            tenant: sample.tenant.clone(),
+            principal: Some(sample.principal.clone()),
+            key: sample.key_id.clone(),
+        };
+        if let Some(totals) = self.rows.get_mut(&key) {
+            totals.add(&sample.usage, sample.status);
+            return;
+        }
+        let key = if self.attributed < MAX_ROLLUP_SERIES {
+            self.attributed = self.attributed.saturating_add(1);
+            key
+        } else {
+            // One folded row per (hour, tenant): tenants are declared in
+            // configuration and hours are bounded by retention, so the folded
+            // rows are bounded too.
+            RollupKey {
+                principal: None,
+                key: None,
+                ..key
+            }
+        };
+        self.rows.entry(key).or_default().add(&sample.usage, sample.status);
+    }
+
+    /// Drop every bucket that has left the retention window.
+    fn prune(&mut self) {
+        let oldest = self
+            .newest_hour
+            .saturating_sub(ROLLUP_RETENTION_BUCKETS.saturating_sub(1));
+        let before = self.rows.len();
+        let mut removed_attributed = 0usize;
+        self.rows.retain(|key, _| {
+            let keep = key.hour >= oldest;
+            if !keep && !key.is_overflow() {
+                removed_attributed = removed_attributed.saturating_add(1);
+            }
+            keep
+        });
+        if self.rows.len() != before {
+            self.attributed = self.attributed.saturating_sub(removed_attributed);
+        }
+    }
+}
+
+/// A principal's, or one of its keys', totals over a window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowRow {
+    /// The principal, or `None` for the folded, unattributed remainder.
+    pub principal: Option<PrincipalId>,
+    /// The key, or `None` for requests made without one (and the remainder).
+    pub key: Option<hypellm_core::ids::KeyId>,
+    /// The counters.
+    pub totals: UsageTotals,
+}
+
+/// The result of a window read.
+#[derive(Debug, Clone)]
+pub struct WindowUsage {
+    /// Per (principal, key) totals, in a stable order.
+    pub rows: Vec<WindowRow>,
+    /// The start of the first hourly bucket the window includes.
+    pub from_millis: u64,
+    /// Whether any folded, unattributed row fell inside the window.
+    pub truncated: bool,
 }
 
 /// Distinct (tenant, key) rows retained.
@@ -228,6 +403,7 @@ impl UsageAggregate {
             max_series: max_series.max(1),
             rows: RwLock::new(BTreeMap::new()),
             by_key: RwLock::new(BTreeMap::new()),
+            rollups: RwLock::new(Rollups::default()),
             since_millis: RwLock::new(0),
         }
     }
@@ -245,10 +421,10 @@ impl UsageAggregate {
             if let Ok(mut by_key) = self.by_key.write() {
                 let entry = (sample.tenant.clone(), key_id.clone());
                 if let Some(totals) = by_key.get_mut(&entry) {
-                    totals.add(&sample.usage);
+                    totals.add(&sample.usage, sample.status);
                 } else if by_key.len() < MAX_KEY_SERIES {
                     let mut totals = UsageTotals::default();
-                    totals.add(&sample.usage);
+                    totals.add(&sample.usage, sample.status);
                     by_key.insert(entry, totals);
                 }
                 // Past the bound a new key is not recorded. There is no
@@ -256,6 +432,11 @@ impl UsageAggregate {
                 // key" answers nothing an investigation asks, and would read as
                 // a real key's totals.
             }
+        }
+
+        // The rollup is likewise independent of the main table's lock.
+        if let Ok(mut rollups) = self.rollups.write() {
+            rollups.record(sample, now_millis);
         }
 
         let Ok(mut rows) = self.rows.write() else {
@@ -281,7 +462,7 @@ impl UsageAggregate {
         // cap limits how many *distinct* rows exist, not how much traffic an
         // existing row can account for.
         if let Some(totals) = rows.get_mut(&key) {
-            totals.add(&sample.usage);
+            totals.add(&sample.usage, sample.status);
             return;
         }
 
@@ -295,11 +476,11 @@ impl UsageAggregate {
                 status: sample.status,
                 cost_class: sample.cost_class.0,
             };
-            rows.entry(overflow).or_default().add(&sample.usage);
+            rows.entry(overflow).or_default().add(&sample.usage, sample.status);
             return;
         }
 
-        rows.entry(key).or_default().add(&sample.usage);
+        rows.entry(key).or_default().add(&sample.usage, sample.status);
     }
 
     /// Rows visible to a caller.
@@ -332,7 +513,57 @@ impl UsageAggregate {
             .collect()
     }
 
-    /// The totals across every visible row.
+    /// Per-principal and per-key totals since `from_millis`, at hourly
+    /// granularity: the window starts at the beginning of the hour containing
+    /// `from_millis`, which is reported back so a caller can say so.
+    ///
+    /// `principal` restricts the result exactly as [`rows`](Self::rows) does,
+    /// and a folded row is withheld from a principal-restricted read for the
+    /// same reason. Never crosses a tenant boundary.
+    #[must_use]
+    pub fn window(
+        &self,
+        tenant: &TenantId,
+        principal: Option<&PrincipalId>,
+        from_millis: u64,
+    ) -> WindowUsage {
+        let from_hour = hour_of(from_millis);
+        let mut merged: BTreeMap<(Option<PrincipalId>, Option<hypellm_core::ids::KeyId>), UsageTotals> =
+            BTreeMap::new();
+        let mut truncated = false;
+        if let Ok(rollups) = self.rollups.read() {
+            for (key, totals) in &rollups.rows {
+                if key.hour < from_hour || key.tenant != *tenant {
+                    continue;
+                }
+                if let Some(wanted) = principal {
+                    if key.principal.as_ref() != Some(wanted) {
+                        continue;
+                    }
+                }
+                truncated |= key.is_overflow();
+                merged
+                    .entry((key.principal.clone(), key.key.clone()))
+                    .or_default()
+                    .merge_from(totals);
+            }
+        }
+        WindowUsage {
+            rows: merged
+                .into_iter()
+                .map(|((principal, key), totals)| WindowRow { principal, key, totals })
+                .collect(),
+            from_millis: from_hour.saturating_mul(ROLLUP_BUCKET_MILLIS),
+            truncated,
+        }
+    }
+
+    /// How many rollup rows are held, folded ones included.
+    #[must_use]
+    pub fn rollup_len(&self) -> usize {
+        self.rollups.read().map_or(0, |rollups| rollups.rows.len())
+    }
+
     /// Totals for one key, or `None` if it has served nothing.
     ///
     /// Tenant-scoped like every other management read: a key identifier from
@@ -365,23 +596,12 @@ impl UsageAggregate {
             .unwrap_or_default()
     }
 
+    /// The totals across every visible row.
+    #[must_use]
     pub fn summary(&self, tenant: &TenantId, principal: Option<&PrincipalId>) -> UsageTotals {
         let mut summary = UsageTotals::default();
         for row in self.rows(tenant, principal) {
-            summary.requests = summary.requests.saturating_add(row.totals.requests);
-            summary.input_tokens = summary.input_tokens.saturating_add(row.totals.input_tokens);
-            summary.output_tokens = summary
-                .output_tokens
-                .saturating_add(row.totals.output_tokens);
-            summary.cached_input_tokens = summary
-                .cached_input_tokens
-                .saturating_add(row.totals.cached_input_tokens);
-            summary.reasoning_tokens = summary
-                .reasoning_tokens
-                .saturating_add(row.totals.reasoning_tokens);
-            summary.estimated_requests = summary
-                .estimated_requests
-                .saturating_add(row.totals.estimated_requests);
+            summary.merge_from(&row.totals);
         }
         summary
     }

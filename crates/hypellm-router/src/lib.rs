@@ -54,6 +54,7 @@ pub mod fleet;
 pub mod jobs;
 pub mod hardening;
 pub mod pipeline;
+pub mod probe;
 pub mod protocol;
 pub mod routes;
 pub mod server;

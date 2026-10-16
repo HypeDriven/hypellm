@@ -363,3 +363,94 @@ quota scope=target:local:model concurrency=1 queued=4
         .collect();
     assert_eq!(order, vec!["hold", "standard", "batch"]);
 }
+
+/// Mint a key through the management API, as the Keys screen does, and return
+/// its one-time secret.
+fn mint_through_the_management_api(router: &TestRouter, body: &str) -> (u16, String) {
+    use hypellm_core::rbac::Role;
+    let api = hypellm_admin_api::AdminApi::new(Arc::new(hypellm_router::admin::admin_state_from(
+        &router.state,
+        hypellm_admin_api::CorsPolicy::with_origins(Vec::new()),
+        None,
+        None,
+        b"oidc-key-for-tests",
+        &[],
+    )));
+    let state = &router.state;
+    let issued = state
+        .sessions
+        .issue(
+            hypellm_core::ids::PrincipalId::new("user:keys").unwrap(),
+            hypellm_core::ids::TenantId::new("acme").unwrap(),
+            None,
+            None,
+            vec![Role::KeyManager],
+            hypellm_auth::AuthMethod::Password,
+            state.clock.now_millis(),
+        )
+        .expect("session");
+    let version = state.config().snapshot.version;
+    state
+        .sessions
+        .refresh_roles(&issued.session.digest, vec![Role::KeyManager], version)
+        .expect("session");
+    let mut headers = wire_http1::Headers::default();
+    headers
+        .append(
+            "cookie",
+            &format!("{}={}", hypellm_auth::session::COOKIE_NAME, issued.token),
+        )
+        .unwrap();
+    headers
+        .append(hypellm_auth::session::CSRF_HEADER, &issued.csrf_token)
+        .unwrap();
+    headers.append("content-type", "application/json").unwrap();
+    let request = hypellm_admin_api::AdminRequest {
+        method: &wire_http1::Method::Post,
+        path: "/admin/v1/keys",
+        query: None,
+        headers: &headers,
+        body: body.as_bytes(),
+        peer: None,
+        request_id: "0".repeat(32),
+    };
+    match api.handle(&request) {
+        Ok(response) => {
+            let json = parse_str(&response.body, &Limits::DEFAULT).expect("json");
+            (response.status, json.field_str("secret").unwrap_or_default().to_owned())
+        }
+        Err(error) => (error.status(), String::new()),
+    }
+}
+
+#[test]
+fn a_key_minted_narrowed_is_narrowed_from_its_first_request() {
+    // The gap this closes: a key minted unrestricted and narrowed afterwards
+    // could be used, between the two, as widely as its principal allows.
+    let upstream = FakeUpstream::start(ok_response("served"));
+    let harness = Harness::start(router_with_config(
+        &upstream,
+        &three_aliases(upstream.address.port()),
+    ));
+    let (status, secret) = mint_through_the_management_api(
+        &harness.router,
+        r#"{"principal":"svc:test","scopes":["inference","models"],
+            "restrictions":{"models":["agent"],"targets":null,"hosts":null,"priority":null}}"#,
+    );
+    assert_eq!(status, 201);
+
+    // The very first request the new key makes.
+    let first = send(harness.address, &secret, "POST", "/v1/chat/completions", &chat("chat", "x"));
+    assert_eq!(first.status, 404, "{}", first.body);
+    let listed = send(harness.address, &secret, "GET", "/v1/models", "");
+    let ids: Vec<String> = listed
+        .json()
+        .field_array("data")
+        .unwrap()
+        .iter()
+        .map(|m| m.field_str("id").unwrap().to_owned())
+        .collect();
+    assert_eq!(ids, vec!["agent".to_owned()]);
+    let kept = send(harness.address, &secret, "POST", "/v1/chat/completions", &chat("agent", "x"));
+    assert_eq!(kept.status, 200, "{}", kept.body);
+}

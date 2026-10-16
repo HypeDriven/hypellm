@@ -41,6 +41,7 @@
 <details open class="nav-group"><summary>Components</summary><ul>
 <li><a href="components/fleet-agent.html">Fleet agent</a></li>
 <li><a href="components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="components/tls-helper.html">Outbound TLS helper</a></li>
 <li><a href="components/container-init.html">Container init</a></li>
 <li><a href="components/tray-monitor.html">Windows tray monitor</a></li>
 </ul></details>
@@ -378,6 +379,15 @@ characters of <code>[A-Za-z0-9_-]</code> before they reach a log or an error bod
 <code>StartupError::Unreachable</code> (exit 2) listing each endpoint that &quot;requires
 outbound TLS, but no <code>tls_helper_socket</code> is configured&quot;. The router never
 silently downgrades.</p>
+<p>The reference helper is <a href="components/tls-helper.html"><code>tls-helper/</code></a>: the
+platform's OpenSSL through Python's <code>ssl</code> module, a deny-by-default
+<code>(sni, port)</code> allowlist, and a re-check of the router's pinned address. The pod in
+<code>k8s/hypellm.yaml</code> runs it as a sidecar on <code>/run/hypellm-tls/tls.sock</code>, idle until
+the <code>settings</code> record names it:</p>
+<pre><code class="language-text">tls_helper_socket=/run/hypellm-tls/tls.sock
+</code></pre>
+<p>Its component page has a complete DeepSeek example — credential, provider,
+target and alias — and what each refusal code means.</p>
 <h3 id="identity-verification">Identity verification</h3>
 <p>JWT signature verification is delegated the same way, to a local verifier socket
 at <code>settings oidc_verifier_socket</code>:</p>
@@ -1223,6 +1233,15 @@ before relying on a job identifier across a restart. The bounds are
 <li><code>settings keepalive_interval_ms</code> controls the SSE keepalive cadence. A stream
 whose provider is silent gets a comment at that interval (default 15 s; zero
 disables it).</li>
+<li><code>settings target_probe_interval_ms</code> (default 10,000; 0 switches it off; otherwise at
+least 1,000) and <code>target_probe_timeout_ms</code> (default 2,000; 1 to 10,000 and below the
+interval) drive the liveness probe. One thread asks every llama.cpp and SemIf endpoint
+<code>GET /health</code> in turn. Two failures in a row exclude its targets as
+<code>probe_unreachable</code>, and two successes restore them. Remote API families and
+fleet-managed targets are not probed. The outcome is the <code>probe</code> field of
+<code>GET /admin/v1/targets</code>, the <code>hypellm_target_probe_up</code> gauge, and
+<code>hypellm_target_probes_total{outcome}</code>. See
+<a href="deferred-issues.html#target-health-is-observed-not-probed">what the probe covers</a>.</li>
 <li><code>settings metrics_listen</code> binds a dedicated listener serving only
 <code>GET /metrics</code> and <code>GET /health/live</code>. Everything else on that address
 answers 404.</li>

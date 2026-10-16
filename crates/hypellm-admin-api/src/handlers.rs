@@ -1470,6 +1470,7 @@ impl AdminApi {
 
             (Method::Get, "/admin/v1/keys") => self.list_keys(session),
             (Method::Post, "/admin/v1/keys") => self.create_key(request, session),
+            (Method::Get, "/admin/v1/keys:ceiling") => self.principal_key_ceiling(request, session),
 
             (Method::Get, "/admin/v1/credentials") => self.list_credentials(session),
 
@@ -1480,6 +1481,9 @@ impl AdminApi {
             }
 
             (Method::Get, "/admin/v1/usage") => self.list_usage(session),
+            (Method::Get, "/admin/v1/usage/principals") => {
+                self.usage_by_principal(request, session)
+            }
 
             (Method::Get, "/admin/v1/fleet/enrollments") => self.list_enrollments(session),
             (Method::Post, "/admin/v1/fleet/enrollments") => {
@@ -2492,6 +2496,27 @@ impl AdminApi {
             "quarantined",
             Value::from(self.state.health.is_quarantined(&target.id)),
         );
+        // What the router's own liveness probe last saw, or null for a target
+        // it does not probe (a remote family, a fleet-managed target, or the
+        // probe switched off). Separate from `breaker_state`, which only
+        // routed requests move.
+        object.push(
+            "probe",
+            self.state
+                .health
+                .probe_status(&target.id)
+                .map_or(Value::Null, |status| {
+                    let mut probe = Object::new();
+                    probe.push("state", Value::from(status.state.as_str()));
+                    probe.push("last_ok", Value::from(status.last_ok));
+                    probe.push("last_probe_at", Value::from(status.last_probe_wall_ms));
+                    probe.push(
+                        "consecutive_failures",
+                        Value::from(u64::from(status.consecutive_failures)),
+                    );
+                    Value::Object(probe)
+                }),
+        );
         // Disclosed so a client can satisfy `If-Match` from a read, rather than
         // reimplementing the server's canonical-JSON digest or falling back to
         // `*` — which would defeat the concurrency control of 15.4.
@@ -2645,8 +2670,14 @@ impl AdminApi {
         let mut degraded = 0u64;
         for id in config.snapshot.targets.keys().filter(|id| visible.contains(id)) {
             let (worst, _) = self.breaker_states(id, now);
+            let probed_down = self
+                .state
+                .health
+                .probe_status(id)
+                .is_some_and(|p| p.state == hypellm_core::health::ProbeState::Unreachable);
             if worst == hypellm_core::health::BreakerState::Closed
                 && !self.state.health.is_quarantined(id)
+                && !probed_down
             {
                 healthy += 1;
             } else {
@@ -3120,6 +3151,176 @@ impl AdminApi {
         // incomplete breakdown and a wrong one.
         envelope.push("truncated", Value::from(self.state.usage.is_saturated()));
         envelope.push("totals", Value::Object(totals));
+        Ok(ApiResponse::ok(&Value::Object(envelope)))
+    }
+
+    /// `GET /admin/v1/usage/principals?window=24h|7d|30d[&principal=…]`:
+    /// each principal's totals over a window, and each of its keys'.
+    ///
+    /// The question this answers is the one asked before setting a limit —
+    /// what did this principal, and each key it holds, actually use — so it is
+    /// shaped for that: rows per principal and per key rather than the main
+    /// view's full cross-product, over the last day, week or month at hourly
+    /// granularity.
+    ///
+    /// Authorization is `list_usage`'s exactly. `ReadTenantUsage` sees every
+    /// principal in the tenant and may filter to one; `ReadOwnUsage` sees only
+    /// its own principal and that principal's keys, and a `principal=` naming
+    /// anyone else answers with nothing rather than a refusal, which would
+    /// confirm the name exists. A folded remainder is reported only to a
+    /// tenant-wide reader, for `rows`' reason: it is nobody's in particular.
+    fn usage_by_principal(
+        &self,
+        request: &AdminRequest<'_>,
+        session: &Session,
+    ) -> Result<ApiResponse, ApiError> {
+        let tenant_wide = self.require(session, Permission::ReadTenantUsage).is_ok();
+        if !tenant_wide {
+            self.require(session, Permission::ReadOwnUsage)?;
+        }
+        let params = query_params(request.query);
+        let window = param(&params, "window").unwrap_or_else(|| "24h".to_owned());
+        let span_millis: u64 = match window.as_str() {
+            "24h" => 24 * 3_600_000,
+            "7d" => 7 * 24 * 3_600_000,
+            "30d" => 30 * 24 * 3_600_000,
+            _ => {
+                return Err(ApiError::new(
+                    ApiErrorCode::InvalidRequest,
+                    "'window' must be one of 24h, 7d, 30d",
+                ));
+            }
+        };
+        // A filter is an identifier or nothing. One that does not parse can
+        // name no principal, so it matches none rather than being an error
+        // that echoes it.
+        let requested = param(&params, "principal").filter(|p| !p.is_empty());
+        let named = requested.as_deref().map(PrincipalId::new);
+        let filter: Option<PrincipalId> = match (tenant_wide, named) {
+            (true, None) => None,
+            (true, Some(Ok(principal))) => Some(principal),
+            (false, None) => Some(session.principal.clone()),
+            (false, Some(Ok(principal))) if principal == session.principal => Some(principal),
+            // Somebody else, or nothing parseable: an empty answer.
+            (_, Some(_)) => None,
+        };
+        let matches_nothing = requested.is_some() && filter.is_none();
+
+        let now = self.state.clock.wall_millis();
+        let usage = if matches_nothing {
+            crate::usage::WindowUsage {
+                rows: Vec::new(),
+                from_millis: now.saturating_sub(span_millis),
+                truncated: false,
+            }
+        } else {
+            self.state
+                .usage
+                .window(&session.tenant, filter.as_ref(), now.saturating_sub(span_millis))
+        };
+
+        let totals_value = |totals: &crate::usage::UsageTotals| {
+            let mut object = Object::new();
+            object.push("requests", Value::from(totals.requests));
+            object.push("input_tokens", Value::from(totals.input_tokens));
+            object.push("output_tokens", Value::from(totals.output_tokens));
+            object.push("cached_input_tokens", Value::from(totals.cached_input_tokens));
+            object.push("reasoning_tokens", Value::from(totals.reasoning_tokens));
+            object.push("estimated_requests", Value::from(totals.estimated_requests));
+            object.push("failed_requests", Value::from(totals.failed_requests));
+            object.push("throttled_requests", Value::from(totals.throttled_requests));
+            object
+        };
+
+        let mut principals: BTreeMap<PrincipalId, (crate::usage::UsageTotals, u64)> =
+            BTreeMap::new();
+        let mut unattributed = crate::usage::UsageTotals::default();
+        let mut keys: Vec<Value> = Vec::new();
+        for row in &usage.rows {
+            let Some(principal) = &row.principal else {
+                unattributed.merge_from(&row.totals);
+                continue;
+            };
+            let entry = principals.entry(principal.clone()).or_default();
+            entry.0.merge_from(&row.totals);
+            let Some(key_id) = &row.key else {
+                continue;
+            };
+            entry.1 = entry.1.saturating_add(1);
+            let mut object = totals_value(&row.totals);
+            object.push("key_id", Value::from(key_id.as_str()));
+            object.push("principal", Value::from(principal.as_str()));
+            // The record as it stands now, for the screen's label. A key in
+            // this tenant's usage is this tenant's key; the filter is kept
+            // anyway, so a store anomaly cannot surface another tenant's
+            // description.
+            let record = self
+                .state
+                .keys
+                .get(key_id)
+                .filter(|record| record.tenant == session.tenant);
+            object.push_opt(
+                "description",
+                record
+                    .as_ref()
+                    .and_then(|record| record.description.as_deref())
+                    .map(Value::from),
+            );
+            object.push(
+                "revoked",
+                Value::from(record.as_ref().is_some_and(|record| record.revoked)),
+            );
+            // Lifetime, not windowed: the ledger is cumulative by design.
+            let view = self.state.budgets.view(key_id);
+            let mut budget = Object::new();
+            budget.push("token_limit", view.limit.map_or(Value::Null, Value::from));
+            budget.push("consumed_tokens", Value::from(view.consumed));
+            budget.push(
+                "remaining_tokens",
+                view.remaining().map_or(Value::Null, Value::from),
+            );
+            object.push("budget", Value::Object(budget));
+            keys.push(Value::Object(object));
+        }
+
+        let principal_items: Vec<Value> = principals
+            .iter()
+            .map(|(principal, (totals, key_count))| {
+                let mut object = totals_value(totals);
+                object.push("principal", Value::from(principal.as_str()));
+                object.push("keys", Value::from(*key_count));
+                Value::Object(object)
+            })
+            .collect();
+
+        let since = self.state.usage.since_millis();
+        let mut envelope = Object::new();
+        envelope.push("window", Value::from(window.as_str()));
+        envelope.push("from", Value::from(usage.from_millis));
+        envelope.push("until", Value::from(now));
+        // Usage lives in memory: a window reaching back past the router's start
+        // covers only what this process saw, and the screen must say so.
+        envelope.push("counting_since", Value::from(since));
+        envelope.push(
+            "partial",
+            Value::from(since == 0 || since > usage.from_millis),
+        );
+        envelope.push(
+            "scope",
+            Value::from(if tenant_wide { "tenant" } else { "principal" }),
+        );
+        envelope.push("tenant", Value::from(session.tenant.as_str()));
+        envelope.push("principals", Value::Array(principal_items));
+        envelope.push("keys", Value::Array(keys));
+        envelope.push(
+            "unattributed",
+            if tenant_wide && unattributed.requests > 0 {
+                Value::Object(totals_value(&unattributed))
+            } else {
+                Value::Null
+            },
+        );
+        envelope.push("truncated", Value::from(tenant_wide && usage.truncated));
         Ok(ApiResponse::ok(&Value::Object(envelope)))
     }
 
@@ -4738,6 +4939,26 @@ impl AdminApi {
             budget => Some(budget),
         };
 
+        // A key may be minted already narrowed, with exactly the body and the
+        // ceiling check `PUT /keys/{id}/restrictions` applies. Parsed before
+        // the key exists, like the budget, so a malformed or out-of-ceiling
+        // restriction creates nothing. All four fields null is no narrowing,
+        // and writes no frame.
+        let initial_restrictions = match body.get("restrictions") {
+            None | Some(Value::Null) => None,
+            Some(value) if value.as_object().is_some() => {
+                Some(self.parse_key_restrictions(value, &principal, &session.tenant)?)
+            }
+            Some(_) => {
+                return Err(ApiError::new(
+                    ApiErrorCode::ValidationFailed,
+                    "'restrictions' must be an object naming models, targets, hosts and \
+                     priority, or null",
+                ));
+            }
+        }
+        .filter(|restrictions| *restrictions != Default::default());
+
         let new_key = self
             .state
             .keys
@@ -4764,6 +4985,12 @@ impl AdminApi {
             .map_err(|_| ApiError::new(ApiErrorCode::InternalFault, "cannot create a key"))?;
 
         let key_id = new_key.id().clone();
+        // Narrowed in memory before anything else happens, so there is no
+        // moment — even one in which nobody yet holds the secret — when the
+        // running router has this key wider than it was asked for.
+        if let Some(restrictions) = &initial_restrictions {
+            self.state.keys.set_restrictions(&key_id, restrictions.clone());
+        }
 
         // `KeyStore::create` has already made the key usable in memory, so
         // every refusal below revokes it again before answering: "not
@@ -4780,12 +5007,23 @@ impl AdminApi {
         )
         .with_object(key_id.as_str())
         .with_tenant(session.tenant.as_str());
-        let event = match &initial_budget {
-            Some((limit, _)) => event.with_reason(&format!(
+        let mut reasons = Vec::new();
+        if let Some((limit, _)) = &initial_budget {
+            reasons.push(format!(
                 "initial token_limit {}",
                 limit.map_or_else(|| "unlimited".to_owned(), |limit| limit.to_string())
-            )),
-            None => event,
+            ));
+        }
+        if let Some(restrictions) = &initial_restrictions {
+            reasons.push(format!(
+                "initial restrictions {}",
+                describe_restriction(restrictions)
+            ));
+        }
+        let event = if reasons.is_empty() {
+            event
+        } else {
+            event.with_reason(&reasons.join("; "))
         };
         if let Err(error) = self.record_audit(event.clone()) {
             self.state.keys.revoke(&key_id);
@@ -4809,6 +5047,43 @@ impl AdminApi {
                 ));
             }
         }
+        // The restriction before the key record, for the budget's reason: a
+        // restriction frame for a key that never became durable is inert —
+        // replay holds it until the key's own record arrives, and none does —
+        // while a durable key whose restriction failed to commit would be an
+        // unrestricted key somebody had asked to be narrowed.
+        //
+        // Embedding the restriction in the key record instead would make the
+        // two one frame, but a router from before restrictions existed reads
+        // that record without the field and would serve the key unrestricted.
+        // A separate `ApiKeyRestriction` frame is a protected kind such a
+        // router refuses to start on: it fails closed, not open.
+        if let Some(restrictions) = &initial_restrictions {
+            let change = hypellm_auth::RestrictionChange {
+                id: key_id.clone(),
+                restrictions: restrictions.clone(),
+            };
+            if self
+                .state
+                .store
+                .append(
+                    hypellm_store::RecordKind::ApiKeyRestriction,
+                    &change.to_payload(),
+                )
+                .is_err()
+            {
+                self.state.keys.revoke(&key_id);
+                self.record_abandoned(
+                    event,
+                    "the key's restrictions could not be written durably",
+                );
+                return Err(ApiError::new(
+                    ApiErrorCode::InternalFault,
+                    "the key's restrictions could not be recorded durably and the key was not \
+                     created",
+                ));
+            }
+        }
         if self
             .state
             .store
@@ -4827,12 +5102,23 @@ impl AdminApi {
         }
 
         // Specification 9.2 and 15.3: displayed once, never retrievable again.
+        let scopes: Vec<Value> = new_key
+            .record
+            .scopes
+            .iter()
+            .map(|scope| Value::from(scope.as_str()))
+            .collect();
         let secret = new_key.into_secret();
         let mut root = Object::new();
         root.push("id", Value::from(key_id.as_str()));
         root.push("principal", Value::from(principal.as_str()));
+        root.push("scopes", Value::Array(scopes));
         root.push_opt("expires_at", expires_at.map(Value::from));
         root.push("secret", Value::from(secret.as_str()));
+        root.push(
+            "restrictions",
+            restrictions_value(&initial_restrictions.unwrap_or_default()),
+        );
         root.push(
             "budget",
             crate::budget::budget_value(
@@ -5065,8 +5351,41 @@ impl AdminApi {
     /// is on every request.
     fn key_restrictions(&self, session: &Session, raw_id: &str) -> Result<ApiResponse, ApiError> {
         let (key_id, record) = self.managed_key(session, raw_id)?;
+        let limits = self.ceiling_value(&record.principal, &record.tenant);
+
+        let shared = self
+            .state
+            .keys
+            .list()
+            .iter()
+            .filter(|other| {
+                other.id != key_id
+                    && !other.revoked
+                    && other.tenant == record.tenant
+                    && other.principal == record.principal
+            })
+            .count();
+
+        let mut root = Object::new();
+        root.push("id", Value::from(key_id.as_str()));
+        root.push("principal", Value::from(record.principal.as_str()));
+        root.push("restrictions", restrictions_value(&record.restrictions));
+        root.push("ceiling", limits);
+        root.push(
+            "keys_sharing_principal",
+            Value::from(u64::try_from(shared).unwrap_or(u64::MAX)),
+        );
+        let mut response = ApiResponse::ok(&Value::Object(root));
+        response.etag = Some(key_etag(&record));
+        Ok(response)
+    }
+
+    /// What `principal` may use in `tenant` under the active configuration,
+    /// as the restriction editors offer it: aliases with their targets,
+    /// targets with their provider and slave, fleet slaves, and queue class.
+    fn ceiling_value(&self, principal: &PrincipalId, tenant: &TenantId) -> Value {
         let config = self.state.config();
-        let ceiling = principal_ceiling(&config, &record.principal, &record.tenant);
+        let ceiling = principal_ceiling(&config, principal, tenant);
 
         let mut models = Vec::new();
         for (alias, targets) in &ceiling.alias_targets {
@@ -5121,71 +5440,59 @@ impl AdminApi {
             Value::Array(ceiling.hosts.iter().map(|h| Value::from(h.as_str())).collect()),
         );
         limits.push("priority", Value::from(ceiling.class.as_str()));
+        Value::Object(limits)
+    }
 
+    /// `GET /admin/v1/keys:ceiling?principal=<id>`: the ceiling a key minted
+    /// for `principal` in the caller's tenant could be narrowed within, for
+    /// the create form, which has no key yet to read it from. The same
+    /// information `GET /keys/{id}/restrictions` gives for an existing key,
+    /// to the same permission.
+    fn principal_key_ceiling(
+        &self,
+        request: &AdminRequest<'_>,
+        session: &Session,
+    ) -> Result<ApiResponse, ApiError> {
+        self.require(session, Permission::ManageKeys)?;
+        let params = query_params(request.query);
+        let principal = param(&params, "principal")
+            .and_then(|raw| PrincipalId::new(&raw).ok())
+            .ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::InvalidRequest,
+                    "'principal' must name a valid principal identifier",
+                )
+            })?;
         let shared = self
             .state
             .keys
             .list()
             .iter()
-            .filter(|other| {
-                other.id != key_id
-                    && !other.revoked
-                    && other.tenant == record.tenant
-                    && other.principal == record.principal
-            })
+            .filter(|key| !key.revoked && key.tenant == session.tenant && key.principal == principal)
             .count();
-
         let mut root = Object::new();
-        root.push("id", Value::from(key_id.as_str()));
-        root.push("principal", Value::from(record.principal.as_str()));
-        root.push("restrictions", restrictions_value(&record.restrictions));
-        root.push("ceiling", Value::Object(limits));
+        root.push("principal", Value::from(principal.as_str()));
+        root.push("ceiling", self.ceiling_value(&principal, &session.tenant));
         root.push(
             "keys_sharing_principal",
             Value::from(u64::try_from(shared).unwrap_or(u64::MAX)),
         );
-        let mut response = ApiResponse::ok(&Value::Object(root));
-        response.etag = Some(key_etag(&record));
-        Ok(response)
+        Ok(ApiResponse::ok(&Value::Object(root)))
     }
 
-    /// `PUT /admin/v1/keys/{id}/restrictions`: replace a key's restrictions
-    /// whole. The body names all four of `models`, `targets`, `hosts` and
-    /// `priority`; `null` narrows nothing.
+    /// Read a restriction body — all four of `models`, `targets`, `hosts` and
+    /// `priority` — and check it against the ceiling the active configuration
+    /// gives `principal` in `tenant`.
     ///
-    /// A key's restrictions are a subset of its principal's access, so every
-    /// entry is checked against the ceiling the active configuration gives the
-    /// principal and refused if it lies outside. That check is a courtesy to
-    /// the operator, not the guarantee: routing intersects the restriction
-    /// with the live policy on every request, so a later publication that
-    /// shrinks the principal's access shrinks the key's with it.
-    ///
-    /// No second person is involved, unlike a policy change, because nothing
-    /// here can widen what the principal's policy allows. Lifting a
-    /// restriction returns the key to that policy and no further.
-    fn set_key_restrictions(
+    /// Shared by `PUT /keys/{id}/restrictions` and by key creation, so a key
+    /// minted narrowed is held to exactly what narrowing it later would be.
+    fn parse_key_restrictions(
         &self,
-        request: &AdminRequest<'_>,
-        session: &Session,
-        raw_id: &str,
-    ) -> Result<ApiResponse, ApiError> {
+        body: &Value,
+        principal: &PrincipalId,
+        tenant: &TenantId,
+    ) -> Result<hypellm_core::key_restriction::KeyRestriction, ApiError> {
         use hypellm_core::ids::{AliasId, HostId};
-        let (key_id, record) = self.managed_key(session, raw_id)?;
-        if_match_satisfied(request.if_match(), &key_etag(&record))?;
-        if record.revoked {
-            return Err(ApiError::new(
-                ApiErrorCode::Conflict,
-                "the key is revoked; a revoked key cannot be given restrictions",
-            ));
-        }
-
-        let body = request.json(&Limits::SMALL)?;
-        if body.as_object().is_none() {
-            return Err(ApiError::new(
-                ApiErrorCode::InvalidRequest,
-                "a restriction change is a JSON object",
-            ));
-        }
         let models = restriction_list(&body, "models", |s| AliasId::new(s).ok())?;
         let targets = restriction_list(&body, "targets", |s| TargetId::new(s).ok())?;
         let hosts = restriction_list(&body, "hosts", |s| HostId::new(s).ok())?;
@@ -5211,7 +5518,7 @@ impl AdminApi {
         };
 
         let config = self.state.config();
-        let ceiling = principal_ceiling(&config, &record.principal, &record.tenant);
+        let ceiling = principal_ceiling(&config, principal, tenant);
         // A name the configuration declares is the operator's own and safe to
         // repeat. One it does not is caller input, refused without echoing it:
         // an identifier-shaped string is as likely a pasted key as a typo.
@@ -5221,7 +5528,7 @@ impl AdminApi {
                 if exists {
                     format!(
                         "{what} '{name}' is outside what principal '{}' may use; a key can                          only narrow its principal's access",
-                        record.principal
+                        principal
                     )
                 } else {
                     format!("an entry names a {what} the active configuration does not declare")
@@ -5258,7 +5565,7 @@ impl AdminApi {
                 ApiErrorCode::ValidationFailed,
                 format!(
                     "principal '{}' queues at '{}'; a key may lower its priority but not                      raise it",
-                    record.principal,
+                    principal,
                     ceiling.class.as_str()
                 ),
             ));
@@ -5270,6 +5577,47 @@ impl AdminApi {
             hosts,
             priority,
         };
+        Ok(restrictions)
+    }
+
+    /// `PUT /admin/v1/keys/{id}/restrictions`: replace a key's restrictions
+    /// whole. The body names all four of `models`, `targets`, `hosts` and
+    /// `priority`; `null` narrows nothing.
+    ///
+    /// A key's restrictions are a subset of its principal's access, so every
+    /// entry is checked against the ceiling the active configuration gives the
+    /// principal and refused if it lies outside. That check is a courtesy to
+    /// the operator, not the guarantee: routing intersects the restriction
+    /// with the live policy on every request, so a later publication that
+    /// shrinks the principal's access shrinks the key's with it.
+    ///
+    /// No second person is involved, unlike a policy change, because nothing
+    /// here can widen what the principal's policy allows. Lifting a
+    /// restriction returns the key to that policy and no further.
+    fn set_key_restrictions(
+        &self,
+        request: &AdminRequest<'_>,
+        session: &Session,
+        raw_id: &str,
+    ) -> Result<ApiResponse, ApiError> {
+        let (key_id, record) = self.managed_key(session, raw_id)?;
+        if_match_satisfied(request.if_match(), &key_etag(&record))?;
+        if record.revoked {
+            return Err(ApiError::new(
+                ApiErrorCode::Conflict,
+                "the key is revoked; a revoked key cannot be given restrictions",
+            ));
+        }
+
+        let body = request.json(&Limits::SMALL)?;
+        if body.as_object().is_none() {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidRequest,
+                "a restriction change is a JSON object",
+            ));
+        }
+        let restrictions =
+            self.parse_key_restrictions(&body, &record.principal, &record.tenant)?;
         let event = AuditEvent::new(
             self.state.clock.wall_millis(),
             session.principal.as_str(),

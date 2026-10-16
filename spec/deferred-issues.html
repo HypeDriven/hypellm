@@ -41,6 +41,7 @@
 <details open class="nav-group"><summary>Components</summary><ul>
 <li><a href="components/fleet-agent.html">Fleet agent</a></li>
 <li><a href="components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="components/tls-helper.html">Outbound TLS helper</a></li>
 <li><a href="components/container-init.html">Container init</a></li>
 <li><a href="components/tray-monitor.html">Windows tray monitor</a></li>
 </ul></details>
@@ -93,6 +94,11 @@
 <td>Declare <code>price</code> records for the targets a budget should cover, or use a per-key token budget, which counts tokens rather than money.</td>
 </tr>
 <tr>
+<td>Usage history</td>
+<td>Usage aggregates live in memory. A restart starts them again from zero, so the usage screen's totals and its 24-hour, 7-day and 30-day per-principal windows cover only what the running process has served; the window view says so as <code>partial</code>. The per-principal view is hourly, keeps 30 days, and has no alias or target dimension — that breakdown is the main usage table's, since the router started. A key's token-budget ledger is the exception: it is durable.</td>
+<td>Read the window's "counting since" before acting on a total. For consumption that must survive restarts, rely on per-key token budgets or export the figures before restarting.</td>
+</tr>
+<tr>
 <td>Per-key token budgets</td>
 <td>Implemented, with one deviation: reservations are durable as a per-key high-water mark, not record by record. An unclean stop charges a key for headroom it had drawn and not used; it never returns spent credit. Budgets are per node, anonymous callers have none, and a job that cannot be funded fails rather than answering 402.</td>
 <td>Size <code>settings budget_draw_tokens</code> for what an unclean stop may cost a key (zero costs only what was in flight). Give a key to one node, or split its allowance between nodes by hand. Do not combine finite budgets with anonymous access.</td>
@@ -104,8 +110,8 @@
 </tr>
 <tr>
 <td>Per-key access restrictions</td>
-<td>A key can be narrowed to some of its principal's aliases, targets and fleet slaves, and to a lower queue class. A new key is unrestricted until its first restriction change; the endpoint's ceiling check ignores binding denies; a router older than this change refuses to start on a log holding a restriction change.</td>
-<td>Restrict a key before handing out its secret. Before rolling back across this change, restore a backup taken before the first restriction edit.</td>
+<td>A key can be narrowed to some of its principal's aliases, targets and fleet slaves, and to a lower queue class, when it is minted or later. The endpoint's ceiling check ignores binding denies; a router older than this change refuses to start on a log holding a restriction change.</td>
+<td>Before rolling back across this change, restore a backup taken before the first restricted key or restriction edit.</td>
 </tr>
 <tr>
 <td>Concurrency</td>
@@ -144,8 +150,8 @@
 </tr>
 <tr>
 <td>Target health</td>
-<td>The router runs no readiness probe. A target's breaker state reflects only the requests routed to it, so a target nothing has been routed to lately reads as healthy whether or not its container is still running.</td>
-<td>Read <code>/targets</code> and <code>targets_healthy</code> as &quot;nothing is known to be wrong&quot;, not &quot;answered a moment ago&quot;. Take liveness from the container runtime or the slave's own health endpoint.</td>
+<td>The liveness probe covers llama.cpp and SemIf endpoints only. A target of a remote API family is not probed, so its health is still learned only from the requests routed to it. A fleet-managed target is not probed either; the fleet's own observation stands in for it. Each router probes for itself.</td>
+<td>For a remote provider, read <code>breaker_state: &quot;closed&quot;</code> as &quot;nothing is known to be wrong&quot;, not &quot;answered a moment ago&quot;. Leave <code>settings target_probe_interval_ms</code> at its default unless the slaves' <code>/health</code> is unusually expensive.</td>
 </tr>
 <tr>
 <td>Streaming</td>
@@ -238,6 +244,11 @@
 <td>Give those machines stable addresses (DHCP reservations) and list the addresses.</td>
 </tr>
 <tr>
+<td>Outbound TLS helper</td>
+<td>The reference helper in <code>tls-helper/</code> verifies certificates against the image's CA store but does not check revocation (no OCSP or CRL), presents no client certificate, and negotiates HTTP/1.1 only. Its CA store and OpenSSL are whatever the pinned <code>python:3.13-slim</code> image carries. The router-side suite does not run against it: its own Python suite and a manual router-to-helper-to-TLS check cover the boundary.</td>
+<td>Move the image digest forward to take CA and OpenSSL updates. Use a provider that does not need client certificates, or put a terminator that does in front of it.</td>
+</tr>
+<tr>
 <td>Cleartext to slaves</td>
 <td>Plain HTTP is permitted to a private address, or a name resolving to one, under <code>egress=private_network</code>. Prompts and completions to an orchestrated slave are unencrypted on the operator's own network.</td>
 <td>Treat the fleet network as trusted, or terminate TLS in front of each slave and use <code>scheme=https</code>.</td>
@@ -249,8 +260,8 @@
 </tr>
 <tr>
 <td>Backups and audit export</td>
-<td><code>hypellm-router --backup</code> takes an exact copy on demand, but nothing schedules it, and audit export is not shipped anywhere.</td>
-<td>Run <code>--backup</code> from the deployment's existing backup schedule; periodically call the audit export endpoint and store the result immutably.</td>
+<td><code>hypellm-router --backup</code> takes an exact copy on demand. The local k3s profile schedules it nightly (<code>k8s/backup.yaml</code>) and keeps 14 dated copies, but on the same disk as the state it copies; the router itself schedules nothing, and audit export is not shipped anywhere.</td>
+<td>Copy <code>run/backups/archive</code> off the machine; elsewhere, run <code>--backup</code> from the deployment's existing backup schedule; periodically call the audit export endpoint and store the result immutably.</td>
 </tr>
 </tbody>
 </table></div>
@@ -382,14 +393,14 @@
 <li><strong>A router older than this change will not start on a log holding one.</strong> <code>ApiKeyExpiry</code> is a protected kind, and an older reader treats a protected frame of a kind it does not know as an integrity violation (<code>UnexpectedMac</code>) and stops. Before rolling back across this change, restore a backup taken before the first expiry edit, accepting that keys and revocations recorded since are lost.</li>
 </ul>
 <h2 id="per-key-access-restrictions">Per-key access restrictions</h2>
-<p><strong>Specification:</strong> §6.2, §9.2, §12, §16. <strong>Implementation:</strong> <code>hypellm_core::key_restriction</code>, <code>RoutingContext::key</code> in <code>hypellm_core::policy</code>, <code>AdminApi::set_key_restrictions</code> and <code>key_restrictions</code> in <code>crates/hypellm-admin-api/src/handlers.rs</code>, <code>RecordKind::ApiKeyRestriction</code>, the Access action on the Keys screen.</p>
-<p>A key may be narrowed within its principal's access: to some of the aliases the principal may use, to some of the targets (a model on a specific provider or slave) it may be served by, to some fleet slaves, and to an admission class no higher than the principal's. The principal's policy stays the ceiling, and enforcement is the intersection with the live policy on every request. §9.2 lists key scopes and source restrictions but no such narrowing, so this is an extension, and <code>GET</code>/<code>PUT /admin/v1/keys/{id}/restrictions</code> are additions to §16's table. Boundaries:</p>
+<p><strong>Specification:</strong> §6.2, §9.2, §12, §16. <strong>Implementation:</strong> <code>hypellm_core::key_restriction</code>, <code>RoutingContext::key</code> in <code>hypellm_core::policy</code>, <code>AdminApi::set_key_restrictions</code>, <code>key_restrictions</code>, <code>principal_key_ceiling</code> and <code>create_key</code> in <code>crates/hypellm-admin-api/src/handlers.rs</code>, <code>RecordKind::ApiKeyRestriction</code>, the Access action and the create form on the Keys screen.</p>
+<p>A key may be narrowed within its principal's access: to some of the aliases the principal may use, to some of the targets (a model on a specific provider or slave) it may be served by, to some fleet slaves, and to an admission class no higher than the principal's. The principal's policy stays the ceiling, and enforcement is the intersection with the live policy on every request. §9.2 lists key scopes and source restrictions but no such narrowing, so this is an extension, and <code>GET</code>/<code>PUT /admin/v1/keys/{id}/restrictions</code>, <code>GET /admin/v1/keys:ceiling</code> and the <code>restrictions</code> field of <code>POST /admin/v1/keys</code> are additions to §16's table. Boundaries:</p>
 <ul>
 <li><strong>A restricted alias looks ungranted.</strong> <code>/v1/models</code> omits it and a request for it answers <code>model_not_found</code>, byte for byte the answer for an alias the principal has no grant for. So does an alias every one of whose targets the key is kept off — the same rule fleet access follows — rather than the <code>no_eligible_target</code> a policy deny gives, because a distinct answer would tell the key the alias exists. The decision trace records <code>key_restricted</code> against each target removed.</li>
 <li><strong>The write-time check is approximate.</strong> The ceiling the endpoint checks against is the aliases granted for any operation and the targets their fleet grants reach; binding denies and pins are not applied to it. A target a binding denies can therefore be chosen and will simply never be routed to. Routing, not the check, is the guarantee.</li>
-<li><strong>A key is minted unrestricted.</strong> Restrictions are set after creation, so a new key is usable at its principal's full access until the first restriction change lands. Mint it, restrict it, then hand out the secret.</li>
+<li><strong>A key can be minted narrowed.</strong> <code>POST /admin/v1/keys</code> takes <code>restrictions</code> with the <code>PUT</code>'s body and checks, and a refused one creates no key. The restriction is written to the log <em>before</em> the key record, and replay carries it to that record, so a crash between the two leaves an inert restriction rather than a durable key wider than it was asked to be. Without <code>restrictions</code> a key is minted at its principal's full access, as before.</li>
 <li><strong>Priority is a cap on the queue class only.</strong> It changes where a key's requests wait under contention, not quotas, budgets or routing.</li>
-<li><strong>A router older than this change will not start on a log holding one.</strong> <code>ApiKeyRestriction</code> is a protected kind; an older reader treats it as an integrity violation and stops. Before rolling back across this change, restore a backup taken before the first restriction edit.</li>
+<li><strong>A router older than this change will not start on a log holding one.</strong> <code>ApiKeyRestriction</code> is a protected kind; an older reader treats it as an integrity violation and stops. Before rolling back across this change, restore a backup taken before the first restricted key or restriction edit.</li>
 </ul>
 <h2 id="per-key-token-budgets">Per-key token budgets</h2>
 <p><strong>Specification:</strong> <a href="router-specification.html#121-per-key-token-budgets">§12.1–12.3</a>, §15.3, §16. <strong>Implementation:</strong> <code>hypellm_core::budget</code> (the ledger), <code>hypellm_admin_api::budget</code> and the three <code>/admin/v1/keys/{id}/budget</code> handlers, <code>hypellm_router::pipeline</code> (reserve and settle), <code>RecordKind::KeyBudget</code>.</p>
@@ -463,19 +474,23 @@
 <li><strong>There is nothing to revoke and nothing to attribute.</strong> Every anonymous request is the same principal, so per-caller rate limiting, quota, and audit attribution are all at the granularity of &quot;everyone who did not present a key&quot;. Usage for that principal is a single aggregate.</li>
 <li><strong>Reaching the listener is the entire authorization check.</strong> On a listener bound to a network anyone else can reach, this is an open inference endpoint and the fleet's capacity is spendable by anyone who finds it. That is the intended behaviour of the switch, which is why it is off by default and why turning it on is a <code>critical</code> log line rather than an informational one.</li>
 </ul>
-<h2 id="target-health-is-observed-not-probed">Target health is observed, not probed</h2>
-<p><strong>Specification:</strong> §13. <strong>Implementation:</strong> <code>hypellm_core::health</code>, <code>GET /admin/v1/targets</code>, <code>GET /admin/v1/overview</code>.</p>
-<p>The router polls nothing. A target's health is learned from the requests routed to it — outcomes move its circuit breaker — plus whatever an operator has declared by draining, disabling, quarantining or putting it in maintenance. There is no background probe of a slave's <code>/health</code>, <code>/props</code> or any other endpoint, and no configuration record to enable one.</p>
-<p>So <code>breaker_state: &quot;closed&quot;</code> means <em>nothing is known to be wrong with this target</em>, not <em>this target answered recently</em>. A container that stopped a minute ago still reads as closed until the first request finds out. <code>targets_healthy</code> on <code>/overview</code> counts on the same rule, so it will report eight of eight for a fleet where half the machines are off.</p>
-<p>The direction this is wrong in is the survivable one: the first request to a stopped target fails and fails over, before any client-visible byte, under the §6.5 rules. The direction to be careful about is reading a management screen as a liveness display. The desktop monitor in <code>tray/</code> shows this state as <strong>ready</strong> and says in every such row's tooltip that it is what the router knows rather than a check on the container; the states it reports positively — failing, draining, quarantined, maintenance, disabled — are all things the router actually established.</p>
-<p>Get liveness from the machines themselves. The router's target list answers which targets are <em>permitted and not known broken</em>, which is a different question.</p>
+<h2 id="target-health-is-observed-not-probed">Target health: what the probe covers</h2>
+<p><strong>Specification:</strong> §13. <strong>Implementation:</strong> <code>hypellm_router::probe</code>, <code>hypellm_core::health</code> (<code>ProbeStatus</code>), <code>GET /admin/v1/targets</code>, <code>GET /admin/v1/overview</code>.</p>
+<p>One thread probes every llama.cpp and SemIf endpoint with <code>GET /health</code> on <code>settings target_probe_interval_ms</code> (default 10 s; 0 switches it off). Each probe has a deadline of <code>target_probe_timeout_ms</code> (default 2 s). Two failed probes in a row exclude the target as <code>probe_unreachable</code>, without any request being routed to it. Two good probes in a row restore it, and its preference then ramps back over 30 s, as it does after a breaker closes. llama.cpp answers 503 while it loads a model, so a slave restarting its server is excluded until it can serve.</p>
+<p>The probe never moves a breaker, and a breaker never moves the probe's verdict. A probe success cannot close a breaker that routed requests opened; only that breaker's own half-open requests can. A probe failure cannot open one, so a probe outage never spends a breaker's cooldown. A target is routable only when both allow it, and the decision trace says which one excluded it. The Targets screen shows both, and <code>targets_healthy</code> on <code>/overview</code> counts a probed-down target as degraded.</p>
+<p>What remains unprobed:</p>
+<ul>
+<li><strong>Remote API families</strong> (OpenAI, Anthropic, DeepSeek, Moonshot, the generic adapter). They have no liveness path the router could call without spending a request, so a closed breaker there still means <em>nothing is known to be wrong</em>, not <em>answered a moment ago</em>. The first request to a broken one fails and fails over before any client-visible byte, under the §6.5 rules. Their <code>probe</code> field on <code>/targets</code> is <code>null</code>.</li>
+<li><strong>Fleet-managed targets</strong>, those with a deployment while <code>fleet_enabled=true</code>. A stopped container there is a cold target the planner may start, and excluding it would mean it is never started (§26.4: only <code>Infeasible</code> excludes). The fleet's observation is its liveness signal.</li>
+<li><strong>Other nodes.</strong> Each router probes for itself; nothing is shared.</li>
+</ul>
 <h2 id="security-boundaries-worth-understanding">Security boundaries worth understanding</h2>
 <p>These are design boundaries rather than defects, but they affect deployment:</p>
 <ul>
 <li>Inbound TLS is supplied by a trusted edge; outbound TLS and OIDC signature verification are supplied by local platform helpers.</li>
 <li>The management session cookie is <code>__Host-</code> prefixed and <code>Secure</code>, so browsers store it only over HTTPS or on <code>localhost</code>/<code>127.0.0.1</code>. Management sign-in — including password sign-in — does not work over plain HTTP on any other address.</li>
 <li>Possession of the secrets directory defeats keyed store-integrity and authentication controls. Protect it separately from state.</li>
-<li>The TLS helper and OIDC verifier are part of the trusted computing base. The reference verifier in <code>verifier/</code> holds the OAuth client secret and decides which identity tokens are authentic; review it as such.</li>
+<li>The TLS helper and OIDC verifier are part of the trusted computing base. The reference TLS helper in <code>tls-helper/</code> sees every remote provider's prompts, completions and credentials in plaintext and decides which certificates are authentic. The reference verifier in <code>verifier/</code> holds the OAuth client secret and decides which identity tokens are authentic; review it as such.</li>
 <li>Availability against an attacker capable of filling the configured connection cap is bounded, not guaranteed.</li>
 <li>API and module changes involving auth, parsers, credential handling, policy activation or storage integrity require two-person review.</li>
 </ul>
@@ -504,7 +519,7 @@
 <li class="toc-level-2"><a href="#reranking-and-the-semif-scorer-behind-it">Reranking, and the SemIf scorer behind it</a></li>
 <li class="toc-level-2"><a href="#local-password-sign-in-is-a-deviation">Local password sign-in is a deviation</a></li>
 <li class="toc-level-2"><a href="#anonymous-inference-access-is-a-deviation">Anonymous inference access is a deviation</a></li>
-<li class="toc-level-2"><a href="#target-health-is-observed-not-probed">Target health is observed, not probed</a></li>
+<li class="toc-level-2"><a href="#target-health-is-observed-not-probed">Target health: what the probe covers</a></li>
 <li class="toc-level-2"><a href="#security-boundaries-worth-understanding">Security boundaries worth understanding</a></li>
       </ol></details>
     </aside>

@@ -41,6 +41,7 @@
 <details open class="nav-group"><summary>Components</summary><ul>
 <li><a href="../components/fleet-agent.html">Fleet agent</a></li>
 <li><a href="../components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="../components/tls-helper.html">Outbound TLS helper</a></li>
 <li><a href="../components/container-init.html">Container init</a></li>
 <li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
 </ul></details>
@@ -497,9 +498,15 @@ management listeners differ, so both are given.</p>
 </tr>
 <tr>
 <td>Background threads</td>
-<td>4 fixed — accept loop, management listener, housekeeping, and the metrics listener when <code>settings metrics_listen</code> names one — plus <code>settings job_workers</code> (default 0)</td>
+<td>5 fixed — accept loop, management listener, housekeeping, the liveness probe, and the metrics listener when <code>settings metrics_listen</code> names one — plus <code>settings job_workers</code> (default 0)</td>
 <td>—</td>
 <td><code>Router::run</code>; none is created per request (3.2)</td>
+</tr>
+<tr>
+<td>Liveness probe</td>
+<td>One endpoint at a time, each within <code>settings target_probe_timeout_ms</code> (1–10,000 ms, below the interval); rounds every <code>target_probe_interval_ms</code> (0 off, else at least 1,000 ms); the response head only is read, and the socket is never pooled</td>
+<td>10,000 ms interval, 2,000 ms timeout</td>
+<td><code>probe::probe_loop</code>, <code>Egress::dial_probe</code>; shutdown is checked between probes, so a drain waits for at most one</td>
 </tr>
 <tr>
 <td>Live jobs per tenant</td>
@@ -680,6 +687,14 @@ and nothing else.</p>
 integration tests and the benchmark harness must build the <em>same</em> router the
 binary builds — <code>pipeline::execute</code>, <code>dispatch::attempt</code>, and the <code>protocol</code>
 renderers are exposed for that reason, not as a stable extension point.</p>
+<p><code>probe::run_round</code>, <code>probe::probe_set</code> and <code>probe::probe_loop</code> are public for the
+same reason. The probe set is a function of the validated configuration alone:
+llama.cpp and SemIf providers, minus targets with a deployment while the fleet is
+enabled, because a stopped container there is a cold target, not a dead one
+(specification 26.4). The probe publishes <code>hypellm_target_probe_up{target}</code> and
+<code>hypellm_target_probes_total{target,outcome}</code>, with <code>outcome</code> one of <code>ok</code> and
+<code>failed</code>, and logs only the edges <code>target.probe_unreachable</code> and
+<code>target.probe_reachable</code>.</p>
 <p><code>server::ListenerMetrics</code> is optional and per-plane. A <code>Server</code> without one is
 still correct; it simply publishes no connection or byte counters, which is the
 right default for the benchmark harness and for tests that assert on behaviour

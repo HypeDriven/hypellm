@@ -41,6 +41,7 @@
 <details open class="nav-group"><summary>Components</summary><ul>
 <li><a href="components/fleet-agent.html">Fleet agent</a></li>
 <li><a href="components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="components/tls-helper.html">Outbound TLS helper</a></li>
 <li><a href="components/container-init.html">Container init</a></li>
 <li><a href="components/tray-monitor.html">Windows tray monitor</a></li>
 </ul></details>
@@ -169,8 +170,12 @@ GET /admin/v1/traffic         # ReadSummary
 <code>config_version</code>, <code>config_digest</code>, <code>audit_head</code>, <code>audit_records</code>.</p>
 <p><code>targets</code> returns, per target: <code>state</code>, <code>breaker_state</code>
 (<code>closed</code> / <code>open</code> / <code>half_open</code>), <code>in_flight</code>, <code>total_requests</code>,
-<code>total_failures</code>, <code>quarantined</code>, plus declared capabilities and cost class
-(<code>handlers.rs</code>, <code>render_target</code>).</p>
+<code>total_failures</code>, <code>quarantined</code>, <code>probe</code>, plus declared capabilities and cost class
+(<code>handlers.rs</code>, <code>render_target</code>). <code>probe</code> is the liveness probe's last view —
+<code>state</code> (<code>reachable</code> / <code>unreachable</code>), <code>last_ok</code>, <code>last_probe_at</code>,
+<code>consecutive_failures</code> — or <code>null</code> for a target the router does not probe. An
+<code>unreachable</code> probe excludes the target as <code>probe_unreachable</code> even while its
+breaker reads <code>closed</code>, and <code>targets_healthy</code> counts it as degraded.</p>
 <p><code>traffic</code> returns the figures the other two cannot: a rolling rate and latency
 window, and the admission limits beside their occupancy. The counters on
 <code>targets</code> are cumulative since the router started, so the ratio between them is
@@ -507,6 +512,7 @@ outlive the revocation by up to the request deadline
 <h3 id="2-search-the-audit-and-usage-record">2. Search the audit and usage record</h3>
 <pre><code>GET /admin/v1/audit?limit=500        # ReadAudit, cursor-paginated, tenant-scoped
 GET /admin/v1/usage                  # ReadOwnUsage / ReadTenantUsage
+GET /admin/v1/usage/principals?window=24h&amp;principal=&lt;p&gt;   # same permissions
 </code></pre>
 <blockquote>
 <p><strong>The view is a window, not the record.</strong> Every management mutation is
@@ -526,17 +532,21 @@ status, cost class) totals for the caller's tenant, distinguishing
 provider-reported from router-estimated numbers so an estimate cannot read as a
 bill.</p>
 <blockquote>
-<p><strong>Searching &quot;by key pseudonym&quot; is not available.</strong> Specification 22.3 step 20
-asks for it. <code>Pseudonymizer</code> produces deterministic tenant and principal
-pseudonyms for <strong>log lines</strong> (<code>crates/hypellm-telemetry/src/logs.rs</code>), and
-<code>GET /admin/v1/usage</code> still carries no key dimension, so &quot;search <em>usage</em> by
-key pseudonym&quot; is unmet. For the audit half, filter directly:</p>
+<p><strong>Usage by key is available; by pseudonym it is not.</strong> Specification 22.3 step 20
+asks to search usage by key pseudonym. Usage is attributed to the key itself:
+<code>GET /admin/v1/usage</code> carries <code>by_key</code> totals since the router started, and
+<code>GET /admin/v1/usage/principals</code> each key's totals over the last day, week or month,
+including refused and throttled requests — both tenant-wide for
+<code>ReadTenantUsage</code>. Both are in memory, so a restart during the incident loses
+them. <code>Pseudonymizer</code>'s pseudonyms exist only in <strong>log lines</strong>
+(<code>crates/hypellm-telemetry/src/logs.rs</code>), not in usage. For the audit half, filter
+directly:</p>
 <pre><code>GET /admin/v1/audit?actor=user:someone&amp;action=key_revoked&amp;since=&lt;ms&gt;&amp;until=&lt;ms&gt;&amp;durable=true
 </code></pre>
 <p>Every parameter narrows and none widens: the tenant filter runs first, so no
-query string reaches another tenant's records. For usage, filter the router's
-structured logs by the principal pseudonym and correlate to the key through
-<code>GET /admin/v1/keys</code> .</p>
+query string reaches another tenant's records. For usage older than the router's
+start, filter the router's structured logs by the principal pseudonym and
+correlate to the key through <code>GET /admin/v1/keys</code>.</p>
 <p><strong><code>method</code> distinguishes how a caller authenticated:</strong> <code>api_key</code>, <code>oidc</code>,
 <code>break_glass</code>, or <code>local_peer</code>.</p>
 <p>The in-memory audit index is a 2 048-record ring and is lost on restart; the

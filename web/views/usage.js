@@ -33,6 +33,15 @@
  *   nothing is filtered, and the visible subset when something is — labelled
  *   either way rather than left for the operator to guess.
  *
+ * The "By principal and key" panel reads `GET /admin/v1/usage/principals`, a
+ * second, narrower aggregate: hourly totals per principal and per key over the
+ * last day, week or month, so an operator can see what a principal and each of
+ * its keys used before setting their limits. It is filtered and sorted by the
+ * router's own window rather than client-side, and it states the two ways its
+ * figures can be less than they look: usage lives in memory, so a window that
+ * reaches back past the router's start is partial; and past the aggregate's
+ * bound, usage folds into an unattributed remainder.
+ *
  * The screen is read-only: usage is a counter the data plane writes, and the
  * management API exposes no mutation for it. Nothing here needs `If-Match`,
  * a confirmation, or the non-optimistic mutation discipline of specification
@@ -71,6 +80,28 @@ export const meta = {
  * answer to the question the screen is usually opened with.
  */
 const DEFAULT_ROW_LIMIT = 200;
+
+/** The windows `/usage/principals` accepts. */
+const WINDOWS = [
+  { value: '24h', label: 'Last 24 hours' },
+  { value: '7d', label: 'Last 7 days' },
+  { value: '30d', label: 'Last 30 days' },
+];
+
+/** What the principal and key tables can be ordered by, largest first. */
+const SORTS = [
+  { value: 'requests', label: 'Requests', of: (row) => counter(row.requests) || 0 },
+  {
+    value: 'tokens',
+    label: 'Total tokens',
+    of: (row) => (counter(row.input_tokens) || 0) + (counter(row.output_tokens) || 0),
+  },
+  {
+    value: 'refused',
+    label: 'Failed and throttled',
+    of: (row) => (counter(row.failed_requests) || 0) + (counter(row.throttled_requests) || 0),
+  },
+];
 
 /** The dimensions a usage row is broken down by, in the handler's own order. */
 const DIMENSIONS = [
@@ -271,11 +302,214 @@ function fillOptions(select, values, allLabel) {
  * @param {(tone: string, message: string) => void} ctx.notify
  * @returns {Promise<void>}
  */
+/**
+ * The "By principal and key" panel.
+ *
+ * @param {object} ctx The view context.
+ * @returns {Promise<HTMLElement>}
+ */
+async function principalPanel(ctx) {
+  const seeded = {
+    principal: ctx.query && ctx.query.get('principal') ? String(ctx.query.get('principal')) : '',
+    key: ctx.query && ctx.query.get('key') ? String(ctx.query.get('key')) : '',
+  };
+  const view = { window: '24h', sort: 'requests', principal: seeded.principal, envelope: {} };
+
+  const windowSelect = el(
+    'select',
+    {},
+    WINDOWS.map((option) => el('option', { value: option.value }, option.label)),
+  );
+  const sortSelect = el(
+    'select',
+    {},
+    SORTS.map((option) => el('option', { value: option.value }, option.label)),
+  );
+  const host = el('div');
+  const status = el('p', { class: 'panel__note', role: 'status', 'aria-live': 'polite' });
+
+  async function load() {
+    const query = new URLSearchParams({ window: view.window });
+    const { data } = await ctx.api.get(`/usage/principals?${query.toString()}`);
+    view.envelope = data || {};
+    paint();
+  }
+
+  function sorted(rows) {
+    const sort = SORTS.find((option) => option.value === view.sort) || SORTS[0];
+    return [...rows].sort((a, b) => sort.of(b) - sort.of(a) || String(a.principal).localeCompare(String(b.principal)));
+  }
+
+  function refusedCell(row) {
+    const failed = counter(row.failed_requests) || 0;
+    const throttled = counter(row.throttled_requests) || 0;
+    if (failed === 0 && throttled === 0) return text('0');
+    return el('span', {}, [
+      text(`${formatCount(failed)} failed`),
+      text(' · '),
+      text(`${formatCount(throttled)} throttled`),
+    ]);
+  }
+
+  const measures = [
+    { label: 'Requests', numeric: true, cell: (row) => countCell(row.requests) },
+    { label: 'Input tokens', numeric: true, cell: (row) => countCell(row.input_tokens) },
+    { label: 'Output tokens', numeric: true, cell: (row) => countCell(row.output_tokens) },
+    { label: 'Estimated', numeric: true, cell: (row) => countCell(row.estimated_requests) },
+    { label: 'Refused', cell: refusedCell },
+  ];
+
+  function paint() {
+    const envelope = view.envelope;
+    const principals = Array.isArray(envelope.principals) ? envelope.principals : [];
+    const keys = Array.isArray(envelope.keys) ? envelope.keys : [];
+    const blocks = [];
+
+    blocks.push(
+      definitionList([
+        ['Window', `${formatTime(envelope.from)} to ${formatTime(envelope.until)}, by the hour`],
+        [
+          'Scope',
+          envelope.scope === 'tenant' ? 'Every principal in the tenant' : 'Only your own principal and its keys',
+        ],
+      ]),
+    );
+    if (envelope.partial === true) {
+      // Usage is held in memory. A month that silently meant "since the last
+      // restart" would be read as a month of consumption.
+      blocks.push(
+        banner(
+          'warn',
+          `Partial window: the router keeps usage in memory and has been counting since ${formatTime(envelope.counting_since)}. Anything before that, including before the last restart, is not included.`,
+        ),
+      );
+    }
+    if (envelope.truncated === true && envelope.unattributed) {
+      blocks.push(
+        banner(
+          'warn',
+          `Attribution is incomplete: past its bounded number of rows the router folded ${formatCount(envelope.unattributed.requests)} request(s) into an unattributed remainder. They are counted in no principal below.`,
+        ),
+      );
+    }
+
+    blocks.push(
+      table({
+        caption: `${formatCount(principals.length)} principal(s), largest first by ${(SORTS.find((s) => s.value === view.sort) || SORTS[0]).label.toLowerCase()}. Estimated counts requests whose tokens the router estimated because the provider reported none.`,
+        columns: [
+          {
+            label: 'Principal',
+            cell: (row) => {
+              const name = String(row.principal);
+              const pick = el('button', {
+                type: 'button',
+                class: 'button button--quiet',
+                'aria-pressed': view.principal === name ? 'true' : 'false',
+                text: name,
+              });
+              pick.addEventListener('click', () => {
+                view.principal = view.principal === name ? '' : name;
+                paint();
+              });
+              return pick;
+            },
+          },
+          ...measures,
+          { label: 'Keys', numeric: true, cell: (row) => countCell(row.keys) },
+        ],
+        rows: sorted(principals),
+        empty:
+          envelope.scope === 'tenant'
+            ? 'No requests were recorded in this window.'
+            : 'You made no requests in this window.',
+      }),
+    );
+
+    if (view.principal) {
+      const own = keys.filter((row) => String(row.principal) === view.principal);
+      const access = el('a', { href: `#/principal-access?principal=${encodeURIComponent(view.principal)}` }, 'Set this principal’s access and limits');
+      blocks.push(
+        el('h3', { text: `Keys held by ${view.principal}` }),
+        el('p', {}, [access]),
+        table({
+          caption: `${formatCount(own.length)} key(s) with requests in this window. The token budget is the key’s lifetime ledger, not this window.`,
+          columns: [
+            {
+              label: 'Key id',
+              cell: (row) => {
+                const id = el('span', { class: 'mono', text: String(row.key_id) });
+                return seeded.key && String(row.key_id) === seeded.key ? el('strong', {}, [id]) : id;
+              },
+            },
+            { label: 'Description', cell: (row) => text(row.description ? String(row.description) : '—') },
+            { label: 'Status', cell: (row) => (row.revoked ? pill('Revoked', 'danger') : pill('Live', 'ok')) },
+            ...measures,
+            {
+              label: 'Token budget',
+              cell: (row) => {
+                const budget = row.budget || {};
+                const consumed = formatCount(counter(budget.consumed_tokens) || 0);
+                return text(
+                  budget.token_limit === null || budget.token_limit === undefined
+                    ? `${consumed} used, no limit`
+                    : `${consumed} of ${formatCount(counter(budget.token_limit) || 0)} used`,
+                );
+              },
+            },
+          ],
+          rows: sorted(own),
+          empty: `No key held by ${view.principal} made a request in this window. Requests made without a key still count toward the principal above.`,
+        }),
+      );
+    } else if (principals.length > 0) {
+      blocks.push(el('p', { class: 'panel__note', text: 'Choose a principal to see each of its keys.' }));
+    }
+
+    render(host, el('div', { class: 'view__body' }, blocks));
+  }
+
+  windowSelect.addEventListener('change', async () => {
+    view.window = windowSelect.value;
+    status.textContent = '';
+    try {
+      await load();
+      status.textContent = `Showing ${(WINDOWS.find((w) => w.value === view.window) || WINDOWS[0]).label.toLowerCase()}.`;
+    } catch (error) {
+      if (error && error.name === 'AbortError') return;
+      status.textContent = 'The window could not be read; the figures shown are from the previous one.';
+      throw error;
+    }
+  });
+  sortSelect.addEventListener('change', () => {
+    view.sort = sortSelect.value;
+    paint();
+  });
+
+  await load();
+
+  return panel({
+    title: 'By principal and key',
+    note: 'What each principal, and each of its keys, used over a window — read before setting their limits on Principal access or the Keys screen.',
+    content: [
+      toolbar(
+        [
+          inlineField({ id: 'usage-window', label: 'Window', control: windowSelect }),
+          inlineField({ id: 'usage-sort', label: 'Sort by', control: sortSelect }),
+        ],
+        { label: 'Principal usage controls' },
+      ),
+      status,
+      host,
+    ],
+  });
+}
+
 export async function mount(container, ctx) {
   // Awaited before anything is drawn, so the shell's "Loading…" line and
   // `aria-busy` cover the wait, and a failure reaches the shell error boundary
   // with the router's own message and request id rather than a half-built page.
   const first = await ctx.api.get('/usage');
+  const byPrincipal = await principalPanel(ctx);
 
   const state = {
     /** @type {object} The `/admin/v1/usage` envelope. */
@@ -693,6 +927,7 @@ export async function mount(container, ctx) {
       actions: [refresh],
       content: [scopeHost, statusLine],
     }),
+    byPrincipal,
     panel({
       title: 'Breakdown',
       note: 'Grouping and filtering are applied here, to the rows the router returned; the usage endpoint takes no filter parameters, so nothing on this screen changes what was asked for.',

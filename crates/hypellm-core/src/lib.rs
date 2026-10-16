@@ -359,6 +359,7 @@ mod invariant_tests {
             ExclusionReason::TargetMaintenance,
             ExclusionReason::TargetQuarantined,
             ExclusionReason::CircuitOpen,
+            ExclusionReason::ProbeUnreachable,
             ExclusionReason::ModalityUnsupported,
             ExclusionReason::ToolsUnsupported,
             ExclusionReason::StructuredOutputUnsupported,

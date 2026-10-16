@@ -547,10 +547,11 @@ impl Router {
         // A shipped default credential is the one configuration mistake that
         // is invisible from inside the process and fatal from outside it, so
         // the router says it out loud on every start. `docker/hypellm.conf`
-        // ships `admin/admin` on purpose — it is what makes a fresh checkout
-        // usable before an identity provider exists — and the whole point of
-        // that convenience is that it must not survive contact with a network
-        // anybody else can reach.
+        // once shipped `admin/admin` so a fresh checkout was usable before an
+        // identity provider existed; it now carries generated passwords, but
+        // any configuration may still declare a username-as-password account,
+        // and that convenience must not survive contact with a network anybody
+        // else can reach.
         //
         // "The password is the username" is the cheapest test that catches it.
         // It costs one verification per local account, so it runs
@@ -1152,6 +1153,20 @@ impl Router {
                 .spawn(move || housekeeping_loop(&state, &stopping, fleet_key.as_deref()))?
         };
 
+        // The liveness probe (`crate::probe`). One thread for the process,
+        // started here and never from a request; it does nothing while
+        // `target_probe_interval_ms` is zero, and observes the same shutdown
+        // handle as housekeeping, so a drain waits for at most one probe.
+        let probe = {
+            let state = Arc::clone(&state);
+            let stopping = self.inference.shutdown_handle();
+            std::thread::Builder::new()
+                .name("hypellm-probe".to_owned())
+                .spawn(move || {
+                    crate::probe::probe_loop(&state, &|| stopping.is_shutting_down());
+                })?
+        };
+
         // The job pool. A fixed number of threads, started here and never from
         // a request (specification 3.2), and none at all unless
         // `settings job_workers` asked for them.
@@ -1185,6 +1200,7 @@ impl Router {
             let _ = thread.join();
         }
         let _ = housekeeping.join();
+        let _ = probe.join();
 
         // After the listeners have drained: a job accepted on the last request
         // before the drain still gets its worker. `shutdown` stops new
@@ -1759,11 +1775,20 @@ fn restore_anonymous_access(recovery: &hypellm_store::Recovery) -> bool {
 /// a revocation whichever order the two were written in.
 fn restore_keys(recovery: &hypellm_store::Recovery, keys: &KeyStore) -> RestoredKeys {
     let mut counts = RestoredKeys::default();
+    // A key minted narrowed has its restriction written *before* its own
+    // record (`create_key`), so a crash between the two leaves an inert
+    // restriction rather than a durable unrestricted key. Replay therefore
+    // holds a restriction naming a key it has not yet seen, and applies it
+    // when that key's record arrives. Bounded by the frames in the log.
+    let mut pending = BTreeMap::new();
 
     for frame in &recovery.frames {
         match frame.kind {
             RecordKind::ApiKey => match hypellm_auth::KeyRecord::from_payload(&frame.payload) {
-                Some(record) => {
+                Some(mut record) => {
+                    if let Some(restrictions) = pending.remove(&record.id) {
+                        record.restrictions = restrictions;
+                    }
                     keys.insert(record);
                     counts.restored = counts.restored.saturating_add(1);
                 }
@@ -1791,7 +1816,11 @@ fn restore_keys(recovery: &hypellm_store::Recovery, keys: &KeyStore) -> Restored
             RecordKind::ApiKeyRestriction => {
                 match hypellm_auth::RestrictionChange::from_payload(&frame.payload) {
                     Some(change) => {
-                        keys.set_restrictions(&change.id, change.restrictions);
+                        if keys.get(&change.id).is_some() {
+                            keys.set_restrictions(&change.id, change.restrictions);
+                        } else {
+                            pending.insert(change.id, change.restrictions);
+                        }
                     }
                     None => counts.unreadable = counts.unreadable.saturating_add(1),
                 }
@@ -2434,6 +2463,86 @@ binding id=b scope=tenant:acme model=* prefer=local:m
         let counts = restore_keys(&recovery, &keys);
         assert_eq!(counts, RestoredKeys { restored: 1, unreadable: 0 });
         assert_eq!(keys.get(&id).map(|r| r.restrictions), Some(narrowed_to_agent()));
+    }
+
+    #[test]
+    fn a_key_minted_narrowed_is_restored_narrowed() {
+        // `create_key` writes the restriction *before* the key record, so a
+        // crash between them cannot leave a durable unrestricted key. Replay
+        // has to carry that early frame to the record that follows; dropped
+        // as "a key it has not seen", the key would return unrestricted.
+        let dir = TempDir::new("startup-minted-narrowed");
+        let verifier_key = b"a-key-verifier-key-for-these-tests";
+        let id = {
+            let (store, _) = Store::open(dir.path(), b"a-store-mac-key-for-these-tests", 0)
+                .expect("open store");
+            let new_key = KeyStore::new(verifier_key)
+                .create(
+                    hypellm_core::ids::TenantId::new("acme").expect("tenant"),
+                    hypellm_core::ids::PrincipalId::new("svc:test").expect("principal"),
+                    vec![hypellm_auth::Scope::Inference],
+                    None,
+                    hypellm_auth::SourceRestriction::Any,
+                    None,
+                    1_767_225_600_000,
+                )
+                .expect("entropy");
+            let change = hypellm_auth::RestrictionChange {
+                id: new_key.id().clone(),
+                restrictions: narrowed_to_agent(),
+            };
+            store
+                .append(RecordKind::ApiKeyRestriction, &change.to_payload())
+                .expect("append restriction");
+            store
+                .append(RecordKind::ApiKey, &new_key.record.to_payload())
+                .expect("append key");
+            new_key.id().clone()
+        };
+        let (_store, recovery) = Store::open(dir.path(), b"a-store-mac-key-for-these-tests", 0)
+            .expect("reopen");
+        let keys = KeyStore::new(verifier_key);
+        let counts = restore_keys(&recovery, &keys);
+        assert_eq!(counts, RestoredKeys { restored: 1, unreadable: 0 });
+        assert_eq!(keys.get(&id).map(|r| r.restrictions), Some(narrowed_to_agent()));
+    }
+
+    #[test]
+    fn a_restriction_whose_key_never_became_durable_restores_nothing() {
+        // The crash this ordering exists for: the restriction reached the log
+        // and the key record did not. Nothing may authenticate afterwards.
+        let dir = TempDir::new("startup-orphan-restriction");
+        let verifier_key = b"a-key-verifier-key-for-these-tests";
+        let (id, secret) = {
+            let (store, _) = Store::open(dir.path(), b"a-store-mac-key-for-these-tests", 0)
+                .expect("open store");
+            let new_key = KeyStore::new(verifier_key)
+                .create(
+                    hypellm_core::ids::TenantId::new("acme").expect("tenant"),
+                    hypellm_core::ids::PrincipalId::new("svc:test").expect("principal"),
+                    vec![hypellm_auth::Scope::Inference],
+                    None,
+                    hypellm_auth::SourceRestriction::Any,
+                    None,
+                    1_767_225_600_000,
+                )
+                .expect("entropy");
+            let change = hypellm_auth::RestrictionChange {
+                id: new_key.id().clone(),
+                restrictions: narrowed_to_agent(),
+            };
+            store
+                .append(RecordKind::ApiKeyRestriction, &change.to_payload())
+                .expect("append restriction");
+            (new_key.id().clone(), new_key.into_secret())
+        };
+        let (_store, recovery) = Store::open(dir.path(), b"a-store-mac-key-for-these-tests", 0)
+            .expect("reopen");
+        let keys = KeyStore::new(verifier_key);
+        let counts = restore_keys(&recovery, &keys);
+        assert_eq!(counts, RestoredKeys { restored: 0, unreadable: 0 });
+        assert!(keys.get(&id).is_none());
+        assert!(keys.verify(&secret, None, 1_767_225_600_001).is_err());
     }
 
     #[test]

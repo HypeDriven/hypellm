@@ -41,6 +41,7 @@
 <details open class="nav-group"><summary>Components</summary><ul>
 <li><a href="../components/fleet-agent.html">Fleet agent</a></li>
 <li><a href="../components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="../components/tls-helper.html">Outbound TLS helper</a></li>
 <li><a href="../components/container-init.html">Container init</a></li>
 <li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
 </ul></details>
@@ -224,6 +225,11 @@ apart, and <code>Egress::dial_fresh</code> opens a connection bypassing the pool
 <strong>not</strong> the egress guard, which it applies exactly as <code>acquire</code> does. The
 retry policy itself lives in the router's dispatch layer, not here: this crate
 still contains no retry loop.</p>
+<p><code>Egress::dial_probe</code> is the liveness probe's dial: the same resolve, validate and
+pin path under the provider's egress profile, so a probe can reach nothing a
+request could not. It differs only in its connect timeout, which is the shorter
+of the probe's and the egress default, and in its pool key class (<code>probe</code>), so
+a probe socket is never mistaken for a request's.</p>
 <p><code>is_pooled</code> on its own is <strong>not</strong> sufficient grounds to replay a request, and
 a caller that treats it that way has a specification 6.5 defect. A live pooled
 connection can also fail while reading the head — a timeout, a partial head —

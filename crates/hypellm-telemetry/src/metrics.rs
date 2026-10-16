@@ -777,6 +777,10 @@ pub mod names {
     pub const UPSTREAM_ERRORS: &str = "hypellm_upstream_errors_total";
     /// Circuit breaker state, as a gauge per target.
     pub const BREAKER_STATE: &str = "hypellm_breaker_state";
+    /// Whether the liveness probe currently finds a target reachable: 1 or 0.
+    pub const TARGET_PROBE_UP: &str = "hypellm_target_probe_up";
+    /// Liveness probes completed, by target and `outcome` (`ok` or `failed`).
+    pub const TARGET_PROBES: &str = "hypellm_target_probes_total";
     /// Authentication failures.
     pub const AUTH_FAILURES: &str = "hypellm_auth_failures_total";
     /// Admission rejections, by scope and reason.

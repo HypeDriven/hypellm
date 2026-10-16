@@ -208,6 +208,9 @@ export async function mount(container, ctx) {
       datalist,
       buttonRow([show]),
       pickerStatus,
+      subject
+        ? el('p', {}, [el('a', { href: `#/usage?principal=${encodeURIComponent(subject)}` }, `What ${subject} used recently`)])
+        : null,
     ]);
 
     if (!subject) {

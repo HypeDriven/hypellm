@@ -57,4 +57,4 @@ pub use handlers::{
 };
 pub use response::{ApiError, ApiErrorCode, ApiResponse, Pagination};
 pub use traffic::{LatencySummary, TrafficSample, TrafficSummary, TrafficWindow};
-pub use usage::{UsageAggregate, UsageSample, UsageStatus, UsageTotals};
+pub use usage::{UsageAggregate, UsageSample, UsageStatus, UsageTotals, WindowRow, WindowUsage};

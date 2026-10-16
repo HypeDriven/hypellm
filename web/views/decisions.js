@@ -62,6 +62,7 @@ const EXCLUSION_MEANINGS = {
   target_maintenance: 'The target is in a maintenance window.',
   target_quarantined: 'An operator quarantined the target.',
   circuit_open: "The target's circuit breaker is open.",
+  probe_unreachable: "The router's liveness probe found the target's server down; it is excluded until the probe succeeds again.",
   unhealthy: "The target is too unhealthy for this request's failure policy.",
   modality_unsupported: 'The target does not accept a required input modality.',
   tools_unsupported: 'The target does not support tool calling.',

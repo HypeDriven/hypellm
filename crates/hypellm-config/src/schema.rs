@@ -93,6 +93,8 @@ pub const SCHEMAS: &[Schema] = &[
             "job_retention_ms",
             "max_recovery_waiters",
             "max_parked_requests",
+            "target_probe_interval_ms",
+            "target_probe_timeout_ms",
         ],
         singleton: true,
     },

@@ -35,6 +35,8 @@ metrics_port   := `sed -n 's/.*metrics_listen=[^:]*:\([0-9]*\).*/\1/p' docker/hy
 state_dir     := justfile_directory() / "run" / "state"
 secrets_dir   := justfile_directory() / "run" / "secrets"
 tailscale_dir := justfile_directory() / "run" / "tailscale"
+# Nightly backups (k8s/backup.yaml): `current` is the router's backup_dir, `archive` the dated copies.
+backups_dir   := justfile_directory() / "run" / "backups"
 
 # The identity verifier's two directories, created empty and used only by the
 # verifier `just oidc` starts (see spec/components/identity-verifier.html). `verify` is the socket
@@ -589,8 +591,8 @@ _ports:
 # hostPath volumes are declared `type: Directory`, so they have to exist, owned
 # by the invoking user, before the pod starts.
 _dirs:
-    @mkdir -p "{{state_dir}}" "{{secrets_dir}}" "{{tailscale_dir}}" "{{verify_dir}}" "{{verifier_dir}}"
-    @chmod 0700 "{{secrets_dir}}" "{{tailscale_dir}}" "{{verifier_dir}}"
+    @mkdir -p "{{state_dir}}" "{{secrets_dir}}" "{{tailscale_dir}}" "{{verify_dir}}" "{{verifier_dir}}" "{{backups_dir}}/current"
+    @chmod 0700 "{{secrets_dir}}" "{{tailscale_dir}}" "{{verifier_dir}}" "{{backups_dir}}" "{{backups_dir}}/current"
 
 # Generate the secret bundle once. A missing key is a startup failure by
 # design (exit 5) and is never silently regenerated: a router that invents its

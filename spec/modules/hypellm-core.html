@@ -41,6 +41,7 @@
 <details open class="nav-group"><summary>Components</summary><ul>
 <li><a href="../components/fleet-agent.html">Fleet agent</a></li>
 <li><a href="../components/identity-verifier.html">Identity verifier</a></li>
+<li><a href="../components/tls-helper.html">Outbound TLS helper</a></li>
 <li><a href="../components/container-init.html">Container init</a></li>
 <li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
 </ul></details>
@@ -152,7 +153,7 @@ exclusion reasons; no I/O&quot;.</p>
 <td>12</td>
 </tr>
 <tr>
-<td>Circuit breakers, EWMA, live state</td>
+<td>Circuit breakers, EWMA, liveness-probe records, live state</td>
 <td><code>health</code></td>
 <td>13</td>
 </tr>
@@ -765,6 +766,14 @@ layer covers the ones nobody did.</p>
 <ul>
 <li><a href="../../crates/hypellm-core/src/policy.rs"><code>LiveState</code></a> is the seam. Implement it to inject health; <code>IdealLiveState</code>
 reports everything healthy and is what policy simulation uses.</li>
+<li><code>LiveState::probe_unreachable</code> (default <code>false</code>) is the liveness probe's
+eligibility filter, reported as <code>ExclusionReason::ProbeUnreachable</code>. In
+<code>HealthRegistry</code> it is backed by <code>record_probe</code>, <code>probe_status</code> and
+<code>retain_probes</code>: two failures in a row (<code>PROBE_FAILURES_TO_EXCLUDE</code>) exclude a
+target, two successes (<code>PROBE_SUCCESSES_TO_RESTORE</code>) restore it, and the
+restoration ramp then applies. A probe record never reads or writes a breaker,
+so a probe success cannot close a breaker that routed requests opened. The map
+holds only targets the router is currently probing.</li>
 <li><code>rbac::Role</code> is re-exported as <code>ManagementRole</code> because <code>canonical::Role</code> is a
 message role. The two would read identically at a call site and mean entirely
 different things.</li>

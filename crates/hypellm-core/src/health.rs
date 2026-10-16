@@ -103,6 +103,134 @@ impl BreakerState {
 /// incident.
 pub const WEIGHT_RESTORATION_MILLIS: u64 = 30_000;
 
+/// How much of a preference has been restored `now_ms`, for a recovery at
+/// `since_ms`, in thousandths.
+///
+/// Floor of 100, so a just-recovered target keeps a tenth of its preference
+/// rather than being effectively excluded by arithmetic.
+///
+/// Integer division is deliberate and the truncation is harmless: this is a
+/// preference weight in thousandths, and rounding a ramp down by one part in a
+/// thousand delays full restoration by 30 ms. Floating point here would trade
+/// an exactly-reproducible score — which Appendix B's determinism requirement
+/// rests on — for precision that means nothing.
+fn ramp_permille(since_ms: u64, now_ms: u64) -> u64 {
+    let elapsed = now_ms.saturating_sub(since_ms);
+    if elapsed >= WEIGHT_RESTORATION_MILLIS {
+        return 1000;
+    }
+    #[allow(
+        clippy::integer_division,
+        reason = "a preference ramp in thousandths; truncation costs 30ms of \
+                  restoration and keeps the score exactly reproducible"
+    )]
+    let progress = elapsed.saturating_mul(900) / WEIGHT_RESTORATION_MILLIS.max(1);
+    100_u64.saturating_add(progress)
+}
+
+/// Consecutive failed liveness probes before a target is treated as down.
+///
+/// Two, so one dropped packet or one slow answer does not take a working
+/// machine out of rotation, while a stopped server is excluded within two
+/// probe intervals of the first miss.
+pub const PROBE_FAILURES_TO_EXCLUDE: u32 = 2;
+
+/// Consecutive successful liveness probes before a probed-down target is
+/// routable again.
+///
+/// The probe's counterpart to [`BreakerConfig::half_open_successes_to_close`]:
+/// a server that answers once while it is still loading its model is not yet
+/// one to send the full load to. The restoration ramp then applies on top, as
+/// it does after a breaker closes.
+pub const PROBE_SUCCESSES_TO_RESTORE: u32 = 2;
+
+/// What the liveness probe last concluded about a target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeState {
+    /// Nothing the probe has seen says the target is down.
+    Reachable,
+    /// The probe failed [`PROBE_FAILURES_TO_EXCLUDE`] times in a row and has
+    /// not since succeeded [`PROBE_SUCCESSES_TO_RESTORE`] times in a row.
+    Unreachable,
+}
+
+impl ProbeState {
+    /// Stable name for the management API and metrics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reachable => "reachable",
+            Self::Unreachable => "unreachable",
+        }
+    }
+}
+
+/// The liveness probe's record for one target.
+///
+/// Deliberately not a circuit breaker. A breaker is moved by the outcomes of
+/// routed requests and nothing else; this is moved by the background probe
+/// and nothing else, and neither reads or writes the other. That separation is
+/// the whole safety argument: a probe success cannot close a breaker that real
+/// traffic opened — its half-open probes still decide — and a probe failure
+/// cannot open one, so a probe outage never consumes a breaker's exponential
+/// cooldown. A target is routable only when *both* allow it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeStatus {
+    /// The current conclusion.
+    pub state: ProbeState,
+    /// Failed probes since the last success.
+    pub consecutive_failures: u32,
+    /// Successful probes since the last failure.
+    pub consecutive_successes: u32,
+    /// Whether the most recent probe succeeded.
+    pub last_ok: bool,
+    /// Wall-clock time of the most recent probe, for display.
+    pub last_probe_wall_ms: u64,
+    /// Monotonic time the target was last restored, for the ramp.
+    restored_at_ms: Option<u64>,
+}
+
+impl ProbeStatus {
+    const fn fresh() -> Self {
+        Self {
+            state: ProbeState::Reachable,
+            consecutive_failures: 0,
+            consecutive_successes: 0,
+            last_ok: true,
+            last_probe_wall_ms: 0,
+            restored_at_ms: None,
+        }
+    }
+
+    /// Fold one probe outcome in, returning the new state if it changed.
+    fn observe(&mut self, ok: bool, now_ms: u64, wall_ms: u64) -> Option<ProbeState> {
+        self.last_ok = ok;
+        self.last_probe_wall_ms = wall_ms;
+        if ok {
+            self.consecutive_failures = 0;
+            self.consecutive_successes = self.consecutive_successes.saturating_add(1);
+            if self.state == ProbeState::Unreachable
+                && self.consecutive_successes >= PROBE_SUCCESSES_TO_RESTORE
+            {
+                self.state = ProbeState::Reachable;
+                self.restored_at_ms = Some(now_ms);
+                return Some(ProbeState::Reachable);
+            }
+        } else {
+            self.consecutive_successes = 0;
+            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            if self.state == ProbeState::Reachable
+                && self.consecutive_failures >= PROBE_FAILURES_TO_EXCLUDE
+            {
+                self.state = ProbeState::Unreachable;
+                self.restored_at_ms = None;
+                return Some(ProbeState::Unreachable);
+            }
+        }
+        None
+    }
+}
+
 /// How long a half-open probe may stay outstanding before its slot is
 /// reclaimed.
 ///
@@ -273,29 +401,9 @@ impl Breaker {
     #[must_use]
     pub fn restoration_permille(&self, now_ms: u64) -> u64 {
         let inner = self.lock();
-        let Some(closed_at) = inner.closed_at_ms else {
-            return 1000;
-        };
-        let elapsed = now_ms.saturating_sub(closed_at);
-        if elapsed >= WEIGHT_RESTORATION_MILLIS {
-            return 1000;
-        }
-        // Floor of 100, so a just-recovered target keeps a tenth of its
-        // preference rather than being effectively excluded by arithmetic.
-        //
-        // Integer division is deliberate and the truncation is harmless: this
-        // is a preference weight in thousandths, and rounding a ramp down by
-        // one part in a thousand delays full restoration by 30 ms. Floating
-        // point here would trade an exactly-reproducible score — which
-        // Appendix B's determinism requirement rests on — for precision that
-        // means nothing.
-        #[allow(
-            clippy::integer_division,
-            reason = "a preference ramp in thousandths; truncation costs 30ms of \
-                      restoration and keeps the score exactly reproducible"
-        )]
-        let progress = elapsed.saturating_mul(900) / WEIGHT_RESTORATION_MILLIS.max(1);
-        100_u64.saturating_add(progress)
+        inner
+            .closed_at_ms
+            .map_or(1000, |closed_at| ramp_permille(closed_at, now_ms))
     }
 
     fn transition_if_cooled(&self, inner: &mut BreakerInner, now_ms: u64) {
@@ -699,6 +807,9 @@ pub struct HealthRegistry {
     /// set here does not survive one — recorded in `spec/deferred-issues.html`
     /// rather than left for an operator to discover.
     admin_states: RwLock<BTreeMap<TargetId, AdminState>>,
+    /// The liveness probe's record per target. Absent means never probed,
+    /// which reads exactly as reachable.
+    probes: RwLock<BTreeMap<TargetId, ProbeStatus>>,
 }
 
 impl HealthRegistry {
@@ -713,6 +824,7 @@ impl HealthRegistry {
             capacities: RwLock::new(BTreeMap::new()),
             queue_allowance: RwLock::new(BTreeMap::new()),
             admin_states: RwLock::new(BTreeMap::new()),
+            probes: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -815,6 +927,50 @@ impl HealthRegistry {
             .is_some_and(|until| until > now)
     }
 
+    /// Fold one liveness-probe outcome into a target's record.
+    ///
+    /// Returns the new [`ProbeState`] when this outcome changed it, so the
+    /// caller can log the edge rather than every probe. Touches no breaker.
+    pub fn record_probe(&self, target: &TargetId, ok: bool) -> Option<ProbeState> {
+        let now = self.clock.now_millis();
+        let wall = self.clock.wall_millis();
+        let Ok(mut map) = self.probes.write() else {
+            return None;
+        };
+        map.entry(target.clone())
+            .or_insert_with(ProbeStatus::fresh)
+            .observe(ok, now, wall)
+    }
+
+    /// The liveness probe's record for a target, if it has ever been probed.
+    #[must_use]
+    pub fn probe_status(&self, target: &TargetId) -> Option<ProbeStatus> {
+        self.probes.read().ok().and_then(|m| m.get(target).copied())
+    }
+
+    /// Forget the probe record of every target not in `probed`.
+    ///
+    /// A target that leaves the probe set — removed by a publication, placed
+    /// under the fleet, or with probing switched off — must not stay excluded
+    /// on a verdict nothing will ever revise. Bounded by the configuration: the
+    /// map never holds a target the probe is not currently probing.
+    pub fn retain_probes(&self, probed: &std::collections::BTreeSet<TargetId>) {
+        if let Ok(mut map) = self.probes.write() {
+            map.retain(|target, _| probed.contains(target));
+        }
+    }
+
+    fn probe_down(&self, target: &TargetId) -> bool {
+        self.probe_status(target)
+            .is_some_and(|status| status.state == ProbeState::Unreachable)
+    }
+
+    fn probe_restoration_permille(&self, target: &TargetId, now_ms: u64) -> u64 {
+        self.probe_status(target)
+            .and_then(|status| status.restored_at_ms)
+            .map_or(1000, |since| ramp_permille(since, now_ms))
+    }
+
     /// Whether any operation class for this target has an open circuit.
     fn any_circuit_open(&self, target: &TargetId) -> bool {
         let now = self.clock.now_millis();
@@ -845,14 +1001,18 @@ impl HealthRegistry {
     /// whose embeddings breaker just closed has not fully recovered, whatever
     /// its chat breaker says.
     fn worst_restoration_permille(&self, target: &TargetId, now_ms: u64) -> u64 {
+        // A target the probe just restored ramps back exactly as one whose
+        // breaker just closed: the same "probably, not certainly" recovery.
+        let probe = self.probe_restoration_permille(target, now_ms);
         let Ok(map) = self.entries.read() else {
-            return 1000;
+            return probe;
         };
         map.iter()
             .filter(|(k, _)| k.target == *target)
             .map(|(_, h)| h.breaker.restoration_permille(now_ms))
             .min()
             .unwrap_or(1000)
+            .min(probe)
     }
 
     fn slowest_first_byte(&self, target: &TargetId) -> Option<u64> {
@@ -879,6 +1039,10 @@ impl HealthRegistry {
 impl LiveState for HealthRegistry {
     fn circuit_open(&self, target: &TargetId) -> bool {
         self.is_quarantined(target) || self.any_circuit_open(target)
+    }
+
+    fn probe_unreachable(&self, target: &TargetId) -> bool {
+        self.probe_down(target)
     }
 
     fn admin_override(&self, target: &TargetId) -> Option<AdminState> {
@@ -1382,6 +1546,105 @@ mod tests {
 
         registry.release_quarantine(&target);
         assert!(!registry.circuit_open(&target));
+    }
+
+    // -- Liveness probe -----------------------------------------------------
+
+    #[test]
+    fn a_target_is_excluded_only_after_consecutive_probe_failures() {
+        let clock = Arc::new(TestClock::new());
+        let registry = HealthRegistry::new(Arc::clone(&clock) as Arc<dyn Clock>, config());
+        let target = tid("t");
+
+        assert!(!registry.probe_unreachable(&target), "never probed reads as reachable");
+        assert_eq!(registry.record_probe(&target, false), None);
+        assert!(!registry.probe_unreachable(&target), "one miss is not an outage");
+        // A success in between resets the count.
+        assert_eq!(registry.record_probe(&target, true), None);
+        assert_eq!(registry.record_probe(&target, false), None);
+        assert!(!registry.probe_unreachable(&target));
+        assert_eq!(
+            registry.record_probe(&target, false),
+            Some(ProbeState::Unreachable)
+        );
+        assert!(registry.probe_unreachable(&target));
+        let status = registry.probe_status(&target).unwrap();
+        assert_eq!(status.consecutive_failures, PROBE_FAILURES_TO_EXCLUDE);
+        assert!(!status.last_ok);
+    }
+
+    #[test]
+    fn a_probed_down_target_needs_consecutive_successes_and_then_ramps() {
+        let clock = Arc::new(TestClock::new());
+        let registry = HealthRegistry::new(Arc::clone(&clock) as Arc<dyn Clock>, config());
+        let target = tid("t");
+        for _ in 0..PROBE_FAILURES_TO_EXCLUDE {
+            registry.record_probe(&target, false);
+        }
+        assert!(registry.probe_unreachable(&target));
+
+        assert_eq!(registry.record_probe(&target, true), None);
+        assert!(registry.probe_unreachable(&target), "one answer is not recovery");
+        assert_eq!(registry.record_probe(&target, true), Some(ProbeState::Reachable));
+        assert!(!registry.probe_unreachable(&target));
+
+        // Restored, but ramped: penalised like a breaker that just closed, and
+        // fully restored once the ramp has run.
+        assert!(registry.health_penalty(&target) < 0);
+        clock.advance(WEIGHT_RESTORATION_MILLIS);
+        assert_eq!(registry.health_penalty(&target), 0);
+    }
+
+    #[test]
+    fn the_probe_and_the_breaker_never_move_each_other() {
+        // Real traffic opens the breaker; a run of probe successes must not
+        // close it, because only the breaker's own half-open probes may.
+        let clock = Arc::new(TestClock::new());
+        let registry = HealthRegistry::new(Arc::clone(&clock) as Arc<dyn Clock>, config());
+        let target = tid("t");
+        let h = registry.entry(&target, Operation::Chat);
+        for _ in 0..8 {
+            h.record_failure(UpstreamErrorClass::Connection, clock.now_millis());
+        }
+        assert_eq!(h.breaker.state(clock.now_millis()), BreakerState::Open);
+        for _ in 0..20 {
+            registry.record_probe(&target, true);
+        }
+        assert_eq!(
+            h.breaker.state(clock.now_millis()),
+            BreakerState::Open,
+            "a probe success closed a breaker real traffic opened"
+        );
+        assert!(registry.circuit_open(&target));
+
+        // And the other way: a probe outage leaves a closed breaker closed, with
+        // no failures in its window.
+        let other = tid("u");
+        let g = registry.entry(&other, Operation::Chat);
+        for _ in 0..20 {
+            registry.record_probe(&other, false);
+        }
+        assert_eq!(g.breaker.state(clock.now_millis()), BreakerState::Closed);
+        assert_eq!(g.breaker.failure_percent(clock.now_millis()), 0);
+        assert!(!registry.circuit_open(&other));
+        assert!(registry.probe_unreachable(&other));
+    }
+
+    #[test]
+    fn a_target_leaving_the_probe_set_is_not_left_excluded() {
+        let clock = Arc::new(TestClock::new());
+        let registry = HealthRegistry::new(Arc::clone(&clock) as Arc<dyn Clock>, config());
+        let down = tid("down");
+        let kept = tid("kept");
+        for _ in 0..PROBE_FAILURES_TO_EXCLUDE {
+            registry.record_probe(&down, false);
+            registry.record_probe(&kept, false);
+        }
+        let keep: std::collections::BTreeSet<TargetId> = [kept.clone()].into_iter().collect();
+        registry.retain_probes(&keep);
+        assert!(!registry.probe_unreachable(&down));
+        assert!(registry.probe_status(&down).is_none());
+        assert!(registry.probe_unreachable(&kept));
     }
 
     #[test]

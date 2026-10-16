@@ -2865,6 +2865,9 @@ impl hypellm_core::policy::LiveState for FleetAwareLiveState<'_> {
     fn circuit_open(&self, target: &TargetId) -> bool {
         self.health.circuit_open(target)
     }
+    fn probe_unreachable(&self, target: &TargetId) -> bool {
+        self.health.probe_unreachable(target)
+    }
     fn health_penalty(&self, target: &TargetId) -> i64 {
         self.health.health_penalty(target)
     }

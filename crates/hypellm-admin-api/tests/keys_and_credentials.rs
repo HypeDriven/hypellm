@@ -2369,6 +2369,139 @@ fn restricting_a_key_changes_the_stored_key_durably_and_shows_in_the_listing() {
 }
 
 #[test]
+fn a_key_minted_with_restrictions_is_narrowed_before_its_record_is_durable() {
+    let admin = Harness::with_config(&restriction_config());
+    let oncall = admin.break_glass();
+    let response = admin.post(
+        &oncall,
+        "/admin/v1/keys",
+        &format!(r#"{{"principal":"svc:ci","scopes":["inference"],"restrictions":{NARROW_TO_AGENT}}}"#),
+    );
+    assert_eq!(response.status, 201, "{}", response.body);
+    let id = response.str_field("id");
+    let key = KeyId::new(&id).unwrap();
+
+    // The record the router consults is narrowed, not only the answer.
+    let stored = admin.state.keys.get(&key).unwrap().restrictions;
+    assert_eq!(stored.priority, Some(hypellm_core::admission::PriorityClass::Batch));
+    assert_eq!(
+        stored.models.as_ref().map(|m| m.iter().map(|a| a.as_str().to_owned()).collect::<Vec<_>>()),
+        Some(vec!["agent".to_owned()])
+    );
+    let answer = response.json();
+    let restrictions = answer.get("restrictions").expect("the answer names them");
+    assert_eq!(restrictions.field_str("priority").unwrap(), "batch");
+    // The one-time panel shows the scopes the key was issued with.
+    let scopes: Vec<&str> = answer
+        .field_array("scopes")
+        .unwrap()
+        .iter()
+        .filter_map(wire_json::Value::as_str)
+        .collect();
+    assert_eq!(scopes, vec!["inference"]);
+
+    // The restriction precedes the key record in the log: a crash between
+    // the two must leave an inert restriction, never a durable key wider than
+    // it was asked to be.
+    let restriction_frames = durable_frames(&admin, RecordKind::ApiKeyRestriction);
+    let key_frames = durable_frames(&admin, RecordKind::ApiKey);
+    assert_eq!(restriction_frames.len(), 1);
+    assert_eq!(key_frames.len(), 1);
+    assert!(
+        restriction_frames[0].sequence < key_frames[0].sequence,
+        "the restriction must be durable before the key is"
+    );
+    let change =
+        hypellm_auth::RestrictionChange::from_payload(&restriction_frames[0].payload).expect("decodes");
+    assert_eq!(change.id, key);
+    assert_eq!(change.restrictions, stored);
+
+    let audit = admin.get(&oncall, "/admin/v1/audit");
+    assert!(audit.body_contains("initial restrictions"), "{}", audit.body);
+}
+
+#[test]
+fn a_key_minted_with_a_bad_restriction_does_not_exist_anywhere() {
+    // Refused before the key exists, so a refusal leaves nothing: not in
+    // memory, where it would authenticate, and not on disk, where a restart
+    // would bring it back.
+    let admin = Harness::with_config(&restriction_config());
+    let oncall = admin.break_glass();
+    let before = admin.state.keys.list().len();
+
+    for restrictions in [
+        // Outside the principal's ceiling: denied by a grant.
+        r#"{"models":["secret"],"targets":null,"hosts":null,"priority":null}"#,
+        // Above the principal's batch class.
+        r#"{"models":null,"targets":null,"hosts":null,"priority":"standard"}"#,
+        // A missing field is not "unrestricted".
+        r#"{"models":["agent"],"targets":null,"hosts":null}"#,
+        r#"{"models":[],"targets":null,"hosts":null,"priority":null}"#,
+        r#"["agent"]"#,
+        r#""agent""#,
+    ] {
+        let response = admin.post(
+            &oncall,
+            "/admin/v1/keys",
+            &format!(r#"{{"principal":"svc:ci","scopes":["inference"],"restrictions":{restrictions}}}"#),
+        );
+        assert!(
+            response.status == 400 || response.status == 422,
+            "{restrictions}: {} {}",
+            response.status,
+            response.body
+        );
+        assert!(!response.body_contains("\"secret\":"), "{restrictions}: {}", response.body);
+    }
+    assert_eq!(admin.state.keys.list().len(), before, "a refused key exists in memory");
+    assert!(durable_frames(&admin, RecordKind::ApiKey).is_empty());
+    assert!(durable_frames(&admin, RecordKind::ApiKeyRestriction).is_empty());
+}
+
+#[test]
+fn the_create_form_reads_a_principals_ceiling_before_any_key_exists() {
+    let admin = Harness::with_config(&restriction_config());
+    let oncall = admin.break_glass();
+    let response = admin.get_query(&oncall, "/admin/v1/keys:ceiling", "principal=svc:ci");
+    assert_eq!(response.status, 200, "{}", response.body);
+    let json = response.json();
+    let ceiling = json.get("ceiling").expect("ceiling");
+    let models: Vec<String> = ceiling
+        .field_array("models")
+        .unwrap()
+        .iter()
+        .map(|m| m.field_str("id").unwrap().to_owned())
+        .collect();
+    assert_eq!(models, vec!["agent".to_owned(), "test-alias".to_owned()], "'secret' is denied to svc:ci");
+    assert_eq!(ceiling.field_str("priority").unwrap(), "batch");
+    assert_eq!(json.get("keys_sharing_principal").and_then(wire_json::Value::as_u64), Some(0));
+
+    // The same permission as reading an existing key's restrictions.
+    for session in unprivileged_roles(&admin) {
+        let refused = admin.get_query(&session, "/admin/v1/keys:ceiling", "principal=svc:ci");
+        assert_eq!(refused.status, 403, "{:?}: {}", session.roles, refused.body);
+    }
+    let malformed = admin.get_query(&oncall, "/admin/v1/keys:ceiling", "principal=not%20a%20principal");
+    assert_eq!(malformed.status, 400, "{}", malformed.body);
+}
+
+#[test]
+fn restrictions_that_narrow_nothing_mint_an_ordinary_key() {
+    let admin = Harness::with_config(&restriction_config());
+    let oncall = admin.break_glass();
+    let response = admin.post(
+        &oncall,
+        "/admin/v1/keys",
+        r#"{"principal":"svc:ci","scopes":["inference"],
+            "restrictions":{"models":null,"targets":null,"hosts":null,"priority":null}}"#,
+    );
+    assert_eq!(response.status, 201, "{}", response.body);
+    let key = KeyId::new(&response.str_field("id")).unwrap();
+    assert!(admin.state.keys.get(&key).unwrap().restrictions.is_unrestricted());
+    assert!(durable_frames(&admin, RecordKind::ApiKeyRestriction).is_empty());
+}
+
+#[test]
 fn the_restriction_read_offers_exactly_the_principals_ceiling() {
     let admin = Harness::with_config(&restriction_config());
     let oncall = admin.break_glass();

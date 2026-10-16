@@ -46,7 +46,7 @@
  */
 
 import { ApiError } from '../api.js';
-import { el, formatCount, pill } from '../components/dom.js';
+import { el, formatCount, formatTime, pill } from '../components/dom.js';
 import {
   actionButton,
   confirmPrompt,
@@ -187,7 +187,42 @@ function healthCell(target) {
   return el('span', { class: 'pill-row' }, [
     pill(breaker.label, breaker.tone),
     target.quarantined ? pill('Quarantined', 'danger') : null,
+    probePill(target.probe),
   ]);
+}
+
+/**
+ * What the router's liveness probe last saw, when it probes this target.
+ *
+ * `probe` is null for a target the router does not probe — a remote family, a
+ * fleet-managed target, or the probe switched off — and nothing is drawn: no
+ * pill is a truer statement than an invented "unknown". The breaker pill beside
+ * it is moved only by routed requests; this one only by the probe.
+ *
+ * @param {object|null|undefined} probe
+ * @returns {HTMLElement|null}
+ */
+function probePill(probe) {
+  if (!probe || typeof probe !== 'object') return null;
+  const when =
+    typeof probe.last_probe_at === 'number' && probe.last_probe_at > 0
+      ? formatTime(probe.last_probe_at)
+      : 'never';
+  if (probe.state === 'unreachable') {
+    const element = pill('Probe: down', 'danger');
+    element.title = `The liveness probe failed ${formatCount(probe.consecutive_failures)} times in a row (last ${when}). The router excludes this target until it answers again.`;
+    return element;
+  }
+  const element = pill(probe.last_ok ? 'Probe: up' : 'Probe: missed', probe.last_ok ? 'ok' : 'warn');
+  element.title = probe.last_ok
+    ? `The liveness probe last answered at ${when}.`
+    : `The last liveness probe (${when}) failed; one more failure in a row excludes the target.`;
+  return element;
+}
+
+/** Whether the probe currently excludes a target. @param {object} row @returns {boolean} */
+function probedDown(row) {
+  return Boolean(row.probe && row.probe.state === 'unreachable');
 }
 
 /** @param {unknown} value @returns {number|null} */
@@ -341,10 +376,18 @@ export async function mount(container, ctx) {
       if (view.filters.state !== 'all' && row.state !== view.filters.state) {
         return false;
       }
-      if (view.filters.health === 'healthy' && (row.breaker_state !== 'closed' || row.quarantined)) {
+      if (
+        view.filters.health === 'healthy' &&
+        (row.breaker_state !== 'closed' || row.quarantined || probedDown(row))
+      ) {
         return false;
       }
-      if (view.filters.health === 'impaired' && row.breaker_state === 'closed' && !row.quarantined) {
+      if (
+        view.filters.health === 'impaired' &&
+        row.breaker_state === 'closed' &&
+        !row.quarantined &&
+        !probedDown(row)
+      ) {
         return false;
       }
       if (needle !== '') {
@@ -371,8 +414,8 @@ export async function mount(container, ctx) {
 
   const healthFilter = el('select', {}, [
     el('option', { value: 'all' }, 'Any health'),
-    el('option', { value: 'healthy' }, 'Breaker closed, not quarantined'),
-    el('option', { value: 'impaired' }, 'Breaker open or quarantined'),
+    el('option', { value: 'healthy' }, 'Breaker closed, probe not down, not quarantined'),
+    el('option', { value: 'impaired' }, 'Breaker open, probe down, or quarantined'),
   ]);
   healthFilter.addEventListener('change', () => {
     view.filters.health = healthFilter.value;
@@ -456,6 +499,7 @@ export async function mount(container, ctx) {
     const admitting = rows.filter((row) => row.state === 'enabled' && !row.quarantined).length;
     const withdrawn = rows.filter((row) => row.state !== 'enabled').length;
     const impaired = rows.filter((row) => row.breaker_state !== 'closed').length;
+    const unreachable = rows.filter(probedDown).length;
     const inFlight = rows.reduce((total, row) => total + (numberOf(row.in_flight) || 0), 0);
     const more = Boolean(view.envelope && view.envelope.has_more);
 
@@ -466,6 +510,7 @@ export async function mount(container, ctx) {
         stat('Admitting requests', formatCount(admitting), 'Enabled and not quarantined'),
         stat('Withdrawn', formatCount(withdrawn), 'Draining, maintenance, quarantined, or disabled'),
         stat('Breaker not closed', formatCount(impaired), 'Open or half open'),
+        stat('Probe down', formatCount(unreachable), 'Excluded until the liveness probe answers again'),
         stat('Requests in flight', formatCount(inFlight), 'Summed across loaded targets'),
       ]),
     );
