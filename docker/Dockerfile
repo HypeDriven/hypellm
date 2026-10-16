@@ -34,6 +34,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY web ./web
 COPY spec ./spec
+COPY host ./host
 
 # The supply-chain and static-web gate (specification 4/4.1/15). It is not
 # advisory: a finding fails the image build, which is the point of running it

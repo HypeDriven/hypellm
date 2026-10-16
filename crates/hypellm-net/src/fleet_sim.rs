@@ -77,6 +77,19 @@ pub struct AgentScript {
     pub raw_deployments: Vec<String>,
     /// Extra top-level inventory keys, rendered verbatim.
     pub extra_inventory: String,
+    /// The digest the agent claims once it has accepted an `ENROLL` offer
+    /// naming at least one host — standing in for the reference agent
+    /// rewriting its table, so a test can watch a mismatch resolve.
+    pub digest_after_enroll: Option<String>,
+    /// Hosts the inventory reports as reachable, with ample free disk.
+    pub observed_hosts: BTreeSet<HostId>,
+    /// Artifacts present and verified on a host, with the image ID the host
+    /// reports. A completed `COPY` adds to this.
+    pub placements: BTreeMap<(ArtifactId, HostId), String>,
+    /// What a relayed `COPY` of an artifact actually hashes to, when that is
+    /// not what the router asked for — a source host serving something else
+    /// under the artifact's name. Absent, the relayed archive is honest.
+    pub relay_yields: BTreeMap<ArtifactId, String>,
 }
 
 impl AgentScript {
@@ -92,7 +105,46 @@ impl AgentScript {
             initial_states: BTreeMap::new(),
             raw_deployments: Vec::new(),
             extra_inventory: String::new(),
+            digest_after_enroll: None,
+            observed_hosts: BTreeSet::new(),
+            placements: BTreeMap::new(),
+            relay_yields: BTreeMap::new(),
         }
+    }
+
+    /// Report `host` as reachable, with ample free disk.
+    #[must_use]
+    pub fn with_observed_host(mut self, host: &str) -> Self {
+        if let Ok(id) = HostId::new(host) {
+            self.observed_hosts.insert(id);
+        }
+        self
+    }
+
+    /// Report `artifact` present and verified on `host`, as image `image_id`.
+    #[must_use]
+    pub fn with_placement(mut self, artifact: &str, host: &str, image_id: &str) -> Self {
+        if let (Ok(a), Ok(h)) = (ArtifactId::new(artifact), HostId::new(host)) {
+            self.placements.insert((a, h), image_id.to_owned());
+        }
+        self
+    }
+
+    /// Make a relayed copy of `artifact` hash to `image_id`, whatever was
+    /// asked for — a tampered source.
+    #[must_use]
+    pub fn with_relay_yielding(mut self, artifact: &str, image_id: &str) -> Self {
+        if let Ok(a) = ArtifactId::new(artifact) {
+            self.relay_yields.insert(a, image_id.to_owned());
+        }
+        self
+    }
+
+    /// Claim `digest` after an `ENROLL` offer naming at least one host.
+    #[must_use]
+    pub fn with_digest_after_enroll(mut self, digest: impl Into<String>) -> Self {
+        self.digest_after_enroll = Some(digest.into());
+        self
     }
 
     /// Admit one deployment with a behaviour.
@@ -150,6 +202,19 @@ pub struct SimulatedAgent {
     nonces: Arc<Mutex<BTreeSet<String>>>,
     /// Current state per deployment, as the agent believes it.
     states: Arc<Mutex<BTreeMap<DeploymentId, String>>>,
+    /// Every `ENROLL` payload received, in order.
+    offers: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// Artifact placements as the agent currently believes them.
+    placements: Arc<Mutex<BTreeMap<(ArtifactId, HostId), String>>>,
+}
+
+/// One in-flight `COPY`, and whether its relayed archive verifies.
+#[derive(Debug, Clone)]
+struct Transfer {
+    artifact: ArtifactId,
+    to: HostId,
+    image_id: String,
+    verifies: bool,
 }
 
 /// One in-flight verb, and what it will end as.
@@ -188,8 +253,13 @@ impl SimulatedAgent {
         let states = Arc::new(Mutex::new(script.initial_states.clone()));
         let countdowns = Arc::new(Mutex::new(BTreeMap::new()));
         let next_activation = Arc::new(AtomicU64::new(1));
+        let offers = Arc::new(Mutex::new(Vec::new()));
+        let digest = Arc::new(Mutex::new(script.fleet_digest.clone()));
+        let placements = Arc::new(Mutex::new(script.placements.clone()));
 
         let worker = Arc::new(Worker {
+            offers: Arc::clone(&offers),
+            digest,
             script,
             stop: Arc::clone(&stop),
             seen: Arc::clone(&seen),
@@ -197,6 +267,8 @@ impl SimulatedAgent {
             states: Arc::clone(&states),
             countdowns: Arc::clone(&countdowns),
             next_activation: Arc::clone(&next_activation),
+            placements: Arc::clone(&placements),
+            transfers: Mutex::new(BTreeMap::new()),
         });
         let handle = thread::spawn(move || worker.run(&listener));
 
@@ -207,7 +279,22 @@ impl SimulatedAgent {
             seen,
             nonces,
             states,
+            offers,
+            placements,
         }
+    }
+
+    /// The image ID the agent reports for `artifact` on `host`, if any.
+    #[must_use]
+    pub fn placement(&self, artifact: &str, host: &str) -> Option<String> {
+        let key = (ArtifactId::new(artifact).ok()?, HostId::new(host).ok()?);
+        self.placements.lock().ok()?.get(&key).cloned()
+    }
+
+    /// Every `ENROLL` payload the agent received, in order.
+    #[must_use]
+    pub fn offers(&self) -> Vec<Vec<u8>> {
+        self.offers.lock().map(|o| o.clone()).unwrap_or_default()
     }
 
     /// The socket path.
@@ -262,6 +349,11 @@ struct Worker {
     states: Arc<Mutex<BTreeMap<DeploymentId, String>>>,
     countdowns: Arc<Mutex<BTreeMap<ActivationId, Pending>>>,
     next_activation: Arc<AtomicU64>,
+    offers: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// The digest currently claimed.
+    digest: Arc<Mutex<String>>,
+    placements: Arc<Mutex<BTreeMap<(ArtifactId, HostId), String>>>,
+    transfers: Mutex<BTreeMap<ActivationId, Transfer>>,
 }
 
 impl Worker {
@@ -333,6 +425,21 @@ impl Worker {
                 seen.push(line.clone());
             }
 
+            if let Some(raw) = line.strip_prefix("ENROLL ") {
+                let reply = if authenticated {
+                    match self.enroll(&mut reader, raw) {
+                        Some(reply) => reply,
+                        None => return,
+                    }
+                } else {
+                    "ERR unauthenticated\n".to_owned()
+                };
+                if writer.write_all(reply.as_bytes()).is_err() || writer.flush().is_err() {
+                    return;
+                }
+                continue;
+            }
+
             // Rendered before the status line, because the status line
             // declares its length and the two must not be able to disagree.
             let inventory = self.inventory();
@@ -352,6 +459,50 @@ impl Worker {
         }
     }
 
+    /// Read and record one `ENROLL` payload. `None` ends the connection.
+    fn enroll(&self, reader: &mut BufReader<UnixStream>, raw: &str) -> Option<String> {
+        let length: usize = raw.parse().ok()?;
+        if length > hypellm_fleet::enroll::MAX_OFFER_BYTES {
+            return Some("ERR offer_too_large\n".to_owned());
+        }
+        let mut payload = vec![0u8; length];
+        let mut filled = 0;
+        while filled < length {
+            match reader.read(payload.get_mut(filled..)?) {
+                Ok(0) => return None,
+                Ok(n) => filled += n,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if self.stop.load(Ordering::SeqCst) {
+                        return None;
+                    }
+                }
+                Err(_) => return None,
+            }
+        }
+        let hosts = wire_json::parse(&payload, &wire_json::Limits::SMALL)
+            .ok()
+            .and_then(|v| v.get("hosts").and_then(|h| h.as_array().map(<[_]>::len)));
+        if let Ok(mut offers) = self.offers.lock() {
+            offers.push(payload);
+        }
+        let Some(count) = hosts else {
+            return Some("ERR malformed\n".to_owned());
+        };
+        if count > 0 {
+            if let (Some(next), Ok(mut digest)) =
+                (&self.script.digest_after_enroll, self.digest.lock())
+            {
+                next.clone_into(&mut digest);
+            }
+        }
+        Some(format!("OK {count}\n"))
+    }
+
     /// Render the inventory from the agent's own belief.
     ///
     /// A conformant agent reports what it observes, so the simulation does too:
@@ -368,11 +519,35 @@ impl Worker {
             }
         }
         items.extend(self.script.raw_deployments.iter().cloned());
-        let extra = if self.script.extra_inventory.is_empty() {
+        let mut extra = if self.script.extra_inventory.is_empty() {
             String::new()
         } else {
             format!(",{}", self.script.extra_inventory)
         };
+        if !self.script.observed_hosts.is_empty() {
+            let hosts: Vec<String> = self
+                .script
+                .observed_hosts
+                .iter()
+                .map(|h| {
+                    format!(r#"{{"id":"{h}","reachable":true,"free_disk_bytes":1099511627776}}"#)
+                })
+                .collect();
+            extra.push_str(&format!(r#","hosts":[{}]"#, hosts.join(",")));
+        }
+        if let Ok(placements) = self.placements.lock() {
+            if !placements.is_empty() {
+                let artifacts: Vec<String> = placements
+                    .iter()
+                    .map(|((a, h), image)| {
+                        format!(
+                            r#"{{"id":"{a}","host":"{h}","present":true,"verified":true,"bytes_present":0,"image_id":"{image}"}}"#
+                        )
+                    })
+                    .collect();
+                extra.push_str(&format!(r#","artifacts":[{}]"#, artifacts.join(",")));
+            }
+        }
         format!(r#"{{"deployments":[{}]{extra}}}"#, items.join(","))
     }
 
@@ -417,7 +592,11 @@ impl Worker {
             // session opens so the router can *read* the disagreement, and the
             // router is what refuses to issue a mutating verb.
             *authenticated = true;
-            return format!("OK sim-1 {}\n", self.script.fleet_digest);
+            let digest = self
+                .digest
+                .lock()
+                .map_or_else(|_| self.script.fleet_digest.clone(), |d| d.clone());
+            return format!("OK sim-1 {digest}\n");
         }
 
         if !*authenticated {
@@ -486,6 +665,59 @@ impl Worker {
                 let id = self.next_activation.fetch_add(1, Ordering::SeqCst);
                 format!("ACCEPTED act-{id}\n")
             }
+            "COPY" => {
+                let (Some(raw_artifact), Some(raw_from), Some(raw_to), Some(_), Some(image)) = (
+                    parts.next(),
+                    parts.next(),
+                    parts.next(),
+                    parts.next(),
+                    parts.next(),
+                ) else {
+                    return "ERR malformed\n".to_owned();
+                };
+                let (Ok(artifact), Ok(from), Ok(to)) = (
+                    ArtifactId::new(raw_artifact),
+                    HostId::new(raw_from),
+                    HostId::new(raw_to),
+                ) else {
+                    return "ERR malformed\n".to_owned();
+                };
+                if !self.script.artifacts.contains(&artifact) {
+                    return "ERR unknown_artifact\n".to_owned();
+                }
+                let source_holds = self
+                    .placements
+                    .lock()
+                    .map(|p| p.contains_key(&(artifact.clone(), from)))
+                    .unwrap_or(false);
+                if !source_holds {
+                    return "ERR source_missing\n".to_owned();
+                }
+                // The relay hashes what the source actually sent. An honest
+                // source yields the ID asked for; a tampered one does not,
+                // and nothing is loaded.
+                let verifies = self
+                    .script
+                    .relay_yields
+                    .get(&artifact)
+                    .is_none_or(|actual| actual == image);
+                let id = self.next_activation.fetch_add(1, Ordering::SeqCst);
+                let Ok(activation) = ActivationId::new(format!("act-{id}")) else {
+                    return "ERR internal\n".to_owned();
+                };
+                if let Ok(mut transfers) = self.transfers.lock() {
+                    transfers.insert(
+                        activation.clone(),
+                        Transfer {
+                            artifact,
+                            to,
+                            image_id: image.to_owned(),
+                            verifies,
+                        },
+                    );
+                }
+                format!("ACCEPTED {activation}\n")
+            }
             "STATUS" => {
                 let Some(raw) = parts.next() else {
                     return "ERR malformed\n".to_owned();
@@ -493,6 +725,20 @@ impl Worker {
                 let Ok(activation) = ActivationId::new(raw) else {
                     return "ERR unknown_activation\n".to_owned();
                 };
+                let transfer = self
+                    .transfers
+                    .lock()
+                    .ok()
+                    .and_then(|t| t.get(&activation).cloned());
+                if let Some(transfer) = transfer {
+                    if !transfer.verifies {
+                        return "OK failed checksum_mismatch 0\n".to_owned();
+                    }
+                    if let Ok(mut placements) = self.placements.lock() {
+                        placements.insert((transfer.artifact, transfer.to), transfer.image_id);
+                    }
+                    return "OK ready verified 1000\n".to_owned();
+                }
                 let Ok(mut countdowns) = self.countdowns.lock() else {
                     return "ERR internal\n".to_owned();
                 };

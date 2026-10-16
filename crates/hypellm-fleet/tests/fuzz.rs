@@ -66,6 +66,7 @@ fn fleet() -> FleetConfig {
             observation_interval_ms: 5_000,
             observation_max_age_ms: 30_000,
             request_timeout_ms: 5_000,
+            ssh_public_key: None,
         },
     );
     fleet.hosts.insert(
@@ -119,6 +120,7 @@ fn fleet() -> FleetConfig {
             arch: Arch::Aarch64,
             size_bytes: 20 * 1024 * 1024 * 1024,
             digest: format!("sha256:{}", "0".repeat(64)),
+            image_id: None,
             source: "mirror".to_owned(),
         },
     );
@@ -131,6 +133,7 @@ const INVENTORY_SEEDS: &[&[u8]] = &[
     br#"{"accelerators":[{"id":"gb10","used_memory_bytes":10,"total_memory_bytes":100}]}"#,
     br#"{"hosts":[{"id":"spark","reachable":true,"free_disk_bytes":1024,"arch":"aarch64"}]}"#,
     br#"{"artifacts":[{"id":"music3","host":"spark","present":true,"verified":true}]}"#,
+    br#"{"artifacts":[{"id":"music3","host":"spark","present":true,"verified":true,"image_id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#,
     br#"{"deployments":[],"hosts":[],"accelerators":[],"artifacts":[]}"#,
     br#"{}"#,
 ];
@@ -164,9 +167,17 @@ fn agent_inventory_never_adopts_an_undeclared_identifier() {
                 "adopted accelerator {id}"
             );
         }
-        for (artifact, host) in inventory.artifacts.keys() {
+        for ((artifact, host), placement) in &inventory.artifacts {
             assert!(fleet.artifacts.contains_key(artifact), "adopted artifact");
             assert!(fleet.hosts.contains_key(host), "adopted host by artifact");
+            // An adopted image ID is exactly one: it is compared against the
+            // kept checksum, and a near-miss spelling must never be adopted
+            // as a different ID from the right image.
+            if let Some(id) = &placement.image_id {
+                let hex = id.as_str().strip_prefix("sha256:").expect("prefix");
+                assert_eq!(hex.len(), 64, "adopted {id}");
+                assert!(hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+            }
         }
         for observation in inventory.accelerators.values() {
             assert!(
@@ -228,6 +239,7 @@ const REPLY_SEEDS: &[&[u8]] = &[
     b"OK starting loading 500\n",
     b"ERR unknown_deployment\n",
     b"OK\n",
+    b"OK 3\n",
     b"\n",
 ];
 
@@ -250,7 +262,48 @@ fn requests() -> Vec<AgentRequest> {
         AgentRequest::Cancel {
             activation: hypellm_core::ids::ActivationId::new("act-7").unwrap(),
         },
+        AgentRequest::Enroll { length: 100 },
+        AgentRequest::Copy {
+            artifact: ArtifactId::new("music3").unwrap(),
+            from: HostId::new("spark").unwrap(),
+            to: HostId::new("rig").unwrap(),
+            deadline_ms: 1_000,
+            image_id: hypellm_fleet::model::ImageId::parse(&format!("sha256:{}", "a".repeat(64)))
+                .unwrap(),
+        },
     ]
+}
+
+#[test]
+fn no_copy_line_carries_anything_but_its_six_tokens() {
+    // The image ID is the one non-identifier on the socket. Whatever a
+    // mutated value looks like, it either fails to become an `ImageId` or
+    // crosses as exactly one token: no space, no newline, no second verb.
+    let mut rng = Rng::new(0x1_0C0F);
+    let seed = format!("sha256:{}", "a".repeat(64));
+    let mut built = 0u32;
+    for _ in 0..4_000 {
+        let case = mutate(seed.as_bytes(), &mut rng);
+        let Ok(text) = std::str::from_utf8(&case) else {
+            continue;
+        };
+        let Some(image_id) = hypellm_fleet::model::ImageId::parse(text) else {
+            continue;
+        };
+        built += 1;
+        let line = hypellm_fleet::protocol::encode_request(&AgentRequest::Copy {
+            artifact: ArtifactId::new("music3").unwrap(),
+            from: HostId::new("spark").unwrap(),
+            to: HostId::new("rig").unwrap(),
+            deadline_ms: 1_000,
+            image_id,
+        });
+        assert_eq!(line.matches('\n').count(), 1, "{line:?}");
+        assert!(line.ends_with('\n'));
+        assert_eq!(line.trim_end().split(' ').count(), 6, "{line:?}");
+        assert!(line.len() <= MAX_LINE);
+    }
+    assert!(built > 10, "only {built} mutated IDs parsed; the target is not exercised");
 }
 
 #[test]
@@ -319,6 +372,12 @@ fn no_malformed_agent_reply_advances_the_activation_state_machine() {
                     AgentReply::InventoryPending { length } => {
                         assert!(length <= MAX_INVENTORY_BYTES);
                     }
+                    AgentReply::Enrolled { accepted } => {
+                        assert!(
+                            usize::try_from(accepted).unwrap()
+                                <= hypellm_fleet::enroll::MAX_OFFER_HOSTS
+                        );
+                    }
                     AgentReply::Accepted { .. } | AgentReply::Ok => {}
                 }
             }
@@ -356,8 +415,10 @@ fn a_reply_is_never_parsed_against_a_verb_that_did_not_provoke_it() {
                 | (AgentRequest::Activate { .. }, AgentReply::Accepted { .. })
                 | (AgentRequest::Deactivate { .. }, AgentReply::Accepted { .. })
                 | (AgentRequest::Fetch { .. }, AgentReply::Accepted { .. })
+                | (AgentRequest::Copy { .. }, AgentReply::Accepted { .. })
                 | (AgentRequest::Status { .. }, AgentReply::Status { .. })
-                | (AgentRequest::Cancel { .. }, AgentReply::Ok) => true,
+                | (AgentRequest::Cancel { .. }, AgentReply::Ok)
+                | (AgentRequest::Enroll { .. }, AgentReply::Enrolled { .. }) => true,
                 _ => false,
             };
             assert!(
@@ -482,4 +543,44 @@ fn no_interleaving_of_lease_operations_leaks_a_lease() {
             "round {round}: leases leaked"
         );
     }
+}
+
+/// A registration as a slave sends it, for the mutator to start from.
+const REGISTRATION_SEED: &str = r#"{"address":"192.168.1.20","arch":"x86_64","hostname":"spark-1","ssh_user":"albert","data_dir":"/home/albert/.hypellm","memory_bytes":68719476736,"gpus":[{"index":0,"name":"RTX 4090","memory_bytes":25769803776}],"ssh_host_key":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINaR4JuJGhj5Y/y0fV0dwnAAHCoxBRNiBi5JkRlcQU2M host@x","device_key":"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAX5iBIxDSO2VYlfFZRE/T1VJfwE4OL9kokNcCposqRRI=\n-----END PUBLIC KEY-----\n","kit_version":"1.0.0"}"#;
+
+#[test]
+fn no_accepted_registration_carries_a_value_that_escapes_a_file_or_a_shell() {
+    // The registration endpoint is reachable without a session, and what it
+    // accepts ends up in the agent's `known_hosts`, its JSON table, an `ssh`
+    // destination and a `docker -v` path. The property: whatever parses is
+    // already safe in all four, whatever the mutation did.
+    let mut rng = Rng::new(0x2_0010);
+    let mut accepted = 0u32;
+    for _ in 0..8_000 {
+        let case = mutate(REGISTRATION_SEED.as_bytes(), &mut rng);
+        let Ok(value) = wire_json::parse(&case, &wire_json::Limits::SMALL) else {
+            continue;
+        };
+        let Ok(registration) = hypellm_fleet::enroll::parse_registration(&value) else {
+            continue;
+        };
+        accepted += 1;
+        assert!(hypellm_fleet::enroll::is_data_dir(&registration.data_dir));
+        assert!(!registration.data_dir.contains(".."));
+        assert!(
+            registration
+                .ssh_user
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-.".contains(&b))
+                && !registration.ssh_user.starts_with('-'),
+            "{:?}",
+            registration.ssh_user
+        );
+        let line = registration.host_key.line();
+        assert!(!line.contains('\n') && line.split(' ').count() == 2, "{line:?}");
+        assert!(registration.gpus.len() <= hypellm_fleet::enroll::MAX_GPUS);
+        assert!(registration.hostname.chars().all(|c| !c.is_control() && c != '"'));
+        assert!(!registration.address.is_unspecified());
+    }
+    assert!(accepted > 50, "only {accepted} registrations parsed");
 }

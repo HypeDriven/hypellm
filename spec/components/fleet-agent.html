@@ -105,6 +105,13 @@ it. The goal is specific: <strong>a fully compromised router cannot cause arbitr
 code to run on a slave.</strong> It can reorder declared deployments; it cannot
 introduce one.</p>
 <p>An unrecognised identifier is refused with <code>ERR unknown_deployment</code>.</p>
+<p>The one exception is <code>ENROLL</code> (specification 26.8): the router may
+<em>offer</em> hosts that an administrator approved and a second person published,
+with their address, SSH login, host key, data directory and accelerators. The
+agent adopts an offer only when its own file sets <code>enrollment.accept</code>, only for
+addresses inside its own <code>enrollment.cidrs</code>, pins each host key, and gives an
+enrolled host no deployment. A hand-written host of the same identifier wins.
+See <a href="#enrolled-hosts">Enrolled hosts</a>.</p>
 <h2 id="obligations">Obligations</h2>
 <p>These are normative. An agent that does not keep them is not this agent.</p>
 <ul>
@@ -148,7 +155,7 @@ hostname as readily as an address (<code>&quot;ssh&quot;: &quot;hypellm@gpu3.lan
 <p>A reload that changes the digest ends every session authenticated under the
 old one: the next request gets <code>ERR fleet_configuration_changed</code> and the
 connection is closed. The router's next handshake then compares the new digest.</p>
-<p>To add a machine:</p>
+<p>To add a machine by hand:</p>
 <ol>
 <li>Add its host, accelerators, and deployments to this file. Orchestration
 pauses at this point with <code>fleet_configuration_mismatch</code>, because the
@@ -158,8 +165,9 @@ serving.</li>
 records, from the dashboard's fleet screen or the configuration file.
 Orchestration resumes once the two digests agree again.</li>
 </ol>
-<p>The router cannot add a row here. The reload reads only this file on disk, so
-§26.2's boundary is unchanged.</p>
+<p>Or enroll it, and let the agent take the host from the router's offer: see
+<a href="#enrolled-hosts">Enrolled hosts</a>. Either way, the router cannot add a
+deployment row: the commands that run come only from this file.</p>
 <h3 id="2-confirm-both-sides-agree">2. Confirm both sides agree</h3>
 <pre><code class="language-bash">agent/fleet-agent --config agent/fleet.example.json --print-digest
 cargo run -q -p hypellm-router -- --check --config spec/examples/fleet.conf
@@ -179,6 +187,7 @@ not, and does.</p>
 </code></pre>
 <p>Copy <code>&lt;secrets&gt;/fleet.key</code> to the agent's own directory, owner-readable only.
 The handshake carries <code>HMAC-SHA-256(fleet.key, version ‖ nonce ‖ fleet-digest)</code>,
+where each part is preceded by its length as a big-endian 64-bit integer,
 so it binds both the protocol version and the fleet each side claims, and the
 agent rejects a nonce it has already accepted.</p>
 <p>This is deliberately <strong>stronger than the control socket's <code>control.key</code></strong>, and
@@ -210,13 +219,129 @@ property of how it was built rather than of this agent.</li>
 SSH lands in WSL, where <code>powershell.exe</code> interop reaches the Windows side.
 Driving that is entirely the agent's concern — the router must never learn
 that some hosts need it — but this reference agent does not implement it.</li>
-<li><strong>No forced <code>command=</code> enforcement.</strong> It is documented above as an obligation
-and configured on the slave, not by this program. An agent deployed without it
-has a much larger blast radius than one with it.</li>
+<li><strong>No forced <code>command=</code> check.</strong> It is an obligation above, configured on the
+slave rather than by this program. The host kit (<code>host/install.sh</code>) installs
+one on an enrolled machine; a machine added by hand has whatever its operator
+configured, and an agent key without the restriction has a much larger blast
+radius.</li>
+<li><strong>Image relay always goes through this machine.</strong> <code>COPY</code> never
+connects two slaves directly, even when they could reach each other, so every
+byte crosses the agent machine's link twice and needs room in its spool.</li>
+<li><strong>Only images move.</strong> A container's state directory is not copied, and a
+running container is never migrated.</li>
 <li><strong>Observation is serial.</strong> Each host is probed in turn on the observing
 thread. With five hosts and a five-second interval this is comfortable; with
 fifty it would not be.</li>
 </ul>
+<h2 id="enrolled-hosts">Enrolled hosts</h2>
+<p>Specification 26.8. A machine runs the host kit
+(<code>curl -fsSL https://ROUTER/fleet/v1/install.sh | sh -s -- …</code>, the exact command
+minted on the Fleet screen), registers, and is approved; a second person
+publishes its records. The router then offers it to this agent with
+<code>ENROLL</code>. To let the agent accept, add to its file:</p>
+<pre><code class="language-json">&quot;enrollment&quot;: {
+  &quot;accept&quot;: true,
+  &quot;cidrs&quot;: [&quot;10.0.0.0/24&quot;],
+  &quot;state_file&quot;: &quot;/var/lib/hypellm-agent/enrolled.json&quot;,
+  &quot;known_hosts_file&quot;: &quot;/var/lib/hypellm-agent/enrolled_known_hosts&quot;,
+  &quot;max_activations_per_hour&quot;: 12
+}
+</code></pre>
+<p>Each offered host is validated here — identifier, architecture, login,
+<code>ssh-ed25519</code> host key, data directory — and refused unless its address is in
+<code>cidrs</code>. One bad entry is left out without failing the rest. Accepted hosts are
+written to <code>state_file</code>, and their keys to <code>known_hosts_file</code> as
+<code>hypellm.&lt;id&gt; ssh-ed25519 …</code>, both atomically and owner-only, before the table
+changes; the agent then reaches each one with
+<code>-o UserKnownHostsFile=… -o StrictHostKeyChecking=yes -o HostKeyAlias=hypellm.&lt;id&gt;</code>,
+so the machine must present the key it registered with. The offer replaces the
+previous one: a host the router withdrew (revoked) is dropped and its key
+unpinned. Restarting re-reads <code>state_file</code>.</p>
+<p>An enrolled host has no deployment. Write its deployment rows in this file as
+for any host — they may name an enrolled host — and publish the matching
+router-side records.</p>
+<p>The host kit's shim (<code>&lt;data-dir&gt;/bin/hypellm-host-shim</code>) runs only the
+commands this agent issues: <code>df -B1 --output=avail</code>, <code>nvidia-smi --query-gpu=…</code>,
+<code>docker ps|start|stop|inspect|image inspect|pull|save|load|rm</code> with fixed
+argument shapes, <code>docker create</code> with the vocabulary below, <code>mkdir -p</code> of a
+container's state directory, and <code>curl</code> to <code>127.0.0.1</code> or <code>localhost</code>. A
+deployment row whose commands fall outside that list is refused on an enrolled
+machine with exit status 126. Host kit 1.0 lacks <code>create</code>, <code>rm</code>, <code>save</code>,
+<code>load</code> and <code>mkdir</code>; re-run the command an administrator mints to upgrade a
+machine to 1.1, which keeps its data directory, device key and registration.</p>
+<h2 id="containers-from-templates">Containers from templates</h2>
+<p>Specification 26.12. Instead of hand-made <code>start</code> and <code>stop</code> commands
+against a container someone created on the slave, a deployment row may say how
+to create it:</p>
+<pre><code class="language-json">{
+  &quot;id&quot;: &quot;rig-qwen&quot;, &quot;host&quot;: &quot;rig&quot;, &quot;accelerator&quot;: &quot;rig-gpu0&quot;,
+  &quot;run&quot;: {
+    &quot;image&quot;: &quot;llama-server&quot;,
+    &quot;ports&quot;: [{&quot;bind&quot;: &quot;192.168.1.20&quot;, &quot;host&quot;: 8080, &quot;container&quot;: 8080}],
+    &quot;env&quot;: [&quot;LLAMA_ARG_CTX_SIZE=131072&quot;],
+    &quot;args&quot;: [&quot;--model&quot;, &quot;/state/qwen.gguf&quot;, &quot;--port&quot;, &quot;8080&quot;],
+    &quot;state_path&quot;: &quot;/state&quot;
+  },
+  &quot;probe&quot;: [&quot;curl&quot;, &quot;-fsS&quot;, &quot;--max-time&quot;, &quot;5&quot;, &quot;http://127.0.0.1:8080/health&quot;]
+}
+</code></pre>
+<p><code>image</code> names an artifact row, whose <code>image</code> field is the reference on the
+host (default: its id). The host must declare <code>data_dir</code> — an enrolled host
+carries the one it registered — and the container's state lives in
+<code>&lt;data_dir&gt;/containers/&lt;deployment-id&gt;</code>, mounted at <code>state_path</code>. The GPU
+is the accelerator row's <code>index</code>. The container is named
+<code>hypellm-&lt;deployment-id&gt;</code> unless <code>container</code> says otherwise, and
+<code>start</code>/<code>stop</code> default to <code>docker start</code>/<code>docker stop</code> of it.</p>
+<p>On <code>ACTIVATE</code> the agent creates the state directory, then the container if it
+is absent, labelled <code>hypellm.template=&lt;sha256&gt;</code> over the whole create command.
+A container whose label differs was made from an older row: it is removed with
+<code>docker rm</code> (never <code>-f</code>, so a running one is never removed) and created
+again. A template the shim would refuse — a deployment id that is not one plain
+path segment, a bind that is not an IPv4 address, an environment key that is not
+an identifier, a state path with <code>..</code> — is refused when the file is loaded.</p>
+<p>The shim's <code>docker create</code> vocabulary is <code>--name</code>, the
+<code>hypellm.template</code> label, <code>--gpus device=N</code>, <code>-p &lt;IPv4&gt;:&lt;port&gt;:&lt;port&gt;</code>,
+<code>-v &lt;data_dir&gt;/containers/&lt;name&gt;:&lt;path&gt;</code>, <code>-e KEY=VALUE</code> and
+<code>--restart no</code>, then the image and the container's own arguments. Privileged
+mode, host networking or PID namespace, capabilities, devices, and any other
+mount are refused, so the agent's key cannot be turned into a root shell on the
+slave through <code>docker create</code>.</p>
+<h2 id="image-relay">Image relay</h2>
+<p>Specification 26.12. <code>COPY &lt;artifact&gt; &lt;source&gt; &lt;destination&gt; &lt;deadline-ms&gt; &lt;image-id&gt;</code>
+moves an image between two hosts in this table, through this machine — no
+registry, and no connection between the two slaves. Enable it with:</p>
+<pre><code class="language-json">&quot;transfer&quot;: {
+  &quot;spool_dir&quot;: &quot;/var/lib/hypellm-agent/spool&quot;,
+  &quot;max_spool_bytes&quot;: 107374182400
+}
+</code></pre>
+<p>Without the block every <code>COPY</code> is refused <code>copy_disabled</code>. A copy:</p>
+<ol>
+<li>streams <code>docker save &lt;image&gt;</code> from the source into
+<code>&lt;spool_dir&gt;/&lt;activation&gt;.tar</code>, killed the moment it exceeds
+<code>max_spool_bytes</code>, the router's deadline, or a <code>CANCEL</code>;</li>
+<li>hashes the archive: the configuration must hash to the image ID, each layer —
+decompressed if gzip — to its <code>rootfs.diff_ids</code> entry, and an OCI blob to its
+own name. Both layouts <code>docker save</code> writes are read; an archive holding two
+images, an escaping link, or a zstd layer (which nothing in Python's standard
+library can decompress, so nothing could check) is refused;</li>
+<li>streams a <strong>fresh</strong> archive, rebuilt from exactly the verified configuration
+and layers and tagged with this table's reference, into <code>docker load</code> on the
+destination — never the archive it received, whose other members a newer
+<code>docker load</code> might prefer;</li>
+<li>checks that the destination now reports the image ID, and deletes the spool.</li>
+</ol>
+<p>Any mismatch ends the copy <code>failed checksum_mismatch</code> with nothing loaded.
+The image ID is the one non-identifier on the socket; it can only narrow, and
+when this table pins <code>image_id</code> on the artifact a router asking for another is
+refused <code>checksum_mismatch</code>. A <code>COPY</code> and a <code>FETCH</code> share the
+one-transfer-per-destination rule. An artifact whose <code>image</code> is a digest
+reference (<code>name@sha256:…</code>) cannot be copied (<code>copy_needs_tag</code>): nothing
+would be left to check it by name afterwards.</p>
+<p>Observation reports, per artifact on each host, <code>present</code>, <code>verified</code> — now
+meaning the image carries the registry digest declared for it — and the
+<code>image_id</code> the host reports, which the router compares with the checksum it
+keeps.</p>
 <h2 id="protocol">Protocol</h2>
 <pre><code class="language-text">→ HELLO 1 &lt;nonce&gt; &lt;fleet-digest&gt; &lt;hmac&gt;\n
 ← OK &lt;agent-version&gt; &lt;fleet-digest&gt;\n | ERR &lt;code&gt;\n
@@ -233,12 +358,21 @@ fifty it would not be.</li>
 → FETCH &lt;artifact-id&gt; &lt;host-id&gt; &lt;deadline-ms&gt;\n
 ← ACCEPTED &lt;activation-id&gt;\n | ERR &lt;code&gt;\n
 
+→ COPY &lt;artifact-id&gt; &lt;source-host&gt; &lt;dest-host&gt; &lt;deadline-ms&gt; &lt;image-id&gt;\n
+← ACCEPTED &lt;activation-id&gt;\n | ERR &lt;code&gt;\n
+
 → STATUS &lt;activation-id&gt;\n
 ← OK &lt;state&gt; &lt;detail-code&gt; &lt;progress-permille&gt;\n
 
 → CANCEL &lt;activation-id&gt;\n
 ← OK\n | ERR &lt;code&gt;\n
+
+→ ENROLL &lt;length&gt;\n&lt;offer JSON, at most 64 KiB&gt;
+← OK &lt;accepted-count&gt;\n | ERR &lt;code&gt;\n
 </code></pre>
+<p><code>ENROLL</code> is served on an authenticated session whatever the router's digest
+says — a newly published host is what makes them disagree — and the agent
+closes the session after answering it.</p>
 <p><code>ACTIVATE</code>, <code>DEACTIVATE</code>, and <code>FETCH</code> are asynchronous, and re-sending one
 returns the same <code>activation-id</code> rather than starting a second one — which is
 what makes the router's crash recovery tractable. <code>ACTIVATE</code> and <code>DEACTIVATE</code>

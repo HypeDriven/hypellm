@@ -102,6 +102,16 @@ pub enum PlanStep {
         /// Which host to place it on.
         host: HostId,
     },
+    /// Copy an artifact from a host that holds a verified copy, relayed and
+    /// checked against the kept checksum by the agent (specification 26.12).
+    Copy {
+        /// Which artifact.
+        artifact: ArtifactId,
+        /// The host holding the verified copy.
+        from: HostId,
+        /// Which host to place it on.
+        to: HostId,
+    },
     /// Start the deployment the plan exists for.
     Activate(DeploymentId),
 }
@@ -113,6 +123,7 @@ impl PlanStep {
         match self {
             Self::Evict(_) => "evict",
             Self::Fetch { .. } => "fetch",
+            Self::Copy { .. } => "copy",
             Self::Activate(_) => "activate",
         }
     }
@@ -152,12 +163,16 @@ impl Plan {
         self.steps.iter().any(|s| matches!(s, PlanStep::Evict(_)))
     }
 
-    /// Whether the plan downloads anything.
+    /// Whether the plan moves an artifact onto a host, by fetch or by copy.
+    ///
+    /// One predicate for both, because what callers ask it — "may a
+    /// prediction do this?" — has the same answer for either: a transfer is
+    /// gigabytes of disk and bandwidth, and only real demand pays for that.
     #[must_use]
     pub fn fetches(&self) -> bool {
         self.steps
             .iter()
-            .any(|s| matches!(s, PlanStep::Fetch { .. }))
+            .any(|s| matches!(s, PlanStep::Fetch { .. } | PlanStep::Copy { .. }))
     }
 }
 
@@ -564,9 +579,22 @@ pub fn plan(
                 return PlanOutcome::Infeasible(ExclusionReason::ArtifactUnavailable);
             }
             fetch_ms = estimated_fetch_ms(artifact.size_bytes, snapshot, &deployment.id);
-            steps.push(PlanStep::Fetch {
-                artifact: artifact_id.clone(),
-                host: host.id.clone(),
+            // A verified copy on another host is preferred to the registry:
+            // it needs no registry at all, and it is checked against the
+            // checksum the router keeps rather than against whatever the
+            // registry now serves under the tag. `copy_source` only ever
+            // names a host reporting exactly that checksum, so a tampered
+            // host is never a source.
+            steps.push(match snapshot.copy_source(artifact_id, &host.id) {
+                Some(from) => PlanStep::Copy {
+                    artifact: artifact_id.clone(),
+                    from,
+                    to: host.id.clone(),
+                },
+                None => PlanStep::Fetch {
+                    artifact: artifact_id.clone(),
+                    host: host.id.clone(),
+                },
             });
         }
     }
@@ -631,7 +659,7 @@ pub fn plan(
         // was appended first.
         steps.sort_by_key(|step| match step {
             PlanStep::Evict(_) => 0,
-            PlanStep::Fetch { .. } => 1,
+            PlanStep::Fetch { .. } | PlanStep::Copy { .. } => 1,
             PlanStep::Activate(_) => 2,
         });
     }
@@ -897,6 +925,7 @@ mod tests {
                 observation_interval_ms: 5_000,
                 observation_max_age_ms: 30_000,
                 request_timeout_ms: 5_000,
+                ssh_public_key: None,
             },
         );
         fleet.hosts.insert(
@@ -1171,6 +1200,7 @@ mod tests {
                 arch: Arch::Aarch64,
                 size_bytes: 20 * GIB,
                 digest: "sha256:00".to_owned(),
+                image_id: None,
                 source: "mirror-local".to_owned(),
             },
         );

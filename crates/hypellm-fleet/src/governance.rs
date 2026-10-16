@@ -380,6 +380,62 @@ impl ActivationQueue {
         }
     }
 
+    /// Register a parked request as waiting, without deciding anything.
+    ///
+    /// A request that parks stays counted for as long as it is parked, so the
+    /// demand and the age it represents keep accumulating toward the trigger
+    /// between the rounds in which it re-asks with [`Self::poll`]. Returns
+    /// `false` when the capability's queue is full; a request refused here
+    /// must not call [`Self::leave`].
+    pub fn park(&self, capability: Capability, now_ms: u64) -> bool {
+        let Ok(mut map) = self.inner.write() else {
+            return false;
+        };
+        let state = map.entry(capability).or_insert(QueueState {
+            waiting: 0,
+            oldest_ms: now_ms,
+            triggered: false,
+        });
+        if state.waiting >= MAX_QUEUED_PER_CAPABILITY {
+            return false;
+        }
+        if state.waiting == 0 {
+            state.oldest_ms = now_ms;
+        }
+        state.waiting = state.waiting.saturating_add(1);
+        true
+    }
+
+    /// Ask, on behalf of a request already counted by [`Self::park`], whether
+    /// it should now pay for the activation.
+    ///
+    /// The same thresholds as [`Self::admit`], without counting the caller a
+    /// second time: a parked request re-asking each round must not inflate
+    /// demand to the trigger by itself.
+    pub fn poll(&self, capability: Capability, policy: &FleetPolicy, now_ms: u64) -> QueueAdmission {
+        let Ok(mut map) = self.inner.write() else {
+            return QueueAdmission::Activate;
+        };
+        let Some(state) = map.get_mut(&capability) else {
+            // Not registered: nobody is counted, so nothing has accumulated.
+            return QueueAdmission::Wait {
+                retry_in_ms: policy.activation_max_wait_ms,
+            };
+        };
+        if state.triggered {
+            return QueueAdmission::Wait { retry_in_ms: 0 };
+        }
+        let waited = now_ms.saturating_sub(state.oldest_ms);
+        let enough_demand = state.waiting >= policy.activation_min_demand.max(1);
+        if enough_demand || waited >= policy.activation_max_wait_ms {
+            state.triggered = true;
+            return QueueAdmission::Activate;
+        }
+        QueueAdmission::Wait {
+            retry_in_ms: policy.activation_max_wait_ms.saturating_sub(waited),
+        }
+    }
+
     /// Note that a waiting request has left the queue, for any reason.
     pub fn leave(&self, capability: Capability) {
         if let Ok(mut map) = self.inner.write() {
@@ -399,6 +455,21 @@ impl ActivationQueue {
     /// after a failed activation would make every subsequent request wait for
     /// something that is never coming.
     pub fn settle(&self, capability: Capability) {
+        if let Ok(mut map) = self.inner.write() {
+            if let Some(state) = map.get_mut(&capability) {
+                state.triggered = false;
+            }
+        }
+    }
+
+    /// Withdraw a trigger the scheduler refused (specification 26.11).
+    ///
+    /// The queue said this capability had earned an activation, and the
+    /// churn-aware gate said another waiting for the same host should go
+    /// first. Left set, the flag would tell every later request that an
+    /// activation is coming when none is; cleared, the next request to ask is
+    /// gated again and goes once the host is free and it ranks first.
+    pub fn untrigger(&self, capability: Capability) {
         if let Ok(mut map) = self.inner.write() {
             if let Some(state) = map.get_mut(&capability) {
                 state.triggered = false;
@@ -568,5 +639,79 @@ mod tests {
             queue.admit(Capability::TextToMusic, &policy, 0),
             QueueAdmission::Full
         );
+    }
+
+    #[test]
+    fn a_parked_request_ages_toward_the_trigger_where_a_departing_one_cannot() {
+        let policy = FleetPolicy {
+            activation_min_demand: 3,
+            activation_max_wait_ms: 20_000,
+            ..FleetPolicy::DEFAULT
+        };
+
+        // Ask, leave, ask again: the queue empties between rounds, the age
+        // restarts each time, and the trigger is never reached.
+        let departing = ActivationQueue::new();
+        for round in 0..30_u64 {
+            let now = round * 1_000;
+            assert_ne!(
+                departing.admit(Capability::TextToMusic, &policy, now),
+                QueueAdmission::Activate,
+                "round {round}"
+            );
+            departing.leave(Capability::TextToMusic);
+        }
+
+        // Parked: counted once for the whole wait, so its age is the wait.
+        let parked = ActivationQueue::new();
+        assert!(parked.park(Capability::TextToMusic, 0));
+        assert!(matches!(
+            parked.poll(Capability::TextToMusic, &policy, 1_000),
+            QueueAdmission::Wait { .. }
+        ));
+        assert_eq!(
+            parked.poll(Capability::TextToMusic, &policy, 20_000),
+            QueueAdmission::Activate
+        );
+        assert_eq!(
+            parked.poll(Capability::TextToMusic, &policy, 20_001),
+            QueueAdmission::Wait { retry_in_ms: 0 },
+            "one swap per period of demand, however often it re-asks"
+        );
+        assert_eq!(parked.depths().get(&Capability::TextToMusic), Some(&1));
+        parked.leave(Capability::TextToMusic);
+        assert!(parked.depths().is_empty());
+    }
+
+    #[test]
+    fn re_asking_while_parked_does_not_count_the_request_twice() {
+        let policy = FleetPolicy {
+            activation_min_demand: 2,
+            activation_max_wait_ms: 60_000,
+            ..FleetPolicy::DEFAULT
+        };
+        let queue = ActivationQueue::new();
+        assert!(queue.park(Capability::TextToMusic, 0));
+        for _ in 0..10 {
+            assert!(matches!(
+                queue.poll(Capability::TextToMusic, &policy, 10),
+                QueueAdmission::Wait { .. }
+            ));
+        }
+        assert!(queue.park(Capability::TextToMusic, 20));
+        assert_eq!(
+            queue.poll(Capability::TextToMusic, &policy, 30),
+            QueueAdmission::Activate,
+            "two parked requests are the demand of two"
+        );
+    }
+
+    #[test]
+    fn parking_is_bounded_by_the_same_ceiling_as_admission() {
+        let queue = ActivationQueue::new();
+        for _ in 0..MAX_QUEUED_PER_CAPABILITY {
+            assert!(queue.park(Capability::TextToMusic, 0));
+        }
+        assert!(!queue.park(Capability::TextToMusic, 0));
     }
 }

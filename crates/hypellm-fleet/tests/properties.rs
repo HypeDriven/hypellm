@@ -117,6 +117,7 @@ fn fleet() -> FleetConfig {
             observation_interval_ms: 5_000,
             observation_max_age_ms: 30_000,
             request_timeout_ms: 5_000,
+            ssh_public_key: None,
         },
     );
     fleet.hosts.insert(
@@ -673,6 +674,7 @@ fn an_unfetchable_artifact_never_produces_a_plan_that_evicts() {
                 arch,
                 size_bytes: 20 * GIB,
                 digest: format!("sha256:{}", "0".repeat(64)),
+                image_id: None,
                 source: "mirror".to_owned(),
             },
         );
@@ -718,6 +720,7 @@ fn an_unfetchable_artifact_never_produces_a_plan_that_evicts() {
                 present: true,
                 verified: true,
                 bytes_present: 20 * GIB,
+                image_id: None,
             },
         );
         let with_artifact =
@@ -771,4 +774,599 @@ fn a_deployment_that_may_not_autostart_is_never_started_by_demand() {
             "case {case}: routing demand started an operator-only deployment"
         );
     }
+}
+
+// -- Idle stop (specification 26.10) ------------------------------------------
+
+/// A random one-host fleet of up to four ready deployments, each with a random
+/// anchor, ownership, in-flight count, idle time and residency, under a random
+/// idle window.
+fn idle_case(rng: &mut Rng) -> (
+    FleetSnapshot,
+    DemandSnapshot,
+    std::collections::BTreeMap<DeploymentId, u32>,
+    u64,
+) {
+    let now = 50_000_000;
+    let window = [0, 60_000, 900_000, 3_600_000][usize::try_from(rng.below(4)).unwrap()];
+    let mut fleet = fleet();
+    fleet.default_policy = FleetPolicy {
+        idle_stop_ms: window,
+        adopt_unmanaged: rng.bool(),
+        ..FleetPolicy::DEFAULT
+    };
+    let count = 1 + rng.below(4);
+    let mut ids = Vec::new();
+    for i in 0..count {
+        let id = format!("d{i}");
+        let mut d = deployment(&id, 8 * GIB);
+        d.pinned = rng.below(4) == 0;
+        d.evictable = rng.below(4) != 0;
+        d.min_resident_ms = rng.below(2_000_000);
+        fleet.deployments.insert(d.id.clone(), d);
+        ids.push(id);
+    }
+    let observed_at = now - rng.below(60_000);
+    let mut snapshot = snapshot_of(fleet, observed_at);
+    let mut demand = DemandSnapshot::default();
+    let mut in_flight = std::collections::BTreeMap::new();
+    for id in &ids {
+        if rng.below(5) != 0 {
+            make_ready(&mut snapshot, id, now - rng.below(5_000_000), 8 * GIB);
+        }
+        if rng.below(4) == 0 {
+            snapshot.unmanaged.insert(did(id));
+        }
+        if rng.below(4) == 0 {
+            in_flight.insert(did(id), 1 + u32::try_from(rng.below(3)).unwrap());
+        }
+        demand.idle_ms.insert(did(id), rng.below(5_000_000));
+        if rng.bool() {
+            snapshot
+                .deployment_capabilities
+                .insert(did(id), Capability::TextToMusic);
+        }
+    }
+    if rng.below(4) == 0 {
+        demand.queued.insert(Capability::TextToMusic, 1);
+    }
+    (snapshot, demand, in_flight, now)
+}
+
+#[test]
+fn an_idle_stop_never_takes_a_model_that_is_in_use_anchored_recent_or_not_ours() {
+    use hypellm_fleet::idle::{IdleInputs, idle_stops};
+    let mut rng = Rng::new(0x1D1E_0001);
+    let mut stopped_some = 0;
+    for case in 0..CASES {
+        let (snapshot, demand, in_flight, now) = idle_case(&mut rng);
+        let inputs = IdleInputs {
+            snapshot: &snapshot,
+            demand: &demand,
+            in_flight: &in_flight,
+            max_observation_age_ms: 30_000,
+            now_ms: now,
+        };
+        let stops = idle_stops(&inputs);
+        assert!(stops.len() <= 1, "case {case}: more than one stop on one host");
+        let policy = snapshot.config.default_policy;
+        for id in &stops {
+            let d = &snapshot.config.deployments[id];
+            assert_ne!(policy.idle_stop_ms, 0, "case {case}: idle stop is switched off");
+            assert!(!d.pinned && d.evictable, "case {case}: {id} is anchored");
+            assert!(
+                snapshot.is_router_owned(id) || policy.adopt_unmanaged,
+                "case {case}: {id} is not the router's"
+            );
+            assert!(snapshot.state_of(id).is_serving(), "case {case}: {id} is not serving");
+            assert_eq!(in_flight.get(id).copied().unwrap_or(0), 0, "case {case}: {id} in flight");
+            let waiting = snapshot
+                .deployment_capabilities
+                .get(id)
+                .map_or(0, |c| demand.queue_depth(*c));
+            assert_eq!(waiting, 0, "case {case}: {id} has requests waiting");
+            assert!(demand.idle(id) >= policy.idle_stop_ms, "case {case}: {id} used recently");
+            let resident = snapshot.resident_for_ms(id, now);
+            assert!(
+                resident >= policy.idle_stop_ms && resident >= d.min_resident_ms,
+                "case {case}: {id} not resident long enough"
+            );
+            assert!(
+                snapshot.belief_is_fresh(now, 30_000),
+                "case {case}: acted on stale belief"
+            );
+            stopped_some += 1;
+        }
+        // Determinism: equal inputs, equal answer.
+        assert_eq!(stops, idle_stops(&inputs), "case {case}");
+    }
+    // The generator must reach the interesting branch, or the property above
+    // is vacuous.
+    assert!(stopped_some > CASES / 20, "only {stopped_some} cases stopped anything");
+}
+
+#[test]
+fn an_idle_stop_picks_the_longest_idle_model_on_each_host() {
+    use hypellm_fleet::idle::{IdleInputs, idle_hold, idle_stops};
+    let mut rng = Rng::new(0x1D1E_0002);
+    for case in 0..CASES {
+        let (snapshot, demand, in_flight, now) = idle_case(&mut rng);
+        let inputs = IdleInputs {
+            snapshot: &snapshot,
+            demand: &demand,
+            in_flight: &in_flight,
+            max_observation_age_ms: 30_000,
+            now_ms: now,
+        };
+        let eligible: Vec<&DeploymentId> = snapshot
+            .config
+            .deployments
+            .keys()
+            .filter(|id| idle_hold(&inputs, id).is_ok())
+            .collect();
+        let stops = idle_stops(&inputs);
+        if !snapshot.belief_is_fresh(now, 30_000) {
+            assert!(stops.is_empty(), "case {case}");
+            continue;
+        }
+        assert_eq!(stops.is_empty(), eligible.is_empty(), "case {case}");
+        if let Some(chosen) = stops.first() {
+            for other in &eligible {
+                assert!(
+                    demand.idle(chosen) >= demand.idle(other),
+                    "case {case}: {chosen} chosen over the longer-idle {other}"
+                );
+            }
+        }
+    }
+}
+
+// -- Churn-aware scheduling (specification 26.11) ---------------------------
+
+use hypellm_fleet::schedule::{
+    Asking, Contender, JobClass, JobEntry, Proceed, Verdict, gate, pick_job, rank,
+};
+
+fn schedule_policy(rng: &mut Rng) -> FleetPolicy {
+    FleetPolicy {
+        activation_min_demand: 1 + u32::try_from(rng.below(3)).unwrap(),
+        activation_max_wait_ms: rng.below(30_000),
+        max_reorder_wait_ms: 5_000 + rng.below(200_000),
+        ..FleetPolicy::DEFAULT
+    }
+}
+
+/// Contenders with deliberately clustered ages and demand, so ties, the
+/// starvation boundary and the readiness boundary are all hit often.
+fn contenders(rng: &mut Rng, now: u64) -> Vec<Contender> {
+    let count = 2 + rng.below(5);
+    (0..count)
+        .map(|i| Contender {
+            deployment: did(&format!("d{i}")),
+            waiting: 1 + u32::try_from(rng.below(4)).unwrap(),
+            oldest_ms: now.saturating_sub(rng.below(4) * 60_000),
+            restore_cost_ms: 10_000 * (1 + rng.below(3)),
+        })
+        .collect()
+}
+
+fn shuffled<T: Clone>(rng: &mut Rng, items: &[T]) -> Vec<T> {
+    let mut out = items.to_vec();
+    for i in (1..out.len()).rev() {
+        let j = usize::try_from(rng.below(u64::try_from(i + 1).unwrap())).unwrap();
+        out.swap(i, j);
+    }
+    out
+}
+
+#[test]
+fn scheduling_decisions_do_not_depend_on_the_order_their_inputs_arrive_in() {
+    // Appendix B: equal inputs give equal answers, never map or arrival order.
+    // The contenders come from a queue the router iterates; a scheduler that
+    // let that iteration order break a tie would hand the host to whichever
+    // capability happened to sort first.
+    for seed in 0..CASES {
+        let mut rng = Rng::new(u64::from(seed) + 7_001);
+        let policy = schedule_policy(&mut rng);
+        let now = 1_000_000;
+        let all = contenders(&mut rng, now);
+        let permuted = shuffled(&mut rng, &all);
+
+        let order = |list: &[Contender]| -> Vec<DeploymentId> {
+            rank(list, now, &policy).iter().map(|c| c.deployment.clone()).collect()
+        };
+        assert_eq!(order(&all), order(&permuted), "seed {seed}: ranking moved");
+
+        for asking in &all {
+            let evicts = rng.bool();
+            let victims_busy = rng.bool();
+            let question = Asking {
+                deployment: &asking.deployment,
+                evicts,
+                victims_busy,
+            };
+            assert_eq!(
+                gate(&question, &all, now, &policy),
+                gate(&question, &permuted, now, &policy),
+                "seed {seed}: the gate's answer for {} moved",
+                asking.deployment
+            );
+        }
+
+        let jobs: Vec<JobEntry> = (0..8_u64)
+            .map(|seq| JobEntry {
+                seq,
+                submitted_ms: now.saturating_sub(rng.below(4) * 60_000),
+                due: rng.below(5) != 0,
+                class: match rng.below(4) {
+                    0 => JobClass::Warm,
+                    1 => JobClass::Activating,
+                    2 => JobClass::Cold("a".to_owned()),
+                    _ => JobClass::Cold("b".to_owned()),
+                },
+            })
+            .collect();
+        let shuffled_jobs = shuffled(&mut rng, &jobs);
+        let seq_of = |list: &[JobEntry]| {
+            pick_job(list, now, policy.max_reorder_wait_ms).map(|i| list[i].seq)
+        };
+        assert_eq!(seq_of(&jobs), seq_of(&shuffled_jobs), "seed {seed}: job pick moved");
+    }
+}
+
+#[test]
+fn nothing_waits_behind_reordering_past_the_bound() {
+    // The bound is what makes reordering safe to ship: whatever the scores,
+    // work that has waited `max_reorder_wait_ms` is first in line. Fixtures
+    // put enormous demand on the young contenders, so only the bound can
+    // explain the starving one going first.
+    for seed in 0..CASES {
+        let mut rng = Rng::new(u64::from(seed) + 9_001);
+        let policy = schedule_policy(&mut rng);
+        let now = 10_000_000;
+        let mut all = contenders(&mut rng, now);
+        for contender in &mut all {
+            contender.oldest_ms = now.saturating_sub(rng.below(policy.max_reorder_wait_ms));
+            contender.waiting = 200;
+        }
+        let starving = rng.below(u64::try_from(all.len()).unwrap());
+        let starving = usize::try_from(starving).unwrap();
+        all[starving].waiting = 1;
+        all[starving].restore_cost_ms = 600_000;
+        all[starving].oldest_ms = now - policy.max_reorder_wait_ms - rng.below(10_000);
+
+        let me = all[starving].clone();
+        let busy = Asking {
+            deployment: &me.deployment,
+            evicts: true,
+            victims_busy: true,
+        };
+        assert!(
+            matches!(gate(&busy, &all, now, &policy), Verdict::Proceed(Proceed::Starving)),
+            "seed {seed}: starving demand was held back"
+        );
+        for other in all.iter().filter(|c| c.deployment != me.deployment) {
+            let asking = Asking {
+                deployment: &other.deployment,
+                evicts: false,
+                victims_busy: false,
+            };
+            assert!(
+                matches!(gate(&asking, &all, now, &policy), Verdict::Defer(_)),
+                "seed {seed}: {} went ahead of starving demand",
+                other.deployment
+            );
+        }
+
+        // Jobs: a due job past the bound is always the one taken.
+        let old = rng.below(8);
+        let jobs: Vec<JobEntry> = (0..8_u64)
+            .map(|seq| JobEntry {
+                seq,
+                submitted_ms: if seq == old {
+                    now - policy.max_reorder_wait_ms
+                } else {
+                    now - rng.below(policy.max_reorder_wait_ms)
+                },
+                due: true,
+                class: if seq == old {
+                    JobClass::Cold("lonely".to_owned())
+                } else {
+                    JobClass::Warm
+                },
+            })
+            .collect();
+        let picked = pick_job(&jobs, now, policy.max_reorder_wait_ms).unwrap();
+        assert_eq!(jobs[picked].seq, old, "seed {seed}: a starving job was passed over");
+    }
+}
+
+/// One slot, two models, serial service: how many loads, and the longest wait.
+///
+/// `scheduled` asks [`gate`] on behalf of each waiting model, as parked
+/// requests do, and keeps serving the loaded model when none may go; the
+/// baseline serves strictly oldest-first.
+fn simulate(arrivals: &[(u64, usize)], load_ms: u64, serve_ms: u64, policy: &FleetPolicy, scheduled: bool) -> (u32, u64) {
+    let mut waiting: Vec<(u64, usize)> = Vec::new();
+    let mut next = 0;
+    let mut now = 0_u64;
+    let mut loaded: Option<usize> = None;
+    let mut loads = 0_u32;
+    let mut longest = 0_u64;
+    let mut served = 0;
+    while served < arrivals.len() {
+        while next < arrivals.len() && arrivals[next].0 <= now {
+            waiting.push(arrivals[next]);
+            next += 1;
+        }
+        if waiting.is_empty() {
+            now = arrivals[next].0;
+            continue;
+        }
+        let oldest_of = |model: usize| waiting.iter().filter(|w| w.1 == model).map(|w| w.0).min();
+        let model = if scheduled {
+            let contenders: Vec<Contender> = (0..2)
+                .filter(|m| Some(*m) != loaded)
+                .filter_map(|m| {
+                    oldest_of(m).map(|oldest_ms| Contender {
+                        deployment: did(&format!("m{m}")),
+                        waiting: u32::try_from(waiting.iter().filter(|w| w.1 == m).count()).unwrap(),
+                        oldest_ms,
+                        restore_cost_ms: load_ms,
+                    })
+                })
+                .collect();
+            let warm_has_work = loaded.is_some_and(|l| oldest_of(l).is_some());
+            // Each waiting model asks the gate, exactly as a parked request
+            // does; the first allowed to go is loaded. If none is, the loaded
+            // model keeps serving its own work.
+            contenders
+                .iter()
+                .find(|c| {
+                    let asking = Asking {
+                        deployment: &c.deployment,
+                        evicts: loaded.is_some(),
+                        victims_busy: warm_has_work,
+                    };
+                    matches!(gate(&asking, &contenders, now, policy), Verdict::Proceed(_))
+                })
+                .map_or(loaded.unwrap_or(0), |c| {
+                    usize::from(c.deployment.as_str() == "m1")
+                })
+        } else {
+            waiting.iter().min_by_key(|w| w.0).unwrap().1
+        };
+        if loaded != Some(model) {
+            loads += 1;
+            now += load_ms;
+            loaded = Some(model);
+        }
+        let position = waiting
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.1 == model)
+            .min_by_key(|(_, w)| w.0)
+            .map(|(i, _)| i)
+            .unwrap();
+        let (arrived, _) = waiting.remove(position);
+        longest = longest.max(now - arrived);
+        now += serve_ms;
+        served += 1;
+    }
+    (loads, longest)
+}
+
+#[test]
+fn interleaved_demand_for_two_models_costs_fewer_loads_than_arrival_order() {
+    // The adversarial case for a one-slot host: requests for two models
+    // arriving strictly alternately, faster than a load. Arrival order loads
+    // on nearly every request. The scheduler must load measurably less, and
+    // must still serve everyone within the bound plus the work already
+    // committed when they started starving.
+    let mut fifo_total = 0_u64;
+    let mut scheduled_total = 0_u64;
+    for seed in 0..CASES {
+        let mut rng = Rng::new(u64::from(seed) + 11_001);
+        let load_ms = 20_000 + rng.below(60_000);
+        let serve_ms = 1_000 + rng.below(5_000);
+        let gap_ms = 200 + rng.below(serve_ms);
+        let count = 8 + rng.below(16);
+        let arrivals: Vec<(u64, usize)> = (0..count)
+            .map(|i| (i * gap_ms, usize::try_from(i % 2).unwrap()))
+            .collect();
+        // A bound shorter than a load makes everything starving the moment a
+        // host frees, which is arrival order by design; the claim is about a
+        // bound that leaves room to reorder.
+        let policy = FleetPolicy {
+            max_reorder_wait_ms: 2 * load_ms + rng.below(300_000),
+            ..FleetPolicy::DEFAULT
+        };
+
+        let (fifo_loads, _) = simulate(&arrivals, load_ms, serve_ms, &policy, false);
+        let (loads, longest) = simulate(&arrivals, load_ms, serve_ms, &policy, true);
+        assert!(
+            loads < fifo_loads,
+            "seed {seed}: {loads} loads scheduled against {fifo_loads} in arrival order"
+        );
+        // Every request is served within the bound plus, at worst, a load and
+        // a service for each request older than it: past the bound, work goes
+        // in age order, and each older request may cost a swap.
+        let ceiling = policy.max_reorder_wait_ms + count * (load_ms + serve_ms);
+        assert!(longest <= ceiling, "seed {seed}: a request waited {longest} ms against {ceiling}");
+        fifo_total += u64::from(fifo_loads);
+        scheduled_total += u64::from(loads);
+    }
+    // The aggregate, so the report can quote a measured reduction.
+    println!("interleaved two-model demand: {fifo_total} loads in arrival order, {scheduled_total} scheduled");
+    assert!(scheduled_total * 2 <= fifo_total, "less than a halving: {scheduled_total} vs {fifo_total}");
+}
+
+#[test]
+fn scheduling_priority_never_overflows() {
+    for seed in 0..CASES {
+        let mut rng = Rng::new(u64::from(seed) + 13_001);
+        let contender = Contender {
+            deployment: did("x"),
+            waiting: u32::try_from(rng.next_u64() >> 32).unwrap(),
+            oldest_ms: rng.next_u64(),
+            restore_cost_ms: rng.next_u64(),
+        };
+        // Must not panic in debug builds, where overflow would.
+        let now = rng.next_u64();
+        let _ = contender.priority(now);
+        let _ = contender.is_starving(now, &FleetPolicy::DEFAULT);
+    }
+}
+
+// -- Specification 26.12: copies are only ever verified -----------------------
+
+/// What one candidate source host holds, for the copy property.
+#[derive(Debug, Clone, Copy)]
+enum Holding {
+    Nothing,
+    Kept,
+    Other,
+    NoId,
+    Unreachable,
+}
+
+#[test]
+fn a_copy_is_planned_only_from_a_host_reporting_the_kept_checksum_and_preferred_to_a_fetch() {
+    use hypellm_core::ids::ArtifactId;
+    use hypellm_fleet::model::{Artifact, ArtifactKind, ImageId};
+    use hypellm_fleet::plan::PlanStep;
+    use hypellm_fleet::state::{ArtifactPlacement, HostObservation};
+
+    let kept = ImageId::parse(&format!("sha256:{}", "a".repeat(64))).unwrap();
+    let other = ImageId::parse(&format!("sha256:{}", "b".repeat(64))).unwrap();
+    let mut rng = Rng::new(0xF1EE_C0B1);
+    let mut copies = 0;
+    let mut fetches = 0;
+    for case in 0..CASES {
+        let now = 10_000_000;
+        let mut fleet = fleet();
+        fleet.default_policy.allow_fetch = true;
+        let artifact = ArtifactId::new("music3").unwrap();
+        // Pinned in configuration, learned, or neither.
+        let anchor = rng.below(3);
+        fleet.artifacts.insert(
+            artifact.clone(),
+            Artifact {
+                id: artifact.clone(),
+                kind: ArtifactKind::Image,
+                arch: Arch::Aarch64,
+                size_bytes: GIB,
+                digest: format!("sha256:{}", "0".repeat(64)),
+                image_id: (anchor == 0).then(|| kept.clone()),
+                source: "mirror".to_owned(),
+            },
+        );
+        // Candidate sources, named so the honest one is often *not* first in
+        // identifier order: the tampered hosts sort ahead of it.
+        let count = 1 + rng.below(5);
+        let mut holdings = Vec::new();
+        for n in 0..count {
+            let holding = match rng.below(5) {
+                0 => Holding::Nothing,
+                1 => Holding::Kept,
+                2 => Holding::Other,
+                3 => Holding::NoId,
+                _ => Holding::Unreachable,
+            };
+            let id = HostId::new(&format!("peer-{n}")).unwrap();
+            fleet.hosts.insert(
+                id.clone(),
+                Host {
+                    id: id.clone(),
+                    agent: AgentId::new("local").unwrap(),
+                    arch: Arch::Aarch64,
+                    state: HostState::Enabled,
+                    reserved_memory_bytes: 0,
+                    max_concurrent_activations: 1,
+                },
+            );
+            holdings.push((id, holding));
+        }
+        let mut incoming = deployment("music3", 8 * GIB);
+        incoming.artifact = Some(artifact.clone());
+        fleet.deployments.insert(incoming.id.clone(), incoming.clone());
+
+        let mut snapshot = snapshot_of(fleet, now);
+        if anchor == 1 {
+            snapshot.learned_checksums.insert(artifact.clone(), kept.clone());
+        }
+        let spark = HostId::new("spark").unwrap();
+        for host in std::iter::once(&spark).chain(holdings.iter().map(|(h, _)| h)) {
+            snapshot.inventory.hosts.insert(
+                host.clone(),
+                HostObservation {
+                    host: host.clone(),
+                    reachable: true,
+                    free_disk_bytes: 100 * GIB,
+                    arch: Some(Arch::Aarch64),
+                },
+            );
+        }
+        for (host, holding) in &holdings {
+            let image_id = match holding {
+                Holding::Nothing => continue,
+                Holding::Kept | Holding::Unreachable => Some(kept.clone()),
+                Holding::Other => Some(other.clone()),
+                Holding::NoId => None,
+            };
+            if matches!(holding, Holding::Unreachable) {
+                snapshot.inventory.hosts.get_mut(host).unwrap().reachable = false;
+            }
+            snapshot.inventory.artifacts.insert(
+                (artifact.clone(), host.clone()),
+                ArtifactPlacement {
+                    artifact: artifact.clone(),
+                    host: host.clone(),
+                    present: true,
+                    // The agent's registry check passes everywhere: the kept
+                    // checksum, not this flag, is what must decide.
+                    verified: true,
+                    bytes_present: GIB,
+                    image_id,
+                },
+            );
+        }
+
+        let mut ctx = context(now);
+        ctx.may_fetch = true;
+        let outcome = plan(&snapshot, &DemandSnapshot::default(), &incoming.target, &ctx);
+        let PlanOutcome::Plan(planned) = &outcome else {
+            panic!("case {case}: a fetchable artifact on an empty host refused: {outcome:?}");
+        };
+        let transfer = planned
+            .steps
+            .iter()
+            .find(|s| matches!(s, PlanStep::Fetch { .. } | PlanStep::Copy { .. }))
+            .expect("the artifact is absent on spark, so it must be acquired");
+
+        let honest: Option<&HostId> = holdings
+            .iter()
+            .find(|(_, h)| matches!(h, Holding::Kept))
+            .map(|(id, _)| id);
+        match (anchor, honest, transfer) {
+            // No checksum kept: there is nothing to verify a copy against.
+            (2, _, PlanStep::Copy { .. }) => {
+                panic!("case {case}: planned a copy with no kept checksum: {holdings:?}")
+            }
+            (_, Some(expected), PlanStep::Copy { from, to, .. }) if anchor != 2 => {
+                assert_eq!(from, expected, "case {case}: {holdings:?}");
+                assert_eq!(to, &spark);
+                copies += 1;
+            }
+            (_, Some(_), PlanStep::Fetch { .. }) if anchor != 2 => {
+                panic!("case {case}: fetched although a verified peer exists: {holdings:?}")
+            }
+            (_, None, PlanStep::Copy { from, .. }) => {
+                panic!("case {case}: copied from unverified {from}: {holdings:?}")
+            }
+            _ => fetches += 1,
+        }
+    }
+    // Both branches were reached, or the property proved half of itself.
+    assert!(copies > 50 && fetches > 50, "copies {copies}, fetches {fetches}");
 }

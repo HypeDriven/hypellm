@@ -18,6 +18,21 @@
     "    cargo run -q -p hypellm-router -- --check --config spec/examples/fleet.conf"
   ],
 
+  "enrollment": {
+    "_comment": "Specification 26.8. Off by default. When true, hosts the router offers after an administrator approves them (and a second person publishes their records) join this table: only inside these networks, each pinned to the SSH host key it registered with, and with no deployment until one is written below.",
+    "accept": false,
+    "cidrs": ["10.0.0.0/24"],
+    "state_file": "/var/lib/hypellm-agent/enrolled.json",
+    "known_hosts_file": "/var/lib/hypellm-agent/enrolled_known_hosts",
+    "max_activations_per_hour": 12
+  },
+
+  "transfer": {
+    "_comment": "Specification 26.12. Where COPY spools an image while it is verified, on this machine. Remove the block to refuse COPY. Each copy needs up to max_spool_bytes free here.",
+    "spool_dir": "/var/lib/hypellm-agent/spool",
+    "max_spool_bytes": 107374182400
+  },
+
   "hosts": [
     {
       "id": "spark",

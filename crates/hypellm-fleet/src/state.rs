@@ -19,7 +19,7 @@
 //! half-applied observation is worse than none, because the router would then
 //! plan against a mixture of two moments.
 
-use crate::model::{Arch, FleetConfig};
+use crate::model::{Arch, FleetConfig, ImageId};
 use core::fmt;
 use hypellm_core::ids::{AcceleratorId, ArtifactId, DeploymentId, HostId, LeaseId, TargetId};
 use hypellm_core::target::Capability;
@@ -241,6 +241,13 @@ pub struct ArtifactPlacement {
     pub verified: bool,
     /// Bytes present, for a partial fetch.
     pub bytes_present: u64,
+    /// The image ID the host reports for the artifact, when it holds one.
+    ///
+    /// The host's assertion, like everything in an inventory. It is compared
+    /// against the checksum the router keeps (specification 26.12): a host
+    /// reporting a different ID holds something else under the artifact's
+    /// name, and is neither activated with it nor used as a copy source.
+    pub image_id: Option<ImageId>,
 }
 
 /// One complete, valid observation of the fleet.
@@ -336,6 +343,25 @@ fn observed_u32(
 ) -> Result<u32, InventoryError> {
     let raw = observed_u64(value, key, field)?;
     u32::try_from(raw).map_err(|_| InventoryError::OutOfRange { field })
+}
+
+/// An optional `image_id`, refused rather than dropped when malformed.
+///
+/// Dropping a malformed ID would read as "this host reports no ID", which
+/// is the honest-but-old-agent case; an agent sending a value that is not an
+/// image ID is something else, and the whole observation is refused the way
+/// any other out-of-range field is.
+fn observed_image_id(value: &Value) -> Result<Option<ImageId>, InventoryError> {
+    match value.get("image_id") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_str()
+            .and_then(ImageId::parse)
+            .map(Some)
+            .ok_or(InventoryError::OutOfRange {
+                field: "artifacts.image_id",
+            }),
+    }
 }
 
 /// Parse an agent inventory against the declared fleet.
@@ -518,6 +544,7 @@ pub fn parse_inventory(
                     present: item.get("present").and_then(Value::as_bool).unwrap_or(false),
                     verified: item.get("verified").and_then(Value::as_bool).unwrap_or(false),
                     bytes_present: observed_u64(item, "bytes_present", "artifacts.bytes_present")?,
+                    image_id: observed_image_id(item)?,
                 },
             );
         }
@@ -647,6 +674,11 @@ pub struct FleetSnapshot {
     /// unclassified target, and its retention value rests on recency and the
     /// operator's weight.
     pub deployment_capabilities: BTreeMap<DeploymentId, Capability>,
+    /// Image IDs the router learned and keeps, by artifact.
+    ///
+    /// Consulted only for an artifact whose configuration pins no `image_id`;
+    /// a pinned one always wins (specification 26.12).
+    pub learned_checksums: BTreeMap<ArtifactId, ImageId>,
 }
 
 /// Observed lifecycle durations for one deployment.
@@ -705,6 +737,7 @@ impl FleetSnapshot {
             digest_agreed: true,
             agents_reachable: true,
             deployment_capabilities: BTreeMap::new(),
+            learned_checksums: BTreeMap::new(),
         }
     }
 
@@ -860,12 +893,75 @@ impl FleetSnapshot {
     }
 
     /// Whether an artifact is present and verified on a host.
+    ///
+    /// When the router keeps a checksum for the artifact, that is the test:
+    /// the host must report exactly that image ID. A host that reports none
+    /// cannot show it holds the right image, and one that reports another is
+    /// holding something else; either way the artifact is not ready there, so
+    /// the planner treats it as absent and acquires it rather than starting a
+    /// deployment on an image nobody vouched for. The agent's own `verified`
+    /// flag — its registry-digest check — is not required as well, because a
+    /// copied image carries no registry digest (`docker load` does not restore
+    /// one) and is nonetheless the one image whose content was hashed.
+    ///
+    /// With no kept checksum, the agent's registry-digest check is all there
+    /// is, as before.
     #[must_use]
     pub fn artifact_ready(&self, artifact: &ArtifactId, host: &HostId) -> bool {
+        let Some(placement) = self.inventory.artifacts.get(&(artifact.clone(), host.clone()))
+        else {
+            return false;
+        };
+        if !placement.present {
+            return false;
+        }
+        match self.kept_checksum(artifact) {
+            None => placement.verified,
+            Some(kept) => placement.image_id.as_ref() == Some(kept),
+        }
+    }
+
+    /// The image ID the router holds an artifact to: pinned, else learned.
+    #[must_use]
+    pub fn kept_checksum(&self, artifact: &ArtifactId) -> Option<&ImageId> {
+        self.config
+            .artifacts
+            .get(artifact)
+            .and_then(|a| a.image_id.as_ref())
+            .or_else(|| self.learned_checksums.get(artifact))
+    }
+
+    /// Whether a host reports an image under the artifact's name whose ID
+    /// differs from the kept checksum.
+    #[must_use]
+    pub fn artifact_tampered(&self, artifact: &ArtifactId, host: &HostId) -> bool {
+        let Some(kept) = self.kept_checksum(artifact) else {
+            return false;
+        };
         self.inventory
             .artifacts
             .get(&(artifact.clone(), host.clone()))
-            .is_some_and(|p| p.present && p.verified)
+            .is_some_and(|p| p.present && p.image_id.as_ref().is_some_and(|id| id != kept))
+    }
+
+    /// A host an artifact may be copied to `destination` from, if any.
+    ///
+    /// The source must be a different, reachable, enabled host of the same
+    /// architecture that reports exactly the kept checksum. With no kept
+    /// checksum there is nothing to verify a copy against, so there is no
+    /// source at all. The first in identifier order is chosen, so the answer
+    /// depends on belief and never on map iteration order.
+    #[must_use]
+    pub fn copy_source(&self, artifact: &ArtifactId, destination: &HostId) -> Option<HostId> {
+        self.kept_checksum(artifact)?;
+        let arch = self.config.artifacts.get(artifact)?.arch;
+        self.config
+            .hosts
+            .values()
+            .filter(|h| &h.id != destination && h.arch == arch && h.state.admits_traffic())
+            .filter(|h| self.inventory.hosts.get(&h.id).is_some_and(|o| o.reachable))
+            .find(|h| self.artifact_ready(artifact, &h.id))
+            .map(|h| h.id.clone())
     }
 
     /// Free disk the agent reports for a host.

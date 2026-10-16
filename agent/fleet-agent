@@ -35,6 +35,16 @@ The design rules it exists to keep
    agent's own table, in the same canonical form the router uses. A mismatch is
    reported and the router refuses to act; the agent does not adopt the
    router's view.
+6. **A copy is hashed here, not believed.** `COPY` relays an image from one
+   host to another through this machine. The archive is spooled, every layer
+   and the configuration are hashed against the image ID, and only a fresh
+   archive rebuilt from the verified parts is loaded on the destination — so
+   a source host serving something else under the name loads nothing.
+7. **Enrollment is an offer, not an instruction.** With `enrollment.accept`
+   set, the router may offer hosts an administrator approved and a second
+   person published. Each is checked here: its address must be inside this
+   file's `enrollment.cidrs`, its SSH host key is pinned, and it carries no
+   deployment. Off by default.
 
 Only the standard library is used.
 """
@@ -42,8 +52,12 @@ Only the standard library is used.
 from __future__ import annotations
 
 import argparse
+import base64
+import gzip
+import io
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -52,8 +66,10 @@ import socket
 import socketserver
 import subprocess
 import sys
+import tarfile
 import threading
 import time
+import zlib
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -104,6 +120,43 @@ MAX_RETAINED_ACTIVATIONS = 1024
 RELOAD_CHECK_SECONDS = 1.0
 # Distinct invalid versions of the file remembered, so each is reported once.
 MAX_REJECTED_STAMPS = 64
+
+# Enrollment (specification 26.8). The offer is bounded on both sides.
+MAX_OFFER_BYTES = 64 * 1024
+MAX_OFFER_HOSTS = 64
+MAX_OFFER_ACCELERATORS = 16
+# Stricter than IDENTIFIER: an enrolled host id becomes a known_hosts alias,
+# where ':' would read as a port.
+ENROLLED_ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+SSH_USER = re.compile(r"^[a-z0-9_][a-z0-9_.-]{0,31}$")
+DATA_DIR = re.compile(r"^/[A-Za-z0-9/._-]{0,255}$")
+SSH_ED25519 = re.compile(r"^ssh-ed25519 ([A-Za-z0-9+/]{68})$")
+
+# Containers from templates (specification 26.12). Bounded like everything
+# else in the table, and checked to the same vocabulary the host shim allows,
+# so a template the shim would refuse is refused here, at load, with a reason.
+CONTAINER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
+# A deployment id that becomes a directory name under the data directory.
+PATH_SEGMENT = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$")
+IMAGE_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./:@-]{0,254}$")
+IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
+CONTAINER_PATH = re.compile(r"^/[A-Za-z0-9/._-]{0,255}$")
+ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+IPV4 = re.compile(r"^[0-9]{1,3}(\.[0-9]{1,3}){3}$")
+MAX_RUN_PORTS = 16
+MAX_RUN_ARGS = 64
+MAX_RUN_ENV = 64
+MAX_RUN_VALUE = 1024
+TEMPLATE_LABEL = "hypellm.template"
+
+# Image relay. The spool cap is the operator's, bounded here; the archive
+# bounds keep a hostile source from making verification itself expensive.
+MAX_SPOOL_BYTES = 1024 * 1024 * 1024 * 1024
+MAX_ARCHIVE_MEMBERS = 8192
+MAX_ARCHIVE_JSON = 4 * 1024 * 1024
+MAX_IMAGE_LAYERS = 256
+MAX_LINK_HOPS = 4
+COPY_CHUNK = 1024 * 1024
 
 # Activation states after which nothing more happens to an activation.
 TERMINAL_STATES = {"ready", "failed", "stopped", "cancelled"}
@@ -162,6 +215,34 @@ class Deployment:
     # Optional: the container name, so `docker ps` can report residency.
     container: str = ""
     artifact: str = ""
+    # Optional: create the container from this template when it is absent.
+    run: "RunTemplate | None" = None
+
+
+@dataclass
+class RunTemplate:
+    """How to create a deployment's container (specification 26.12).
+
+    Every field comes from this agent's table. The router never supplies one,
+    and the create command is built from these and the host's own data
+    directory alone.
+    """
+
+    image: str  # an artifact id in this table
+    container: str
+    # (bind address, host port, container port)
+    ports: list[tuple[str, int, int]] = field(default_factory=list)
+    args: list[str] = field(default_factory=list)
+    env: list[str] = field(default_factory=list)
+    state_path: str = "/state"
+
+
+@dataclass
+class TransferConfig:
+    """Where relayed images are spooled, and how large one may be."""
+
+    spool_dir: str
+    max_spool_bytes: int
 
 
 @dataclass
@@ -177,6 +258,8 @@ class Host:
     accelerators: list[dict[str, Any]] = field(default_factory=list)
     # Per-host activation rate limit, independent of the router's.
     max_activations_per_hour: int = 12
+    # Where containers keep their state. Required for a `run` template.
+    data_dir: str = ""
 
 
 @dataclass
@@ -187,49 +270,72 @@ class Artifact:
     arch: str
     digest: str
     host_pull: dict[str, list[str]] = field(default_factory=dict)
+    # The image reference on a host. Defaults to the id.
+    image: str = ""
+    # The image ID (configuration digest), when the operator pinned it. A
+    # router asking for a copy under any other ID is refused.
+    image_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.image:
+            self.image = self.id
 
 
 class Fleet:
     """The agent's own view of what exists.
 
-    This is the allowlist. The router cannot extend it, and nothing here is
-    derived from anything the router sends.
+    This is the allowlist. Hosts, deployments and artifacts come from the
+    operator's file. The one exception is enrollment (specification 26.8):
+    when the file sets `enrollment.accept`, hosts the router *offers* may join
+    — each inside the file's CIDR allowlist, each with a pinned host key, and
+    none with a deployment. What runs anywhere is still only what the file
+    says.
     """
 
-    def __init__(self, document: dict[str, Any]) -> None:
+    def __init__(
+        self, document: dict[str, Any], enrolled: list[Host] | None = None
+    ) -> None:
         self.hosts: dict[str, Host] = {}
         self.deployments: dict[str, Deployment] = {}
         self.artifacts: dict[str, Artifact] = {}
+        # Hosts this table holds because the router offered them, kept apart
+        # so `enrolled_ids` can tell an operator which is which.
+        self.enrolled_ids: set[str] = set()
+        self.enrollment = EnrollmentConfig.from_document(document)
+        # The hand-written document, so an offer can rebuild the table
+        # without re-reading a file that may have changed since.
+        self.document = document
+
+        self.transfer = transfer_config(document)
 
         for raw in document.get("hosts", []):
+            data_dir = raw.get("data_dir", "")
+            if data_dir and (
+                not isinstance(data_dir, str)
+                or not DATA_DIR.match(data_dir)
+                or ".." in data_dir.split("/")
+            ):
+                raise ValueError(f"host {raw.get('id')}: data_dir must be a plain absolute path")
             host = Host(
                 id=raw["id"],
                 arch=raw["arch"],
                 ssh=raw["ssh"],
                 ssh_options=list(raw.get("ssh_options", [])),
-                disk_path=raw.get("disk_path", "/"),
+                disk_path=raw.get("disk_path", data_dir or "/"),
                 accelerators=list(raw.get("accelerators", [])),
                 max_activations_per_hour=int(raw.get("max_activations_per_hour", 12)),
+                data_dir=data_dir,
             )
             self.hosts[host.id] = host
 
-        for raw in document.get("deployments", []):
-            deployment = Deployment(
-                id=raw["id"],
-                host=raw["host"],
-                accelerator=raw["accelerator"],
-                start=list(raw["start"]),
-                stop=list(raw["stop"]),
-                probe=list(raw.get("probe", [])),
-                container=raw.get("container", ""),
-                artifact=raw.get("artifact", ""),
-            )
-            if deployment.host not in self.hosts:
-                raise ValueError(
-                    f"deployment {deployment.id} names host {deployment.host}, "
-                    "which is not declared"
-                )
-            self.deployments[deployment.id] = deployment
+        # Enrolled hosts join before deployments are checked, so a hand-written
+        # deployment may name one. A hand-written host of the same id wins: the
+        # file an operator wrote outranks anything the router offered.
+        if self.enrollment.accept:
+            for host in enrolled or []:
+                if host.id not in self.hosts:
+                    self.hosts[host.id] = host
+                    self.enrolled_ids.add(host.id)
 
         for raw in document.get("artifacts", []):
             artifact = Artifact(
@@ -237,8 +343,43 @@ class Fleet:
                 arch=raw["arch"],
                 digest=raw["digest"],
                 host_pull={k: list(v) for k, v in raw.get("host_pull", {}).items()},
+                image=raw.get("image", ""),
+                image_id=raw.get("image_id", ""),
             )
+            if not IMAGE_REF.match(artifact.image):
+                raise ValueError(f"artifact {artifact.id}: image is not a plain reference")
+            if artifact.image_id and not IMAGE_ID.match(artifact.image_id):
+                raise ValueError(
+                    f"artifact {artifact.id}: image_id must be sha256: and 64 lowercase hex"
+                )
             self.artifacts[artifact.id] = artifact
+
+        for raw in document.get("deployments", []):
+            if raw["host"] not in self.hosts:
+                raise ValueError(
+                    f"deployment {raw['id']} names host {raw['host']}, which is not declared"
+                )
+            host = self.hosts[raw["host"]]
+            run = None
+            if "run" in raw:
+                run = run_template(raw["id"], raw["run"], host, self.artifacts)
+            container = raw.get("container", "") or (run.container if run else "")
+            deployment = Deployment(
+                id=raw["id"],
+                host=raw["host"],
+                accelerator=raw["accelerator"],
+                # A templated deployment starts and stops its own container
+                # unless the row says otherwise.
+                start=list(raw["start"]) if "start" in raw or run is None
+                else ["docker", "start", container],
+                stop=list(raw["stop"]) if "stop" in raw or run is None
+                else ["docker", "stop", container],
+                probe=list(raw.get("probe", [])),
+                container=container,
+                artifact=raw.get("artifact", "") or (run.image if run else ""),
+                run=run,
+            )
+            self.deployments[deployment.id] = deployment
 
     def canonical_form(self) -> str:
         """The text the fleet digest is computed over.
@@ -267,6 +408,339 @@ class Fleet:
 
     def digest(self) -> str:
         return hashlib.sha256(self.canonical_form().encode("utf-8")).hexdigest()
+
+
+def transfer_config(document: dict[str, Any]) -> TransferConfig | None:
+    """The `transfer` block, or None when this agent relays no images."""
+    raw = document.get("transfer")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("transfer must be an object")
+    spool_dir = raw.get("spool_dir")
+    limit = raw.get("max_spool_bytes")
+    if not isinstance(spool_dir, str) or not spool_dir.startswith("/"):
+        raise ValueError("transfer.spool_dir must be an absolute path")
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 0 < limit <= MAX_SPOOL_BYTES:
+        raise ValueError("transfer.max_spool_bytes must be a positive byte count")
+    return TransferConfig(spool_dir=spool_dir, max_spool_bytes=limit)
+
+
+def run_template(
+    deployment_id: str, raw: Any, host: Host, artifacts: dict[str, Artifact]
+) -> RunTemplate:
+    """Validate a `run` template against this table and the shim's vocabulary."""
+
+    def bad(why: str) -> ValueError:
+        return ValueError(f"deployment {deployment_id}: run {why}")
+
+    if not isinstance(raw, dict):
+        raise bad("must be an object")
+    if not PATH_SEGMENT.match(deployment_id):
+        # The id names the state directory, so it must be one plain segment.
+        raise bad("needs a deployment id of letters, digits, '.', '_' and '-'")
+    if not host.data_dir:
+        raise bad(f"needs host {host.id} to declare a data_dir")
+    image = raw.get("image")
+    artifact = artifacts.get(image) if isinstance(image, str) else None
+    if artifact is None:
+        raise bad("image must name an artifact in this table")
+    if artifact.arch != host.arch:
+        raise bad(f"image {image} is {artifact.arch}, but host {host.id} is {host.arch}")
+    container = raw.get("container", f"hypellm-{deployment_id}")
+    if not isinstance(container, str) or not CONTAINER_NAME.match(container):
+        raise bad("container is not a plain container name")
+    ports: list[tuple[str, int, int]] = []
+    raw_ports = raw.get("ports", [])
+    if not isinstance(raw_ports, list) or len(raw_ports) > MAX_RUN_PORTS:
+        raise bad(f"ports must be a list of at most {MAX_RUN_PORTS}")
+    for entry in raw_ports:
+        if not isinstance(entry, dict):
+            raise bad("each port must be an object")
+        bind = entry.get("bind", "127.0.0.1")
+        published = entry.get("host")
+        inside = entry.get("container", published)
+        if not isinstance(bind, str) or not IPV4.match(bind):
+            raise bad("port bind must be an IPv4 address")
+        for number in (published, inside):
+            if not isinstance(number, int) or isinstance(number, bool) or not 1 <= number <= 65535:
+                raise bad("ports must be between 1 and 65535")
+        ports.append((bind, published, inside))
+    args = raw.get("args", [])
+    env = raw.get("env", [])
+    for name, values, limit in (("args", args, MAX_RUN_ARGS), ("env", env, MAX_RUN_ENV)):
+        if not isinstance(values, list) or len(values) > limit:
+            raise bad(f"{name} must be a list of at most {limit}")
+        for value in values:
+            if (
+                not isinstance(value, str)
+                or len(value) > MAX_RUN_VALUE
+                or any(ch in value for ch in "\n\r\0")
+            ):
+                raise bad(f"{name} entries must be single-line strings")
+    for entry in env:
+        key, sep, _ = entry.partition("=")
+        if not sep or not ENV_KEY.match(key):
+            raise bad("env entries must be KEY=VALUE")
+    state_path = raw.get("state_path", "/state")
+    if (
+        not isinstance(state_path, str)
+        or not CONTAINER_PATH.match(state_path)
+        or ".." in state_path.split("/")
+    ):
+        raise bad("state_path must be a plain absolute path")
+    return RunTemplate(
+        image=image,
+        container=container,
+        ports=ports,
+        args=list(args),
+        env=list(env),
+        state_path=state_path,
+    )
+
+
+def container_plan(
+    deployment: Deployment, host: Host, artifact: Artifact
+) -> tuple[list[str], list[str], str]:
+    """The state-directory and create commands for a templated deployment.
+
+    Returns `(mkdir argv, docker create argv, template label)`. The label is
+    the SHA-256 of everything else the create command says, so a container
+    created from an older template is recognised and recreated rather than
+    started as it was.
+    """
+    run = deployment.run
+    assert run is not None
+    state_dir = f"{host.data_dir.rstrip('/')}/containers/{deployment.id}"
+    options: list[str] = []
+    index = next(
+        (a.get("index") for a in host.accelerators if a.get("id") == deployment.accelerator),
+        None,
+    )
+    if isinstance(index, int) and not isinstance(index, bool):
+        options += ["--gpus", f"device={index}"]
+    for bind, published, inside in run.ports:
+        options += ["-p", f"{bind}:{published}:{inside}"]
+    options += ["-v", f"{state_dir}:{run.state_path}"]
+    for entry in run.env:
+        options += ["-e", entry]
+    options += ["--restart", "no"]
+    tail = [artifact.image, *run.args]
+    label = hashlib.sha256(
+        json.dumps([run.container, options, tail], separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    create = [
+        "docker", "create", "--name", run.container,
+        "--label", f"{TEMPLATE_LABEL}={label}",
+        *options, *tail,
+    ]
+    return ["mkdir", "-p", state_dir], create, label
+
+
+@dataclass
+class EnrollmentConfig:
+    """Whether, and within what bounds, this agent adopts router offers.
+
+    Off unless the operator's own file says otherwise. The router can only
+    *offer*: an address outside `cidrs` is refused, every host key is pinned,
+    and an enrolled host carries no deployment — what runs on it is still the
+    hand-written table.
+    """
+
+    accept: bool = False
+    cidrs: list[Any] = field(default_factory=list)
+    state_file: str = ""
+    known_hosts_file: str = ""
+    max_activations_per_hour: int = 12
+
+    @classmethod
+    def from_document(cls, document: dict[str, Any]) -> "EnrollmentConfig":
+        raw = document.get("enrollment")
+        if raw is None:
+            return cls()
+        if not isinstance(raw, dict):
+            raise ValueError("enrollment must be an object")
+        accept = raw.get("accept", False)
+        if not isinstance(accept, bool):
+            raise ValueError("enrollment.accept must be true or false")
+        cidrs = [ipaddress.ip_network(c, strict=False) for c in raw.get("cidrs", [])]
+        state_file = raw.get("state_file", "")
+        known_hosts_file = raw.get("known_hosts_file", "")
+        if accept:
+            if not cidrs:
+                # An empty allowlist would accept nothing; say so rather than
+                # silently enrolling nobody.
+                raise ValueError("enrollment.accept needs at least one entry in enrollment.cidrs")
+            for name, value in (("state_file", state_file), ("known_hosts_file", known_hosts_file)):
+                if not isinstance(value, str) or not value.startswith("/"):
+                    raise ValueError(f"enrollment.{name} must be an absolute path")
+        return cls(
+            accept=accept,
+            cidrs=cidrs,
+            state_file=state_file,
+            known_hosts_file=known_hosts_file,
+            max_activations_per_hour=int(raw.get("max_activations_per_hour", 12)),
+        )
+
+    def permits(self, address: Any) -> bool:
+        return any(
+            address.version == network.version and address in network for network in self.cidrs
+        )
+
+
+def ssh_ed25519_valid(line: str) -> bool:
+    """Whether `line` is exactly `ssh-ed25519 <one 32-byte key>`."""
+    match = SSH_ED25519.match(line or "")
+    if not match:
+        return False
+    try:
+        blob = base64.b64decode(match.group(1) + "=" * (-len(match.group(1)) % 4), validate=True)
+    except (ValueError, TypeError):
+        return False
+    return (
+        len(blob) == 51
+        and blob[:4] == (11).to_bytes(4, "big")
+        and blob[4:15] == b"ssh-ed25519"
+        and blob[15:19] == (32).to_bytes(4, "big")
+    )
+
+
+def enrolled_host(raw: Any, config: EnrollmentConfig) -> Host | None:
+    """One offered host, validated against this agent's own rules, or None."""
+    if not isinstance(raw, dict):
+        return None
+    host_id = raw.get("id")
+    arch = raw.get("arch")
+    user = raw.get("ssh_user")
+    key = raw.get("host_key")
+    data_dir = raw.get("data_dir")
+    if not isinstance(host_id, str) or not ENROLLED_ID.match(host_id):
+        return None
+    if arch not in ("x86_64", "aarch64"):
+        return None
+    if not isinstance(user, str) or not SSH_USER.match(user):
+        return None
+    if not isinstance(key, str) or not ssh_ed25519_valid(key):
+        return None
+    if (
+        not isinstance(data_dir, str)
+        or not DATA_DIR.match(data_dir)
+        or ".." in data_dir.split("/")
+    ):
+        return None
+    try:
+        address = ipaddress.ip_address(raw.get("address", ""))
+    except ValueError:
+        return None
+    if not config.permits(address):
+        # The control that keeps a compromised router from aiming this
+        # agent's key at an arbitrary machine.
+        return None
+    accelerators = []
+    raw_accelerators = raw.get("accelerators", [])
+    if not isinstance(raw_accelerators, list) or len(raw_accelerators) > MAX_OFFER_ACCELERATORS:
+        return None
+    for accelerator in raw_accelerators:
+        if not isinstance(accelerator, dict):
+            return None
+        accelerator_id = accelerator.get("id")
+        if not isinstance(accelerator_id, str) or not IDENTIFIER.match(accelerator_id):
+            return None
+        entry: dict[str, Any] = {"id": accelerator_id}
+        index = accelerator.get("index")
+        if index is not None:
+            if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < 64:
+                return None
+            entry["index"] = index
+        accelerators.append(entry)
+    return Host(
+        id=host_id,
+        arch=arch,
+        ssh=f"{user}@{address}",
+        ssh_options=[
+            "-o", f"UserKnownHostsFile={config.known_hosts_file}",
+            "-o", "StrictHostKeyChecking=yes",
+            "-o", f"HostKeyAlias=hypellm.{host_id}",
+        ],
+        disk_path=data_dir,
+        accelerators=accelerators,
+        max_activations_per_hour=config.max_activations_per_hour,
+        data_dir=data_dir,
+    )
+
+
+def host_record(host: Host, key: str) -> dict[str, Any]:
+    """What the state file keeps for an enrolled host: the offer, as accepted."""
+    user, _, address = host.ssh.partition("@")
+    return {
+        "id": host.id,
+        "arch": host.arch,
+        "address": address,
+        "ssh_user": user,
+        "host_key": key,
+        "data_dir": host.disk_path,
+        "accelerators": host.accelerators,
+    }
+
+
+def write_atomically(path: str, data: bytes) -> None:
+    """Replace `path` with `data`, owner-only, so a crash leaves old or new."""
+    temporary = f"{path}.tmp-{os.getpid()}"
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def load_enrolled(config: EnrollmentConfig) -> tuple[list[Host], dict[str, str]]:
+    """The enrolled hosts in the state file, re-validated, with their keys."""
+    if not config.accept or not config.state_file:
+        return [], {}
+    try:
+        with open(config.state_file, "rb") as handle:
+            document = json.load(handle)
+    except FileNotFoundError:
+        return [], {}
+    except (OSError, ValueError) as error:
+        print(
+            f"fleet agent: ignoring unreadable enrollment state {config.state_file} "
+            f"({truncate(error.__class__.__name__)})",
+            file=sys.stderr,
+        )
+        return [], {}
+    hosts: list[Host] = []
+    keys: dict[str, str] = {}
+    for raw in (document.get("hosts", []) if isinstance(document, dict) else [])[:MAX_OFFER_HOSTS]:
+        host = enrolled_host(raw, config)
+        if host is not None:
+            hosts.append(host)
+            keys[host.id] = raw["host_key"]
+    return hosts, keys
+
+
+def hello_tag(key: bytes, version: str, nonce: str, digest: str) -> str:
+    """HMAC-SHA-256 over the parts, each preceded by its length (u64, big-endian).
+
+    Exactly `hypellm_crypto::hmac::hmac_sha256_parts`, which the router uses.
+    Plain concatenation would let "1" + "2abc" and "12" + "abc" share a tag —
+    and, worse, would not match the router at all, so every real handshake
+    failed as `unauthenticated`.
+    """
+    mac = hmac.new(key, digestmod=hashlib.sha256)
+    for part in (version, nonce, digest):
+        data = part.encode("utf-8")
+        mac.update(len(data).to_bytes(8, "big"))
+        mac.update(data)
+    return mac.hexdigest()
 
 
 _AGENT_NAME = "local"
@@ -336,6 +810,7 @@ class Agent:
         key: bytes,
         command_timeout: int,
         config_path: str | None = None,
+        enrolled_keys: dict[str, str] | None = None,
     ) -> None:
         # `fleet` and `digest` are replaced together, under `_lock`, by
         # `maybe_reload`. A verb reads `self.fleet` once and works from that
@@ -359,6 +834,9 @@ class Agent:
         # slower, and the router cannot see a fetch an operator started.
         self._fetches: dict[str, str] = {}
         self.limiter = RateLimiter()
+        # The pinned host key of each enrolled host.
+        self._enrolled_keys: dict[str, str] = dict(enrolled_keys or {})
+        self._enroll_lock = threading.Lock()
         self._activations: dict[str, Activation] = {}
         self._leases: dict[str, str] = {}  # lease -> activation id
         self._states: dict[str, str] = {}
@@ -395,7 +873,14 @@ class Agent:
                 return False
             try:
                 with open(self._config_path, "rb") as handle:
-                    fleet = Fleet(json.load(handle))
+                    document = json.load(handle)
+                if not isinstance(document, dict):
+                    raise ValueError("the table must be a JSON object")
+                enrolled = [
+                    host for host in self.fleet.hosts.values()
+                    if host.id in self.fleet.enrolled_ids
+                ]
+                fleet = Fleet(document, enrolled)
                 # Inside the guard: the digest walks accelerator rows, and a
                 # malformed one is as much a rejected file as a missing key.
                 digest = fleet.digest()
@@ -524,11 +1009,7 @@ class Agent:
             if len(self._nonces) > 65536:
                 self._nonces.clear()
             self._nonces.add(nonce)
-        expected = hmac.new(
-            self.key,
-            (version + nonce + claimed).encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
+        expected = hello_tag(self.key, version, nonce, claimed)
         if not hmac.compare_digest(expected, tag or ""):
             return "ERR unauthenticated"
         # Authenticated whether or not the digests agree: the router proved it
@@ -629,7 +1110,7 @@ class Agent:
                 if in_flight in {"starting", "probing", "stopping", "draining", "fetching"}:
                     state = in_flight
                 elif deployment.container and deployment.container in running:
-                    state = "ready" if self.probe(deployment) else "probing"
+                    state = "ready" if self.probe(deployment, host) else "probing"
                 else:
                     state = "stopped"
                 deployments.append(
@@ -645,15 +1126,17 @@ class Agent:
             for artifact in fleet.artifacts.values():
                 if artifact.arch != host.arch:
                     continue
-                artifacts.append(
-                    {
-                        "id": artifact.id,
-                        "host": host.id,
-                        "present": self.artifact_present(host, artifact),
-                        "verified": self.artifact_present(host, artifact),
-                        "bytes_present": 0,
-                    }
-                )
+                present, verified, image_id = self.artifact_report(host, artifact)
+                entry: dict[str, Any] = {
+                    "id": artifact.id,
+                    "host": host.id,
+                    "present": present,
+                    "verified": verified,
+                    "bytes_present": 0,
+                }
+                if image_id:
+                    entry["image_id"] = image_id
+                artifacts.append(entry)
 
         payload = json.dumps(
             {
@@ -686,11 +1169,32 @@ class Agent:
         code, _ = self.run_on(host, deployment.probe)
         return code == 0
 
-    def artifact_present(self, host: Host, artifact: Artifact) -> bool:
+    def artifact_report(self, host: Host, artifact: Artifact) -> tuple[bool, bool, str]:
+        """Whether the host holds the artifact, whether its registry digest
+        matches, and the image ID it reports — one inspect for all three.
+
+        `verified` means the image carries the manifest digest the operator
+        declared, which is the check a registry pull can pass. It used to be
+        "present" under another name. The image ID is reported whatever it
+        is: comparing it with the checksum the router keeps is the router's
+        job (specification 26.12), and an ID this side withheld because it
+        looked wrong would hide exactly the host the router needs to see.
+        """
         code, output = self.run_on(
-            host, ["docker", "image", "inspect", "--format", "{{.Id}}", artifact.id]
+            host,
+            [
+                "docker", "image", "inspect", "--format",
+                "{{.Id}} {{join .RepoDigests \",\"}}", artifact.image,
+            ],
         )
-        return code == 0 and bool(output.strip())
+        if code != 0:
+            return (False, False, "")
+        image_id, _, digests = output.strip().partition(" ")
+        if not IMAGE_ID.match(image_id):
+            return (False, False, "")
+        wanted = artifact.digest.split(":")[-1]
+        verified = any(d.endswith("@sha256:" + wanted) for d in digests.split(",") if d)
+        return (True, verified, image_id)
 
     def start_verb(self, deployment_id: str, lease: str, starting: bool) -> str:
         if not IDENTIFIER.match(deployment_id or ""):
@@ -735,6 +1239,15 @@ class Agent:
         activation.state = "starting" if activation.starting else "stopping"
         activation.detail = "running"
         activation.progress = 100
+        problem = None
+        if activation.starting and deployment.run is not None:
+            problem = self.ensure_container(deployment, host)
+        if problem is not None:
+            activation.state = "failed"
+            activation.detail = problem
+            with self._lock:
+                self._states[deployment.id] = activation.state
+            return
         code, _ = self.run_on(host, argv)
         if activation.cancelled.is_set():
             activation.state = "cancelled"
@@ -771,6 +1284,39 @@ class Agent:
 
         with self._lock:
             self._states[deployment.id] = activation.state
+
+    def ensure_container(self, deployment: Deployment, host: Host) -> str | None:
+        """Create a templated deployment's container if it is absent or stale.
+
+        Returns None when the container is there and current, or a detail code.
+        A container whose template label differs was created from an older
+        row; it is removed (`docker rm` without `-f`, so a running one is never
+        removed) and created again. Everything run here is built by
+        `container_plan` from this table.
+        """
+        artifact = self.fleet.artifacts.get(deployment.run.image) if deployment.run else None
+        if artifact is None:
+            return "unknown_artifact"
+        mkdir, create, label = container_plan(deployment, host, artifact)
+        name = deployment.run.container
+        code, _ = self.run_on(host, mkdir)
+        if code != 0:
+            return "state_dir_failed"
+        code, output = self.run_on(
+            host,
+            ["docker", "inspect", "--format",
+             '{{index .Config.Labels "' + TEMPLATE_LABEL + '"}}', name],
+        )
+        if code == 0:
+            if output.strip() == label:
+                return None
+            code, _ = self.run_on(host, ["docker", "rm", name])
+            if code != 0:
+                return "container_busy"
+        code, _ = self.run_on(host, create)
+        if code != 0:
+            return f"create_exit_{code}"
+        return None
 
     def fetch(self, artifact_id: str, host_id: str, deadline_ms: str) -> str:
         """Acquire an artifact on a host, resuming rather than restarting.
@@ -928,13 +1474,323 @@ class Agent:
                 waited += 1.0
             backoff = min(backoff * 2, MAX_FETCH_BACKOFF_SECONDS)
 
+    def copy(
+        self,
+        artifact_id: str,
+        source_id: str,
+        dest_id: str,
+        deadline_ms: str,
+        image_id: str,
+    ) -> str:
+        """Relay an image from one host to another, verified (specification 26.12).
+
+        Everything but the image ID is resolved from this agent's table: the
+        image reference, both SSH destinations, the spool. The image ID can
+        only narrow what is accepted — nothing whose content does not hash to
+        it is loaded — and when this table pins one, a router asking for a
+        different one is refused outright.
+
+        Shares `_fetches` with FETCH: one transfer per destination host,
+        whichever verb asked, because both write the same disk.
+        """
+        for value in (artifact_id, source_id, dest_id):
+            if not IDENTIFIER.match(value or ""):
+                return "ERR malformed"
+        if not deadline_ms.isdigit() or len(deadline_ms) > 12:
+            return "ERR malformed"
+        if not IMAGE_ID.match(image_id or ""):
+            return "ERR malformed"
+        fleet = self.fleet
+        transfer = fleet.transfer
+        if transfer is None:
+            return "ERR copy_disabled"
+        artifact = fleet.artifacts.get(artifact_id)
+        source = fleet.hosts.get(source_id)
+        dest = fleet.hosts.get(dest_id)
+        if artifact is None:
+            return "ERR unknown_artifact"
+        if source is None or dest is None or source_id == dest_id:
+            return "ERR unknown_host"
+        if artifact.arch != source.arch or artifact.arch != dest.arch:
+            return "ERR arch_mismatch"
+        if artifact.image_id and artifact.image_id != image_id:
+            return "ERR checksum_mismatch"
+        if "@" in artifact.image:
+            # A digest reference survives no save/load, so the destination
+            # could never be checked by name afterwards.
+            return "ERR copy_needs_tag"
+        budget = min(max(int(deadline_ms) / 1000.0, 1.0), MAX_FETCH_SECONDS)
+
+        with self._lock:
+            in_flight = self._fetches.get(dest_id)
+            if in_flight is not None:
+                running = self._activations.get(in_flight)
+                if running is not None and running.state == "fetching":
+                    if running.deployment == artifact_id:
+                        return f"ACCEPTED {in_flight}"
+                    return "ERR host_busy"
+            if not self._admit_locked():
+                return "ERR busy"
+            activation_id = f"act-{self._next}"
+            self._next += 1
+            activation = Activation(activation_id, artifact_id, True)
+            activation.state = "fetching"
+            activation.detail = "copy_queued"
+            self._activations[activation_id] = activation
+            self._fetches[dest_id] = activation_id
+
+        def run() -> None:
+            try:
+                self._run_copy(activation, artifact, source, dest, image_id, budget, transfer)
+            finally:
+                with self._lock:
+                    if self._fetches.get(dest_id) == activation.id:
+                        del self._fetches[dest_id]
+
+        self._spawn(run)
+        return f"ACCEPTED {activation_id}"
+
+    def _run_copy(
+        self,
+        activation: Activation,
+        artifact: Artifact,
+        source: Host,
+        dest: Host,
+        image_id: str,
+        budget: float,
+        transfer: TransferConfig,
+    ) -> None:
+        """Spool, verify, rebuild, load, and check. Any failure loads nothing."""
+        expires_at = time.monotonic() + budget
+        spool = os.path.join(transfer.spool_dir, f"{activation.id}.tar")
+
+        def fail(detail: str) -> None:
+            activation.state = "cancelled" if activation.cancelled.is_set() else "failed"
+            activation.detail = "cancelled" if activation.cancelled.is_set() else detail
+
+        try:
+            activation.detail = "saving"
+            code, detail = self.save_to_file(
+                source, artifact.image, spool, transfer.max_spool_bytes,
+                expires_at, activation.cancelled,
+            )
+            if code != 0:
+                return fail(detail)
+            activation.detail = "verifying"
+            try:
+                verified = verify_image_archive(spool, image_id)
+            except ArchiveError as error:
+                return fail(error.code)
+            if activation.cancelled.is_set():
+                return fail("cancelled")
+            activation.detail = "loading"
+            code, detail = self.load_archive(
+                dest,
+                lambda out: write_clean_archive(spool, verified, artifact.image, out),
+                expires_at,
+                activation.cancelled,
+            )
+            if code != 0:
+                return fail(detail)
+            code, output = self.run_on(
+                dest, ["docker", "image", "inspect", "--format", "{{.Id}}", tagged(artifact.image)]
+            )
+            if code != 0 or output.strip() != image_id:
+                return fail("checksum_mismatch")
+            activation.state = "ready"
+            activation.detail = "verified"
+            activation.progress = 1000
+        finally:
+            try:
+                os.unlink(spool)
+            except OSError:
+                pass
+
+    def save_to_file(
+        self,
+        host: Host,
+        reference: str,
+        path: str,
+        limit: int,
+        expires_at: float,
+        cancelled: threading.Event,
+    ) -> tuple[int, str]:
+        """Stream `docker save` from `host` into `path`, at most `limit` bytes.
+
+        Returns `(0, "")` or a non-zero code with a detail. Killed on the
+        deadline, on cancellation, and the moment the archive outgrows the
+        spool cap — so a source that streams forever fills nothing.
+        """
+        remaining = expires_at - time.monotonic()
+        if remaining <= 0 or not self._commands.acquire(timeout=remaining):
+            return (124, "timeout")
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except OSError:
+            self._commands.release()
+            return (125, "spool_unavailable")
+        try:
+            process = subprocess.Popen(  # noqa: S603 - argv from this table
+                ssh_command(host, ["docker", "save", reference]),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                shell=False,
+            )
+        except OSError as error:
+            os.close(descriptor)
+            self._commands.release()
+            return (125, truncate(error.__class__.__name__))
+        written = 0
+        outcome = (0, "")
+        watchdog = _Watchdog(process, expires_at, cancelled)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                stream = process.stdout
+                assert stream is not None
+                while True:
+                    chunk = stream.read(COPY_CHUNK)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > limit:
+                        process.kill()
+                        outcome = (1, "spool_full")
+                        break
+                    handle.write(chunk)
+                watchdog.stop()
+            code = process.wait(timeout=max(expires_at - time.monotonic(), 1.0))
+            if outcome[0] == 0 and watchdog.fired:
+                outcome = (124, "cancelled" if cancelled.is_set() else "timeout")
+            elif outcome[0] == 0 and code != 0:
+                outcome = (code, f"save_exit_{code}")
+        except (OSError, subprocess.TimeoutExpired):
+            process.kill()
+            outcome = (125, "spool_write_failed")
+        finally:
+            watchdog.stop()
+            self._commands.release()
+        return outcome
+
+    def load_archive(
+        self,
+        host: Host,
+        write: Any,
+        expires_at: float,
+        cancelled: threading.Event,
+    ) -> tuple[int, str]:
+        """Stream what `write(out)` produces into `docker load` on `host`."""
+        remaining = expires_at - time.monotonic()
+        if remaining <= 0 or not self._commands.acquire(timeout=remaining):
+            return (124, "timeout")
+        try:
+            process = subprocess.Popen(  # noqa: S603 - argv from this table
+                ssh_command(host, ["docker", "load", "-q"]),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                shell=False,
+            )
+        except OSError as error:
+            self._commands.release()
+            return (125, truncate(error.__class__.__name__))
+        watchdog = _Watchdog(process, expires_at, cancelled)
+        try:
+            stream = process.stdin
+            assert stream is not None
+            try:
+                write(stream)
+                stream.close()
+            except ArchiveError as error:
+                # Abandon the load mid-archive: an incomplete archive is one
+                # `docker load` refuses whole.
+                process.kill()
+                process.wait(timeout=10)
+                return (1, error.code)
+            except (OSError, BrokenPipeError):
+                process.kill()
+            code = process.wait(timeout=max(expires_at - time.monotonic(), 1.0))
+            watchdog.stop()
+            if watchdog.fired:
+                return (124, "cancelled" if cancelled.is_set() else "timeout")
+            return (0, "") if code == 0 else (code, f"load_exit_{code}")
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return (124, "timeout")
+        finally:
+            watchdog.stop()
+            self._commands.release()
+
     def verify(self, host: Host, artifact: Artifact) -> bool:
         code, output = self.run_on(
-            host, ["docker", "image", "inspect", "--format", "{{index .RepoDigests 0}}", artifact.id]
+            host,
+            ["docker", "image", "inspect", "--format", "{{index .RepoDigests 0}}", artifact.image],
         )
         if code != 0:
             return False
         return artifact.digest.split(":")[-1] in output
+
+    def enroll(self, payload: bytes) -> str:
+        """Adopt the router's offer of enrolled hosts (specification 26.8).
+
+        Only when this agent's own table opts in. Each offered host is checked
+        against this agent's rules — its CIDR allowlist above all — and one
+        that fails is left out rather than failing the offer, so a single bad
+        entry cannot keep every other machine out. The accepted set *replaces*
+        the previous one: a host the router withdrew is dropped.
+
+        The state file and the pinned keys are written before the table
+        changes, so a crash leaves a table that matches what is on disk.
+        """
+        fleet = self.fleet
+        config = fleet.enrollment
+        if not config.accept:
+            return "ERR enrollment_disabled"
+        try:
+            document = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return "ERR malformed"
+        offered = document.get("hosts") if isinstance(document, dict) else None
+        if not isinstance(offered, list) or len(offered) > MAX_OFFER_HOSTS:
+            return "ERR malformed"
+
+        hand_written = set(fleet.hosts) - fleet.enrolled_ids
+        accepted: list[Host] = []
+        keys: dict[str, str] = {}
+        for raw in offered:
+            host = enrolled_host(raw, config)
+            if host is None or host.id in hand_written or host.id in keys:
+                continue
+            accepted.append(host)
+            keys[host.id] = raw["host_key"]
+
+        with self._enroll_lock:
+            try:
+                known = "".join(f"hypellm.{h.id} {keys[h.id]}\n" for h in accepted)
+                write_atomically(config.known_hosts_file, known.encode("utf-8"))
+                state = {"hosts": [host_record(h, keys[h.id]) for h in accepted]}
+                write_atomically(
+                    config.state_file, json.dumps(state, indent=1).encode("utf-8")
+                )
+                rebuilt = Fleet(fleet.document, accepted)
+                digest = rebuilt.digest()
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                print(
+                    f"fleet agent: enrollment offer not adopted "
+                    f"({truncate(error.__class__.__name__)})",
+                    file=sys.stderr,
+                )
+                return "ERR enrollment_not_stored"
+            with self._lock:
+                self.fleet = rebuilt
+                self.digest = digest
+                self._enrolled_keys = keys
+            self.limiter.retain(set(rebuilt.hosts))
+        print(
+            f"fleet agent: holding {len(accepted)} enrolled host(s); digest {digest}",
+            file=sys.stderr,
+        )
+        return f"OK {len(accepted)}"
 
     def status(self, activation_id: str) -> str:
         if not IDENTIFIER.match(activation_id or ""):
@@ -957,6 +1813,267 @@ class Agent:
             return "ERR unknown_activation"
         activation.cancelled.set()
         return "OK"
+
+
+@dataclass
+class VerifiedLayer:
+    """One layer of a verified archive: where it is and what it hashed to."""
+
+    member: str
+    compressed: bool
+    size: int  # uncompressed bytes
+    diff_id: str
+
+
+@dataclass
+class VerifiedImage:
+    """An image archive whose configuration and layers hashed as claimed."""
+
+    image_id: str
+    config: bytes
+    layers: list[VerifiedLayer]
+
+
+class ArchiveError(Exception):
+    """Why an archive was refused, as a detail code."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def _normalise(name: str) -> str:
+    while name.startswith("./"):
+        name = name[2:]
+    return name
+
+
+def _resolve(index: dict[str, tarfile.TarInfo], name: str) -> tarfile.TarInfo:
+    """The regular file `name` names, following at most a few links.
+
+    The legacy `docker save` layout links a repeated layer to its first copy,
+    so links are followed — inside the archive only, and never more than
+    `MAX_LINK_HOPS`, so a cycle is an error rather than a loop.
+    """
+    current = _normalise(name)
+    for _ in range(MAX_LINK_HOPS + 1):
+        member = index.get(current)
+        if member is None:
+            raise ArchiveError("archive_member_missing")
+        if member.isfile():
+            return member
+        if member.issym():
+            base = os.path.dirname(current)
+            current = os.path.normpath(os.path.join(base, member.linkname))
+        elif member.islnk():
+            current = _normalise(member.linkname)
+        else:
+            raise ArchiveError("archive_member_invalid")
+        if current.startswith("../") or current.startswith("/") or current == "..":
+            raise ArchiveError("archive_member_invalid")
+    raise ArchiveError("archive_link_loop")
+
+
+def _read_small(tar: tarfile.TarFile, member: tarfile.TarInfo) -> bytes:
+    if member.size > MAX_ARCHIVE_JSON:
+        raise ArchiveError("archive_member_too_large")
+    handle = tar.extractfile(member)
+    if handle is None:
+        raise ArchiveError("archive_member_invalid")
+    return handle.read(MAX_ARCHIVE_JSON + 1)
+
+
+def _hash_layer(handle: Any) -> tuple[str, str, int, bool]:
+    """(raw sha256, uncompressed sha256, uncompressed size, compressed)."""
+    raw = hashlib.sha256()
+    plain = hashlib.sha256()
+    size = 0
+    head = handle.read(2)
+    compressed = head == b"\x1f\x8b"
+    if head == b"\x28\xb5":
+        # zstd: nothing in the standard library can decompress it, so its
+        # diff_id cannot be checked, so it is refused rather than trusted.
+        raise ArchiveError("unsupported_layer_compression")
+    decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS) if compressed else None
+
+    def feed(chunk: bytes) -> None:
+        nonlocal size
+        raw.update(chunk)
+        if decompressor is None:
+            plain.update(chunk)
+            size += len(chunk)
+        else:
+            out = decompressor.decompress(chunk)
+            plain.update(out)
+            size += len(out)
+
+    feed(head)
+    while True:
+        chunk = handle.read(COPY_CHUNK)
+        if not chunk:
+            break
+        feed(chunk)
+    if decompressor is not None:
+        tail = decompressor.flush()
+        plain.update(tail)
+        size += len(tail)
+        if not decompressor.eof:
+            raise ArchiveError("layer_truncated")
+    return ("sha256:" + raw.hexdigest(), "sha256:" + plain.hexdigest(), size, compressed)
+
+
+def verify_image_archive(path: str, image_id: str) -> VerifiedImage:
+    """Hash a `docker save` archive against `image_id`, or raise ArchiveError.
+
+    Both layouts `docker save` writes carry a `manifest.json` naming one
+    configuration and its layers — the legacy one by path, the OCI one by
+    `blobs/sha256/<hex>`. The configuration must hash to `image_id`, which is
+    the definition of an image ID; each layer, decompressed if it is gzip,
+    must hash to the configuration's `rootfs.diff_ids` entry at its position;
+    and an OCI blob must hash to the name it is stored under. An archive that
+    holds more than one image is refused: a copy moves one artifact.
+
+    Nothing from the archive is executed or extracted to disk. What is
+    returned is enough to rebuild a clean archive from exactly these parts.
+    """
+    if not IMAGE_ID.match(image_id):
+        raise ArchiveError("malformed")
+    try:
+        tar = tarfile.open(path, "r:")
+    except (OSError, tarfile.TarError):
+        raise ArchiveError("archive_invalid") from None
+    with tar:
+        index: dict[str, tarfile.TarInfo] = {}
+        try:
+            for count, member in enumerate(tar):
+                if count >= MAX_ARCHIVE_MEMBERS:
+                    raise ArchiveError("archive_too_many_members")
+                index[_normalise(member.name)] = member
+        except tarfile.TarError:
+            raise ArchiveError("archive_invalid") from None
+        try:
+            manifest = json.loads(_read_small(tar, _resolve(index, "manifest.json")))
+        except ValueError:
+            raise ArchiveError("archive_invalid") from None
+        if not isinstance(manifest, list) or len(manifest) != 1 or not isinstance(manifest[0], dict):
+            raise ArchiveError("archive_not_one_image")
+        entry = manifest[0]
+        config_name = entry.get("Config")
+        layer_names = entry.get("Layers")
+        if not isinstance(config_name, str) or not isinstance(layer_names, list):
+            raise ArchiveError("archive_invalid")
+        if len(layer_names) > MAX_IMAGE_LAYERS or not all(isinstance(n, str) for n in layer_names):
+            raise ArchiveError("archive_invalid")
+
+        config = _read_small(tar, _resolve(index, config_name))
+        if "sha256:" + hashlib.sha256(config).hexdigest() != image_id:
+            raise ArchiveError("checksum_mismatch")
+        try:
+            parsed = json.loads(config)
+        except ValueError:
+            raise ArchiveError("archive_invalid") from None
+        rootfs = parsed.get("rootfs") if isinstance(parsed, dict) else None
+        diff_ids = rootfs.get("diff_ids") if isinstance(rootfs, dict) else None
+        if (
+            not isinstance(diff_ids, list)
+            or len(diff_ids) != len(layer_names)
+            or not all(isinstance(d, str) and IMAGE_ID.match(d) for d in diff_ids)
+        ):
+            raise ArchiveError("checksum_mismatch")
+
+        layers: list[VerifiedLayer] = []
+        for name, diff_id in zip(layer_names, diff_ids):
+            member = _resolve(index, name)
+            handle = tar.extractfile(member)
+            if handle is None:
+                raise ArchiveError("archive_member_invalid")
+            try:
+                raw, plain, size, compressed = _hash_layer(handle)
+            except (OSError, EOFError, zlib.error):
+                raise ArchiveError("checksum_mismatch") from None
+            if plain != diff_id:
+                raise ArchiveError("checksum_mismatch")
+            blob = _normalise(member.name)
+            if blob.startswith("blobs/sha256/") and raw != "sha256:" + blob.rsplit("/", 1)[-1]:
+                raise ArchiveError("checksum_mismatch")
+            layers.append(VerifiedLayer(member.name, compressed, size, diff_id))
+        return VerifiedImage(image_id=image_id, config=config, layers=layers)
+
+
+def tagged(reference: str) -> str:
+    """`reference` with an explicit tag, as `docker load` records one."""
+    last = reference.rsplit("/", 1)[-1]
+    return reference if ":" in last else reference + ":latest"
+
+
+def write_clean_archive(
+    source_path: str, image: VerifiedImage, reference: str, out: Any
+) -> None:
+    """Write a fresh legacy `docker save` archive of exactly the verified parts.
+
+    The relayed archive is never forwarded as it came. Its index, any extra
+    images, any `repositories` or `index.json` that `docker load` might prefer,
+    and its tags are all discarded; what the destination loads is one
+    manifest naming one configuration — the bytes that hashed to the image
+    ID — and the layers, decompressed, each re-hashed as it is written. A
+    layer that reads differently the second time fails the write.
+    """
+    hex_id = image.image_id.split(":", 1)[1]
+    with tarfile.open(source_path, "r:") as source, tarfile.open(
+        fileobj=out, mode="w|", format=tarfile.GNU_FORMAT
+    ) as sink:
+        index = {_normalise(m.name): m for m in source.getmembers()}
+        layer_paths: list[str] = []
+        for position, layer in enumerate(image.layers):
+            member = _resolve(index, layer.member)
+            raw = source.extractfile(member)
+            if raw is None:
+                raise ArchiveError("archive_member_invalid")
+            reader: Any = gzip.GzipFile(fileobj=raw) if layer.compressed else raw
+            checker = _HashingReader(reader, layer.size)
+            info = tarfile.TarInfo(f"{position}/layer.tar")
+            info.size = layer.size
+            info.mode = 0o644
+            sink.addfile(info, checker)
+            if checker.digest() != layer.diff_id:
+                raise ArchiveError("checksum_mismatch")
+            layer_paths.append(info.name)
+        for name, data in (
+            (f"{hex_id}.json", image.config),
+            (
+                "manifest.json",
+                json.dumps(
+                    [{"Config": f"{hex_id}.json", "RepoTags": [tagged(reference)],
+                      "Layers": layer_paths}],
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+            ),
+        ):
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            info.mode = 0o644
+            sink.addfile(info, io.BytesIO(data))
+
+
+class _HashingReader:
+    """A reader that hashes what passes through and never yields past `limit`."""
+
+    def __init__(self, inner: Any, limit: int) -> None:
+        self._inner = inner
+        self._left = limit
+        self._hash = hashlib.sha256()
+
+    def read(self, size: int = -1) -> bytes:
+        if self._left <= 0:
+            return b""
+        want = self._left if size is None or size < 0 else min(size, self._left)
+        data = self._inner.read(want)
+        self._left -= len(data)
+        self._hash.update(data)
+        return data
+
+    def digest(self) -> str:
+        return "sha256:" + self._hash.hexdigest()
 
 
 def file_stamp(path: str) -> tuple[int, int] | None:
@@ -986,6 +2103,36 @@ def ssh_command(host: Host, argv: list[str]) -> list[str]:
     command.append(host.ssh)
     command.append(shlex.join(argv))
     return command
+
+
+class _Watchdog:
+    """Kill a process at a deadline or on cancellation, from a thread.
+
+    A blocking read on the process's pipe cannot also watch a clock, so this
+    does, and the read then ends because the process did.
+    """
+
+    def __init__(self, process: Any, expires_at: float, cancelled: threading.Event) -> None:
+        self.fired = False
+        self._process = process
+        self._expires_at = expires_at
+        self._cancelled = cancelled
+        self._done = threading.Event()
+        self._thread = threading.Thread(target=self._watch, daemon=True)
+        self._thread.start()
+
+    def _watch(self) -> None:
+        while not self._done.wait(0.5):
+            if self._cancelled.is_set() or time.monotonic() >= self._expires_at:
+                self.fired = True
+                try:
+                    self._process.kill()
+                except OSError:
+                    pass
+                return
+
+    def stop(self) -> None:
+        self._done.set()
 
 
 class Handler(socketserver.BaseRequestHandler):
@@ -1022,6 +2169,28 @@ class Handler(socketserver.BaseRequestHandler):
                 if not line:
                     return
                 agent.maybe_reload()
+                if authenticated and line.startswith("ENROLL "):
+                    # The one verb with a payload after its line. It is allowed
+                    # whatever the router's digest says: a newly published host
+                    # is what makes the two disagree, and this resolves it.
+                    raw_length = line[len("ENROLL "):]
+                    if not raw_length.isdigit() or int(raw_length) > MAX_OFFER_BYTES:
+                        self.send(b"ERR malformed\n")
+                        return
+                    length = int(raw_length)
+                    while len(buffer) < length:
+                        try:
+                            more = self.request.recv(min(65536, length - len(buffer)))
+                        except (TimeoutError, socket.timeout, OSError):
+                            return
+                        if not more:
+                            return
+                        buffer += more
+                    payload, buffer = buffer[:length], buffer[length:]
+                    self.send(agent.enroll(payload).encode("utf-8") + b"\n")
+                    # The table may have changed under this session; end it, so
+                    # anything further is said under a fresh HELLO.
+                    return
                 if authenticated and session_digest != agent.digest:
                     # The table changed under an authenticated session, and the
                     # digests are compared only at HELLO. Answering on the old
@@ -1066,6 +2235,8 @@ class Handler(socketserver.BaseRequestHandler):
             return (agent.start_verb(parts[1], parts[2], False), None)
         if verb == "FETCH" and len(parts) == 4:
             return (agent.fetch(parts[1], parts[2], parts[3]), None)
+        if verb == "COPY" and len(parts) == 6:
+            return (agent.copy(parts[1], parts[2], parts[3], parts[4], parts[5]), None)
         if verb == "STATUS" and len(parts) == 2:
             return (agent.status(parts[1]), None)
         if verb == "CANCEL" and len(parts) == 2:
@@ -1106,7 +2277,9 @@ def main() -> int:
     _AGENT_NAME = args.agent_id
 
     with open(args.config, "rb") as handle:
-        fleet = Fleet(json.load(handle))
+        document = json.load(handle)
+    enrolled, enrolled_keys = load_enrolled(EnrollmentConfig.from_document(document))
+    fleet = Fleet(document, enrolled)
 
     if args.print_digest:
         print(fleet.digest())
@@ -1122,7 +2295,13 @@ def main() -> int:
         print("fleet.key must be at least 32 bytes", file=sys.stderr)
         return 2
 
-    agent = Agent(fleet, key, args.command_timeout, config_path=args.config)
+    agent = Agent(
+        fleet,
+        key,
+        args.command_timeout,
+        config_path=args.config,
+        enrolled_keys=enrolled_keys,
+    )
 
     if os.path.exists(args.socket):
         os.unlink(args.socket)

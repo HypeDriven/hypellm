@@ -144,13 +144,41 @@ impl FleetAgentClient {
         &self.socket_path
     }
 
-    /// Open a session, performing the authenticated handshake.
+    /// Offer the enrolled hosts (specification 26.8) and return how many the
+    /// agent holds.
     ///
-    /// The digest is computed by the caller from its own `FleetConfig` and
-    /// compared against the agent's. A mismatch is an error rather than a
-    /// warning, and the session is not returned: without a shared
-    /// understanding of what each identifier means, no verb is safe to send.
-    pub fn open(&self, key: &[u8], fleet_digest: &str) -> Result<FleetSession, FleetError> {
+    /// A connection of its own, and the one exchange that proceeds when the
+    /// digests disagree: a newly published host is exactly what makes them
+    /// disagree, and this is how the agent learns of it. The handshake is
+    /// still authenticated — the agent proves nothing, but it refuses a
+    /// router that cannot produce the tag — and the session is closed after
+    /// the one verb, so no mutating verb can follow on a mismatched session.
+    pub fn enroll(&self, key: &[u8], fleet_digest: &str, offer: &[u8]) -> Result<u32, FleetError> {
+        if offer.len() > hypellm_fleet::enroll::MAX_OFFER_BYTES {
+            return Err(FleetError::Protocol(ProtocolError::TooLong));
+        }
+        let mut session = self.handshake(key, fleet_digest)?.0;
+        let request = AgentRequest::Enroll {
+            length: offer.len(),
+        };
+        let line = encode_request(&request);
+        session
+            .writer
+            .write_all(line.as_bytes())
+            .map_err(FleetError::Unavailable)?;
+        session.writer.write_all(offer).map_err(FleetError::Unavailable)?;
+        session.writer.flush().map_err(FleetError::Unavailable)?;
+        let reply = session.read_line()?;
+        match parse_reply(&request, &reply).map_err(FleetError::Protocol)? {
+            AgentReply::Enrolled { accepted } => Ok(accepted),
+            AgentReply::Error { code } => Err(FleetError::Refused { code }),
+            _ => Err(FleetError::Protocol(ProtocolError::Malformed)),
+        }
+    }
+
+    /// Connect and perform `HELLO`, returning the session and the agent's
+    /// digest without judging it.
+    fn handshake(&self, key: &[u8], fleet_digest: &str) -> Result<(FleetSession, String), FleetError> {
         let stream = crate::egress::connect_unix(std::path::Path::new(&self.socket_path), self.timeout)
             .map_err(FleetError::Unavailable)?;
         stream
@@ -179,21 +207,32 @@ impl FleetAgentClient {
                 agent_version,
                 fleet_digest: theirs,
             } => {
-                // A constant-time comparison is not required here — the digest
-                // is public, computed from configuration both sides hold — but
-                // the comparison must be exact and must fail closed.
-                if theirs != fleet_digest {
-                    return Err(FleetError::DigestMismatch {
-                        ours: fleet_digest.to_owned(),
-                        theirs,
-                    });
-                }
                 session.agent_version = agent_version;
-                Ok(session)
+                Ok((session, theirs))
             }
             AgentReply::Error { code } => Err(FleetError::Refused { code }),
             _ => Err(FleetError::Protocol(ProtocolError::Malformed)),
         }
+    }
+
+    /// Open a session, performing the authenticated handshake.
+    ///
+    /// The digest is computed by the caller from its own `FleetConfig` and
+    /// compared against the agent's. A mismatch is an error rather than a
+    /// warning, and the session is not returned: without a shared
+    /// understanding of what each identifier means, no verb is safe to send.
+    pub fn open(&self, key: &[u8], fleet_digest: &str) -> Result<FleetSession, FleetError> {
+        let (session, theirs) = self.handshake(key, fleet_digest)?;
+        // A constant-time comparison is not required here — the digest is
+        // public, computed from configuration both sides hold — but the
+        // comparison must be exact and must fail closed.
+        if theirs != fleet_digest {
+            return Err(FleetError::DigestMismatch {
+                ours: fleet_digest.to_owned(),
+                theirs,
+            });
+        }
+        Ok(session)
     }
 }
 
@@ -323,6 +362,26 @@ impl FleetSession {
             artifact: artifact.clone(),
             host: host.clone(),
             deadline_ms,
+        })
+    }
+
+    /// Copy an artifact between hosts through the agent, verified against
+    /// `image_id` (specification 26.12). One transfer per destination host;
+    /// polled and cancelled like a fetch.
+    pub fn copy(
+        &mut self,
+        artifact: &ArtifactId,
+        from: &HostId,
+        to: &HostId,
+        deadline_ms: u64,
+        image_id: &hypellm_fleet::model::ImageId,
+    ) -> Result<ActivationId, FleetError> {
+        self.accepted(&AgentRequest::Copy {
+            artifact: artifact.clone(),
+            from: from.clone(),
+            to: to.clone(),
+            deadline_ms,
+            image_id: image_id.clone(),
         })
     }
 
@@ -532,6 +591,36 @@ mod tests {
         let error = client.open(b"key", DIGEST).expect_err("must refuse");
         assert_eq!(error.code(), "fleet_reply_too_large");
         let _ = server.join();
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "specification 18.2 permits this in tests")]
+    fn an_offer_is_delivered_even_when_the_digests_disagree() {
+        // A newly published host is what makes them disagree; refusing to
+        // deliver the offer that resolves it would make enrollment impossible.
+        let dir = TempDir::new("fleet-enroll");
+        let (path, server) = agent(
+            &dir,
+            "a.sock",
+            vec![b"OK agent-1 sha256other\n".to_vec(), b"OK 1\n".to_vec()],
+        );
+        let client = FleetAgentClient::new(path, Duration::from_secs(5));
+        let accepted = client
+            .enroll(b"key", DIGEST, br#"{"hosts":[]}"#)
+            .expect("delivered");
+        assert_eq!(accepted, 1);
+        let sent = String::from_utf8(server.join().expect("join")).expect("utf8");
+        let line = sent.lines().nth(1).unwrap_or_default();
+        assert_eq!(line, "ENROLL 12");
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, reason = "specification 18.2 permits this in tests")]
+    fn an_oversized_offer_is_never_sent() {
+        let client = FleetAgentClient::new("/nonexistent/fleet.sock", Duration::from_millis(50));
+        let offer = vec![b' '; hypellm_fleet::enroll::MAX_OFFER_BYTES + 1];
+        let error = client.enroll(b"key", DIGEST, &offer).expect_err("refused");
+        assert_eq!(error.code(), "fleet_reply_too_large");
     }
 
     #[test]

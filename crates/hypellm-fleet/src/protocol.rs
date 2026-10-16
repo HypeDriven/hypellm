@@ -23,20 +23,58 @@
 //! → FETCH <artifact-id> <host-id> <deadline-ms>\n
 //! ← ACCEPTED <activation-id>\n | ERR <code>\n
 //!
+//! → COPY <artifact-id> <source-host-id> <dest-host-id> <deadline-ms> <image-id>\n
+//! ← ACCEPTED <activation-id>\n | ERR <code>\n
+//!
 //! → STATUS <activation-id>\n
 //! ← OK <state> <detail-code> <progress-permille>\n
 //!
 //! → CANCEL <activation-id>\n
 //! ← OK\n | ERR <code>\n
+//!
+//! → ENROLL <length>\n<offer JSON, at most 64 KiB>
+//! ← OK <accepted-count>\n | ERR <code>\n
 //! ```
 //!
 //! # What may cross this socket
 //!
-//! Identifiers and bounded integers. No image name, no host address, no file
-//! path, no container name, no Docker flag, no shell fragment, no URL. Both
-//! sides hold the identifiers from their own configuration, and the agent
-//! resolves each against its own allowlist. The goal is specific: **a fully
-//! compromised router cannot cause arbitrary code to run on a slave.**
+//! Identifiers and bounded integers — with one exception, `ENROLL`. No image
+//! name, no file path, no container name, no Docker flag, no shell fragment,
+//! no URL. Both sides hold the identifiers from their own configuration, and
+//! the agent resolves each against its own allowlist. The goal is specific:
+//! **a fully compromised router cannot cause arbitrary code to run on a
+//! slave.**
+//!
+//! `ENROLL` carries what an administrator approved and a second person
+//! published (specification 26.8): for each enrolled host, its address, SSH
+//! login, pinned host key, data directory and accelerators
+//! ([`crate::enroll::encode_offer`]). It is the one verb that names a host
+//! address, and it does not weaken the goal above, for four reasons the agent
+//! enforces rather than trusts:
+//!
+//! - the agent adds nothing unless its own configuration opts in;
+//! - an address outside the agent's own CIDR allowlist is refused;
+//! - the host key is pinned (`StrictHostKeyChecking=yes`), so an offered
+//!   address can only be reached as the machine that registered;
+//! - an enrolled host carries no deployment. What runs on it is still the
+//!   agent's own hand-written table, and a router can only *offer* a host it
+//!   could not command anything on.
+//!
+//! The worst a compromised router can do with `ENROLL` is make the agent
+//! attempt SSH, with the agent's key, to an address inside a network the
+//! operator already allowlisted — and remove enrolled hosts, which is denial
+//! of service the router could cause anyway.
+//!
+//! `COPY` carries one value that is not an identifier: the image ID the copy
+//! must match ([`ImageId`], validated as `sha256:` and 64 lowercase hex, so it
+//! is one token by construction). It names no image, path or host address —
+//! the agent resolves the artifact's image reference and both hosts from its
+//! own table — and it can only narrow what the agent accepts. The agent
+//! hashes the relayed archive itself and loads nothing whose content does not
+//! match, and when its own table pins an ID for the artifact it refuses a
+//! router that asks for a different one. The worst a compromised router can
+//! do with `COPY` is move an image the agent's table already names between
+//! two hosts the table already names.
 //!
 //! # Why this is stronger than the control socket
 //!
@@ -66,6 +104,7 @@
 //! a different fleet; and the agent can compare a digest it has actually
 //! received, so a mismatch is reported as a mismatch.
 
+use crate::model::ImageId;
 use core::fmt;
 use hypellm_core::ids::{ActivationId, ArtifactId, DeploymentId, HostId, LeaseId};
 
@@ -119,6 +158,26 @@ pub enum AgentRequest {
         /// How long the agent may take.
         deadline_ms: u64,
     },
+    /// Copy an artifact from one host to another through the agent,
+    /// verified against `image_id` (specification 26.12).
+    ///
+    /// The image ID is the one value on this socket that is neither an
+    /// identifier nor an integer. It is a checksum, validated as `sha256:` and
+    /// 64 lowercase hex characters, and it can only *narrow* what the agent
+    /// accepts: the agent copies nothing whose content does not hash to it,
+    /// and refuses outright when its own table pins a different one.
+    Copy {
+        /// Which artifact.
+        artifact: ArtifactId,
+        /// The host holding a verified copy.
+        from: HostId,
+        /// The host to place it on.
+        to: HostId,
+        /// How long the agent may take.
+        deadline_ms: u64,
+        /// The checksum the copy must match.
+        image_id: ImageId,
+    },
     /// Ask how an activation is going.
     Status {
         /// Which activation.
@@ -129,6 +188,12 @@ pub enum AgentRequest {
         /// Which activation.
         activation: ActivationId,
     },
+    /// Offer the enrolled hosts; `length` bytes of offer follow the line.
+    Enroll {
+        /// Bytes of offer that follow, at most
+        /// [`crate::enroll::MAX_OFFER_BYTES`].
+        length: usize,
+    },
 }
 
 impl AgentRequest {
@@ -136,11 +201,20 @@ impl AgentRequest {
     ///
     /// The router issues no mutating verb while the fleet digests disagree, so
     /// this predicate is a gate rather than a description.
+    ///
+    /// `ENROLL` is not mutating in this sense, deliberately. It starts and
+    /// stops nothing; it changes which hosts the agent can *reach*. And it is
+    /// how a disagreement caused by a newly published host is resolved: gating
+    /// it on agreement would make enrollment impossible by construction.
     #[must_use]
     pub const fn is_mutating(&self) -> bool {
         matches!(
             self,
-            Self::Activate { .. } | Self::Deactivate { .. } | Self::Fetch { .. } | Self::Cancel { .. }
+            Self::Activate { .. }
+                | Self::Deactivate { .. }
+                | Self::Fetch { .. }
+                | Self::Copy { .. }
+                | Self::Cancel { .. }
         )
     }
 
@@ -153,8 +227,10 @@ impl AgentRequest {
             Self::Activate { .. } => "ACTIVATE",
             Self::Deactivate { .. } => "DEACTIVATE",
             Self::Fetch { .. } => "FETCH",
+            Self::Copy { .. } => "COPY",
             Self::Status { .. } => "STATUS",
             Self::Cancel { .. } => "CANCEL",
+            Self::Enroll { .. } => "ENROLL",
         }
     }
 }
@@ -188,8 +264,16 @@ pub fn encode_request(request: &AgentRequest) -> String {
             host,
             deadline_ms,
         } => format!("FETCH {artifact} {host} {deadline_ms}\n"),
+        AgentRequest::Copy {
+            artifact,
+            from,
+            to,
+            deadline_ms,
+            image_id,
+        } => format!("COPY {artifact} {from} {to} {deadline_ms} {image_id}\n"),
         AgentRequest::Status { activation } => format!("STATUS {activation}\n"),
         AgentRequest::Cancel { activation } => format!("CANCEL {activation}\n"),
+        AgentRequest::Enroll { length } => format!("ENROLL {length}\n"),
     }
 }
 
@@ -236,6 +320,11 @@ pub enum AgentReply {
         detail: String,
         /// Progress in permille, 0 to 1000.
         progress_permille: u16,
+    },
+    /// `OK <count>` after `ENROLL` — how many offered hosts the agent holds.
+    Enrolled {
+        /// Hosts the agent accepted from the offer.
+        accepted: u32,
     },
     /// `OK` — a bare acknowledgement.
     Ok,
@@ -368,7 +457,10 @@ pub fn parse_reply(request: &AgentRequest, line: &str) -> Result<AgentReply, Pro
             }
             Ok(AgentReply::InventoryPending { length })
         }
-        AgentRequest::Activate { .. } | AgentRequest::Deactivate { .. } | AgentRequest::Fetch { .. } => {
+        AgentRequest::Activate { .. }
+        | AgentRequest::Deactivate { .. }
+        | AgentRequest::Fetch { .. }
+        | AgentRequest::Copy { .. } => {
             if head != "ACCEPTED" {
                 return Err(ProtocolError::Malformed);
             }
@@ -411,6 +503,24 @@ pub fn parse_reply(request: &AgentRequest, line: &str) -> Result<AgentReply, Pro
             } else {
                 Err(ProtocolError::Malformed)
             }
+        }
+        AgentRequest::Enroll { .. } => {
+            if head != "OK" {
+                return Err(ProtocolError::Malformed);
+            }
+            let Some(raw) = parts.next() else {
+                return Err(ProtocolError::Malformed);
+            };
+            if parts.next().is_some() {
+                return Err(ProtocolError::Malformed);
+            }
+            let accepted: u32 = raw.parse().map_err(|_| ProtocolError::Malformed)?;
+            // More hosts than any offer can carry is an agent answering a
+            // question it was not asked.
+            if usize::try_from(accepted).map_or(true, |n| n > crate::enroll::MAX_OFFER_HOSTS) {
+                return Err(ProtocolError::OutOfRange);
+            }
+            Ok(AgentReply::Enrolled { accepted })
         }
     }
 }
@@ -501,12 +611,45 @@ mod tests {
     }
 
     #[test]
+    fn an_enroll_reply_is_a_bounded_count_and_nothing_else() {
+        let enroll = AgentRequest::Enroll { length: 10 };
+        assert_eq!(encode_request(&enroll), "ENROLL 10\n");
+        assert!(!enroll.is_mutating(), "ENROLL must be sendable while digests disagree");
+        assert_eq!(
+            parse_reply(&enroll, "OK 2\n"),
+            Ok(AgentReply::Enrolled { accepted: 2 })
+        );
+        assert_eq!(parse_reply(&enroll, "OK\n"), Err(ProtocolError::Malformed));
+        assert_eq!(
+            parse_reply(&enroll, "OK 100000\n"),
+            Err(ProtocolError::OutOfRange)
+        );
+        // An ENROLL reply is not an activation, and an activation reply is not
+        // an ENROLL acknowledgement.
+        assert_eq!(parse_reply(&enroll, "ACCEPTED a-1\n"), Err(ProtocolError::Malformed));
+        assert_eq!(parse_reply(&activate(), "OK 2\n"), Err(ProtocolError::Malformed));
+    }
+
+    #[test]
     fn a_reply_with_trailing_fields_is_refused_rather_than_truncated() {
         // Extra fields mean the two sides disagree about the protocol version,
         // and the handshake exists precisely so that they cannot.
         assert_eq!(
             parse_reply(&activate(), "ACCEPTED a-1 extra\n"),
             Err(ProtocolError::Malformed)
+        );
+    }
+
+    #[test]
+    fn the_handshake_hmac_matches_the_reference_agent_framing() {
+        // Pinned: `agent/test_fleet_agent.py` asserts the same hex for the same
+        // inputs. Each part is preceded by its length as a big-endian u64; an
+        // agent that concatenated instead would refuse every real router as
+        // `unauthenticated`, which the simulated agent cannot catch because it
+        // calls this function too.
+        assert_eq!(
+            hello_hmac(b"0123456789abcdef0123456789abcdef", "abc", "sha256:1111"),
+            "aeec82313b85a93a6190222239c66851408850cd3e627a46ed9eaad95d47d73a"
         );
     }
 
@@ -523,5 +666,45 @@ mod tests {
             hello_hmac(key, "ab", "csha256:1111"),
             hello_hmac(key, "abc", "sha256:1111")
         );
+    }
+
+    #[test]
+    fn a_copy_line_is_identifiers_an_integer_and_one_validated_checksum() {
+        let image = format!("sha256:{}", "ab".repeat(32));
+        let copy = AgentRequest::Copy {
+            artifact: ArtifactId::new("llama-server").expect("id"),
+            from: HostId::new("spark").expect("id"),
+            to: HostId::new("gpu-2").expect("id"),
+            deadline_ms: 600_000,
+            image_id: ImageId::parse(&image).expect("image id"),
+        };
+        let line = encode_request(&copy);
+        assert_eq!(line, format!("COPY llama-server spark gpu-2 600000 {image}\n"));
+        assert_eq!(line.matches('\n').count(), 1);
+        assert_eq!(line.trim_end().split(' ').count(), 6);
+        assert!(copy.is_mutating(), "a copy writes a host's disk and must wait for agreement");
+        assert!(matches!(
+            parse_reply(&copy, "ACCEPTED act-9\n"),
+            Ok(AgentReply::Accepted { .. })
+        ));
+        assert_eq!(parse_reply(&copy, "OK 1\n"), Err(ProtocolError::Malformed));
+    }
+
+    #[test]
+    fn an_image_id_that_could_carry_a_second_token_cannot_be_constructed() {
+        let hex = "0".repeat(64);
+        assert!(ImageId::parse(&format!("sha256:{hex}")).is_some());
+        for bad in [
+            format!("sha256:{}", "A".repeat(64)),
+            format!("sha256:{} x", "0".repeat(62)),
+            format!("sha256:{}\n", "0".repeat(63)),
+            format!("sha256:{}", "0".repeat(63)),
+            format!("sha256:{}", "0".repeat(65)),
+            format!("sha512:{hex}"),
+            hex.clone(),
+            String::new(),
+        ] {
+            assert!(ImageId::parse(&bad).is_none(), "accepted {bad:?}");
+        }
     }
 }

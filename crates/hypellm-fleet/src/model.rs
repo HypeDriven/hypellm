@@ -254,6 +254,13 @@ pub struct FleetAgent {
     pub observation_max_age_ms: u64,
     /// Deadline for one socket exchange.
     pub request_timeout_ms: u64,
+    /// The agent's SSH public key, as one `ssh-ed25519 <base64>` line.
+    ///
+    /// Public, and present only so enrollment (specification 26.8) can hand it
+    /// to a new slave to install in `authorized_keys`. Not part of the
+    /// canonical form: it names no fleet identity, and rotating it must not
+    /// pause orchestration with a digest mismatch.
+    pub ssh_public_key: Option<String>,
 }
 
 /// A machine in the fleet.
@@ -387,8 +394,51 @@ pub struct Artifact {
     /// it, and the router's job is to carry the administrator's declaration to
     /// the agent unaltered rather than to reinterpret it.
     pub digest: String,
+    /// The image's content identity, when the administrator pinned it.
+    ///
+    /// Distinct from [`Self::digest`]. That is the registry *manifest* digest,
+    /// which `docker save` and `docker load` do not preserve; this is the image
+    /// ID — the SHA-256 of the image configuration — which they do, and which a
+    /// copied image can therefore be checked against (specification 26.12).
+    /// Absent, the router learns it from the first verified observation and
+    /// keeps that instead.
+    pub image_id: Option<ImageId>,
     /// Administrator-configured source name. Never client-supplied.
     pub source: String,
+}
+
+/// An image ID: `sha256:` and 64 lowercase hex characters.
+///
+/// Validated at construction, so it can cross the agent socket as one token:
+/// its alphabet excludes whitespace, quotes and newlines by construction, the
+/// same property the identifier types have.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ImageId(String);
+
+impl ImageId {
+    /// Parse an image ID, refusing anything that is not exactly one.
+    ///
+    /// Uppercase hex is refused rather than folded: two spellings of one ID
+    /// would compare unequal, and a comparison that said "tampered" for a case
+    /// difference would quarantine an honest host.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        let hex = raw.strip_prefix("sha256:")?;
+        (hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+            .then(|| Self(raw.to_owned()))
+    }
+
+    /// The ID as written.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ImageId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// Governance limits, either fleet-wide or scoped to one host.
@@ -457,6 +507,26 @@ pub struct FleetPolicy {
     /// away. An operator who started a container by hand should not have to
     /// fight the router to keep it.
     pub adopt_unmanaged: bool,
+    /// How long a resident deployment may go unused before the router stops
+    /// it, in milliseconds. Zero disables idle stop.
+    ///
+    /// "Unused" is strict: nothing in flight, nothing queued or parked for its
+    /// capability, and no request dispatched to it for this long. A pinned or
+    /// non-evictable deployment is never idle-stopped, and neither is one the
+    /// router did not start, nor one still inside its dwell floor. An idle stop
+    /// is a deactivation like an eviction, so it accrues the same cooldown and
+    /// flap backoff — a model stopped for idleness and asked for again a
+    /// minute later is a flap, and is governed as one.
+    pub idle_stop_ms: u64,
+    /// How long waiting work may be reordered behind other work, in
+    /// milliseconds. Zero disables reordering (specification 26.11).
+    ///
+    /// The churn-aware scheduler loads the waiting model with the most demand
+    /// per unit of load cost first, takes jobs whose model is loaded ahead of
+    /// cold ones, and defers a swap that would stop a model still carrying
+    /// work. Each of those delays something; this bounds the delay. Work that
+    /// has waited this long goes first, in age order, whatever its score.
+    pub max_reorder_wait_ms: u64,
 }
 
 impl FleetPolicy {
@@ -475,6 +545,8 @@ impl FleetPolicy {
         memory_drift_tolerance_permille: 100,
         prewarm_min_rate_per_minute: 0,
         adopt_unmanaged: false,
+        idle_stop_ms: 900_000,
+        max_reorder_wait_ms: 120_000,
     };
 }
 

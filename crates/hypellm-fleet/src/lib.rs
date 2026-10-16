@@ -70,12 +70,16 @@
 )]
 
 pub mod activation;
+pub mod checksum;
 pub mod demand;
 pub mod durable;
+pub mod enroll;
 pub mod governance;
+pub mod idle;
 pub mod model;
 pub mod plan;
 pub mod protocol;
+pub mod schedule;
 pub mod state;
 
 pub use activation::{
@@ -87,7 +91,7 @@ pub use durable::{ActivationSummary, FlapRecord};
 pub use governance::{ActivationQueue, Budgets, FlapCounter, QueueAdmission};
 pub use model::{
     Accelerator, AcceleratorKind, Arch, Artifact, ArtifactKind, Deployment, FleetAgent,
-    FleetConfig, FleetPolicy, Host, HostState, Readiness,
+    FleetConfig, FleetPolicy, Host, HostState, ImageId, Readiness,
 };
 pub use plan::{Plan, PlanContext, PlanOutcome, PlanStep, PlanTrace, plan, retention_value, revalidate};
 pub use protocol::{AgentReply, AgentRequest, ProtocolError, encode_request, parse_reply};

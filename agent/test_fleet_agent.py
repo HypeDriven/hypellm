@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the reference fleet agent's fetch path.
+"""Tests for the reference fleet agent: fetch, enrollment, image relay and templates.
 
 Run with `python3 -m unittest discover -s agent` or `agent/test_fleet_agent.py`.
 
@@ -485,9 +485,9 @@ class ReloadTest(unittest.TestCase):
         self.parses = 0
         original = agent_module.Fleet
 
-        def counting(document):  # type: ignore[no-untyped-def]
+        def counting(document, *rest):  # type: ignore[no-untyped-def]
             self.parses += 1
-            return original(document)
+            return original(document, *rest)
 
         self._original_fleet = original
         agent_module.Fleet = counting  # type: ignore[assignment]
@@ -526,11 +526,7 @@ class ReloadTest(unittest.TestCase):
         self.assertEqual(self.agent.digest, self._original_fleet(self.added_host()).digest())
         # The handshake reports the table now in force.
         nonce = "n1"
-        tag = hmac.new(
-            b"k" * 32,
-            (agent_module.PROTOCOL_VERSION + nonce + "x").encode(),
-            hashlib.sha256,
-        ).hexdigest()
+        tag = agent_module.hello_tag(b"k" * 32, agent_module.PROTOCOL_VERSION, nonce, "x")
         reply = self.agent.hello(agent_module.PROTOCOL_VERSION, nonce, "x", tag)
         self.assertTrue(reply.endswith(" " + self.agent.digest), reply)
 
@@ -584,11 +580,7 @@ class ReloadTest(unittest.TestCase):
             client.connect(socket_path)
             reader = client.makefile("rb")
             nonce = "n2"
-            tag = hmac.new(
-                b"k" * 32,
-                (agent_module.PROTOCOL_VERSION + nonce + "x").encode(),
-                hashlib.sha256,
-            ).hexdigest()
+            tag = agent_module.hello_tag(b"k" * 32, agent_module.PROTOCOL_VERSION, nonce, "x")
             client.sendall(f"HELLO {agent_module.PROTOCOL_VERSION} {nonce} x {tag}\n".encode())
             self.assertTrue(reader.readline().startswith(b"OK "))
             client.sendall(b"OBSERVE\n")
@@ -605,11 +597,7 @@ class ReloadTest(unittest.TestCase):
             fresh.connect(socket_path)
             fresh_reader = fresh.makefile("rb")
             nonce = "n3"
-            tag = hmac.new(
-                b"k" * 32,
-                (agent_module.PROTOCOL_VERSION + nonce + "x").encode(),
-                hashlib.sha256,
-            ).hexdigest()
+            tag = agent_module.hello_tag(b"k" * 32, agent_module.PROTOCOL_VERSION, nonce, "x")
             fresh.sendall(f"HELLO {agent_module.PROTOCOL_VERSION} {nonce} x {tag}\n".encode())
             self.assertTrue(
                 fresh_reader.readline().rstrip().endswith(self.agent.digest.encode())
@@ -621,6 +609,720 @@ class ReloadTest(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+
+class HandshakeTest(unittest.TestCase):
+    """The agent and the router must compute the same HELLO tag."""
+
+    def test_the_tag_matches_the_routers_pinned_vector(self) -> None:
+        # The same inputs and hex as `hypellm_fleet::protocol`'s
+        # `the_handshake_hmac_matches_the_reference_agent_framing`.
+        key = b"0123456789abcdef0123456789abcdef"
+        self.assertEqual(
+            agent_module.hello_tag(key, "1", "abc", "sha256:1111"),
+            "aeec82313b85a93a6190222239c66851408850cd3e627a46ed9eaad95d47d73a",
+        )
+        # What the agent used to compute, which no real router could match.
+        concatenated = hmac.new(key, b"1abcsha256:1111", hashlib.sha256).hexdigest()
+        self.assertNotEqual(agent_module.hello_tag(key, "1", "abc", "sha256:1111"), concatenated)
+
+    def test_a_router_tag_is_accepted_and_a_concatenated_one_is_not(self) -> None:
+        agent = agent_module.Agent(agent_module.Fleet(FLEET), b"k" * 32, 5)
+        framed = agent_module.hello_tag(b"k" * 32, "1", "n-ok", "d")
+        self.assertTrue(agent.hello("1", "n-ok", "d", framed).startswith("OK "))
+        concatenated = hmac.new(b"k" * 32, b"1n-badd", hashlib.sha256).hexdigest()
+        self.assertEqual(agent.hello("1", "n-bad", "d", concatenated), "ERR unauthenticated")
+
+
+class ObserveProbeTest(unittest.TestCase):
+    """A running container is probed on the host it runs on."""
+
+    def test_a_running_container_is_probed_without_error(self) -> None:
+        fleet = agent_module.Fleet(
+            {
+                "hosts": [{"id": "h1", "arch": "aarch64", "ssh": "hypellm@h1.test"}],
+                "deployments": [
+                    {
+                        "id": "d1", "host": "h1", "accelerator": "a1", "container": "c1",
+                        "start": ["docker", "start", "c1"], "stop": ["docker", "stop", "c1"],
+                        "probe": ["curl", "-fsS", "http://127.0.0.1:8000/"],
+                    }
+                ],
+            }
+        )
+        agent = agent_module.Agent(fleet, b"k" * 32, 5)
+        probed: list[str] = []
+
+        def run_on(host, argv, timeout=None):  # type: ignore[no-untyped-def]
+            if argv[0] == "df":
+                return (0, "Avail\n100\n")
+            if argv[:2] == ["docker", "ps"]:
+                return (0, "c1\tUp 5 minutes\n")
+            if argv[0] == "curl":
+                probed.append(host.id)
+                return (0, "")
+            return (1, "")
+
+        agent.run_on = run_on  # type: ignore[method-assign]
+        report = json.loads(agent.observe())
+        self.assertEqual(report["deployments"][0]["state"], "ready")
+        self.assertEqual(probed, ["h1"])
+
+
+RIG_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINaR4JuJGhj5Y/y0fV0dwnAAHCoxBRNiBi5JkRlcQU2M"
+
+
+def offered(**overrides):  # type: ignore[no-untyped-def]
+    host = {
+        "id": "rig", "arch": "x86_64", "address": "192.168.1.20", "ssh_user": "albert",
+        "host_key": RIG_KEY, "data_dir": "/home/albert/.hypellm",
+        "accelerators": [{"id": "rig-gpu0", "index": 0}],
+    }
+    host.update(overrides)
+    return host
+
+
+class EnrollTest(unittest.TestCase):
+    """The router offers; the agent decides, within its own allowlist."""
+
+    def setUp(self) -> None:
+        self._dir = tempfile.TemporaryDirectory()
+        self.state = os.path.join(self._dir.name, "enrolled.json")
+        self.known = os.path.join(self._dir.name, "enrolled_known_hosts")
+        self.document = json.loads(json.dumps(FLEET))
+        self.document["enrollment"] = {
+            "accept": True,
+            "cidrs": ["192.168.1.0/24"],
+            "state_file": self.state,
+            "known_hosts_file": self.known,
+        }
+        self.agent = agent_module.Agent(agent_module.Fleet(self.document), b"k" * 32, 5)
+
+    def tearDown(self) -> None:
+        self._dir.cleanup()
+
+    def offer(self, *hosts) -> str:  # type: ignore[no-untyped-def]
+        return self.agent.enroll(json.dumps({"hosts": list(hosts)}).encode())
+
+    def test_an_agent_that_has_not_opted_in_adopts_nothing(self) -> None:
+        agent = agent_module.Agent(agent_module.Fleet(FLEET), b"k" * 32, 5)
+        before = agent.digest
+        self.assertEqual(
+            agent.enroll(json.dumps({"hosts": [offered()]}).encode()), "ERR enrollment_disabled"
+        )
+        self.assertEqual(agent.digest, before)
+        self.assertNotIn("rig", agent.fleet.hosts)
+
+    def test_an_accepted_host_is_pinned_and_joins_the_digest_as_the_router_has_it(self) -> None:
+        before = self.agent.digest
+        self.assertEqual(self.offer(offered()), "OK 1")
+        host = self.agent.fleet.hosts["rig"]
+        self.assertEqual(host.ssh, "albert@192.168.1.20")
+        self.assertEqual(host.disk_path, "/home/albert/.hypellm")
+        self.assertIn("StrictHostKeyChecking=yes", host.ssh_options)
+        self.assertIn(f"UserKnownHostsFile={self.known}", host.ssh_options)
+        self.assertIn("HostKeyAlias=hypellm.rig", host.ssh_options)
+        with open(self.known, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), f"hypellm.rig {RIG_KEY}\n")
+        self.assertEqual(os.stat(self.state).st_mode & 0o777, 0o600)
+        self.assertNotEqual(self.agent.digest, before)
+        canonical = self.agent.fleet.canonical_form()
+        self.assertIn("host rig x86_64 local\n", canonical)
+        self.assertIn("accelerator rig-gpu0 rig\n", canonical)
+
+    def test_an_address_outside_the_allowlist_is_refused(self) -> None:
+        # The control that keeps a compromised router from aiming this
+        # agent's key at an arbitrary machine.
+        for address in ("10.0.0.5", "192.168.2.20", "8.8.8.8", "::1", "not-an-ip"):
+            with self.subTest(address=address):
+                self.assertEqual(self.offer(offered(address=address)), "OK 0")
+                self.assertNotIn("rig", self.agent.fleet.hosts)
+
+    def test_a_malformed_entry_is_left_out_without_failing_the_rest(self) -> None:
+        bad = [
+            offered(id="bad-key", host_key="ssh-rsa AAAA"),
+            offered(id="opt", host_key='command="sh" ' + RIG_KEY),
+            offered(id="dots", data_dir="/home/../etc"),
+            offered(id="user", ssh_user="-oProxyCommand=x"),
+            offered(id="colon:id"),
+            offered(id="idx", accelerators=[{"id": "x", "index": True}]),
+            offered(id="arch", arch="mips"),
+        ]
+        self.assertEqual(self.offer(*bad, offered(id="good")), "OK 1")
+        enrolled = self.agent.fleet.enrolled_ids
+        self.assertEqual(enrolled, {"good"})
+
+    def test_a_hand_written_host_outranks_an_offer_of_the_same_id(self) -> None:
+        self.assertEqual(self.offer(offered(id="h1")), "OK 0")
+        self.assertEqual(self.agent.fleet.hosts["h1"].ssh, "hypellm@h1.test")
+
+    def test_a_withdrawn_host_is_dropped_and_its_key_unpinned(self) -> None:
+        self.offer(offered())
+        self.assertEqual(self.offer(), "OK 0")
+        self.assertNotIn("rig", self.agent.fleet.hosts)
+        with open(self.known, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "")
+
+    def test_a_restart_rebuilds_the_same_table_from_the_state_file(self) -> None:
+        self.offer(offered())
+        config = agent_module.EnrollmentConfig.from_document(self.document)
+        hosts, keys = agent_module.load_enrolled(config)
+        restarted = agent_module.Fleet(self.document, hosts)
+        self.assertEqual(restarted.digest(), self.agent.digest)
+        self.assertEqual(keys, {"rig": RIG_KEY})
+
+    def test_a_hand_written_deployment_may_run_on_an_enrolled_host(self) -> None:
+        self.offer(offered())
+        document = json.loads(json.dumps(self.document))
+        document["deployments"] = [
+            {"id": "rig-llm", "host": "rig", "accelerator": "rig-gpu0",
+             "start": ["docker", "start", "llm"], "stop": ["docker", "stop", "llm"]}
+        ]
+        hosts, _ = agent_module.load_enrolled(
+            agent_module.EnrollmentConfig.from_document(document)
+        )
+        fleet = agent_module.Fleet(document, hosts)
+        self.assertIn("rig-llm", fleet.deployments)
+
+    def test_accept_without_an_allowlist_is_a_configuration_error(self) -> None:
+        document = json.loads(json.dumps(self.document))
+        document["enrollment"]["cidrs"] = []
+        with self.assertRaises(ValueError):
+            agent_module.Fleet(document)
+
+    def test_an_offer_over_the_socket_is_answered_and_the_session_ends(self) -> None:
+        socket_path = os.path.join(self._dir.name, "agent.sock")
+        server = agent_module.Server(socket_path, agent_module.Handler)
+        server.agent = self.agent  # type: ignore[attr-defined]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(5.0)
+            client.connect(socket_path)
+            reader = client.makefile("rb")
+            # The router's digest disagrees with the agent's; ENROLL is still
+            # served, because it is how the disagreement resolves.
+            tag = agent_module.hello_tag(b"k" * 32, "1", "n-enroll", "router-digest")
+            client.sendall(f"HELLO 1 n-enroll router-digest {tag}\n".encode())
+            self.assertTrue(reader.readline().startswith(b"OK "))
+            payload = json.dumps({"hosts": [offered()]}).encode()
+            client.sendall(f"ENROLL {len(payload)}\n".encode() + payload)
+            self.assertEqual(reader.readline(), b"OK 1\n")
+            self.assertEqual(reader.readline(), b"", "the session ended after the offer")
+            client.close()
+
+            unauthenticated = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            unauthenticated.settimeout(5.0)
+            unauthenticated.connect(socket_path)
+            unauthenticated.sendall(b"ENROLL 2\n{}")
+            self.assertEqual(unauthenticated.makefile("rb").readline(), b"ERR unauthenticated\n")
+            unauthenticated.close()
+
+            oversize = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            oversize.settimeout(5.0)
+            oversize.connect(socket_path)
+            oversize_reader = oversize.makefile("rb")
+            tag = agent_module.hello_tag(b"k" * 32, "1", "n-big", "d")
+            oversize.sendall(f"HELLO 1 n-big d {tag}\n".encode())
+            oversize_reader.readline()
+            oversize.sendall(f"ENROLL {agent_module.MAX_OFFER_BYTES + 1}\n".encode())
+            self.assertEqual(oversize_reader.readline(), b"ERR malformed\n")
+            oversize.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+
+# -- Specification 26.12: image relay, verification, and container templates --
+
+import gzip
+import io
+import shlex
+import shutil
+import tarfile
+
+
+def _tar_bytes(files: dict[str, bytes]) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as tar:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return buffer.getvalue()
+
+
+def _sha(data: bytes) -> str:
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def build_image(layer_contents: list[bytes], *, oci: bool, extra: dict[str, bytes] | None = None):
+    """A `docker save` archive of one image. Returns (archive bytes, image id)."""
+    layers = [_tar_bytes({f"file{i}": content}) for i, content in enumerate(layer_contents)]
+    config = json.dumps(
+        {"architecture": "arm64", "rootfs": {"type": "layers", "diff_ids": [_sha(l) for l in layers]}}
+    ).encode()
+    image_id = _sha(config)
+    files: dict[str, bytes] = {}
+    if oci:
+        names = []
+        for layer in layers:
+            # OCI blobs may be compressed; the diff_id is still the digest
+            # of the uncompressed layer.
+            blob = gzip.compress(layer, mtime=0)
+            name = f"blobs/sha256/{hashlib.sha256(blob).hexdigest()}"
+            files[name] = blob
+            names.append(name)
+        config_name = f"blobs/sha256/{image_id.split(':')[1]}"
+        files[config_name] = config
+        files["oci-layout"] = b'{"imageLayoutVersion":"1.0.0"}'
+        files["index.json"] = b'{"schemaVersion":2,"manifests":[]}'
+    else:
+        names = []
+        for i, layer in enumerate(layers):
+            files[f"l{i}/layer.tar"] = layer
+            names.append(f"l{i}/layer.tar")
+        config_name = f"{image_id.split(':')[1]}.json"
+        files[config_name] = config
+    files["manifest.json"] = json.dumps(
+        [{"Config": config_name, "RepoTags": ["model:arm"], "Layers": names}]
+    ).encode()
+    files.update(extra or {})
+    return _tar_bytes(files), image_id
+
+
+class ArchiveVerificationTest(unittest.TestCase):
+    """A relayed archive is hashed against the image ID before anything loads it."""
+
+    def setUp(self) -> None:
+        self._dir = tempfile.TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        self._dir.cleanup()
+
+    def spool(self, data: bytes) -> str:
+        path = os.path.join(self._dir.name, f"spool-{len(os.listdir(self._dir.name))}.tar")
+        Path(path).write_bytes(data)
+        return path
+
+    def refused(self, data: bytes, image_id: str) -> str:
+        with self.assertRaises(agent_module.ArchiveError) as caught:
+            agent_module.verify_image_archive(self.spool(data), image_id)
+        return caught.exception.code
+
+    def test_both_layouts_docker_writes_verify(self) -> None:
+        for oci in (False, True):
+            with self.subTest(oci=oci):
+                data, image_id = build_image([b"weights", b"server"], oci=oci)
+                verified = agent_module.verify_image_archive(self.spool(data), image_id)
+                self.assertEqual(verified.image_id, image_id)
+                self.assertEqual(len(verified.layers), 2)
+                self.assertEqual([l.compressed for l in verified.layers], [oci, oci])
+
+    def test_a_tampered_layer_is_refused_though_the_config_is_untouched(self) -> None:
+        honest, image_id = build_image([b"weights"], oci=False)
+        # The same layer path with other content: the config, and so the ID,
+        # still say what the layer should have been.
+        layer = _tar_bytes({"file0": b"backdoor"})
+        tampered = honest.replace(
+            _tar_bytes({"file0": b"weights"}), layer
+        )
+        self.assertNotEqual(honest, tampered)
+        self.assertEqual(self.refused(tampered, image_id), "checksum_mismatch")
+
+    def test_a_tampered_config_or_the_wrong_id_is_refused(self) -> None:
+        data, image_id = build_image([b"weights"], oci=True)
+        other = "sha256:" + "0" * 64
+        self.assertEqual(self.refused(data, other), "checksum_mismatch")
+        # A config rewritten to describe the tampered layer hashes to a new ID.
+        bad, bad_id = build_image([b"backdoor"], oci=True)
+        self.assertNotEqual(bad_id, image_id)
+        self.assertEqual(self.refused(bad, image_id), "checksum_mismatch")
+
+    def test_an_oci_blob_that_does_not_hash_to_its_name_is_refused(self) -> None:
+        data, image_id = build_image([b"weights"], oci=True)
+        # Same uncompressed layer, recompressed differently: its diff_id still
+        # matches, but it is no longer the blob its name claims.
+        with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+            files = {m.name: tar.extractfile(m).read() for m in tar.getmembers()}
+        blob = next(n for n, v in files.items() if n.startswith("blobs/") and v[:2] == b"\x1f\x8b")
+        files[blob] = gzip.compress(gzip.decompress(files[blob]), compresslevel=1, mtime=1)
+        self.assertEqual(self.refused(_tar_bytes(files), image_id), "checksum_mismatch")
+
+    def test_an_archive_of_two_images_or_with_an_escaping_link_is_refused(self) -> None:
+        data, image_id = build_image([b"weights"], oci=False)
+        with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+            files = {m.name: tar.extractfile(m).read() for m in tar.getmembers()}
+        manifest = json.loads(files["manifest.json"])
+        files["manifest.json"] = json.dumps(manifest * 2).encode()
+        self.assertEqual(self.refused(_tar_bytes(files), image_id), "archive_not_one_image")
+
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as tar:
+            link = tarfile.TarInfo("manifest.json")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "../../etc/passwd"
+            tar.addfile(link)
+        self.assertEqual(self.refused(buffer.getvalue(), image_id), "archive_member_invalid")
+        self.assertEqual(self.refused(b"not a tar at all", image_id), "archive_invalid")
+
+    def test_the_destination_gets_a_rebuilt_archive_of_only_the_verified_parts(self) -> None:
+        # The relayed archive carries an index.json naming something else,
+        # which a newer `docker load` might prefer. None of it is forwarded.
+        data, image_id = build_image(
+            [b"weights", b"server"], oci=True,
+            extra={"repositories": b'{"evil":{"latest":"x"}}'},
+        )
+        path = self.spool(data)
+        verified = agent_module.verify_image_archive(path, image_id)
+        out = io.BytesIO()
+        agent_module.write_clean_archive(path, verified, "model:arm", out)
+        rebuilt = self.spool(out.getvalue())
+        again = agent_module.verify_image_archive(rebuilt, image_id)
+        self.assertEqual([l.diff_id for l in again.layers], [l.diff_id for l in verified.layers])
+        with tarfile.open(rebuilt) as tar:
+            names = sorted(m.name for m in tar.getmembers())
+            manifest = json.loads(tar.extractfile("manifest.json").read())
+        self.assertEqual(
+            names,
+            sorted(["0/layer.tar", "1/layer.tar", f"{image_id[7:]}.json", "manifest.json"]),
+        )
+        self.assertEqual(manifest[0]["RepoTags"], ["model:arm"])
+        self.assertEqual(agent_module.tagged("registry.local/llama"), "registry.local/llama:latest")
+        self.assertEqual(agent_module.tagged("registry.local:5000/llama"), "registry.local:5000/llama:latest")
+
+
+COPY_FLEET = {
+    "hosts": [
+        {"id": "h1", "arch": "aarch64", "ssh": "hypellm@h1.test"},
+        {"id": "h3", "arch": "aarch64", "ssh": "hypellm@h3.test"},
+        {"id": "h2", "arch": "x86_64", "ssh": "hypellm@h2.test"},
+    ],
+    "artifacts": [
+        {"id": "model-arm", "arch": "aarch64", "digest": "sha256:abc", "image": "model:arm"},
+        {"id": "other-arm", "arch": "aarch64", "digest": "sha256:def",
+         "host_pull": {"h3": ["docker", "pull", "other:arm"]}},
+    ],
+}
+
+
+class CopyTest(unittest.TestCase):
+    """COPY relays through this machine and loads only what verified."""
+
+    def setUp(self) -> None:
+        self._dir = tempfile.TemporaryDirectory()
+        self.document = json.loads(json.dumps(COPY_FLEET))
+        self.document["transfer"] = {"spool_dir": self._dir.name, "max_spool_bytes": 1 << 30}
+        self.agent = agent_module.Agent(agent_module.Fleet(self.document), b"k" * 32, 5)
+        self.archive, self.image_id = build_image([b"weights"], oci=False)
+        self.loaded: list[bytes] = []
+        self.dest_reports = self.image_id
+        self.saved_from: list[str] = []
+
+        def save_to_file(host, reference, path, limit, expires_at, cancelled):  # type: ignore[no-untyped-def]
+            self.saved_from.append(f"{host.id}:{reference}")
+            Path(path).write_bytes(self.archive)
+            return (0, "")
+
+        def load_archive(host, write, expires_at, cancelled):  # type: ignore[no-untyped-def]
+            out = io.BytesIO()
+            write(out)
+            self.loaded.append(out.getvalue())
+            return (0, "")
+
+        def run_on(host, argv, timeout=None):  # type: ignore[no-untyped-def]
+            if argv[:3] == ["docker", "image", "inspect"]:
+                return (0, self.dest_reports + "\n")
+            return (1, "")
+
+        self.agent.save_to_file = save_to_file  # type: ignore[method-assign]
+        self.agent.load_archive = load_archive  # type: ignore[method-assign]
+        self.agent.run_on = run_on  # type: ignore[method-assign]
+
+    def tearDown(self) -> None:
+        self._dir.cleanup()
+
+    def settle(self, reply: str) -> str:
+        self.assertTrue(reply.startswith("ACCEPTED "), reply)
+        activation = reply.split(" ", 1)[1]
+        for _ in range(500):
+            status = self.agent.status(activation)
+            if status.split(" ")[1] in agent_module.TERMINAL_STATES:
+                return status
+            time.sleep(0.01)
+        self.fail("the copy did not settle")
+
+    def copy(self, image_id: str | None = None) -> str:
+        return self.agent.copy("model-arm", "h1", "h3", "600000", image_id or self.image_id)
+
+    def test_an_honest_copy_loads_the_rebuilt_archive_and_leaves_no_spool(self) -> None:
+        self.assertEqual(self.settle(self.copy()), "OK ready verified 1000")
+        self.assertEqual(self.saved_from, ["h1:model:arm"])
+        self.assertEqual(len(self.loaded), 1)
+        path = os.path.join(self._dir.name, "check.tar")
+        Path(path).write_bytes(self.loaded[0])
+        agent_module.verify_image_archive(path, self.image_id)
+        os.unlink(path)
+        self.assertEqual(os.listdir(self._dir.name), [], "the spool is removed")
+
+    def test_a_source_serving_something_else_loads_nothing(self) -> None:
+        self.archive, _ = build_image([b"backdoor"], oci=False)
+        self.assertEqual(self.settle(self.copy()), "OK failed checksum_mismatch 0")
+        self.assertEqual(self.loaded, [], "nothing reached docker load")
+        self.assertEqual(os.listdir(self._dir.name), [])
+
+    def test_a_destination_that_reports_another_id_after_loading_fails(self) -> None:
+        self.dest_reports = "sha256:" + "f" * 64
+        self.assertEqual(self.settle(self.copy()), "OK failed checksum_mismatch 0")
+
+    def test_a_pinned_id_cannot_be_widened_by_the_router(self) -> None:
+        self.document["artifacts"][0]["image_id"] = self.image_id
+        self.agent.fleet = agent_module.Fleet(self.document)
+        self.assertEqual(self.copy("sha256:" + "e" * 64), "ERR checksum_mismatch")
+        self.assertEqual(self.saved_from, [])
+
+    def test_refusals_before_anything_runs(self) -> None:
+        cases = [
+            (("model-arm", "h1", "h1", "1000", self.image_id), "ERR unknown_host"),
+            (("model-arm", "h1", "h2", "1000", self.image_id), "ERR arch_mismatch"),
+            (("model-arm", "h1", "nope", "1000", self.image_id), "ERR unknown_host"),
+            (("nope", "h1", "h3", "1000", self.image_id), "ERR unknown_artifact"),
+            (("model-arm", "h1", "h3", "1e9", self.image_id), "ERR malformed"),
+            (("model-arm", "h1", "h3", "1000", self.image_id.upper()), "ERR malformed"),
+            (("model-arm", "h1", "h3", "1000", "sha256:x; rm -rf /"), "ERR malformed"),
+        ]
+        for args, expected in cases:
+            with self.subTest(args=args):
+                self.assertEqual(self.agent.copy(*args), expected)
+        self.assertEqual(self.saved_from, [])
+        disabled = json.loads(json.dumps(COPY_FLEET))
+        agent = agent_module.Agent(agent_module.Fleet(disabled), b"k" * 32, 5)
+        self.assertEqual(
+            agent.copy("model-arm", "h1", "h3", "1000", self.image_id), "ERR copy_disabled"
+        )
+
+    def test_one_transfer_per_destination_whichever_verb_asked(self) -> None:
+        release = threading.Event()
+
+        def slow_save(host, reference, path, limit, expires_at, cancelled):  # type: ignore[no-untyped-def]
+            release.wait(5)
+            Path(path).write_bytes(self.archive)
+            return (0, "")
+
+        self.agent.save_to_file = slow_save  # type: ignore[method-assign]
+        first = self.copy()
+        self.assertEqual(self.copy(), first, "a repeated COPY is the same transfer")
+        self.assertEqual(self.agent.fetch("other-arm", "h3", "1000"), "ERR host_busy")
+        release.set()
+        self.settle(first)
+
+    def test_a_cancel_during_the_save_ends_the_copy_as_cancelled(self) -> None:
+        started = threading.Event()
+
+        def blocking_save(host, reference, path, limit, expires_at, cancelled):  # type: ignore[no-untyped-def]
+            started.set()
+            cancelled.wait(5)
+            return (124, "cancelled")
+
+        self.agent.save_to_file = blocking_save  # type: ignore[method-assign]
+        reply = self.copy()
+        started.wait(5)
+        self.assertEqual(self.agent.cancel(reply.split(" ")[1]), "OK")
+        self.assertTrue(self.settle(reply).startswith("OK cancelled cancelled"))
+        self.assertEqual(self.loaded, [])
+
+    def test_a_source_that_outgrows_the_spool_is_cut_off(self) -> None:
+        agent = agent_module.Agent(agent_module.Fleet(self.document), b"k" * 32, 5)
+        saved = agent_module.ssh_command
+        agent_module.ssh_command = lambda host, argv: [  # type: ignore[assignment]
+            sys.executable, "-c",
+            "import sys\nwhile True: sys.stdout.buffer.write(b'x' * 65536)",
+        ]
+        try:
+            path = os.path.join(self._dir.name, "big.tar")
+            code, detail = agent.save_to_file(
+                agent.fleet.hosts["h1"], "model:arm", path, 1 << 20,
+                time.monotonic() + 30, threading.Event(),
+            )
+        finally:
+            agent_module.ssh_command = saved
+        self.assertEqual((code, detail), (1, "spool_full"))
+        self.assertLessEqual(os.path.getsize(path), 1 << 20)
+
+
+RUN_FLEET = {
+    "hosts": [
+        {
+            "id": "rig", "arch": "x86_64", "ssh": "albert@rig.test",
+            "data_dir": "/home/albert/.hypellm",
+            "accelerators": [{"id": "rig-gpu1", "index": 1}],
+        },
+        {"id": "bare", "arch": "x86_64", "ssh": "albert@bare.test"},
+    ],
+    "artifacts": [
+        {"id": "llama-server", "arch": "x86_64", "digest": "sha256:abc",
+         "image": "llama-server:b5000"},
+    ],
+    "deployments": [
+        {
+            "id": "rig-qwen", "host": "rig", "accelerator": "rig-gpu1",
+            "run": {
+                "image": "llama-server",
+                "ports": [{"bind": "192.168.1.20", "host": 8080, "container": 8080}],
+                "env": ["LLAMA_ARG_CTX_SIZE=131072"],
+                "args": ["--model", "/state/qwen.gguf", "--port", "8080"],
+                "state_path": "/state",
+            },
+            "probe": ["curl", "-fsS", "http://127.0.0.1:8080/health"],
+        }
+    ],
+}
+
+
+def _shim_source() -> str:
+    text = (Path(__file__).resolve().parent.parent / "host" / "install.sh").read_text()
+    start = text.index("<<'SHIM'\n") + len("<<'SHIM'\n")
+    return text[start:text.index("\nSHIM\n", start)] + "\n"
+
+
+class RunTemplateTest(unittest.TestCase):
+    """A templated deployment creates its own container, inside the data directory."""
+
+    def fleet(self, mutate=None):  # type: ignore[no-untyped-def]
+        document = json.loads(json.dumps(RUN_FLEET))
+        if mutate:
+            mutate(document)
+        return agent_module.Fleet(document)
+
+    def test_the_create_command_is_built_from_the_table_and_the_data_directory(self) -> None:
+        fleet = self.fleet()
+        deployment = fleet.deployments["rig-qwen"]
+        mkdir, create, label = agent_module.container_plan(
+            deployment, fleet.hosts["rig"], fleet.artifacts["llama-server"]
+        )
+        self.assertEqual(mkdir, ["mkdir", "-p", "/home/albert/.hypellm/containers/rig-qwen"])
+        self.assertEqual(
+            create,
+            [
+                "docker", "create", "--name", "hypellm-rig-qwen",
+                "--label", f"hypellm.template={label}",
+                "--gpus", "device=1",
+                "-p", "192.168.1.20:8080:8080",
+                "-v", "/home/albert/.hypellm/containers/rig-qwen:/state",
+                "-e", "LLAMA_ARG_CTX_SIZE=131072",
+                "--restart", "no",
+                "llama-server:b5000", "--model", "/state/qwen.gguf", "--port", "8080",
+            ],
+        )
+        self.assertEqual(deployment.start, ["docker", "start", "hypellm-rig-qwen"])
+        self.assertEqual(deployment.container, "hypellm-rig-qwen")
+        # The label follows the template: any change recreates the container.
+        changed = self.fleet(lambda d: d["deployments"][0]["run"]["env"].append("X=1"))
+        _, _, other = agent_module.container_plan(
+            changed.deployments["rig-qwen"], changed.hosts["rig"], changed.artifacts["llama-server"]
+        )
+        self.assertNotEqual(label, other)
+
+    def test_a_template_that_could_escape_the_data_directory_is_refused_at_load(self) -> None:
+        def run(**fields):  # type: ignore[no-untyped-def]
+            return lambda d: d["deployments"][0]["run"].update(fields)
+
+        for name, mutate in [
+            ("dot-dot id", lambda d: d["deployments"][0].update(id="..")),
+            ("colon id", lambda d: d["deployments"][0].update(id="a:b")),
+            ("host without data dir", lambda d: d["deployments"][0].update(host="bare")),
+            ("state path escape", run(state_path="/state/../../etc")),
+            ("relative state path", run(state_path="state")),
+            ("container name", run(container="-privileged")),
+            ("bind not an address", run(ports=[{"bind": "0.0.0.0;id", "host": 1}])),
+            ("port out of range", run(ports=[{"host": 70000}])),
+            ("env key", run(env=["BAD-KEY=1"])),
+            ("newline arg", run(args=["a\nb"])),
+            ("unknown image", run(image="nope")),
+            ("data dir traversal", lambda d: d["hosts"][0].update(data_dir="/home/../etc")),
+        ]:
+            with self.subTest(name):
+                with self.assertRaises(ValueError):
+                    self.fleet(mutate)
+
+    def test_a_container_is_created_only_when_absent_or_stale(self) -> None:
+        fleet = self.fleet()
+        agent = agent_module.Agent(fleet, b"k" * 32, 5)
+        deployment = fleet.deployments["rig-qwen"]
+        _, _, label = agent_module.container_plan(
+            deployment, fleet.hosts["rig"], fleet.artifacts["llama-server"]
+        )
+        for existing, rm_code, expected_verbs, expected in [
+            (None, 0, ["mkdir", "inspect", "create"], None),
+            (label, 0, ["mkdir", "inspect"], None),
+            ("0" * 64, 0, ["mkdir", "inspect", "rm", "create"], None),
+            ("0" * 64, 1, ["mkdir", "inspect", "rm"], "container_busy"),
+        ]:
+            with self.subTest(existing=existing, rm_code=rm_code):
+                ran: list[str] = []
+
+                def run_on(host, argv, timeout=None):  # type: ignore[no-untyped-def]
+                    verb = argv[0] if argv[0] == "mkdir" else argv[1]
+                    ran.append(verb)
+                    if verb == "inspect":
+                        return (0, existing + "\n") if existing else (1, "")
+                    if verb == "rm":
+                        return (rm_code, "")
+                    return (0, "")
+
+                agent.run_on = run_on  # type: ignore[method-assign]
+                self.assertEqual(agent.ensure_container(deployment, fleet.hosts["rig"]), expected)
+                self.assertEqual(ran, expected_verbs)
+
+    def test_every_command_the_template_produces_passes_the_host_shim(self) -> None:
+        # The agent and the shim are two ends of one contract. A template the
+        # shim refused would fail on a real slave and nowhere else.
+        shell = shutil.which("dash") or "/bin/sh"
+        fleet = self.fleet()
+        deployment = fleet.deployments["rig-qwen"]
+        with tempfile.TemporaryDirectory() as work:
+            data = Path(work) / "data"
+            (data / "bin").mkdir(parents=True)
+            shim = data / "bin" / "hypellm-host-shim"
+            shim.write_text(_shim_source())
+            shim.chmod(0o755)
+            tools = Path(work) / "tools"
+            tools.mkdir()
+            for tool in ("awk", "sed", "grep", "cat", "printf", "sh"):
+                found = shutil.which(tool)
+                if found:
+                    (tools / tool).symlink_to(found)
+            for tool in ("docker", "mkdir"):
+                (tools / tool).write_text("#!/bin/sh\nexit 0\n")
+                (tools / tool).chmod(0o755)
+            host = fleet.hosts["rig"]
+            host.data_dir = str(data)
+            mkdir, create, label = agent_module.container_plan(
+                deployment, host, fleet.artifacts["llama-server"]
+            )
+            for argv in [
+                mkdir,
+                create,
+                ["docker", "inspect", "--format",
+                 '{{index .Config.Labels "hypellm.template"}}', deployment.run.container],
+                ["docker", "rm", deployment.run.container],
+                deployment.start,
+                deployment.stop,
+                ["docker", "save", "llama-server:b5000"],
+                ["docker", "load", "-q"],
+                ["docker", "image", "inspect", "--format",
+                 '{{.Id}} {{join .RepoDigests ","}}', "llama-server:b5000"],
+                ["docker", "image", "inspect", "--format", "{{.Id}}", "llama-server:b5000"],
+            ]:
+                with self.subTest(argv=argv[:2]):
+                    completed = subprocess.run(
+                        [shell, str(shim)],
+                        env={"PATH": str(tools), "SSH_ORIGINAL_COMMAND": shlex.join(argv)},
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    self.assertEqual(completed.returncode, 0, f"{argv}: {completed.stderr}")
 
 
 if __name__ == "__main__":
