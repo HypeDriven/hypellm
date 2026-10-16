@@ -72,6 +72,7 @@ up: _ports _dirs build _secrets _authkey
     @just _tailnet_up
     kstack wait {{ns}} --timeout 120
     @just _wait
+    @just _drift
     @just endpoints
 
 # --- API keys --------------------------------------------------------------
@@ -590,6 +591,31 @@ lan-firewall:
     powershell.exe -NoProfile -Command "Get-NetFirewallHyperVRule -Name '$name' | Format-Table Name,Direction,Action,LocalPorts" | tr -d '\r'
 
 # --- internals -------------------------------------------------------------
+
+# Warn when docker/hypellm.conf is not what the router is running.
+#
+# After any publication through the management API the router resumes the
+# last published version on every start and ignores the file, so an edit here
+# that `just up` appears to deploy may be doing nothing. The configuration
+# names no pod address, so the file's digest and the running one are directly
+# comparable. A warning, not a failure: a policy published through the API on
+# purpose is exactly this state too.
+_drift:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    file=$(docker run --rm --network none -v "{{config}}:/etc/hypellm/hypellm.conf:ro" \
+        {{image}} --check --config /etc/hypellm/hypellm.conf 2>/dev/null | sed -n 's/^digest //p')
+    running=$({{kubectl}} logs deploy/hypellm -c router 2>/dev/null \
+        | sed -n 's/.*"event":"router.started","config_digest":"\([0-9a-f]*\)".*/\1/p' | tail -1)
+    if [ -z "$file" ] || [ -z "$running" ]; then exit 0; fi
+    case "$file" in
+        "$running"*) ;;
+        *)
+            printf '\n\033[1;33m  %s\033[0m\n' "docker/hypellm.conf is not the active configuration (file ${file:0:12}, running ${running})."
+            printf '  \033[2m%s\033[0m\n' "A policy published through the management API wins on every start; to deploy the file anyway:"
+            printf '  \033[2m%s\033[0m\n\n' "just adopt \"<why the file should replace what was published>\""
+            ;;
+    esac
 
 # A port already taken on this host leaves the publisher pod crash-looping on
 # its bind with nothing saying which listener wanted it. Say both, and say
