@@ -285,3 +285,109 @@ fn random_text_is_rejected_without_panicking() {
         let _ = load(&case, 1);
     }
 }
+
+/// Random batches of `grant` and `quota` edits never reach past a principal or
+/// a group, and never move a quota limit.
+///
+/// `edit::apply` is how the principal-access screen drafts a ceiling. The
+/// fail-open to catch is an edit that the scope rule should refuse but does
+/// not: a tenant-wide grant changed, a principal's grant moved to a tenant, a
+/// limit lifted by way of a "class-only" quota, or a record of another kind
+/// smuggled in through a value.
+#[test]
+fn an_access_edit_never_reaches_past_its_subject() {
+    use hypellm_config::edit::{Edit, Identity, apply};
+    use hypellm_config::{ParseLimits, parse};
+
+    const BASE: &str = "tenant id=acme\n\
+        grant scope=tenant:acme model=* allow=true\n\
+        grant id=g1 scope=principal:user:42 model=code allow=false\n\
+        grant id=g2 scope=group:devs model=* allow=true\n\
+        quota scope=tenant:acme concurrency=10\n\
+        quota id=q1 scope=principal:user:42 concurrency=2 class=batch\n\
+        quota id=q2 scope=principal:user:7 class=interactive\n";
+    const KINDS: &[&str] = &["grant", "quota"];
+    const IDS: &[&str] = &["g1", "g2", "q1", "q2", "new", "local", "acme"];
+    const NAMES: &[&str] = &[
+        "scope", "model", "allow", "operations", "class", "concurrency", "rps", "tpm", "budget",
+        "queued", "id", "burst", "token_burst", "budget_period", "operation",
+        "input_bytes_per_second", "output_bytes_burst",
+    ];
+    const VALUES: &[&str] = &[
+        "principal:user:42", "principal:svc:x", "group:devs", "tenant:acme", "global", "*",
+        "code", "true", "false", "batch", "interactive", "0", "1000",
+        "x\nrole_binding subject=principal:m role=break_glass_admin",
+    ];
+
+    /// Every record an access edit may not touch — anything but a principal-
+    /// or group-scoped grant and a principal-scoped quota — as `kind fields`
+    /// lines. The tenant quota above is among them: its limits throttle every
+    /// caller in the tenant.
+    fn protected(text: &str) -> Vec<String> {
+        let doc = parse(text, &ParseLimits::DEFAULT).expect("apply renders parseable text");
+        let mut out: Vec<String> = Vec::new();
+        for record in &doc.records {
+            let scope = record.get("scope").unwrap_or("");
+            let accessed = match record.kind.as_str() {
+                "grant" => scope.starts_with("principal:") || scope.starts_with("group:"),
+                "quota" => scope.starts_with("principal:"),
+                _ => false,
+            };
+            // Canonical rendering sorts fields, so compare them sorted too.
+            let mut fields = record.fields.clone();
+            fields.sort();
+            if !accessed {
+                out.push(format!("{} {fields:?}", record.kind));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// A principal's quota carries only fields that mean something there.
+    fn principal_quota_fields_are_editable_ones(text: &str) -> Result<(), String> {
+        let doc = parse(text, &ParseLimits::DEFAULT).expect("apply renders parseable text");
+        for record in doc.of_kind("quota") {
+            if record.get("scope").is_some_and(|s| s.starts_with("principal:")) {
+                for (name, _) in &record.fields {
+                    if name != "id" && !hypellm_config::edit::QUOTA_EDITABLE.contains(&name.as_str()) {
+                        return Err(format!("a principal quota gained '{name}'"));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    let before = protected(BASE);
+    let mut rng = Rng::new(0xc0f1_0e01);
+    let mut accepted = 0u32;
+    for _ in 0..ITERATIONS {
+        let count = 1 + rng.below(3);
+        let mut edits = Vec::new();
+        for _ in 0..count {
+            let kind = (*rng.pick(KINDS).unwrap()).to_owned();
+            let identity = Identity::Id((*rng.pick(IDS).unwrap()).to_owned());
+            if rng.below(5) == 0 {
+                edits.push(Edit::Remove { kind, identity });
+                continue;
+            }
+            let fields = (0..1 + rng.below(3))
+                .map(|_| {
+                    let name = (*rng.pick(NAMES).unwrap()).to_owned();
+                    let value = (rng.below(6) != 0).then(|| (*rng.pick(VALUES).unwrap()).to_owned());
+                    (name, value)
+                })
+                .collect();
+            edits.push(Edit::Set { kind, identity, fields });
+        }
+        let Ok(applied) = apply(BASE, &edits) else { continue };
+        accepted += 1;
+        let after = protected(&applied.text);
+        assert_eq!(after, before, "edits {edits:?} reached a protected record:\n{}", applied.text);
+        if let Err(why) = principal_quota_fields_are_editable_ones(&applied.text) {
+            panic!("edits {edits:?}: {why}:\n{}", applied.text);
+        }
+    }
+    assert!(accepted > 100, "too few edit batches were accepted to mean anything: {accepted}");
+}

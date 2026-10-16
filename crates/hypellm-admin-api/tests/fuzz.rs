@@ -390,3 +390,67 @@ fn a_credit_moves_the_limit_by_the_amount_it_named_or_not_at_all() {
     }
     assert!(applied > 0, "no mutated credit was ever applied; the seeds are wrong");
 }
+
+#[test]
+fn no_enrollment_body_registers_a_machine_without_the_token() {
+    // The registration endpoint takes no session and no key — the token is
+    // the only credential. Mutating a well-formed report, including its token
+    // field, must never produce a registration, and must never answer anything
+    // that tells the caller more than "no".
+    let config = harness::default_config().replacen(
+        "settings ",
+        "settings fleet_enroll_url=https://router.test ",
+        1,
+    ) + "fleet_agent id=local socket=/run/hypellm/fleet.sock \
+         ssh_public_key=\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINaR4JuJGhj5Y/y0fV0dwnAAHCoxBRNiBi5JkRlcQU2M\"\n";
+    let admin = Harness::with_config(&config);
+    let operator = admin.operator();
+    let minted = admin.post(
+        &operator,
+        "/admin/v1/fleet/enrollments",
+        r#"{"host":"rig","agent":"local"}"#,
+    );
+    let token = minted.str_field("token");
+    // A different, wrong token of the right shape, so the seed is one byte
+    // flip away from a real one rather than nowhere near it.
+    let mut wrong = token.clone().into_bytes();
+    wrong[0] = if wrong[0] == b'0' { b'1' } else { b'0' };
+    let wrong = String::from_utf8(wrong).unwrap();
+    let seed = format!(
+        r#"{{"token":"{wrong}","address":"192.168.1.20","arch":"x86_64","hostname":"rig","ssh_user":"albert","data_dir":"/home/albert/.hypellm","memory_bytes":68719476736,"gpus":[],"ssh_host_key":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINaR4JuJGhj5Y/y0fV0dwnAAHCoxBRNiBi5JkRlcQU2M","device_key":"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAX5iBIxDSO2VYlfFZRE/T1VJfwE4OL9kokNcCposqRRI=\n-----END PUBLIC KEY-----\n","kit_version":"1.0.0"}}"#
+    );
+    let mut rng = Rng::new(0x00ad_0e01);
+    let mut headers = wire_http1::Headers::default();
+    headers.append("content-type", "application/json").unwrap();
+    for _ in 0..ITERATIONS {
+        let case = fuzz::mutate(seed.as_bytes(), &mut rng);
+        let request = hypellm_admin_api::AdminRequest {
+            method: &Method::Post,
+            path: "/fleet/v1/enroll:complete",
+            query: None,
+            headers: &headers,
+            body: &case,
+            peer: None,
+            request_id: "fuzz".to_owned(),
+        };
+        if let Ok(response) = admin.api.handle_enrollment(&request) {
+            // Only possible if the mutation produced the real token, which a
+            // one-byte flip away from it can: the property is then that the
+            // registration really is the one the token was minted for.
+            assert!(
+                String::from_utf8_lossy(&case).contains(&token),
+                "registered without the token: {}",
+                response.body
+            );
+        }
+    }
+    assert!(
+        admin
+            .state
+            .enrollments
+            .list()
+            .iter()
+            .all(|e| e.host.as_str() == "rig"),
+        "only the minted enrollment exists"
+    );
+}

@@ -522,6 +522,16 @@ pub struct RouterState {
     /// Requests waiting right now for an unreachable provider to recover.
     /// Bounded by `settings max_recovery_waiters`.
     pub recovery_waiters: std::sync::atomic::AtomicU32,
+    /// Requests parked waiting for a cold model to be started for them.
+    ///
+    /// Bounded by `settings max_parked_requests` (specification 26.10).
+    pub parked_requests: std::sync::atomic::AtomicU32,
+    /// Slave enrollments (specification 26.8), shared with the management
+    /// API. The fleet runtime offers what is approved and published to its
+    /// agent.
+    pub enrollments: Arc<hypellm_fleet::enroll::EnrollmentRegistry>,
+    /// Delivers approved, published enrollments to the agents.
+    pub enrollment_offers: Arc<crate::fleet::EnrollmentOfferer>,
     /// Long-running generative work, if `/v1/jobs` is enabled.
     ///
     /// `None` when `settings job_workers` is zero, which is the default: the
@@ -565,6 +575,7 @@ impl RouterState {
     pub fn fleet_view(
         &self,
         request: &hypellm_core::canonical::CanonicalRequest,
+        groups: &[hypellm_core::ids::GroupId],
         permissions: &hypellm_core::rbac::PermissionSet,
     ) -> crate::fleet::FleetView {
         let Some(fleet) = self.fleet() else {
@@ -609,7 +620,25 @@ impl RouterState {
             deadline_remaining_ms: remaining_ms,
             effort_multiplier: multiplier,
             effort_headroom_ms: snapshot.activation_effort_headroom_ms,
-            may_activate: permissions.has(hypellm_core::rbac::Permission::FleetActivate),
+            // Specification 26.10: any caller authorized for the alias may
+            // cause a start. Per-slave authority is not decided here: the
+            // fleet-grant filter removes a target the caller may not use
+            // before it is ranked, and `activate_for` asks again against the
+            // current configuration before a model is loaded. Dwell, cooldown,
+            // flap backoff, the eviction cap and the hourly budget bound what
+            // any caller — this one included — can make the fleet do.
+            may_activate: snapshot.authorizes(
+                &hypellm_core::policy::RoutingContext {
+                    principal: &request.principal,
+                    groups,
+                    tenant: &request.tenant,
+                    attempted: &[],
+                    now_millis: 0,
+                    key: None,
+                },
+                &request.requested_model,
+                request.operation,
+            ),
             may_fetch: permissions.has(hypellm_core::rbac::Permission::FleetFetch),
             capability: alias.capability,
             // Tenant priority would enter here. It is zero until a tenant

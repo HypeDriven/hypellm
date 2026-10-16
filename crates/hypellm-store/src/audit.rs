@@ -44,6 +44,10 @@ pub enum AuditAction {
     KeyCreated,
     /// A router API key was revoked.
     KeyRevoked,
+    /// A router API key's expiry was changed or removed.
+    KeyExpiryChanged,
+    /// A router API key's restrictions were changed or lifted.
+    KeyRestrictionsChanged,
     /// A key's token limit or payment override was set (specification 12.3).
     KeyBudgetSet,
     /// Tokens were credited to a key's budget (specification 12.3).
@@ -118,6 +122,23 @@ pub enum AuditAction {
     FleetLeaseExpired,
     /// The router and an agent disagreed about the fleet digest.
     FleetConfigurationMismatch,
+    /// An enrollment token was minted (specification 26.8).
+    FleetEnrollmentIssued,
+    /// A slave registered with an enrollment token.
+    FleetEnrollmentRegistered,
+    /// An administrator approved a registered slave and its records were drafted.
+    FleetEnrollmentApproved,
+    /// An administrator refused an enrollment.
+    FleetEnrollmentRejected,
+    /// An approved enrollment was withdrawn.
+    FleetEnrollmentRevoked,
+    /// An artifact was copied between hosts through the agent.
+    FleetCopy,
+    /// The router learned and now keeps an artifact's image ID.
+    FleetChecksumLearned,
+    /// A host reported an image under an artifact's name that does not match
+    /// the kept checksum.
+    FleetArtifactTampered,
 }
 
 impl AuditAction {
@@ -135,11 +156,21 @@ impl AuditAction {
             Self::FleetMemoryDrift => "fleet.memory_drift",
             Self::FleetLeaseExpired => "fleet.lease_expired",
             Self::FleetConfigurationMismatch => "fleet.configuration_mismatch",
+            Self::FleetEnrollmentIssued => "fleet.enrollment_issued",
+            Self::FleetEnrollmentRegistered => "fleet.enrollment_registered",
+            Self::FleetEnrollmentApproved => "fleet.enrollment_approved",
+            Self::FleetEnrollmentRejected => "fleet.enrollment_rejected",
+            Self::FleetEnrollmentRevoked => "fleet.enrollment_revoked",
+            Self::FleetCopy => "fleet.copy",
+            Self::FleetChecksumLearned => "fleet.checksum_learned",
+            Self::FleetArtifactTampered => "fleet.artifact_tampered",
             Self::Login => "login",
             Self::Logout => "logout",
             Self::LoginFailed => "login_failed",
             Self::KeyCreated => "key_created",
             Self::KeyRevoked => "key_revoked",
+            Self::KeyExpiryChanged => "key_expiry_changed",
+            Self::KeyRestrictionsChanged => "key_restrictions_changed",
             Self::KeyBudgetSet => "key_budget_set",
             Self::KeyBudgetCredited => "key_budget_credited",
             Self::CredentialCreated => "credential_created",
@@ -186,6 +217,10 @@ impl AuditAction {
                 // operator who enabled it must be able to find out afterwards
                 // *why* the drain deadline was allowed to expire.
                 | Self::FleetForcedStop
+                // A host holding something other than what it should under a
+                // model's name is either corrupted or compromised, and either
+                // way somebody has to go and look.
+                | Self::FleetArtifactTampered
         )
     }
 
@@ -198,6 +233,8 @@ impl AuditAction {
             Self::LoginFailed,
             Self::KeyCreated,
             Self::KeyRevoked,
+            Self::KeyExpiryChanged,
+            Self::KeyRestrictionsChanged,
             Self::KeyBudgetSet,
             Self::KeyBudgetCredited,
             Self::CredentialCreated,
@@ -230,6 +267,14 @@ impl AuditAction {
             Self::FleetMemoryDrift,
             Self::FleetLeaseExpired,
             Self::FleetConfigurationMismatch,
+            Self::FleetEnrollmentIssued,
+            Self::FleetEnrollmentRegistered,
+            Self::FleetEnrollmentApproved,
+            Self::FleetEnrollmentRejected,
+            Self::FleetEnrollmentRevoked,
+            Self::FleetCopy,
+            Self::FleetChecksumLearned,
+            Self::FleetArtifactTampered,
         ]
     }
 }

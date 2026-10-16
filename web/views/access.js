@@ -316,6 +316,14 @@ export async function mount(container, ctx) {
 
   render(container, [
     header,
+    // Per-machine access is fleet configuration, edited where the machines
+    // are. Said here because this is where an operator looks for "who may use
+    // what".
+    el('p', {}, [
+      'Which users may use each slave, and each model on it, is set under ',
+      el('a', { href: '#/fleet' }, 'Fleet → Slave access'),
+      '.',
+    ]),
     summaryPanel,
     identityPanel,
     principalPanel,

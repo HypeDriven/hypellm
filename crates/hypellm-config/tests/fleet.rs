@@ -159,6 +159,25 @@ fn a_budget_that_underflows_to_zero_is_refused_with_an_alternative() {
 }
 
 #[test]
+fn a_reordering_bound_is_zero_or_long_enough_to_mean_something() {
+    // Shorter than a model load, every waiting model is "starving" by the time
+    // a host frees and reordering is arrival order with extra steps; longer
+    // than an hour, "bounded delay" promises nothing (specification 26.11).
+    let host = hypellm_core::ids::HostId::new("spark").unwrap();
+    let default = load(SPARK).expect("builds");
+    assert_eq!(default.fleet.policy_for(&host).max_reorder_wait_ms, 120_000);
+    for ok in ["0", "5000", "3600000"] {
+        let text = format!("{SPARK}\nfleet_policy scope=fleet max_reorder_wait_ms={ok}");
+        let config = load(&text).unwrap_or_else(|e| panic!("{ok} must be accepted: {e:?}"));
+        assert_eq!(config.fleet.policy_for(&host).max_reorder_wait_ms.to_string(), ok);
+    }
+    for bad in ["1", "4999", "3600001"] {
+        let text = format!("{SPARK}\nfleet_policy scope=fleet max_reorder_wait_ms={bad}");
+        assert!(codes(&text).contains(&"invalid_interval".to_owned()), "{bad} was accepted");
+    }
+}
+
+#[test]
 fn a_per_host_policy_overrides_the_fleet_default_whatever_the_record_order() {
     // Record order in a file must not change the effective limits.
     let after = format!(
@@ -232,6 +251,38 @@ artifact id=bad kind=image arch=aarch64 digest=\"{digest}\""
             codes(&text).contains(&"invalid_digest".to_owned()),
             "{digest} was accepted"
         );
+    }
+}
+
+#[test]
+fn a_pinned_image_id_is_kept_exactly_and_a_near_miss_is_refused() {
+    // The pinned image ID is the anchor every copied image is verified
+    // against; a spelling the agent would not produce must not load as one.
+    let zeros = "0".repeat(64);
+    let good = format!("sha256:{}", "ab".repeat(32));
+    let text = format!(
+        "{SPARK}
+artifact id=music3 kind=image arch=aarch64 digest=\"sha256:{zeros}\" image_id=\"{good}\""
+    );
+    let config = load(&text).expect("a well-formed image_id loads");
+    let artifact = config
+        .fleet
+        .artifacts
+        .get(&hypellm_core::ids::ArtifactId::new("music3").unwrap())
+        .unwrap();
+    assert_eq!(artifact.image_id.as_ref().map(|i| i.as_str()), Some(good.as_str()));
+
+    for bad in [
+        format!("sha256:{}", "AB".repeat(32)),
+        format!("sha256:{}", "a".repeat(63)),
+        "sha256:".to_owned(),
+        "ab".repeat(32),
+    ] {
+        let text = format!(
+            "{SPARK}
+artifact id=music3 kind=image arch=aarch64 digest=\"sha256:{zeros}\" image_id=\"{bad}\""
+        );
+        assert!(codes(&text).contains(&"invalid_digest".to_owned()), "{bad} was accepted");
     }
 }
 
@@ -366,4 +417,58 @@ fn an_unknown_capability_verb_is_refused_rather_than_ignored() {
 
     let text = "alias id=weird capability=telepathy targets=spark:music3";
     assert!(codes(text).contains(&"invalid_capability".to_owned()));
+}
+
+#[test]
+fn an_enrollment_origin_is_a_bare_https_origin_and_nothing_that_could_end_an_argument() {
+    // It is pasted into `curl … | sh -s -- --router <it>` on another machine,
+    // so anything beyond scheme, host and port is refused rather than quoted.
+    use hypellm_config::build::enroll_origin;
+    assert_eq!(
+        enroll_origin("https://Router.example.ts.net/").as_deref(),
+        Some("https://router.example.ts.net")
+    );
+    assert_eq!(
+        enroll_origin("https://10.0.0.5:8443").as_deref(),
+        Some("https://10.0.0.5:8443")
+    );
+    for bad in [
+        "http://router.test",
+        "https://router.test/path",
+        "https://router.test?x=1",
+        "https://user@router.test",
+        "https://router.test;id",
+        "https://router.test $(id)",
+        "https://router.test:0",
+        "https://router.test:99999",
+        "https://",
+        "https://-bad.test",
+    ] {
+        assert_eq!(enroll_origin(bad), None, "{bad}");
+    }
+}
+
+#[test]
+fn an_agent_key_must_be_one_ed25519_key_and_its_comment_is_dropped() {
+    let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINaR4JuJGhj5Y/y0fV0dwnAAHCoxBRNiBi5JkRlcQU2M";
+    let config = load(&format!(
+        "fleet_agent id=local socket=/run/hypellm/fleet.sock ssh_public_key=\"{key} agent@router\""
+    ))
+    .expect("valid");
+    let agent = config.fleet.agents.values().next().unwrap();
+    assert_eq!(agent.ssh_public_key.as_deref(), Some(key));
+
+    for bad in [
+        "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ==",
+        "command=\\\"sh\\\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINaR4JuJGhj5Y/y0fV0dwnAAHCoxBRNiBi5JkRlcQU2M",
+        "ssh-ed25519 AAAA",
+    ] {
+        assert_eq!(
+            codes(&format!(
+                "fleet_agent id=local socket=/run/hypellm/fleet.sock ssh_public_key=\"{bad}\""
+            )),
+            ["invalid_ssh_public_key"],
+            "{bad}"
+        );
+    }
 }

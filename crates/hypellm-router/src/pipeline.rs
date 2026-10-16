@@ -68,11 +68,12 @@ impl Outcome {
 
 /// Execute a request end to end.
 ///
-/// `permissions` are the principal's, and are consulted for exactly two
-/// things: whether this caller may cause a deployment to start, and whether
-/// they may cause an artifact to be fetched. Neither is permission to *reach* a
-/// model — that is the alias grant, unchanged — and a caller without them
-/// still uses whatever is already warm.
+/// `permissions` are the principal's, and are consulted for exactly one
+/// thing: whether this caller may cause an artifact to be fetched. Starting a
+/// model is not a permission (specification 26.10): any caller the alias grant
+/// and the fleet grants admit may cause a start, under the fleet's own
+/// governance. Neither is permission to *reach* a model — that is the alias
+/// grant, unchanged.
 pub fn execute(
     state: &RouterState,
     request: &CanonicalRequest,
@@ -124,12 +125,34 @@ pub fn execute_for_key(
             request
         });
     let request = with_usage.as_ref().unwrap_or(request);
-    let first = execute_once(state, &config, request, groups, &permissions, key, sink);
+    let mut first = execute_once(state, &config, request, groups, &permissions, key, sink, false);
+    if awaits_activation(&first) {
+        first = await_activation(state, &config, request, groups, &permissions, key, sink, first);
+    }
     let budget = recovery_budget(&config, request);
     if budget.is_zero() || !awaits_recovery(&first) {
         return first;
     }
     await_recovery(state, &config, request, groups, &permissions, key, sink, first, budget)
+}
+
+/// One routing pass decided under `config`, whatever the router's current
+/// configuration is.
+///
+/// For tests of the moment between routing and acting: a publication that
+/// lands after a request was routed must still be honoured where the request
+/// makes a slave do work, and this is how a test puts a request in exactly
+/// that position without racing a thread.
+#[cfg(any(test, feature = "test-harness"))]
+pub fn execute_under(
+    state: &RouterState,
+    config: &hypellm_config::ValidatedConfig,
+    request: &CanonicalRequest,
+    groups: &[GroupId],
+    permissions: &hypellm_core::rbac::PermissionSet,
+    sink: &mut dyn EventSink,
+) -> Outcome {
+    execute_once(state, config, request, groups, permissions, None, sink, false)
 }
 
 /// The request with its alias's llama.cpp sampler settings applied, or `None`
@@ -272,7 +295,7 @@ fn await_recovery(
         if sink.keepalive().is_err() {
             break "client_gone";
         }
-        outcome = execute_once(state, config, request, groups, permissions, key, sink);
+        outcome = execute_once(state, config, request, groups, permissions, key, sink, false);
         if !awaits_recovery(&outcome) {
             break if outcome.is_success() { "recovered" } else { "failed" };
         }
@@ -282,6 +305,134 @@ fn await_recovery(
     state.recovery_waiters.fetch_sub(1, Ordering::SeqCst);
     record_recovery(state, request, result);
     outcome
+}
+
+/// Whether a failed request should park for a cold model (specification 26.10).
+///
+/// Only when the one thing in the way is an activation that is coming but has
+/// not started — demand batching has not reached its trigger, or the host is
+/// busy with another activation — and nothing was sent. A key-budget refusal
+/// ends the request (specification 12.2), and so does any client-visible
+/// output, so neither parks.
+fn awaits_activation(outcome: &Outcome) -> bool {
+    !outcome.is_success()
+        && !outcome.saw_output
+        && outcome
+            .trace
+            .exclusions
+            .iter()
+            .any(|e| e.reason == ExclusionReason::ActivationQueued)
+        && !outcome
+            .trace
+            .exclusions
+            .iter()
+            .any(|e| e.reason == ExclusionReason::BudgetExceeded)
+}
+
+/// How long a parked request waits between rounds when nothing wakes it.
+///
+/// The fleet wakes parked requests on every commitment, settlement and
+/// observation; this bounds the two things it does not signal — a warm target
+/// freeing a concurrency slot, and the batching queue's age trigger coming due.
+const PARK_SLICE: Duration = Duration::from_millis(250);
+
+/// Park a request until a cold model it can use is started, a warm one frees
+/// up, or its deadline passes (specification 26.10).
+///
+/// The request stays counted in the batching queue for its capability for the
+/// whole wait, so its demand and its age accumulate toward the trigger — a
+/// request that asked, left, and asked again would restart the age each time
+/// and never reach it. Each round is an ordinary pass through the pipeline,
+/// so it holds no admission reservation or budget between rounds, re-routes
+/// against current belief (a warm target with a free slot outranks a cold one
+/// and is simply taken), rides an activation somebody else started, or pays
+/// for the activation itself once the queue says so.
+///
+/// Bounded by the request deadline and by `settings max_parked_requests`
+/// concurrent parked requests; past that, the request fails over as it did
+/// before parking existed. Like a recovery waiter, a parked request holds its
+/// connection.
+#[allow(clippy::too_many_arguments)]
+fn await_activation(
+    state: &RouterState,
+    config: &hypellm_config::ValidatedConfig,
+    request: &CanonicalRequest,
+    groups: &[GroupId],
+    permissions: &hypellm_core::rbac::PermissionSet,
+    key: Option<&KeyId>,
+    sink: &mut dyn EventSink,
+    first: Outcome,
+) -> Outcome {
+    let Some(fleet) = state.fleet() else {
+        return first;
+    };
+    let Some(capability) = config
+        .snapshot
+        .aliases
+        .get(&request.requested_model)
+        .and_then(|alias| alias.capability)
+    else {
+        return first;
+    };
+    let limit = config.settings.max_parked_requests;
+    let admitted = state
+        .parked_requests
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < limit).then(|| n + 1))
+        .is_ok();
+    if !admitted {
+        record_parking(state, request, "refused");
+        return first;
+    }
+    if !fleet.park(capability) {
+        state.parked_requests.fetch_sub(1, Ordering::SeqCst);
+        record_parking(state, request, "refused");
+        return first;
+    }
+    fleet.park_alias(&request.requested_model);
+
+    let clock = state.clock.as_ref();
+    let until = request.limits.deadline;
+    let pending = PendingGauge::enter(state, request, "parked");
+    let mut outcome = first;
+    let mut seen = fleet.wake_signal().generation();
+    let result = loop {
+        if until.is_expired(clock) {
+            break "expired";
+        }
+        let _ = clock.wait_signal(
+            fleet.wake_signal(),
+            seen,
+            PARK_SLICE.min(until.remaining(clock)),
+        );
+        if sink.keepalive().is_err() {
+            break "client_gone";
+        }
+        // Read before the round, so a change made while it runs wakes the
+        // next wait at once rather than being slept through.
+        seen = fleet.wake_signal().generation();
+        outcome = execute_once(state, config, request, groups, permissions, key, sink, true);
+        if !awaits_activation(&outcome) {
+            break if outcome.is_success() { "served" } else { "failed" };
+        }
+    };
+    pending.leave();
+    fleet.unpark_alias(&request.requested_model);
+    fleet.unpark(capability);
+    state.parked_requests.fetch_sub(1, Ordering::SeqCst);
+    record_parking(state, request, result);
+    outcome
+}
+
+fn record_parking(state: &RouterState, request: &CanonicalRequest, result: &str) {
+    let mut labels = hypellm_telemetry::Labels::one(hypellm_telemetry::LabelName::Outcome, result);
+    if let Some(alias) = alias_label(state, request) {
+        labels = labels.with(hypellm_telemetry::LabelName::Alias, alias);
+    }
+    state.telemetry.count(
+        hypellm_telemetry::names::PARKED_WAITS,
+        "Requests that parked for a cold model to be started, by outcome.",
+        &labels,
+    );
 }
 
 fn record_recovery(state: &RouterState, request: &CanonicalRequest, result: &str) {
@@ -416,6 +567,7 @@ fn execute_once(
     permissions: &hypellm_core::rbac::PermissionSet,
     key: Option<&KeyId>,
     sink: &mut dyn EventSink,
+    parked: bool,
 ) -> Outcome {
     let clock = state.clock.as_ref();
     // Specification 19 budgets the *whole* router overhead at 2 ms p50. The
@@ -425,18 +577,22 @@ fn execute_once(
     let snapshot = &config.snapshot;
 
     let attempted: Vec<TargetId> = Vec::new();
+    // Read once per round from the live record, so a restriction tightened
+    // while this request waited for a machine applies to its next round.
+    let restriction = key_restriction(state, key);
     let context = RoutingContext {
         principal: &request.principal,
         groups,
         tenant: &request.tenant,
         attempted: &attempted,
         now_millis: clock.now_millis(),
+        key: restriction.as_ref(),
     };
 
     // Sampled once, before routing, and borrowed for the whole decision. A
     // second sample could classify a target one way for the filter and another
     // for the score.
-    let fleet_view = state.fleet_view(request, permissions);
+    let fleet_view = state.fleet_view(request, groups, permissions);
     let live = crate::fleet::FleetAwareLiveState::new(state.health.as_ref(), &fleet_view);
     let route = snapshot.route(&context, request, &live);
 
@@ -571,9 +727,13 @@ fn execute_once(
         // has already run out of deadline waits not at all.
         let queue_budget = std::time::Duration::from_millis(queue_timeout_ms)
             .min(overall.remaining(clock));
-        let class = state
+        // The key may lower the principal's class and never raise it.
+        let principal_class = state
             .admission
             .class_for(&request.tenant, &request.principal);
+        let class = restriction
+            .as_ref()
+            .map_or(principal_class, |r| r.cap_priority(principal_class));
         // The alias, not just the resolved target: specification 12's
         // "Alias/model" layer limits what the caller asked for, which is the
         // thing they control. A limit attached only to targets would be spread
@@ -741,7 +901,17 @@ fn execute_once(
             }
         } else if candidate.residency.requires_activation() {
             let waiting = PendingGauge::enter(state, request, "activation");
-            let activated = activate_for(state, request, &fleet_view, candidate, overall);
+            let activated =
+                activate_for(
+                    state,
+                    request,
+                    groups,
+                    restriction.as_ref(),
+                    &fleet_view,
+                    candidate,
+                    overall,
+                    parked,
+                );
             waiting.leave();
             match activated {
                 Ok(()) => {}
@@ -775,6 +945,28 @@ fn execute_once(
                 }
             }
         }
+
+        // Counted against the deployment for the whole dispatch, so an idle
+        // stop (specification 26.10) cannot take it down underneath this
+        // request. Refused when an idle stop has already claimed it: the
+        // model is going, so this is a target that is about to need
+        // activation again, and the request parks rather than failing.
+        let dispatch_hold = match state.fleet().map(|fleet| fleet.enter_dispatch(&target.id)) {
+            None | Some(Ok(None)) => None,
+            Some(Ok(Some(hold))) => Some(hold),
+            Some(Err(_)) => {
+                trace.exclusions.push(hypellm_core::decision::Exclusion {
+                    target: target.id.clone(),
+                    reason: ExclusionReason::ActivationQueued,
+                });
+                reservation.release_unused();
+                if let Some(hold) = budget_hold.take() {
+                    hold.release();
+                }
+                permit.release(clock.now_millis());
+                continue;
+            }
+        };
 
         // Recorded before dispatch: the request is bound to this family from
         // the moment an attempt is made against it, whether or not it succeeds.
@@ -890,6 +1082,9 @@ fn execute_once(
             );
         }
         health.exit();
+        if let (Some(fleet), Some(hold)) = (state.fleet(), dispatch_hold) {
+            fleet.leave_dispatch(hold);
+        }
 
         match result {
             Ok(summary) => {
@@ -1082,10 +1277,20 @@ fn no_candidate_error(
     snapshot: &hypellm_core::policy::PolicySnapshot,
     request: &CanonicalRequest,
 ) -> RouterError {
+    // Fleet access and a key restriction count as authorization here: an
+    // alias whose every target the caller is kept off is hidden from
+    // `/v1/models`, so it must answer exactly as an absent alias does — and a
+    // distinct error would tell the caller the model exists somewhere they
+    // are kept off.
     if !snapshot.aliases.contains_key(&request.requested_model)
-        || exclusions
-            .iter()
-            .all(|e| e.reason == ExclusionReason::NotAuthorizedForAlias)
+        || exclusions.iter().all(|e| {
+            matches!(
+                e.reason,
+                ExclusionReason::NotAuthorizedForAlias
+                    | ExclusionReason::FleetAccessDenied
+                    | ExclusionReason::KeyRestricted
+            )
+        })
     {
         return RouterError::new(
             ErrorCode::ModelNotFound,
@@ -1108,6 +1313,25 @@ fn no_candidate_error(
         ErrorCode::NoEligibleTarget,
         "no target met the policy, health, and capability requirements",
     )
+}
+
+/// The restriction of the key a request was made with, if it was made with one.
+///
+/// A key whose record cannot be found is narrowed to nothing rather than to
+/// nothing at all: records are never deleted, so this cannot happen, and if it
+/// did, the direction to fail in is the one that serves no model.
+pub(crate) fn key_restriction(
+    state: &RouterState,
+    key: Option<&KeyId>,
+) -> Option<hypellm_core::key_restriction::KeyRestriction> {
+    let key = key?;
+    Some(state.keys.get(key).map_or_else(
+        || hypellm_core::key_restriction::KeyRestriction {
+            models: Some(std::collections::BTreeSet::new()),
+            ..Default::default()
+        },
+        |record| record.restrictions,
+    ))
 }
 
 /// Publish how many requests are waiting for this target's capacity.
@@ -1616,13 +1840,38 @@ fn wait_for(
 /// names a host, an accelerator, or what else is loaded: specification-extension
 /// 15 makes fleet topology management-plane data, and a data-plane error that
 /// disclosed it would be a cross-tenant leak by another name.
+#[allow(clippy::too_many_arguments)]
 fn activate_for(
     state: &RouterState,
     request: &CanonicalRequest,
+    groups: &[GroupId],
+    restriction: Option<&hypellm_core::key_restriction::KeyRestriction>,
     view: &crate::fleet::FleetView,
     candidate: &hypellm_core::decision::Candidate,
     deadline: Deadline,
+    parked: bool,
 ) -> Result<(), ExclusionReason> {
+    // Asked again here, at the point where a request would make a slave do
+    // work, and not only left to the routing filter that put this candidate
+    // in the list. Routing ran against the snapshot of its moment; this runs
+    // against the current one, so a publication that took the caller off this
+    // slave between the two is honoured before a model is loaded for them.
+    let current = state.config();
+    let context = RoutingContext {
+        principal: &request.principal,
+        groups,
+        tenant: &request.tenant,
+        attempted: &[],
+        now_millis: 0,
+        key: restriction,
+    };
+    if !current
+        .snapshot
+        .fleet_access_permits(&context, &request.requested_model, &candidate.target)
+    {
+        return Err(ExclusionReason::FleetAccessDenied);
+    }
+
     let Some(fleet) = state.fleet() else {
         // A candidate classified as needing activation by a router with no
         // fleet runtime is a contradiction; refuse rather than dispatch to
@@ -1641,19 +1890,32 @@ fn activate_for(
         .aliases
         .get(&request.requested_model)
         .and_then(|a| a.capability);
+    //
+    // A parked request is already counted in the queue for the whole of its
+    // wait, so it re-asks without being counted again; anyone else is counted
+    // for the length of this call.
     if let Some(capability) = capability {
-        match fleet.admit_to_queue(capability, &plan.host) {
+        let admission = if parked {
+            fleet.poll_queue(capability, plan)
+        } else {
+            fleet.admit_to_queue(capability, plan)
+        };
+        match admission {
             hypellm_fleet::governance::QueueAdmission::Activate => {}
             hypellm_fleet::governance::QueueAdmission::Wait { .. } => {
-                // Waiting is not this request\'s job: it fails over to the next
-                // candidate, and the activation the queue triggered serves
-                // whoever asks next. A request that blocked here would hold a
-                // connection and an admission slot for a whole model load.
-                fleet.leave_queue(capability);
-                return Err(ExclusionReason::ActivationExceedsDeadline);
+                // Not this attempt's job to block here, holding an admission
+                // slot for a whole model load: it moves on to the next
+                // candidate, and if nothing serves it, the request parks
+                // (specification 26.10) without holding anything.
+                if !parked {
+                    fleet.leave_queue(capability);
+                }
+                return Err(ExclusionReason::ActivationQueued);
             }
             hypellm_fleet::governance::QueueAdmission::Full => {
-                fleet.leave_queue(capability);
+                if !parked {
+                    fleet.leave_queue(capability);
+                }
                 return Err(ExclusionReason::ActivationBudgetExhausted);
             }
         }
@@ -1667,8 +1929,17 @@ fn activate_for(
         &request.request_id.to_hex(),
         remaining,
     );
-    if let Some(capability) = capability {
+    if let Some(capability) = capability.filter(|_| !parked) {
         fleet.leave_queue(capability);
+    }
+
+    if let crate::fleet::ActivationResult::Failed { code } = &result {
+        // A refusal other than "the host is busy" means this deployment cannot
+        // be activated right now; it must not keep outranking the others
+        // waiting for the same host (specification 26.11).
+        if *code != "fleet_busy" {
+            fleet.note_refused(&plan.deployment, &plan.host);
+        }
     }
 
     match result {
@@ -1677,7 +1948,10 @@ fn activate_for(
             Ok(())
         }
         crate::fleet::ActivationResult::Failed { code } => Err(match code {
-            "fleet_budget_exhausted" | "fleet_busy" => ExclusionReason::ActivationBudgetExhausted,
+            "fleet_budget_exhausted" => ExclusionReason::ActivationBudgetExhausted,
+            // Another activation holds the host, or a plan made a moment ago
+            // lost to one committed since. Both pass, so the request parks.
+            "fleet_busy" => ExclusionReason::ActivationQueued,
             "fleet_activation_timeout" => ExclusionReason::ActivationExceedsDeadline,
             "fleet_unavailable" => ExclusionReason::FleetAgentUnavailable,
             _ => ExclusionReason::HostCapacityInsufficient,

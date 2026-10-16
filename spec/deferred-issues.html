@@ -88,9 +88,24 @@
 </thead>
 <tbody>
 <tr>
+<td>Spend budgets without prices</td>
+<td>A quota's <code>budget</code> is charged from the configured <code>price</code> schedule. With no <code>price</code> records, every request costs zero and a budget never refuses. The Principal access screen says so beside the field.</td>
+<td>Declare <code>price</code> records for the targets a budget should cover, or use a per-key token budget, which counts tokens rather than money.</td>
+</tr>
+<tr>
 <td>Per-key token budgets</td>
 <td>Implemented, with one deviation: reservations are durable as a per-key high-water mark, not record by record. An unclean stop charges a key for headroom it had drawn and not used; it never returns spent credit. Budgets are per node, anonymous callers have none, and a job that cannot be funded fails rather than answering 402.</td>
 <td>Size <code>settings budget_draw_tokens</code> for what an unclean stop may cost a key (zero costs only what was in flight). Give a key to one node, or split its allowance between nodes by hand. Do not combine finite budgets with anonymous access.</td>
+</tr>
+<tr>
+<td>Key expiry and <code>key_manager</code></td>
+<td>An outstanding key's expiry can be changed. A holder of <code>key_manager</code>, a role §9.3 does not list, may set any future expiry or remove it; key authority from break-glass alone, or from the offline token, is capped at the session's end. A router older than this change refuses to start on a log holding an expiry change, or on a configuration binding <code>key_manager</code>.</td>
+<td>Bind <code>key_manager</code> to whoever issues lasting keys. Before rolling back across this change, restore a backup taken before the first expiry edit and remove the binding.</td>
+</tr>
+<tr>
+<td>Per-key access restrictions</td>
+<td>A key can be narrowed to some of its principal's aliases, targets and fleet slaves, and to a lower queue class. A new key is unrestricted until its first restriction change; the endpoint's ceiling check ignores binding denies; a router older than this change refuses to start on a log holding a restriction change.</td>
+<td>Restrict a key before handing out its secret. Before rolling back across this change, restore a backup taken before the first restriction edit.</td>
 </tr>
 <tr>
 <td>Concurrency</td>
@@ -104,8 +119,8 @@
 </tr>
 <tr>
 <td>Multi-node operation</td>
-<td>Independent nodes by design, not by omission: §25 settles state distribution as &quot;single-writer versioned bundles; do not build consensus in v1&quot;. There is no replication, leader election or distributed configuration service, and there will not be one in v1.</td>
-<td>Give every node its own state and secrets directory. Distribute policy by exporting <code>GET /admin/v1/policies/active</code> from the writer and confirming each node's <code>--check</code> prints the same digest. Use <code>quota_partitions</code> so independently deployed nodes do not multiply a tenant's allowance.</td>
+<td>Independent nodes by design, not by omission: §25 settles state distribution as &quot;single-writer versioned bundles; do not build consensus in v1&quot;. There is no replication, leader election or distributed configuration service, and there will not be one in v1. Idle stop (§26.10) counts only the requests <em>this</em> node dispatched, and the reference agent reports no in-flight count, so a node can stop a model another node is still using.</td>
+<td>Give every node its own state and secrets directory. Where two nodes share a fleet, set <code>fleet_policy … idle_stop_ms=0</code> on all but one. Distribute policy by exporting <code>GET /admin/v1/policies/active</code> from the writer and confirming each node's <code>--check</code> prints the same digest. Use <code>quota_partitions</code> so independently deployed nodes do not multiply a tenant's allowance.</td>
 </tr>
 <tr>
 <td>Shutdown</td>
@@ -114,7 +129,7 @@
 </tr>
 <tr>
 <td>Fleet visibility</td>
-<td>Management fleet views are filtered to the deployments whose targets the caller's tenant can reach, but an accelerator shown to a tenant reports whole-pool memory figures, which include other tenants' residents.</td>
+<td>Management fleet views are filtered to the deployments whose targets the caller's tenant can reach, but an accelerator shown to a tenant reports whole-pool memory figures, which include other tenants' residents, and a deployment's <code>waiting</code> count includes other tenants' requests queued or parked for the same capability. A host's <code>next_activation</code> (§26.11) is shown only when its deployment is visible to the caller, but its waiting count is all tenants' demand for that deployment.</td>
 <td>Treat pool occupancy as shared information between tenants placed on one accelerator; give tenants that must not observe each other separate accelerators.</td>
 </tr>
 <tr>
@@ -169,13 +184,53 @@
 </tr>
 <tr>
 <td>Adding a machine</td>
-<td>The dashboard drafts every router-side record, but cannot write the fleet agent's allowlist (§26.2). Orchestration pauses with <code>fleet_configuration_mismatch</code> between editing one side and the other.</td>
-<td>Edit the agent's JSON first (it reloads on change), then publish from the Machines panel; do it in a quiet period.</td>
+<td>Enrollment (§26.8) brings a machine's host and accelerators into both the router's configuration and the agent's allowlist, but not its deployments: each deployment row, now usually a <code>run</code> template the agent creates the container from (§26.12), is still written in the agent's file by hand (§26.2), and orchestration pauses with <code>fleet_configuration_mismatch</code> between editing one side and the other.</td>
+<td>Enroll the machine, then paste the Machines panel's agent-side entry (a <code>run</code> template per deployment) into the agent's JSON — it reloads on change — and publish the router-side records; do it in a quiet period.</td>
 </tr>
 <tr>
-<td>Outage waits</td>
-<td>A request waiting with <code>recovery_wait_ms</code> holds its connection worker for the whole wait.</td>
-<td>Keep <code>max_recovery_waiters</code> well below <code>max_connections</code>, and waits no longer than a machine really takes to come back.</td>
+<td>Slave device keys</td>
+<td>A registering machine reports an Ed25519 device key, which is stored, validated structurally and fingerprinted, and nothing more. No LAN request from a slave to the router exists yet, so no signature by that key is ever verified.</td>
+<td>Treat the device fingerprint as a record of which machine registered, not as an authenticated channel. When slave-to-router requests are defined, their signatures go through the local verifier (§9.1).</td>
+</tr>
+<tr>
+<td>Enrollment offers</td>
+<td>The router offers enrolled hosts only to agents of a configuration with <code>fleet_enabled=true</code>, and an agent adopts them only with <code>enrollment.accept</code>. An offer the agent refuses is retried every observation and logged as <code>fleet.enrollment_offer_failed</code>.</td>
+<td>Switch both on before enrolling. An approved, published machine whose host never appears in the agent's digest is usually an address outside <code>enrollment.cidrs</code>; the agent leaves such hosts out rather than failing the offer.</td>
+</tr>
+<tr>
+<td>Enrollment scope</td>
+<td>Enrollments are fleet-wide rather than per tenant: an operator in any tenant who holds <code>fleet_enroll</code> sees every enrollment and may mint, approve or revoke. Approval still only drafts records; publication keeps its approver rule.</td>
+<td>Grant <code>fleet_enroll</code> (the <code>operator</code> role) only to the people who run the fleet.</td>
+</tr>
+<tr>
+<td>Host kit</td>
+<td>The install script supports Linux slaves with OpenSSH 7.2 or later (for <code>restrict</code>), an Ed25519 sshd host key, and Docker usable without sudo. It does not set up Windows hosts whose SSH lands in WSL, and its forced-command shim refuses any deployment command outside its fixed list — including any <code>docker create</code> option beyond name, template label, one GPU, IPv4-bound ports, the container's own state mount, environment and <code>--restart no</code>. A machine enrolled with host kit 1.0 has no <code>create</code>, <code>rm</code>, <code>save</code>, <code>load</code> or <code>mkdir</code>, so templated deployments and copies to or from it fail until it is upgraded.</td>
+<td>Add other machines by hand, as before. Re-run a freshly minted install command on a 1.0 machine to upgrade it; its data directory, device key and registration are kept. Keep enrolled machines' deployment rows to <code>run</code> templates, or <code>docker start</code>/<code>stop</code> of pre-created containers, and <code>curl</code> probes to loopback.</td>
+</tr>
+<tr>
+<td>Image sync</td>
+<td><code>COPY</code> (§26.12) always relays through the fleet agent's machine, even between slaves that could reach each other, so every byte crosses its link twice and the whole image must fit in its spool (<code>transfer.max_spool_bytes</code>). Only images move: a container's state directory is not copied, and a running container is never migrated. Layers compressed with zstd are refused, because nothing in the agent's standard library can decompress them to check them. An artifact whose agent-side <code>image</code> is a digest reference cannot be copied. The source is the first verified host in identifier order, not the nearest or least loaded.</td>
+<td>Give the agent's machine a spool on a disk with room for the largest image, and a fast link to the slaves. Tag images rather than referring to them by digest. Keep model weights an image needs inside the image, or provision them to each slave's data directory yourself.</td>
+</tr>
+<tr>
+<td>Learned image checksums</td>
+<td>Without <code>image_id</code> on an <code>artifact</code> record, the router learns the checksum from the first observation in which a host reports the image with its registry digest verified — trust on first verified observation. That anchor defends every later copy and every other host against a slave serving something else under the name, but not against the first reporter having lied, and the registry-digest check it rests on is itself that host's report.</td>
+<td>Pin <code>image_id</code> (the image's <code>docker image inspect --format {{.Id}}</code>, taken from a machine you trust) on every artifact whose integrity matters. A learned value appears on the Fleet screen as <code>learned</code>.</td>
+</tr>
+<tr>
+<td>Slave access</td>
+<td>Fleet grants (§26.9) govern only fleet-managed targets — those with a <code>deployment</code>, which places them on a host. A provider declared without one, such as a remote API or a llama.cpp server added by hand, runs on no slave as far as the router knows, and no fleet grant restricts it. The Slave access panel shows the grants written for one subject, not the effective result after scope precedence and the default; there is no "what can this user reach" preview.</td>
+<td>Declare a deployment for every model on a machine whose use must be restricted, or restrict the alias itself with <code>grant</code> and <code>binding deny=</code>. To check an outcome, simulate a request for that principal from Policies.</td>
+</tr>
+<tr>
+<td>Churn-aware scheduling</td>
+<td>The scheduler (§26.11) ranks only the requests parked on <em>this</em> node and checks only this node's in-flight dispatches before deferring a swap — the reference agent reports no in-flight count — so nodes sharing a fleet each order their own demand. Reordering applies to which model a host loads and which job a worker takes; the admission queue for a model's concurrency slots stays fair by tenant and priority and is not grouped by model. A job is classed warm when its model is serving, whether or not a concurrency slot is free, so a warm job may still wait in admission ahead of a cold one.</td>
+<td>Where several nodes share a fleet, send each model's traffic through one node, or set <code>max_reorder_wait_ms=0</code> on all but one. Set <code>max_reorder_wait_ms</code> to the longest delay a caller should accept behind other models' work; 0 restores arrival order.</td>
+</tr>
+<tr>
+<td>Outage and cold-start waits</td>
+<td>A request waiting with <code>recovery_wait_ms</code>, or parked for a cold model to be started (§26.10), holds its connection worker for the whole wait. A parked request is woken by fleet changes, but a warm target freeing a concurrency slot is not signalled: it is noticed on the parked request's next 250 ms round.</td>
+<td>Keep <code>max_recovery_waiters</code> plus <code>max_parked_requests</code> well below <code>max_connections</code>, and waits no longer than a machine really takes to come back. Prefer <code>/v1/jobs</code> for work that may wait minutes for a model.</td>
 </tr>
 <tr>
 <td>Address allowlists</td>
@@ -201,7 +256,7 @@
 </table></div>
 <h2 id="fleet-orchestration">Fleet orchestration</h2>
 <p><strong>Specification:</strong> <a href="orchestration.html">orchestration.html</a> §4–§10, §13, §17–§19. <strong>Implementation:</strong> <code>crates/hypellm-fleet</code>, <code>crates/hypellm-net/src/fleet.rs</code>, <code>crates/hypellm-router/src/fleet.rs</code>, <code>agent/</code>.</p>
-<p>The router observes a declared fleet, plans against it, and starts and stops declared deployments through an out-of-process agent. What is present: the capability contract, residency classification and warmth ranking, the planner with dwell floors, hysteresis, eviction sets and activation budgets, leases with exactly-once release and crash recovery, the management surface, and the Fleet and Activations screens.</p>
+<p>The router observes a declared fleet, plans against it, and starts and stops declared deployments through an out-of-process agent. What is present: the capability contract, residency classification and warmth ranking, the planner with dwell floors, hysteresis, eviction sets and activation budgets, leases with exactly-once release and crash recovery, containers created from agent-side templates, verified image copies between slaves against a kept checksum (§26.12), the management surface, and the Fleet and Activations screens.</p>
 <p>Two parts of the design are deliberately not implemented, and are listed rather than approximated:</p>
 <ul>
 <li><strong>Byte-level resumable fetches (§12).</strong> The reference agent retries a failed pull within the router's deadline, and <code>docker pull</code> skips layers already in the host's content store, so an attempt resumes from what the last one finished. A layer interrupted mid-transfer is re-fetched. An artifact published as a single 40 GB layer therefore restarts, which is a property of how it was built rather than of the agent — but §12's sentence is about bytes, and this delivers it about layers.</li>
@@ -273,7 +328,7 @@
 </tr>
 <tr>
 <td>Jobs waiting for a worker</td>
-<td><code>max_queued_jobs</code></td>
+<td><code>max_queued_jobs</code>, plus one re-queued job per worker</td>
 <td>64</td>
 </tr>
 <tr>
@@ -312,13 +367,30 @@
 <ul>
 <li><strong>Scope.</strong> The key must carry <code>management:read</code>. A mutating request additionally needs <code>management:write</code>; a read key that could POST would make the distinction the Keys screen offers a decoration.</li>
 <li><strong>Permissions come from configuration, not from the key.</strong> The key record carries no roles. Its permissions are the <code>role_binding</code> records for its principal, in the key's own tenant, in the <em>active</em> configuration, resolved on every request — so withdrawing a binding de-powers every key that principal holds immediately, with nothing to find and reissue. A key whose principal has no binding in that tenant is refused, and told why.</li>
-<li><strong>A key cannot carry more than its minter.</strong> A management-scoped key is refused unless its principal's roles are a subset of the minting caller's own roles, excluding <code>break_glass_admin</code>. A key minted from a break-glass session expires no later than that session, and the key records who minted it, so a draft authored through one key cannot be approved through another key the same person minted.</li>
-<li><strong>So no permanent management key can be minted through the API.</strong> <code>ManageKeys</code> belongs only to break-glass, and break-glass keys expire with the session. Automation that needs a lasting management key has to be provisioned out of band, which is a gap, not a feature.</li>
+<li><strong>A key cannot carry more than its minter.</strong> A management-scoped key is refused unless its principal's roles are a subset of the minting caller's own roles, excluding <code>break_glass_admin</code>. A key minted on break-glass authority expires no later than that session, and the key records who minted it, so a draft authored through one key cannot be approved through another key the same person minted.</li>
+<li><strong>Lasting keys need <code>key_manager</code>.</strong> <code>ManageKeys</code> is carried by <code>break_glass_admin</code> and by <code>key_manager</code>, an addition to §9.3's table with only <code>read_summary</code>, <code>read_own_usage</code> and <code>manage_keys</code>. Keys minted on break-glass authority expire with the session: the session was opened with the offline token, or no role other than <code>break_glass_admin</code> grants <code>ManageKeys</code>. A <code>key_manager</code>'s keys last as long as it chooses, even when the same principal also holds break-glass, as the local profile's <code>user:admin</code> does. <code>GET /admin/v1/session</code> reports which applies as <code>keys_capped_to_session</code>. The subset rule above still binds a management-scoped key, so a <code>key_manager</code> cannot mint one for a break-glass principal.</li>
 <li><strong>Two permissions no key may hold.</strong> <code>BreakGlass</code> and <code>ManageKeys</code> are refused to a key whatever its principal's bindings say. §22.4's recovery path is a human with a token held offline; a key that could open it is that control replaced by a string in a CI secret store. And a key that can mint keys can mint a replacement for itself the moment it is revoked, which makes revocation an inconvenience rather than an ending.</li>
 <li><strong>The cookie always wins.</strong> The key path is reached only when no session cookie was sent. CSRF exists because a browser attaches a cookie by itself; nothing attaches an <code>Authorization</code> header by itself, so the key path runs no CSRF check — and a cookie-authenticated request cannot route around the CSRF gate by adding a header.</li>
 <li><strong><code>POST /admin/v1/logout</code> is refused for a key</strong>, because there is no session to end. A <code>204</code> there would report that the credential had been withdrawn while the key still worked. Revoke the key instead; revocation takes effect on both planes at once.</li>
 </ul>
 <p>What it does not do: a management action is attributed to the key's <strong>principal</strong>, exactly as a session's action is. The key identifier reaches the audit chain once per key per router lifetime, as a <code>login</code> record naming the key id, and not on each action. Two keys held by one principal are therefore indistinguishable in the management audit — give each automation its own principal.</p>
+<h2 id="changing-a-keys-expiry">Changing a key's expiry</h2>
+<p><strong>Specification:</strong> §9.2, §15.3, §16. <strong>Implementation:</strong> <code>AdminApi::set_key_expiry</code> in <code>crates/hypellm-admin-api/src/handlers.rs</code>, <code>RecordKind::ApiKeyExpiry</code>, the Expiry action on the Keys screen.</p>
+<p><code>PUT /admin/v1/keys/{id}/expiry</code> is an addition to §16's table, which names no way to change an outstanding key. Two boundaries:</p>
+<ul>
+<li><strong>On break-glass authority it can shorten an expiry or extend it to the session's end, and nothing more.</strong> It applies creation's rule: break-glass authority may not leave behind a key that outlives it, so <code>null</code> and anything past the session are refused. A <code>key_manager</code> (see <a href="#management-access-with-an-api-key">above</a>) may set any future expiry or remove it.</li>
+<li><strong>A router older than this change will not start on a log holding one.</strong> <code>ApiKeyExpiry</code> is a protected kind, and an older reader treats a protected frame of a kind it does not know as an integrity violation (<code>UnexpectedMac</code>) and stops. Before rolling back across this change, restore a backup taken before the first expiry edit, accepting that keys and revocations recorded since are lost.</li>
+</ul>
+<h2 id="per-key-access-restrictions">Per-key access restrictions</h2>
+<p><strong>Specification:</strong> §6.2, §9.2, §12, §16. <strong>Implementation:</strong> <code>hypellm_core::key_restriction</code>, <code>RoutingContext::key</code> in <code>hypellm_core::policy</code>, <code>AdminApi::set_key_restrictions</code> and <code>key_restrictions</code> in <code>crates/hypellm-admin-api/src/handlers.rs</code>, <code>RecordKind::ApiKeyRestriction</code>, the Access action on the Keys screen.</p>
+<p>A key may be narrowed within its principal's access: to some of the aliases the principal may use, to some of the targets (a model on a specific provider or slave) it may be served by, to some fleet slaves, and to an admission class no higher than the principal's. The principal's policy stays the ceiling, and enforcement is the intersection with the live policy on every request. §9.2 lists key scopes and source restrictions but no such narrowing, so this is an extension, and <code>GET</code>/<code>PUT /admin/v1/keys/{id}/restrictions</code> are additions to §16's table. Boundaries:</p>
+<ul>
+<li><strong>A restricted alias looks ungranted.</strong> <code>/v1/models</code> omits it and a request for it answers <code>model_not_found</code>, byte for byte the answer for an alias the principal has no grant for. So does an alias every one of whose targets the key is kept off — the same rule fleet access follows — rather than the <code>no_eligible_target</code> a policy deny gives, because a distinct answer would tell the key the alias exists. The decision trace records <code>key_restricted</code> against each target removed.</li>
+<li><strong>The write-time check is approximate.</strong> The ceiling the endpoint checks against is the aliases granted for any operation and the targets their fleet grants reach; binding denies and pins are not applied to it. A target a binding denies can therefore be chosen and will simply never be routed to. Routing, not the check, is the guarantee.</li>
+<li><strong>A key is minted unrestricted.</strong> Restrictions are set after creation, so a new key is usable at its principal's full access until the first restriction change lands. Mint it, restrict it, then hand out the secret.</li>
+<li><strong>Priority is a cap on the queue class only.</strong> It changes where a key's requests wait under contention, not quotas, budgets or routing.</li>
+<li><strong>A router older than this change will not start on a log holding one.</strong> <code>ApiKeyRestriction</code> is a protected kind; an older reader treats it as an integrity violation and stops. Before rolling back across this change, restore a backup taken before the first restriction edit.</li>
+</ul>
 <h2 id="per-key-token-budgets">Per-key token budgets</h2>
 <p><strong>Specification:</strong> <a href="router-specification.html#121-per-key-token-budgets">§12.1–12.3</a>, §15.3, §16. <strong>Implementation:</strong> <code>hypellm_core::budget</code> (the ledger), <code>hypellm_admin_api::budget</code> and the three <code>/admin/v1/keys/{id}/budget</code> handlers, <code>hypellm_router::pipeline</code> (reserve and settle), <code>RecordKind::KeyBudget</code>.</p>
 <p>A key may carry a cumulative token allowance that does not refill. Every upstream attempt made with the key first reserves a conservative input bound plus the enforced output limit; a key that cannot fund one is answered with HTTP <code>402</code> and <code>token_budget_exhausted</code>, in every protocol's envelope and before a streamed response has sent its head, and the provider is not called. An attempt settles against provider-reported usage, keeps its whole reservation when the provider accepted it and reported none, and costs nothing when it was refused before acceptance. Limits are set and credited through the management API under <code>ManageKeyBudgets</code>, which the <code>key_budget_manager</code> role carries and which a management API key may hold.</p>
@@ -424,6 +496,8 @@
 <li class="toc-level-2"><a href="#jobs-are-in-memory-and-a-restart-loses-them">Jobs are in memory, and a restart loses them</a></li>
 <li class="toc-level-2"><a href="#predictive-pre-warm-is-on-the-dullest-signal-that-works">Predictive pre-warm is on the dullest signal that works</a></li>
 <li class="toc-level-2"><a href="#management-access-with-an-api-key">Management access with an API key</a></li>
+<li class="toc-level-2"><a href="#changing-a-keys-expiry">Changing a key's expiry</a></li>
+<li class="toc-level-2"><a href="#per-key-access-restrictions">Per-key access restrictions</a></li>
 <li class="toc-level-2"><a href="#per-key-token-budgets">Per-key token budgets</a></li>
 <li class="toc-level-2"><a href="#conservative-token-estimation">Conservative token estimation</a></li>
 <li class="toc-level-2"><a href="#data-lifecycle-and-external-operations">Data lifecycle and external operations</a></li>

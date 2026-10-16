@@ -88,6 +88,10 @@ pub trait FleetControl: Send + Sync + core::fmt::Debug {
     /// Acquire an artifact onto a host.
     fn fetch(&self, artifact: &str, host: &str) -> Result<String, &'static str>;
 
+    /// Copy an artifact from one host to another through the agent, verified
+    /// against the checksum the router keeps (specification 26.12).
+    fn copy(&self, artifact: &str, from: &str, to: &str) -> Result<String, &'static str>;
+
     /// Pin, unpin, or change eviction eligibility.
     fn patch(&self, deployment: &str, patch: DeploymentPatch) -> Result<(), &'static str>;
 
@@ -96,6 +100,12 @@ pub trait FleetControl: Send + Sync + core::fmt::Debug {
 
     /// The monotonic clock reading the snapshot should be read against.
     fn now_ms(&self) -> u64;
+
+    /// What each host would load next, by the churn-aware scheduler
+    /// (specification 26.11). Empty when nothing is waiting.
+    fn next_activations(&self) -> Vec<hypellm_fleet::schedule::NextActivation> {
+        Vec::new()
+    }
 }
 
 /// The part of a deployment `If-Match` is compared against on a patch.
@@ -168,6 +178,16 @@ pub fn control_error(code: &'static str) -> ApiError {
             ApiErrorCode::Conflict,
             "the deployment did not become ready",
         ),
+        "checksum_unknown" => ApiError::new(
+            ApiErrorCode::Conflict,
+            "the router keeps no checksum for this artifact yet, so a copy could not be \
+             verified; pin image_id in the configuration or let a verified fetch establish one",
+        ),
+        "copy_source_unverified" => ApiError::new(
+            ApiErrorCode::Conflict,
+            "the source host does not report the artifact under its kept checksum, so it \
+             cannot be copied from",
+        ),
         "fleet_activation_timeout" => ApiError::new(
             ApiErrorCode::Conflict,
             "the activation did not complete before its deadline",
@@ -238,6 +258,7 @@ pub fn render_fleet(control: &dyn FleetControl, visible: &BTreeSet<TargetId>) ->
         Value::from(i64::from(snapshot.inventory.unknown_identifiers)),
     );
 
+    let next = control.next_activations();
     let mut hosts = Vec::new();
     for host in config.hosts.values().filter(|host| shown_hosts.contains(&host.id)) {
         let mut object = Object::new();
@@ -308,6 +329,33 @@ pub fn render_fleet(control: &dyn FleetControl, visible: &BTreeSet<TargetId>) ->
             })
             .collect();
         object.push("accelerators", Value::Array(accelerators));
+        object.push(
+            "max_reorder_wait_ms",
+            Value::from(
+                i64::try_from(config.policy_for(&host.id).max_reorder_wait_ms).unwrap_or(i64::MAX),
+            ),
+        );
+        // What the scheduler would load next here, and why — only when that
+        // deployment is one the caller may see. Another tenant's waiting
+        // model is not named, and is rendered as nothing rather than as a
+        // redacted row whose presence would itself say something is waiting.
+        let shown_next = next.iter().find(|n| {
+            n.host == host.id && shown.iter().any(|deployment| deployment.id == n.deployment)
+        });
+        object.push(
+            "next_activation",
+            shown_next.map_or(Value::Null, |n| {
+                let mut inner = Object::new();
+                inner.push("deployment", Value::from(n.deployment.as_str()));
+                inner.push("reason", Value::from(n.reason));
+                inner.push("waiting", Value::from(i64::from(n.waiting)));
+                inner.push(
+                    "waited_ms",
+                    Value::from(i64::try_from(n.waited_ms).unwrap_or(i64::MAX)),
+                );
+                Value::Object(inner)
+            }),
+        );
         hosts.push(Value::Object(object));
     }
     root.push("hosts", Value::Array(hosts));
@@ -368,12 +416,109 @@ pub fn render_fleet(control: &dyn FleetControl, visible: &BTreeSet<TargetId>) ->
                 "leased",
                 Value::from(snapshot.leases.contains_key(&deployment.id)),
             );
+            // Requests queued or parked for the deployment's capability
+            // (specification 26.10). A whole-fleet figure, like pool memory:
+            // the demand this model would serve, from every tenant.
+            object.push(
+                "waiting",
+                Value::from(i64::from(
+                    snapshot
+                        .deployment_capabilities
+                        .get(&deployment.id)
+                        .map_or(0, |capability| demand.queue_depth(*capability)),
+                )),
+            );
+            // When the deployment would be stopped for idleness, or null when
+            // its host's policy never stops an idle model.
+            let idle_stop_ms = config
+                .accelerator_of(deployment)
+                .map_or(0, |accelerator| config.policy_for(&accelerator.host).idle_stop_ms);
+            object.push(
+                "idle_stop_ms",
+                if idle_stop_ms == 0 {
+                    Value::Null
+                } else {
+                    Value::from(i64::try_from(idle_stop_ms).unwrap_or(i64::MAX))
+                },
+            );
             Value::Object(object)
         })
         .collect();
     root.push("deployments", Value::Array(deployments));
+    root.push("artifacts", render_artifacts(&snapshot, &shown, &shown_hosts));
 
     Value::Object(root)
+}
+
+/// The artifacts the caller's deployments use, with the checksum the router
+/// keeps for each and what every visible host reports (specification 26.12).
+///
+/// Scoped like the rest of the view: an artifact appears only when a shown
+/// deployment uses it, and a placement only on a shown host. `state` is
+/// `verified` when the host reports the kept checksum, `tampered` when it
+/// reports another, and `unverified` when there is nothing to compare —
+/// no kept checksum, or no ID reported.
+fn render_artifacts(
+    snapshot: &FleetSnapshot,
+    shown: &[&hypellm_fleet::model::Deployment],
+    shown_hosts: &BTreeSet<&HostId>,
+) -> Value {
+    let used: BTreeSet<&hypellm_core::ids::ArtifactId> =
+        shown.iter().filter_map(|d| d.artifact.as_ref()).collect();
+    let items: Vec<Value> = used
+        .into_iter()
+        .filter_map(|id| snapshot.config.artifacts.get(id))
+        .map(|artifact| {
+            let mut object = Object::new();
+            object.push("id", Value::from(artifact.id.as_str()));
+            object.push("arch", Value::from(artifact.arch.as_str()));
+            let pinned = artifact.image_id.is_some();
+            match snapshot.kept_checksum(&artifact.id) {
+                Some(kept) => {
+                    object.push("checksum", Value::from(kept.as_str()));
+                    object.push(
+                        "checksum_source",
+                        Value::from(if pinned { "pinned" } else { "learned" }),
+                    );
+                }
+                None => {
+                    object.push("checksum", Value::Null);
+                    object.push("checksum_source", Value::Null);
+                }
+            }
+            let placements: Vec<Value> = snapshot
+                .inventory
+                .artifacts
+                .iter()
+                .filter(|((a, h), p)| a == &artifact.id && shown_hosts.contains(h) && p.present)
+                .map(|((_, host), placement)| {
+                    let state = if snapshot.artifact_tampered(&artifact.id, host) {
+                        "tampered"
+                    } else if snapshot.kept_checksum(&artifact.id).is_some()
+                        && snapshot.artifact_ready(&artifact.id, host)
+                    {
+                        "verified"
+                    } else {
+                        "unverified"
+                    };
+                    let mut entry = Object::new();
+                    entry.push("host", Value::from(host.as_str()));
+                    entry.push(
+                        "image_id",
+                        placement
+                            .image_id
+                            .as_ref()
+                            .map_or(Value::Null, |id| Value::from(id.as_str())),
+                    );
+                    entry.push("state", Value::from(state));
+                    Value::Object(entry)
+                })
+                .collect();
+            object.push("placements", Value::Array(placements));
+            Value::Object(object)
+        })
+        .collect();
+    Value::Array(items)
 }
 
 /// Render `GET /admin/v1/fleet/activations`.
@@ -491,6 +636,16 @@ pub fn render_plan(outcome: &PlanOutcome, shown: &BTreeSet<DeploymentId>) -> Val
                             object.push("artifact", Value::from(artifact.as_str()));
                             object.push("host", Value::from(host.as_str()));
                         }
+                        hypellm_fleet::plan::PlanStep::Copy { artifact, from: _, to } => {
+                            // The source is not named: it is chosen from every
+                            // host holding a verified copy, including hosts
+                            // that carry none of the caller's deployments. That
+                            // a verified copy exists is the caller's to know;
+                            // where it lives is not.
+                            object.push("artifact", Value::from(artifact.as_str()));
+                            object.push("host", Value::from(to.as_str()));
+                            object.push("from", Value::Null);
+                        }
                     }
                     Value::Object(object)
                 })
@@ -586,6 +741,9 @@ mod tests {
         fn fetch(&self, _artifact: &str, _host: &str) -> Result<String, &'static str> {
             Err("fleet_disabled")
         }
+        fn copy(&self, _artifact: &str, _from: &str, _to: &str) -> Result<String, &'static str> {
+            Err("fleet_disabled")
+        }
         fn patch(&self, _deployment: &str, _patch: DeploymentPatch) -> Result<(), &'static str> {
             Err("fleet_disabled")
         }
@@ -608,6 +766,7 @@ mod tests {
                 observation_interval_ms: 5_000,
                 observation_max_age_ms: 30_000,
                 request_timeout_ms: 5_000,
+                ssh_public_key: None,
             },
         );
         fleet.hosts.insert(
@@ -731,5 +890,76 @@ mod tests {
                 "a code must never be echoed into the sentence an operator reads: {code}"
             );
         }
+    }
+
+    #[test]
+    fn the_fleet_view_marks_a_host_holding_another_image_as_tampered() {
+        use hypellm_core::ids::ArtifactId;
+        use hypellm_fleet::model::{Artifact, ArtifactKind, ImageId};
+        use hypellm_fleet::state::ArtifactPlacement;
+
+        let kept = ImageId::parse(&format!("sha256:{}", "a".repeat(64))).expect("id");
+        let other = ImageId::parse(&format!("sha256:{}", "b".repeat(64))).expect("id");
+        let artifact = ArtifactId::new("music3").expect("id");
+        let mut config = fleet();
+        config.artifacts.insert(
+            artifact.clone(),
+            Artifact {
+                id: artifact.clone(),
+                kind: ArtifactKind::Image,
+                arch: Arch::Aarch64,
+                size_bytes: 1,
+                digest: format!("sha256:{}", "0".repeat(64)),
+                image_id: None,
+                source: String::new(),
+            },
+        );
+        if let Some(d) = config.deployments.values_mut().next() {
+            d.artifact = Some(artifact.clone());
+        }
+        let mut snapshot = FleetSnapshot::empty();
+        snapshot.config = Arc::new(config);
+        snapshot.learned_checksums.insert(artifact.clone(), kept.clone());
+        let spark = HostId::new("spark").expect("id");
+        snapshot.inventory.artifacts.insert(
+            (artifact.clone(), spark.clone()),
+            ArtifactPlacement {
+                artifact,
+                host: spark,
+                present: true,
+                verified: true,
+                bytes_present: 0,
+                image_id: Some(other),
+            },
+        );
+        let control = Fake {
+            snapshot: Arc::new(snapshot),
+            now: 1,
+        };
+        let every: BTreeSet<TargetId> = control
+            .snapshot
+            .config
+            .deployments
+            .values()
+            .map(|d| d.target.clone())
+            .collect();
+        let rendered = render_fleet(&control, &every);
+        let artifacts = rendered.get("artifacts").and_then(Value::as_array).expect("artifacts");
+        let first = artifacts.first().expect("one artifact");
+        assert_eq!(first.get("checksum").and_then(Value::as_str), Some(kept.as_str()));
+        assert_eq!(first.get("checksum_source").and_then(Value::as_str), Some("learned"));
+        let placement = first
+            .get("placements")
+            .and_then(Value::as_array)
+            .and_then(|p| p.first())
+            .expect("one placement");
+        assert_eq!(placement.get("state").and_then(Value::as_str), Some("tampered"));
+
+        // A caller who can see none of the deployments sees no artifact.
+        let rendered = render_fleet(&control, &BTreeSet::new());
+        assert_eq!(
+            rendered.get("artifacts").and_then(Value::as_array).map(<[Value]>::len),
+            Some(0)
+        );
     }
 }

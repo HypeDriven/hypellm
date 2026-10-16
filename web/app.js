@@ -40,6 +40,7 @@ import * as targets from './views/targets.js';
 import * as fleet from './views/fleet.js';
 import * as activations from './views/activations.js';
 import * as policies from './views/policies.js';
+import * as principalAccess from './views/principal-access.js';
 import * as access from './views/access.js';
 import * as keys from './views/keys.js';
 import * as credentials from './views/credentials.js';
@@ -59,6 +60,9 @@ const VIEWS = [
   fleet,
   activations,
   policies,
+  // A principal's ceiling sits between routing policy and the people and keys
+  // it applies to: it is policy, written for one subject.
+  principalAccess,
   access,
   keys,
   credentials,

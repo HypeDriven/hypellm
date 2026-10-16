@@ -161,6 +161,20 @@ mark is present but malformed rather than reading it as "unlimited" or "nothing
 spent". Because the kind is protected, a binary that predates it refuses to
 start on a log that contains one, instead of running the keys without their
 budgets.</p>
+<p><strong>Enrollments.</strong> <code>FleetEnrollment</code> (17, specification 26.8) carries one slave
+enrollment: the token's digest (never the token), the slave's registration, and
+the decision. Last frame per enrollment wins on replay. It is <strong>protected</strong>:
+an approval is what leads the fleet agent to trust a machine's host key, and an
+unprotected record could be appended on disk to approve a machine nobody
+reviewed. The codec is <code>hypellm_fleet::enroll</code>, the journal
+<code>hypellm_admin_api::enroll::StoreJournal</code>.</p>
+<p><strong>Kept checksums.</strong> <code>ArtifactChecksum</code> (18, specification 26.12) carries one
+image ID the router learned for an artifact, with the host and time it was
+learned from. <strong>First</strong> frame per artifact wins on replay, so a later frame cannot
+move an anchor. It is <strong>protected</strong>: it is what every copied image is verified
+against, and an unprotected record could be appended on disk to make a tampered
+image the trusted one. The codec is <code>hypellm_fleet::checksum</code>; the router appends
+it before keeping the value.</p>
 <h2 id="threat-notes">Threat notes</h2>
 <p><strong>Two integrity mechanisms for two different adversaries.</strong> CRC-32 covers header
 and payload and detects a torn write, a short read, or bit rot; it is not a

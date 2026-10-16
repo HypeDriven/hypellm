@@ -2255,10 +2255,9 @@ target id=local:model provider=local model=test-model local=true \\
 alias id=test-alias capability=chat targets=local:model description=\"the test model\"
 grant scope=tenant:acme model=* allow=true
 binding id=default scope=tenant:acme model=* prefer=local:model
-# The harness key's principal, bound here rather than carried on the key: a key
-# says who is calling, and the configuration says what they may do. `operator`
-# holds `fleet.activate`, which is permission to make the *fleet* do work; a
-# plain inference key deliberately has none, which `svc:plain` below proves.
+# The harness key's principal holds `operator`, which an operator's manual
+# activation needs. Starting a model from a request does not: `svc:plain` below
+# has no role at all (specification 26.10).
 role_binding subject=principal:svc:test role=operator
 fleet_agent id=local socket=\"{socket}\" observation_interval_ms=1000 \\
     observation_max_age_ms=600000 request_timeout_ms=5000
@@ -2358,12 +2357,44 @@ fn a_second_request_does_not_start_an_already_running_model_again() {
     agent.stop();
 }
 
+/// A key with inference scope and no roles, for principal `principal`.
+#[allow(clippy::unwrap_used, clippy::expect_used, reason = "specification 18.2 permits these in tests")]
+fn plain_key(router: &TestRouter, principal: &str) -> String {
+    router
+        .state
+        .keys
+        .create(
+            hypellm_core::ids::TenantId::new("acme").expect("tenant"),
+            hypellm_core::ids::PrincipalId::new(principal).expect("principal"),
+            vec![hypellm_auth::Scope::Inference],
+            None,
+            hypellm_auth::SourceRestriction::Any,
+            Some("a key with no role at all".to_owned()),
+            router.state.clock.wall_millis(),
+        )
+        .expect("create key")
+        .into_secret()
+}
+
+fn chat_as(harness: &Harness, key: &str) -> Response {
+    let raw = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: router.test\r\n\
+         Content-Type: application/json\r\nConnection: close\r\n\
+         Authorization: Bearer {key}\r\nContent-Length: {}\r\n\r\n{CHAT_BODY}",
+        CHAT_BODY.len()
+    );
+    harness.raw(&raw)
+}
+
+#[allow(clippy::unwrap_used, clippy::expect_used, reason = "specification 18.2 permits these in tests")]
 #[test]
-fn a_key_without_the_fleet_permission_cannot_cause_an_activation() {
-    // The security property, at the outermost boundary. The model is declared,
-    // the deployment is `autostart`, the agent is ready — and an ordinary
-    // inference key still cannot make the fleet do work.
-    let socket = fleet_socket("unpriv");
+fn a_plain_inference_key_starts_a_cold_model_it_is_authorized_for() {
+    // Specification 26.10: starting a model is not a management permission.
+    // A key with no role binding at all — no `operator`, no `fleet.activate` —
+    // is authorized for the alias, so its request starts the model and is
+    // served. The fleet's own governance is what bounds it, not the caller's
+    // role.
+    let socket = fleet_socket("plain");
     let upstream = FakeUpstream::start(chat_completion_response());
     let router = router_with_config_text(&fleet_config_text(upstream.address.port(), &socket));
     let digest = router.state.config().fleet.digest();
@@ -2374,38 +2405,46 @@ fn a_key_without_the_fleet_permission_cannot_cause_an_activation() {
             .with_state("d-model", "stopped"),
     );
     hypellm_router::testing::attach_fleet(&router, FLEET_KEY);
-
-    // A second key with inference scope and no roles at all.
-    let plain = router
-        .state
-        .keys
-        .create(
-            hypellm_core::ids::TenantId::new("acme").expect("tenant"),
-            hypellm_core::ids::PrincipalId::new("svc:plain").expect("principal"),
-            vec![hypellm_auth::Scope::Inference],
-            None,
-            hypellm_auth::SourceRestriction::Any,
-            Some("a key with no fleet permission".to_owned()),
-            router.state.clock.wall_millis(),
-        )
-        .expect("create key")
-        .into_secret();
+    let plain = plain_key(&router, "svc:plain");
 
     let harness = Harness::start(upstream, router);
-    let raw = format!(
-        "POST /v1/chat/completions HTTP/1.1\r\nHost: router.test\r\n\
-         Content-Type: application/json\r\nConnection: close\r\n\
-         Authorization: Bearer {plain}\r\nContent-Length: {}\r\n\r\n{CHAT_BODY}",
-        CHAT_BODY.len()
-    );
-    let response = harness.raw(&raw);
+    let response = chat_as(&harness, &plain);
 
-    assert_eq!(
-        response.status, 503,
-        "the model is not running and this caller may not start it: {}",
-        response.body
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert!(
+        agent.verbs().iter().any(|v| v.starts_with("ACTIVATE d-model ")),
+        "the plain key's request must have started the model: {:?}",
+        agent.verbs()
     );
-    // And nothing about the fleet reaches the caller.
+    assert_eq!(harness.upstream.served(), 1);
+    agent.stop();
+}
+
+#[allow(clippy::unwrap_used, clippy::expect_used, reason = "specification 18.2 permits these in tests")]
+#[test]
+fn a_caller_the_fleet_grants_keep_off_the_slave_cannot_cause_an_activation() {
+    // The other half of the same property. The alias grant admits the caller;
+    // a fleet grant keeps them off the only slave the model runs on. They must
+    // not be able to make that slave do work, and the refusal names nothing.
+    let socket = fleet_socket("denied");
+    let upstream = FakeUpstream::start(chat_completion_response());
+    let text = fleet_config_text(upstream.address.port(), &socket)
+        + "fleet_grant id=off-h1 scope=principal:svc:denied host=h1 model=* allow=false\n";
+    let router = router_with_config_text(&text);
+    let digest = router.state.config().fleet.digest();
+    let mut agent = hypellm_net::fleet_sim::SimulatedAgent::start(
+        &socket,
+        hypellm_net::fleet_sim::AgentScript::empty(digest, FLEET_KEY)
+            .with_deployment("d-model", hypellm_net::fleet_sim::Behaviour::ReadyAfter(1))
+            .with_state("d-model", "stopped"),
+    );
+    hypellm_router::testing::attach_fleet(&router, FLEET_KEY);
+    let denied = plain_key(&router, "svc:denied");
+
+    let harness = Harness::start(upstream, router);
+    let response = chat_as(&harness, &denied);
+
+    assert_ne!(response.status, 200, "{}", response.body);
     for leak in ["h1", "gpu0", "d-model", "activation", "evict"] {
         assert!(
             !response.body.contains(leak),
@@ -2415,9 +2454,74 @@ fn a_key_without_the_fleet_permission_cannot_cause_an_activation() {
     }
     assert!(
         !agent.verbs().iter().any(|v| v.starts_with("ACTIVATE")),
-        "an unauthorized caller must not reach the agent: {:?}",
+        "a caller kept off the slave must not reach the agent: {:?}",
         agent.verbs()
     );
+    assert_eq!(harness.upstream.served(), 0);
+    agent.stop();
+}
+
+#[allow(clippy::unwrap_used, clippy::expect_used, reason = "specification 18.2 permits these in tests")]
+#[test]
+fn a_grant_withdrawn_after_routing_is_honoured_before_a_model_is_started() {
+    // Routing ran under a configuration that let this caller onto the slave;
+    // by the time the request would start a model there, a publication has
+    // taken them off it. The start is asked about again against the current
+    // configuration, and refused — the agent never hears of it.
+    let socket = fleet_socket("withdrawn");
+    let upstream = FakeUpstream::start(chat_completion_response());
+    let before = fleet_config_text(upstream.address.port(), &socket);
+    let router = router_with_config_text(&before);
+    let digest = router.state.config().fleet.digest();
+    let mut agent = hypellm_net::fleet_sim::SimulatedAgent::start(
+        &socket,
+        hypellm_net::fleet_sim::AgentScript::empty(digest, FLEET_KEY)
+            .with_deployment("d-model", hypellm_net::fleet_sim::Behaviour::ReadyAfter(1))
+            .with_state("d-model", "stopped"),
+    );
+    hypellm_router::testing::attach_fleet(&router, FLEET_KEY);
+
+    let routed_under = router.state.config();
+    let after = before
+        + "fleet_grant id=off-h1 scope=principal:svc:late host=h1 model=* allow=false\n";
+    router
+        .state
+        .config
+        .activate(hypellm_config::load(&after, 2).expect("the withdrawal builds"));
+
+    let mut request = hypellm_adapters::testing::request_fixture();
+    request.principal = hypellm_core::ids::PrincipalId::new("svc:late").expect("principal");
+    request.requested_model = hypellm_core::ids::AliasId::new("test-alias").expect("alias");
+    request.limits.deadline = hypellm_core::time::Deadline::after(
+        router.state.clock.as_ref(),
+        Duration::from_secs(30),
+    );
+    let mut sink = hypellm_router::dispatch::AccumulatingSink::default();
+    let outcome = hypellm_router::pipeline::execute_under(
+        &router.state,
+        &routed_under,
+        &request,
+        &[],
+        &hypellm_core::rbac::PermissionSet::empty(),
+        &mut sink,
+    );
+
+    assert!(!outcome.is_success());
+    assert!(
+        outcome
+            .trace
+            .exclusions
+            .iter()
+            .any(|e| e.reason == hypellm_core::decision::ExclusionReason::FleetAccessDenied),
+        "the start must be refused for the withdrawn grant: {:?}",
+        outcome.trace.exclusions
+    );
+    assert!(
+        !agent.verbs().iter().any(|v| v.starts_with("ACTIVATE")),
+        "{:?}",
+        agent.verbs()
+    );
+    assert_eq!(upstream.served(), 0);
     agent.stop();
 }
 
@@ -2483,6 +2587,76 @@ fn a_job_is_accepted_runs_and_yields_its_result() {
         "the result is not a chat response: {}",
         result.body
     );
+}
+
+#[allow(clippy::unwrap_used, clippy::expect_used, reason = "specification 18.2 permits these in tests")]
+#[test]
+fn a_job_that_finds_every_slot_busy_waits_for_one_rather_than_failing() {
+    // Specification 26.10: a job that fails only for want of capacity goes
+    // back in the queue and runs when a slot frees, within its deadline. The
+    // only target has one slot, held for a second and a half by an
+    // interactive request; the job's first pass finds it busy.
+    let upstream = FakeUpstream::start_sequence(vec![
+        chat_completion_response().after(Duration::from_millis(1_500)),
+        chat_completion_response(),
+    ]);
+    let text = hypellm_router::testing::default_config_text(upstream.address.port())
+        .replace("concurrency=8", "concurrency=1")
+        .replace(
+            "default_deadline_ms=5000 retry_budget_ms=5000",
+            "default_deadline_ms=20000 retry_budget_ms=20000 queue_timeout_ms=100",
+        );
+    let router = router_with_config(&upstream, &text);
+    let harness = Harness::start(upstream, router);
+
+    let address = harness.address;
+    let key = harness.router.api_key.clone();
+    let busy = std::thread::spawn(move || {
+        let raw = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: router.test\r\n\
+             Content-Type: application/json\r\nConnection: close\r\n\
+             Authorization: Bearer {key}\r\nContent-Length: {}\r\n\r\n{CHAT_BODY}",
+            CHAT_BODY.len()
+        );
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream.write_all(raw.as_bytes()).unwrap();
+        let mut text = String::new();
+        let _ = stream.read_to_string(&mut text);
+        text
+    });
+    std::thread::sleep(Duration::from_millis(200));
+
+    let accepted = harness.request("POST", "/v1/jobs", CHAT_BODY, true);
+    assert_eq!(accepted.status, 202, "body: {}", accepted.body);
+    let job_id = accepted
+        .body
+        .split("\"job_id\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("a job id")
+        .to_owned();
+
+    let state = Arc::clone(&harness.router.state);
+    let jobs = state.jobs().expect("the harness enables jobs").clone();
+    let worker = std::thread::spawn(move || hypellm_router::jobs::worker_loop(&state));
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    let mut last = String::new();
+    while std::time::Instant::now() < until {
+        last = harness.request("GET", &format!("/v1/jobs/{job_id}"), "", true).body;
+        if last.contains("\"state\":\"succeeded\"") || last.contains("\"state\":\"failed\"") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    jobs.shutdown();
+    let _ = worker.join();
+    assert!(busy.join().unwrap().starts_with("HTTP/1.1 200"));
+
+    assert!(
+        last.contains("\"state\":\"succeeded\""),
+        "the job failed instead of waiting for the slot: {last}"
+    );
+    assert_eq!(harness.upstream.served(), 2);
 }
 
 #[test]

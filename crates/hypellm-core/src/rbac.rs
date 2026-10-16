@@ -68,6 +68,15 @@ pub enum Permission {
     /// This is the one permission on which a single request can cost the fleet
     /// hours of bandwidth and hundreds of gigabytes of disk.
     FleetFetch,
+    /// Enroll a new slave: mint an enrollment token, and approve, reject or
+    /// revoke what registered with one (specification 26.8).
+    ///
+    /// Separate from [`Permission::FleetActivate`] because its consequence is
+    /// of a different kind: an approval is the first step toward the fleet
+    /// agent holding SSH trust in a machine. It drafts records rather than
+    /// publishing them, so a second person still decides — but minting a
+    /// token hands out a credential, which is why it needs a fresh sign-in.
+    FleetEnroll,
     /// Read fleet topology, residency, and activation history.
     ///
     /// Management-plane data. Host identifiers, memory figures, and which
@@ -100,6 +109,7 @@ impl Permission {
             Self::BreakGlass => "break_glass",
             Self::FleetActivate => "fleet_activate",
             Self::FleetFetch => "fleet_fetch",
+            Self::FleetEnroll => "fleet_enroll",
             Self::ReadFleet => "read_fleet",
         }
     }
@@ -122,6 +132,8 @@ impl Permission {
                 // of gigabytes of disk. That is the same class of consequence
                 // as publishing a policy.
                 | Self::FleetFetch
+                // A token is a credential that lets a machine register.
+                | Self::FleetEnroll
         )
     }
 
@@ -148,6 +160,7 @@ impl Permission {
             Self::BreakGlass,
             Self::FleetActivate,
             Self::FleetFetch,
+            Self::FleetEnroll,
             Self::ReadFleet,
         ]
     }
@@ -175,6 +188,17 @@ pub enum Role {
     /// Read and update key token budgets and payment instructions; cannot
     /// create or revoke a key. Assignable to payment automation.
     KeyBudgetManager,
+    /// Create, revoke and change the expiry of router API keys.
+    ///
+    /// An addition to specification 9.3's table, recorded in
+    /// spec/deferred-issues.html. Without it `ManageKeys` exists only inside
+    /// break-glass, and a key minted under break-glass expires with the
+    /// session that minted it — so no ordinary sign-in could issue a key that
+    /// outlives an hour. Holding this role is what lets a key's lifetime be
+    /// decided by a person rather than by the emergency path's clock; it
+    /// carries nothing else, and a management-scoped key it mints may still
+    /// not carry a role its minter lacks.
+    KeyManager,
     /// Read immutable audit and export views.
     Auditor,
     /// Time-limited full access with reauthentication, reason, and alert.
@@ -192,6 +216,7 @@ impl Role {
             Self::PolicyApprover => "policy_approver",
             Self::CredentialManager => "credential_manager",
             Self::KeyBudgetManager => "key_budget_manager",
+            Self::KeyManager => "key_manager",
             Self::Auditor => "auditor",
             Self::BreakGlassAdmin => "break_glass_admin",
         }
@@ -207,6 +232,7 @@ impl Role {
             "policy_approver" => Self::PolicyApprover,
             "credential_manager" => Self::CredentialManager,
             "key_budget_manager" => Self::KeyBudgetManager,
+            "key_manager" => Self::KeyManager,
             "auditor" => Self::Auditor,
             "break_glass_admin" => Self::BreakGlassAdmin,
             _ => return None,
@@ -233,6 +259,9 @@ impl Role {
                 // usually does not — so it stays out of every default role.
                 P::ReadFleet,
                 P::FleetActivate,
+                // Bringing a machine into the fleet is the operator's job;
+                // making it routable is still a publication by an approver.
+                P::FleetEnroll,
             ],
             Self::PolicyEditor => &[
                 P::ReadSummary,
@@ -257,6 +286,10 @@ impl Role {
             // The role is that permission and nothing a payment system has
             // no use for.
             Self::KeyBudgetManager => &[P::ReadSummary, P::ManageKeyBudgets],
+            // Keys and nothing else: not their budgets, which move an
+            // allowance and are `key_budget_manager`'s, and not the
+            // principals or settings break-glass also carries.
+            Self::KeyManager => &[P::ReadSummary, P::ReadOwnUsage, P::ManageKeys],
             Self::Auditor => &[P::ReadSummary, P::ReadAudit, P::ExportAudit],
             Self::BreakGlassAdmin => &[
                 P::ReadSummary,
@@ -279,6 +312,7 @@ impl Role {
                 P::ReadFleet,
                 P::FleetActivate,
                 P::FleetFetch,
+                P::FleetEnroll,
             ],
         }
     }
@@ -305,6 +339,7 @@ impl Role {
             Self::PolicyApprover,
             Self::CredentialManager,
             Self::KeyBudgetManager,
+            Self::KeyManager,
             Self::Auditor,
             Self::BreakGlassAdmin,
         ]
@@ -418,6 +453,25 @@ mod tests {
         }
         // Automation holds no session to refresh.
         assert!(!Permission::ManageKeyBudgets.requires_reauthentication());
+    }
+
+    #[test]
+    fn a_key_manager_manages_keys_and_nothing_else() {
+        assert!(Role::KeyManager.grants(Permission::ManageKeys));
+        assert!(!Role::KeyManager.is_break_glass());
+        for p in Permission::all() {
+            if Role::KeyManager.grants(*p) {
+                assert!(
+                    matches!(
+                        p,
+                        Permission::ReadSummary | Permission::ReadOwnUsage | Permission::ManageKeys
+                    ),
+                    "key manager unexpectedly holds {p}"
+                );
+            }
+        }
+        // Minting a credential still wants a recent sign-in.
+        assert!(Permission::ManageKeys.requires_reauthentication());
     }
 
     #[test]

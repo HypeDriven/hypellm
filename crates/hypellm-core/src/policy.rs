@@ -19,7 +19,10 @@
 
 use crate::canonical::{CanonicalRequest, Operation, ResponseFormat};
 use crate::decision::{Candidate, Exclusion, ExclusionReason, ResidencyClass, ScoreTerms};
-use crate::ids::{AliasId, BindingId, GroupId, PrincipalId, ProviderId, RequestId, TargetId, TenantId};
+use crate::fleet_access::{FleetAccessDefault, FleetGrant};
+use crate::ids::{
+    AliasId, BindingId, GroupId, HostId, PrincipalId, ProviderId, RequestId, TargetId, TenantId,
+};
 use crate::target::{Alias, AdminState, Provider, Target};
 use hypellm_crypto::Digest;
 use std::collections::{BTreeMap, BTreeSet};
@@ -350,6 +353,13 @@ pub struct RoutingContext<'a> {
     /// Routing stays deterministic in the sense Appendix B requires — equal
     /// inputs, including this one, produce equal ordered candidates.
     pub now_millis: u64,
+    /// The API key's narrowing of the principal's access, when the caller
+    /// authenticated with a restricted key.
+    ///
+    /// `None` and an unrestricted value behave identically. Every check that
+    /// reads it is an additional condition, so no value here can admit what
+    /// the principal's policy refuses.
+    pub key: Option<&'a crate::key_restriction::KeyRestriction>,
 }
 
 impl RoutingContext<'_> {
@@ -435,6 +445,15 @@ pub struct PolicySnapshot {
     /// Zero disables the headroom and compares time-to-ready against the
     /// deadline alone.
     pub activation_effort_headroom_ms: u64,
+    /// The slave each fleet-managed target runs on.
+    ///
+    /// Built from the fleet configuration's deployments. A target absent here
+    /// is not fleet-managed, and no fleet grant applies to it.
+    pub fleet_placement: BTreeMap<TargetId, HostId>,
+    /// Who may use which slave, and which model on it.
+    pub fleet_grants: Vec<FleetGrant>,
+    /// What a caller no fleet grant mentions may use.
+    pub fleet_access_default: FleetAccessDefault,
 }
 
 impl PolicySnapshot {
@@ -455,7 +474,37 @@ impl PolicySnapshot {
             max_failure_percent: 100,
             default_document_token_estimate: crate::canonical::DEFAULT_DOCUMENT_TOKEN_ESTIMATE,
             activation_effort_headroom_ms: 5_000,
+            fleet_placement: BTreeMap::new(),
+            fleet_grants: Vec::new(),
+            fleet_access_default: FleetAccessDefault::Allow,
         }
+    }
+
+    /// Whether the caller may be served by `target` for a request naming
+    /// `alias`, as far as fleet grants are concerned.
+    ///
+    /// True for a target that is not fleet-managed. This is the one predicate
+    /// for the rule: routing filters on it, the models list hides an alias
+    /// none of whose targets pass it, and anything that lets a request cause
+    /// work on a slave must ask it before doing so.
+    #[must_use]
+    pub fn fleet_access_permits(
+        &self,
+        ctx: &RoutingContext<'_>,
+        alias: &AliasId,
+        target: &TargetId,
+    ) -> bool {
+        self.fleet_placement.get(target).is_none_or(|host| {
+            ctx.key.is_none_or(|key| key.permits_host(host))
+                && crate::fleet_access::permits(
+                &self.fleet_grants,
+                self.fleet_access_default,
+                ctx,
+                alias,
+                target,
+                host,
+            )
+        })
     }
 
     /// Whether the principal may use this alias for this operation.
@@ -470,6 +519,13 @@ impl PolicySnapshot {
         alias: &AliasId,
         operation: Operation,
     ) -> bool {
+        // A key restricted away from the alias is refused before the grants
+        // are read, and through this predicate rather than beside it: route,
+        // the models list and the activation check all ask here, so a
+        // restricted alias answers exactly as an ungranted one everywhere.
+        if ctx.key.is_some_and(|key| !key.permits_alias(alias)) {
+            return false;
+        }
         let mut best: Option<(u8, bool)> = None;
         for grant in &self.grants {
             if !grant.covers(operation) {
@@ -510,6 +566,30 @@ impl PolicySnapshot {
         self.aliases
             .values()
             .filter(|a| self.authorizes(ctx, &a.id, operation))
+            .collect()
+    }
+
+    /// Aliases this caller could actually be served by, for `GET /v1/models`.
+    ///
+    /// [`Self::visible_aliases`] less every alias all of whose targets run on
+    /// slaves the caller's fleet grants exclude. Listing such an alias would
+    /// advertise a model that always answers "not available"; leaving it out
+    /// makes it indistinguishable from one that does not exist, which is what
+    /// the data plane answers for it too.
+    ///
+    /// Separate from `visible_aliases` because the management views use that
+    /// one to decide what a *tenant* can reach, and an operator's own fleet
+    /// grants must not shrink what they administer.
+    #[must_use]
+    pub fn servable_aliases(&self, ctx: &RoutingContext<'_>, operation: Operation) -> Vec<&Alias> {
+        self.visible_aliases(ctx, operation)
+            .into_iter()
+            .filter(|a| {
+                a.permitted_targets.iter().any(|t| {
+                    ctx.key.is_none_or(|key| key.permits_target(t))
+                        && self.fleet_access_permits(ctx, &a.id, t)
+                })
+            })
             .collect()
     }
 
@@ -659,6 +739,23 @@ impl PolicySnapshot {
 
         if merged.is_denied(target) {
             return Err(ExclusionReason::DeniedByPolicy);
+        }
+
+        // The key's narrowing, ahead of the fleet grant so a target the key
+        // is kept off reports why. The host half is repeated inside
+        // `fleet_access_permits`, which is what the activation re-check asks.
+        if let Some(key) = ctx.key {
+            let host_refused = self
+                .fleet_placement
+                .get(&target.id)
+                .is_some_and(|host| !key.permits_host(host));
+            if !key.permits_target(&target.id) || host_refused {
+                return Err(ExclusionReason::KeyRestricted);
+            }
+        }
+
+        if !self.fleet_access_permits(ctx, &alias.id, &target.id) {
+            return Err(ExclusionReason::FleetAccessDenied);
         }
 
         if let Some(pin) = &merged.pin {
@@ -1273,6 +1370,7 @@ mod tests {
             tenant,
             attempted,
             now_millis: 0,
+            key: None,
         }
     }
 

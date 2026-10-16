@@ -215,6 +215,7 @@ fn route(snapshot: &PolicySnapshot, request: &CanonicalRequest, live: &dyn LiveS
         tenant: &request.tenant,
         attempted: &attempted,
         now_millis: 0,
+        key: None,
     };
     snapshot.route(&context, request, live)
 }

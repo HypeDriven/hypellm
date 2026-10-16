@@ -71,6 +71,8 @@ pub const SCHEMAS: &[Schema] = &[
             "budget_draw_tokens",
             "fleet_enabled",
             "fleet_state_dir",
+            "fleet_enroll_url",
+            "fleet_access_default",
             "max_documents_per_request",
             "max_document_bytes",
             "max_inline_document_bytes",
@@ -90,6 +92,7 @@ pub const SCHEMAS: &[Schema] = &[
             "max_job_result_bytes",
             "job_retention_ms",
             "max_recovery_waiters",
+            "max_parked_requests",
         ],
         singleton: true,
     },
@@ -180,13 +183,18 @@ pub const SCHEMAS: &[Schema] = &[
     Schema {
         kind: "grant",
         required: &["scope"],
-        optional: &["model", "operations", "allow"],
+        // `id` is optional and inert for routing: it exists so that
+        // `POST /admin/v1/policies:edit` can address one grant. A grant written
+        // without one stays editable only as policy text.
+        optional: &["id", "model", "operations", "allow"],
         singleton: false,
     },
     Schema {
         kind: "quota",
         required: &["scope"],
         optional: &[
+            // Addressing only, as on `grant`; see `edit::QUOTA_EDITABLE`.
+            "id",
             "input_bytes_per_second",
             "input_bytes_burst",
             "output_bytes_per_second",
@@ -255,6 +263,7 @@ pub const SCHEMAS: &[Schema] = &[
             "observation_interval_ms",
             "observation_max_age_ms",
             "request_timeout_ms",
+            "ssh_public_key",
         ],
         singleton: false,
     },
@@ -266,6 +275,12 @@ pub const SCHEMAS: &[Schema] = &[
             "reserved_memory_bytes",
             "max_concurrent_activations",
         ],
+        singleton: false,
+    },
+    Schema {
+        kind: "fleet_grant",
+        required: &["id", "scope", "host", "model", "allow"],
+        optional: &[],
         singleton: false,
     },
     Schema {
@@ -297,7 +312,7 @@ pub const SCHEMAS: &[Schema] = &[
     Schema {
         kind: "artifact",
         required: &["id", "kind", "arch", "digest"],
-        optional: &["size_bytes", "source"],
+        optional: &["size_bytes", "source", "image_id"],
         singleton: false,
     },
     Schema {
@@ -317,6 +332,8 @@ pub const SCHEMAS: &[Schema] = &[
             "memory_drift_tolerance_permille",
             "prewarm_min_rate_per_minute",
             "adopt_unmanaged",
+            "idle_stop_ms",
+            "max_reorder_wait_ms",
         ],
         singleton: false,
     },

@@ -23,7 +23,7 @@
 use hypellm_admin_api::{AdminApi, CorsPolicy, DecisionCache};
 use hypellm_auth::{KeyStore, SessionPolicy, SessionStore, TrustedEdge};
 use hypellm_config::ValidatedConfig;
-use hypellm_core::admission::{AdmissionController, ScopeLimits};
+use hypellm_core::admission::AdmissionController;
 use hypellm_core::health::{BreakerConfig, HealthRegistry};
 use hypellm_core::ids::CredentialRef;
 use hypellm_core::time::{Clock, SystemClock};
@@ -863,6 +863,17 @@ impl Router {
             );
         }
 
+        let (enrollments, unreadable_enrollments) =
+            hypellm_admin_api::enroll::restore(&store, &recovery);
+        if unreadable_enrollments > 0 {
+            telemetry.log(
+                &hypellm_telemetry::Event::warn("store.enrollment_records_unreadable").int_field(
+                    hypellm_telemetry::Field::Count,
+                    u64::try_from(unreadable_enrollments).unwrap_or(u64::MAX),
+                ),
+            );
+        }
+
         let sessions = Arc::new(SessionStore::new(
             &secrets.session,
             SessionPolicy {
@@ -940,6 +951,12 @@ impl Router {
             fleet: std::sync::OnceLock::new(),
             admin_fleet: hypellm_admin_api::FleetSlot::default(),
             recovery_waiters: std::sync::atomic::AtomicU32::new(0),
+        parked_requests: std::sync::atomic::AtomicU32::new(0),
+            enrollment_offers: Arc::new(crate::fleet::EnrollmentOfferer::new(
+                Arc::clone(&enrollments),
+                Arc::clone(&telemetry),
+            )),
+            enrollments,
         });
 
         // Built after the state so it shares the same store, clock, and
@@ -1273,6 +1290,7 @@ fn start_fleet(
         Arc::clone(&state.telemetry),
         Arc::clone(&state.store),
     ) {
+        let runtime = runtime.with_enrollments(Arc::clone(&state.enrollment_offers));
         runtime.adopt_policy(policy);
         // Replay leases and flap counters, then take a first observation.
         // Until one succeeds, every cold orchestrated target is ineligible —
@@ -1336,6 +1354,9 @@ fn observation_interval(state: &RouterState, poll: Duration) -> Duration {
         .unwrap_or(Duration::MAX)
 }
 
+/// How often enrollments are offered when no fleet runtime is running.
+const ENROLLMENT_OFFER_INTERVAL: Duration = Duration::from_secs(5);
+
 fn housekeeping_loop(
     state: &Arc<RouterState>,
     stopping: &crate::server::ShutdownHandle,
@@ -1365,6 +1386,20 @@ fn housekeeping_loop(
         // with a publication.
         let observation_interval = observation_interval(state, POLL);
 
+        // With no runtime — a fleet switched on but with no deployment yet —
+        // enrollments are still delivered, on a fixed cadence: enrolling the
+        // first machine is exactly that situation.
+        if state.fleet().is_none() {
+            since_observation = since_observation.saturating_add(POLL);
+            if since_observation >= ENROLLMENT_OFFER_INTERVAL {
+                since_observation = Duration::ZERO;
+                let config = state.config();
+                if let (Some(key), true) = (fleet_key, config.fleet.enabled) {
+                    let _ = state.enrollment_offers.offer(&config.fleet, key, true);
+                }
+            }
+        }
+
         if let Some(fleet) = state.fleet() {
             since_observation = since_observation.saturating_add(POLL);
             if since_observation >= observation_interval {
@@ -1386,6 +1421,11 @@ fn housekeeping_loop(
                 // refreshed, and on this thread rather than a request's: a
                 // speculative activation must never be something a caller waits
                 // behind.
+                // Idle stop (specification 26.10), on the same freshly
+                // observed belief and on this thread for the same reason as
+                // pre-warm: no caller waits behind a stop.
+                let _ = fleet.idle_stop();
+
                 if let Some(deployment) = fleet.prewarm() {
                     state.telemetry.log(
                         &hypellm_telemetry::Event::info("fleet.prewarm_started")
@@ -1687,13 +1727,6 @@ struct RestoredKeys {
     unreadable: u64,
 }
 
-/// Replay API key records and revocations from the durable log.
-///
-/// Frames are applied in sequence order, so a revocation recorded after a
-/// creation wins — which is what makes specification 22.3's "revocation
-/// bypasses configuration publication delay" survive a restart. Without this
-/// the whole key store is empty on boot and every issued credential stops
-/// authenticating.
 /// Whether the last `AnonymousAccess` frame switched it on.
 ///
 /// Last frame wins; absent means off. A frame whose payload does not parse, or
@@ -1716,6 +1749,14 @@ fn restore_anonymous_access(recovery: &hypellm_store::Recovery) -> bool {
         .unwrap_or(false)
 }
 
+/// Replay API key records, expiry changes and revocations from the durable log.
+///
+/// Frames are applied in sequence order, so a revocation recorded after a
+/// creation wins — which is what makes specification 22.3's "revocation
+/// bypasses configuration publication delay" survive a restart. Without this
+/// the whole key store is empty on boot and every issued credential stops
+/// authenticating. An expiry change sets the expiry alone, so it cannot undo
+/// a revocation whichever order the two were written in.
 fn restore_keys(recovery: &hypellm_store::Recovery, keys: &KeyStore) -> RestoredKeys {
     let mut counts = RestoredKeys::default();
 
@@ -1735,6 +1776,22 @@ fn restore_keys(recovery: &hypellm_store::Recovery, keys: &KeyStore) -> Restored
                 {
                     Some(id) => {
                         keys.revoke(&id);
+                    }
+                    None => counts.unreadable = counts.unreadable.saturating_add(1),
+                }
+            }
+            RecordKind::ApiKeyExpiry => {
+                match hypellm_auth::ExpiryChange::from_payload(&frame.payload) {
+                    Some(change) => {
+                        keys.set_expiry(&change.id, change.expires_at_millis);
+                    }
+                    None => counts.unreadable = counts.unreadable.saturating_add(1),
+                }
+            }
+            RecordKind::ApiKeyRestriction => {
+                match hypellm_auth::RestrictionChange::from_payload(&frame.payload) {
+                    Some(change) => {
+                        keys.set_restrictions(&change.id, change.restrictions);
                     }
                     None => counts.unreadable = counts.unreadable.saturating_add(1),
                 }
@@ -1840,73 +1897,7 @@ fn target_queue_allowance(
 }
 
 fn build_admission(config: &ValidatedConfig, clock: Arc<dyn Clock>) -> AdmissionController {
-    let global = config
-        .quotas
-        .iter()
-        .find(|q| q.scope == hypellm_config::QuotaScope::Global)
-        .map_or(
-            ScopeLimits {
-                max_concurrency: 10_000,
-                ..ScopeLimits::UNLIMITED
-            },
-            |q| q.limits,
-        );
-
-    let admission = AdmissionController::new(clock, global);
-    // Specification 12's Global layer byte rates (`DI-053`). Read from the
-    // global quota, which is the only scope the grammar accepts them on.
-    if let Some(rates) = config
-        .quotas
-        .iter()
-        .find(|q| q.scope == hypellm_config::QuotaScope::Global)
-        .map(|q| q.byte_rates)
-    {
-        admission.configure_byte_rates(
-            rates.input_per_second,
-            rates.input_burst,
-            rates.output_per_second,
-            rates.output_burst,
-        );
-    }
-    for quota in &config.quotas {
-        match &quota.scope {
-            hypellm_config::QuotaScope::Global => {}
-            hypellm_config::QuotaScope::Tenant(t) => {
-                admission.configure_tenant(t, quota.limits);
-                admission.set_class(&format!("tenant:{t}"), quota.class);
-            }
-            hypellm_config::QuotaScope::Principal(p) => {
-                admission.configure_principal(p, quota.limits);
-                admission.set_class(&format!("principal:{p}"), quota.class);
-            }
-            hypellm_config::QuotaScope::Target(t) => admission.configure_target(t, quota.limits),
-            hypellm_config::QuotaScope::Alias { alias, operation } => {
-                admission.configure_alias(alias, *operation, quota.limits);
-            }
-        }
-    }
-    // A target with a declared concurrency but no explicit quota still gets a
-    // ceiling, so an undeclared quota does not mean unlimited.
-    for (id, target) in &config.snapshot.targets {
-        if target.max_concurrency > 0
-            && !config
-                .quotas
-                .iter()
-                .any(|q| q.scope == hypellm_config::QuotaScope::Target(id.clone()))
-        {
-            admission.configure_target(
-                id,
-                ScopeLimits {
-                    max_concurrency: target.max_concurrency,
-                    max_queued: config.settings.default_target_queued,
-                    requests_per_second: target.max_requests_per_second,
-                    request_burst: target.max_requests_per_second,
-                    ..ScopeLimits::UNLIMITED
-                },
-            );
-        }
-    }
-    admission
+    AdmissionController::from_plan(clock, &config.admission_plan())
 }
 
 fn build_oidc_config(config: &ValidatedConfig) -> Option<hypellm_auth::oidc::OidcConfig> {
@@ -2297,6 +2288,217 @@ binding id=b scope=tenant:acme model=* prefer=local:m
             keys.verify(&secret, None, 1_767_225_600_001).is_err(),
             "a revoked key must not authenticate after a restart"
         );
+    }
+
+    /// Create one key, appending its record to `store`, and
+    /// return its identifier and secret.
+    fn key_in_store(store: &Store, verifier_key: &[u8], expires_at: Option<u64>) -> (hypellm_core::ids::KeyId, String) {
+        let keys = KeyStore::new(verifier_key);
+        let new_key = keys
+            .create(
+                hypellm_core::ids::TenantId::new("acme").expect("tenant"),
+                hypellm_core::ids::PrincipalId::new("svc:test").expect("principal"),
+                vec![hypellm_auth::Scope::Inference],
+                expires_at,
+                hypellm_auth::SourceRestriction::Any,
+                None,
+                1_767_225_600_000,
+            )
+            .expect("entropy");
+        store
+            .append(RecordKind::ApiKey, &new_key.record.to_payload())
+            .expect("append");
+        let id = new_key.id().clone();
+        (id, new_key.into_secret())
+    }
+
+    #[test]
+    fn an_extended_expiry_survives_a_restart() {
+        // The key was created to expire at T+1s and extended past it. A replay
+        // that skipped the change would kill the key at the old time.
+        let dir = TempDir::new("startup-expiry");
+        let verifier_key = b"a-key-verifier-key-for-these-tests";
+        let created = 1_767_225_600_000;
+        let (id, secret) = {
+            let (store, _) = Store::open(dir.path(), b"a-store-mac-key-for-these-tests", 0)
+                .expect("open store");
+            let (id, secret) = key_in_store(&store, verifier_key, Some(created + 1_000));
+            let change = hypellm_auth::ExpiryChange {
+                id: id.clone(),
+                expires_at_millis: Some(created + 86_400_000),
+            };
+            store
+                .append(RecordKind::ApiKeyExpiry, &change.to_payload())
+                .expect("append expiry");
+            (id, secret)
+        };
+
+        let (_store, recovery) = Store::open(dir.path(), b"a-store-mac-key-for-these-tests", 0)
+            .expect("reopen");
+        let keys = KeyStore::new(verifier_key);
+        let counts = restore_keys(&recovery, &keys);
+
+        assert_eq!(counts, RestoredKeys { restored: 1, unreadable: 0 });
+        assert_eq!(
+            keys.get(&id).and_then(|r| r.expires_at_millis),
+            Some(created + 86_400_000)
+        );
+        assert!(
+            keys.verify(&secret, None, created + 60_000).is_ok(),
+            "a key past its original expiry but inside the extended one must authenticate"
+        );
+    }
+
+    #[test]
+    fn an_expiry_change_after_a_revocation_does_not_resurrect_the_key() {
+        // An expiry change that raced a revocation can land after it in the log.
+        // Replaying it must move the expiry and nothing else.
+        let dir = TempDir::new("startup-expiry-after-revoke");
+        let verifier_key = b"a-key-verifier-key-for-these-tests";
+        let (id, secret) = {
+            let (store, _) = Store::open(dir.path(), b"a-store-mac-key-for-these-tests", 0)
+                .expect("open store");
+            let (id, secret) = key_in_store(&store, verifier_key, Some(1_767_225_601_000));
+            store
+                .append(RecordKind::ApiKeyRevocation, id.as_str().as_bytes())
+                .expect("append revocation");
+            let change = hypellm_auth::ExpiryChange { id: id.clone(), expires_at_millis: None };
+            store
+                .append(RecordKind::ApiKeyExpiry, &change.to_payload())
+                .expect("append expiry");
+            (id, secret)
+        };
+
+        let (_store, recovery) = Store::open(dir.path(), b"a-store-mac-key-for-these-tests", 0)
+            .expect("reopen");
+        let keys = KeyStore::new(verifier_key);
+        restore_keys(&recovery, &keys);
+
+        assert!(keys.get(&id).is_some_and(|r| r.revoked), "the key was resurrected");
+        assert!(keys.verify(&secret, None, 1_767_225_600_001).is_err());
+    }
+
+    #[test]
+    fn an_unreadable_expiry_change_is_counted_and_leaves_the_expiry_alone() {
+        let dir = TempDir::new("startup-bad-expiry");
+        let verifier_key = b"a-key-verifier-key-for-these-tests";
+        let id = {
+            let (store, _) = Store::open(dir.path(), b"a-store-mac-key-for-these-tests", 0)
+                .expect("open store");
+            let (id, _) = key_in_store(&store, verifier_key, Some(1_767_225_601_000));
+            store
+                .append(
+                    RecordKind::ApiKeyExpiry,
+                    format!("{{\"id\":\"{}\"}}", id.as_str()).as_bytes(),
+                )
+                .expect("append");
+            id
+        };
+        let (_store, recovery) = Store::open(dir.path(), b"a-store-mac-key-for-these-tests", 0)
+            .expect("reopen");
+        let keys = KeyStore::new(verifier_key);
+        let counts = restore_keys(&recovery, &keys);
+        assert_eq!(counts, RestoredKeys { restored: 1, unreadable: 1 });
+        assert_eq!(keys.get(&id).and_then(|r| r.expires_at_millis), Some(1_767_225_601_000));
+    }
+
+    fn narrowed_to_agent() -> hypellm_core::key_restriction::KeyRestriction {
+        hypellm_core::key_restriction::KeyRestriction {
+            models: Some([hypellm_core::ids::AliasId::new("agent").unwrap()].into_iter().collect()),
+            priority: Some(hypellm_core::admission::PriorityClass::Batch),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_keys_restrictions_survive_a_restart_and_the_last_change_wins() {
+        // A replay that skipped the frame would bring the key back
+        // unrestricted, which is the widening the restriction exists to stop.
+        let dir = TempDir::new("startup-restriction");
+        let verifier_key = b"a-key-verifier-key-for-these-tests";
+        let id = {
+            let (store, _) = Store::open(dir.path(), b"a-store-mac-key-for-these-tests", 0)
+                .expect("open store");
+            let (id, _) = key_in_store(&store, verifier_key, None);
+            for restrictions in [Default::default(), narrowed_to_agent()] {
+                let change = hypellm_auth::RestrictionChange { id: id.clone(), restrictions };
+                store
+                    .append(RecordKind::ApiKeyRestriction, &change.to_payload())
+                    .expect("append restriction");
+            }
+            id
+        };
+        let (_store, recovery) = Store::open(dir.path(), b"a-store-mac-key-for-these-tests", 0)
+            .expect("reopen");
+        let keys = KeyStore::new(verifier_key);
+        let counts = restore_keys(&recovery, &keys);
+        assert_eq!(counts, RestoredKeys { restored: 1, unreadable: 0 });
+        assert_eq!(keys.get(&id).map(|r| r.restrictions), Some(narrowed_to_agent()));
+    }
+
+    #[test]
+    fn a_restriction_change_after_a_revocation_does_not_resurrect_the_key() {
+        let dir = TempDir::new("startup-restriction-after-revoke");
+        let verifier_key = b"a-key-verifier-key-for-these-tests";
+        let (id, secret) = {
+            let (store, _) = Store::open(dir.path(), b"a-store-mac-key-for-these-tests", 0)
+                .expect("open store");
+            let (id, secret) = key_in_store(&store, verifier_key, None);
+            store
+                .append(RecordKind::ApiKeyRevocation, id.as_str().as_bytes())
+                .expect("append revocation");
+            let change = hypellm_auth::RestrictionChange {
+                id: id.clone(),
+                restrictions: Default::default(),
+            };
+            store
+                .append(RecordKind::ApiKeyRestriction, &change.to_payload())
+                .expect("append restriction");
+            (id, secret)
+        };
+        let (_store, recovery) = Store::open(dir.path(), b"a-store-mac-key-for-these-tests", 0)
+            .expect("reopen");
+        let keys = KeyStore::new(verifier_key);
+        restore_keys(&recovery, &keys);
+        assert!(keys.get(&id).is_some_and(|r| r.revoked), "the key was resurrected");
+        assert!(keys.verify(&secret, None, 1_767_225_600_001).is_err());
+    }
+
+    #[test]
+    fn an_unreadable_restriction_change_is_counted_and_lifts_nothing() {
+        let dir = TempDir::new("startup-bad-restriction");
+        let verifier_key = b"a-key-verifier-key-for-these-tests";
+        let id = {
+            let (store, _) = Store::open(dir.path(), b"a-store-mac-key-for-these-tests", 0)
+                .expect("open store");
+            let (id, _) = key_in_store(&store, verifier_key, None);
+            let change = hypellm_auth::RestrictionChange {
+                id: id.clone(),
+                restrictions: narrowed_to_agent(),
+            };
+            store
+                .append(RecordKind::ApiKeyRestriction, &change.to_payload())
+                .expect("append restriction");
+            // Damaged: no `models` field. Read as "absent" it would lift the
+            // narrowing above.
+            store
+                .append(
+                    RecordKind::ApiKeyRestriction,
+                    format!(
+                        "{{\"id\":\"{}\",\"targets\":null,\"hosts\":null,\"priority\":null}}",
+                        id.as_str()
+                    )
+                    .as_bytes(),
+                )
+                .expect("append");
+            id
+        };
+        let (_store, recovery) = Store::open(dir.path(), b"a-store-mac-key-for-these-tests", 0)
+            .expect("reopen");
+        let keys = KeyStore::new(verifier_key);
+        let counts = restore_keys(&recovery, &keys);
+        assert_eq!(counts, RestoredKeys { restored: 1, unreadable: 1 });
+        assert_eq!(keys.get(&id).map(|r| r.restrictions), Some(narrowed_to_agent()));
     }
 
     #[test]

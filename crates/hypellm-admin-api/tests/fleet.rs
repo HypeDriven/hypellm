@@ -39,6 +39,8 @@ struct Recorder {
     calls: Mutex<Vec<String>>,
     activations: AtomicU32,
     refuse: Mutex<Option<&'static str>>,
+    /// What `next_activations` answers.
+    next: Mutex<Vec<hypellm_fleet::schedule::NextActivation>>,
 }
 
 impl Recorder {
@@ -76,6 +78,7 @@ fn fleet() -> FleetConfig {
             observation_interval_ms: 5_000,
             observation_max_age_ms: 30_000,
             request_timeout_ms: 5_000,
+            ssh_public_key: None,
         },
     );
     fleet.hosts.insert(
@@ -160,6 +163,13 @@ impl FleetControl for Recorder {
         }
         Ok(artifact.to_owned())
     }
+    fn copy(&self, artifact: &str, from: &str, to: &str) -> Result<String, &'static str> {
+        self.record(&format!("copy:{artifact}:{from}:{to}"));
+        if let Some(code) = self.refusal() {
+            return Err(code);
+        }
+        Ok(artifact.to_owned())
+    }
     fn patch(&self, deployment: &str, patch: DeploymentPatch) -> Result<(), &'static str> {
         self.record(&format!("patch:{deployment}:{patch:?}"));
         if let Some(code) = self.refusal() {
@@ -175,6 +185,9 @@ impl FleetControl for Recorder {
     }
     fn now_ms(&self) -> u64 {
         2_000
+    }
+    fn next_activations(&self) -> Vec<hypellm_fleet::schedule::NextActivation> {
+        self.next.lock().map(|n| n.clone()).unwrap_or_default()
     }
 }
 
@@ -486,4 +499,99 @@ fn the_fleet_view_shows_a_tenant_none_of_another_tenants_deployments_or_hosts() 
     let simulated = admin.post(&editor, "/admin/v1/fleet:simulate", r#"{"target":"spark:music3"}"#);
     assert_eq!(simulated.status, 404, "{}", simulated.body);
     assert!(recorder.calls().is_empty(), "{:?}", recorder.calls());
+}
+
+fn next_on_spark(deployment: &str) -> hypellm_fleet::schedule::NextActivation {
+    hypellm_fleet::schedule::NextActivation {
+        host: HostId::new("spark").unwrap(),
+        deployment: DeploymentId::new(deployment).unwrap(),
+        waiting: 3,
+        waited_ms: 4_500,
+        reason: "ranked",
+        contenders: 2,
+    }
+}
+
+#[test]
+fn the_next_activation_is_shown_only_when_the_caller_may_see_that_deployment() {
+    // Specification 26.11: the fleet view says what each host would load next
+    // and why. Another tenant's waiting model must not be named, and must not
+    // appear as a redacted row either — its presence would say something of
+    // theirs is waiting.
+    let visible = Arc::new(Recorder::default());
+    *visible.next.lock().unwrap() = vec![next_on_spark("spark-music3")];
+    let (admin, _) = harness_with(visible);
+    let view = admin.get(&session(&admin, Role::Operator), "/admin/v1/fleet");
+    assert_eq!(view.status, 200, "{}", view.body);
+    let json = view.json();
+    let host = &json.field_array("hosts").unwrap()[0];
+    let next = host.get("next_activation").expect("present");
+    assert_eq!(next.get("deployment").and_then(|v| v.as_str()), Some("spark-music3"));
+    assert_eq!(next.get("reason").and_then(|v| v.as_str()), Some("ranked"));
+    assert_eq!(next.get("waiting").and_then(|v| v.as_u64()), Some(3));
+    assert_eq!(host.get("max_reorder_wait_ms").and_then(|v| v.as_u64()), Some(120_000));
+
+    let hidden = Arc::new(Recorder::default());
+    *hidden.next.lock().unwrap() = vec![next_on_spark("someone-elses-model")];
+    let (admin, _) = harness_with(hidden);
+    let view = admin.get(&session(&admin, Role::Operator), "/admin/v1/fleet");
+    assert_eq!(view.status, 200, "{}", view.body);
+    assert!(!view.body_contains("someone-elses-model"), "{}", view.body);
+    let json = view.json();
+    let host = &json.field_array("hosts").unwrap()[0];
+    assert!(
+        matches!(host.get("next_activation"), Some(wire_json::Value::Null)),
+        "{}",
+        view.body
+    );
+}
+
+#[test]
+fn a_copy_needs_the_fetch_permission_names_both_hosts_and_is_audited() {
+    // A copy commits a host's disk and the fleet's bandwidth exactly as a
+    // fetch does, so it is gated the same way.
+    let (admin, recorder) = harness_with(Arc::new(Recorder::default()));
+    for role in [Role::Operator, Role::PolicyEditor, Role::Viewer] {
+        let session = admin.session("user:operator", TENANT_A, &[role]);
+        let response = admin.post(
+            &session,
+            "/admin/v1/fleet/artifacts/music3:copy",
+            r#"{"from":"spark","to":"rig"}"#,
+        );
+        assert_eq!(response.status, 403, "{role:?} must not be able to start a copy");
+    }
+    assert!(recorder.calls().is_empty());
+
+    let breakglass = admin.session("user:operator", TENANT_A, &[Role::BreakGlassAdmin]);
+    let missing = admin.post(
+        &breakglass,
+        "/admin/v1/fleet/artifacts/music3:copy",
+        r#"{"to":"rig"}"#,
+    );
+    assert_eq!(missing.status, 400, "a copy without a source is not a copy");
+    assert!(recorder.calls().is_empty());
+
+    let response = admin.post(
+        &breakglass,
+        "/admin/v1/fleet/artifacts/music3:copy",
+        r#"{"from":"spark","to":"rig"}"#,
+    );
+    assert_eq!(response.status, 200);
+    assert_eq!(recorder.calls(), vec!["copy:music3:spark:rig".to_owned()]);
+    assert!(audited(&admin, "fleet.copy"));
+}
+
+#[test]
+fn a_refused_copy_says_why_and_is_not_audited_as_done() {
+    let (admin, recorder) = harness_with(Recorder::refusing("copy_source_unverified"));
+    let breakglass = admin.session("user:operator", TENANT_A, &[Role::BreakGlassAdmin]);
+    let response = admin.post(
+        &breakglass,
+        "/admin/v1/fleet/artifacts/music3:copy",
+        r#"{"from":"spark","to":"rig"}"#,
+    );
+    assert_eq!(response.status, 409);
+    assert!(response.body_contains("kept checksum"));
+    assert!(!recorder.calls().is_empty());
+    assert!(!audited(&admin, "fleet.copy"));
 }

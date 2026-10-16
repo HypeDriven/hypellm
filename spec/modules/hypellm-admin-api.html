@@ -177,7 +177,17 @@ second person who reads what they were shown (<code>DI-047</code>).</p>
 <code>set</code>/<code>remove</code> edits, rendered by <code>hypellm_config::edit</code> against the active
 configuration into a draft that is validated at once and still published
 through <code>:publish</code>. It needs <code>EditPolicy</code>, and cannot reach keys, credentials,
-local users, role bindings, quotas or any <code>settings</code> field but <code>fleet_enabled</code>.
+local users, role bindings, a quota's limits, a grant or quota beyond a principal or
+group, or any <code>settings</code> field but <code>fleet_enabled</code>.
+The Principal access screen drafts a principal's ceiling through it: <code>grant</code>
+records for models, one <code>binding</code> with <code>deny=</code> for slaves, and a class-only
+<code>quota</code> for queue priority and limits.
+<strong>Quotas apply on activation.</strong> <code>:publish</code> and <code>policies:rollback</code> hand
+the activated configuration's <code>admission_plan</code> — every scope's limits, the
+global byte rates and the queue classes — to <code>AdmissionController::apply</code>,
+which reconfigures the running scopes in place. A published or rolled-back
+quota is enforced at once, with what each scope has in flight, queued and spent
+carried over.
 <code>GET /admin/v1/policies/active</code> returns the records alongside the canonical
 text for the forms, without <code>local_user</code> records.</p>
 <p><strong>Key budgets</strong> (specification 12.3) are three endpoints under
@@ -197,8 +207,50 @@ original receipt; the same identifier with different content is
 old and new limit and the external operation. The ledger is
 <code>hypellm_core::budget</code>, shared with the data path by <code>Arc</code>; <code>budget.rs</code> here is
 its durable codec and its store-backed journal.</p>
+<p><strong>Key expiry</strong> is <code>PUT /admin/v1/keys/{id}/expiry</code> with
+<code>{"expires_at": &lt;milliseconds&gt; | null}</code>, where <code>null</code> removes the expiry and an
+absent field is refused rather than read as <code>null</code>. It needs <code>ManageKeys</code> and
+<code>If-Match</code>; every listed key carries an <code>etag</code> over its id, expiry and
+revocation, so a tag read before a revocation no longer matches after it. A
+revoked key is <code>409</code>; an expiry now or in the past is <code>400</code> — revocation is how
+a key is stopped. An expired key may be given a later expiry, and its secret
+authenticates again. The authority checks are creation's: a management-scoped
+key is refused unless the caller holds its principal's roles outside
+break-glass, and when the caller's key authority is break-glass alone — the
+offline token, or no role but <code>break_glass_admin</code> granting
+<code>ManageKeys</code> — the expiry may be no later than the session's end and may
+not be removed. A <code>key_manager</code> is not capped; <code>GET /admin/v1/session</code>
+reports which applies as <code>keys_capped_to_session</code>. The audit record precedes the change and
+names both expiries. The change is <code>RecordKind::ApiKeyExpiry</code>, carrying the key id
+and the expiry only — never a re-appended key record, whose <code>revoked</code> field,
+read before a racing revocation, would un-revoke the key on replay.</p>
+<p><strong>Key restrictions</strong> narrow one key within its principal's access.
+<code>GET /admin/v1/keys/{id}/restrictions</code> returns the key's restrictions beside the
+principal's <em>ceiling</em> under the active configuration — the aliases it is granted for any
+operation (each with the targets its fleet grants let it reach), those targets with their
+provider and slave, the slaves, and its admission class — and how many other live keys
+share the principal. <code>PUT</code> replaces the restrictions whole with
+<code>{"models", "targets", "hosts", "priority"}</code>, each <code>null</code> to narrow nothing; an
+absent field is refused rather than read as <code>null</code>, and an empty list is refused
+because a key that may use nothing should be revoked. Every entry must lie inside the
+ceiling and the priority may not be above the principal's, or the change is refused naming
+the configured entry; an entry the configuration does not declare is refused without echoing
+it. The check is a courtesy: routing intersects the restriction with the live policy on every
+request, so a later publication that shrinks the principal's access shrinks the key's with it.
+<code>ManageKeys</code>, <code>If-Match</code> against the key's <code>etag</code> — which now covers the restrictions
+too, so an expiry edit and a restriction edit cannot lose each other — and <code>409</code> on a
+revoked key, exactly as for expiry. No second person is required, because nothing here can
+widen what the policy allows. The audit record (<code>key_restrictions_changed</code>) precedes the
+change and names both states; the change is <code>RecordKind::ApiKeyRestriction</code>, never a
+re-appended key record. Listed keys carry <code>restrictions</code>. Both endpoints are additions to
+specification 16, recorded in <code>spec/deferred-issues.html</code>.</p>
 <h3 id="the-fleet-surface">The fleet surface</h3>
-<p>Seven endpoints under <code>/admin/v1/fleet</code> (specification 26). The live fleet is
+<p>Eight endpoints under <code>/admin/v1/fleet</code> (specification 26), the eighth being
+<code>POST /fleet/artifacts/{id}:copy</code> (26.12), gated by <code>fleet_fetch</code> like a fetch
+and audited <code>fleet.copy</code>. <code>GET /fleet</code> adds an <code>artifacts</code> list: for each artifact
+a visible deployment uses, the kept checksum and whether it was pinned or
+learned, and each visible host's reported image ID as <code>verified</code>,
+<code>tampered</code> or <code>unverified</code>; a simulated copy step names no source host. The live fleet is
 reached through the <code>FleetControl</code> trait, the same shape <code>CredentialSink</code>
 already uses and for the same reason: the router depends on this crate rather
 than the other way round, so the management API knows <em>what</em> it may ask for and
@@ -234,6 +286,42 @@ carries an <code>etag</code> over its patchable fields (<code>fleet::deployment_
 <p><code>fleet_activate</code> and <code>fleet_fetch</code> are separate permissions, and <code>fleet_fetch</code>
 requires a fresh authentication: it is the one action on which a single request
 can cost the fleet hours of bandwidth and hundreds of gigabytes of disk.</p>
+<h3 id="enrollment">Enrollment</h3>
+<p>Specification 26.8. <code>GET</code>/<code>POST /admin/v1/fleet/enrollments</code> and
+<code>…/{id}:approve|:reject|:revoke</code> sit behind the usual gate and need
+<code>fleet_enroll</code> (fresh authentication; approval also needs <code>edit_policy</code>,
+because it drafts records). They do not depend on a running fleet: the registry
+is <code>AdminState::enrollments</code>, not <code>FleetControl</code>. The token is returned once
+and stored only as a digest (<code>enroll::StoreJournal</code> commits
+<code>RecordKind::FleetEnrollment</code> frames before a change is visible). Approval goes
+through <code>hypellm_config::edit</code> exactly as <code>policies:edit</code> does and publishes
+nothing.</p>
+<p><code>AdminApi::handle_enrollment</code> serves the two public endpoints,
+<code>POST /fleet/v1/enroll:begin</code> and <code>:complete</code>. They are the only routes in this
+crate reached with no session and no key: they refuse any request carrying
+<code>Origin</code>, answer 404 unless <code>settings fleet_enroll_url</code> is set, give one answer
+for every unusable token, and throttle failures router-wide. The install script
+they belong to is <code>enroll::INSTALL_SCRIPT</code>, compiled in from
+<code>host/install.sh</code>.</p>
+<p><code>GET /admin/v1/fleet</code> reports, per deployment, <code>waiting</code> — the requests
+queued or parked for its capability, a whole-fleet figure — and
+<code>idle_stop_ms</code>, the host policy's idle window or <code>null</code> when idle stop is off
+(specification 26.10). Per host it reports <code>max_reorder_wait_ms</code> and
+<code>next_activation</code> — the deployment the scheduler would load next, its waiting
+count and age, and the reason — from <code>FleetControl::next_activations</code>, or
+<code>null</code> when that deployment is not one the caller's tenant can see
+(specification 26.11).</p>
+<h3 id="slave-access">Slave access</h3>
+<p>Specification 26.9. <code>GET /admin/v1/fleet/access</code> (<code>fleet_access</code> module) needs
+<code>read_fleet</code> and answers from configuration, so it works with no fleet runtime.
+It shows the hosts and models the caller's tenant can reach, the fleet grants
+whose scope concerns that tenant and whose host and target are themselves
+shown, and the default. The tenant's principals — from identities, local users,
+group membership and unrevoked API keys — are added only for a caller who also
+holds <code>edit_policy</code>, the permission needed to act on them; otherwise
+<code>subjects</code> is <code>null</code>. Writes are <code>fleet_grant</code> and <code>settings
+fleet_access_default</code> edits through <code>policies:edit</code>; there is no write endpoint
+here.</p>
 <h2 id="threat-notes">Threat notes</h2>
 <ul>
 <li><strong>A management API key as a route around the session controls.</strong> <code>/admin/v1</code>
@@ -544,7 +632,7 @@ does <strong>not</strong> currently bound. They are listed as gaps, not as limit
 </table></div>
 <h2 id="fuzz-targets">Fuzz targets</h2>
 <p>Specification 21 lists the management API as a required fuzz surface, and
-<code>tests/fuzz.rs</code> is that suite: eleven targets driving the real <code>AdminApi::handle</code>
+<code>tests/fuzz.rs</code> is that suite: twelve targets driving the real <code>AdminApi::handle</code>
 through the behavioural harness, so a mutation passes the gate, the session
 check, and the CSRF check exactly as a request would. The engine is
 <code>hypellm-test-corpus::fuzz</code>; there is no <code>fuzz/</code> directory and no libFuzzer,
@@ -600,6 +688,10 @@ because specification 4 admits no such dependency.</p>
 <tr>
 <td><code>a_credit_moves_the_limit_by_the_amount_it_named_or_not_at_all</code></td>
 <td>No credit body changes a limit by anything but its stated positive integer</td>
+</tr>
+<tr>
+<td><code>no_enrollment_body_registers_a_machine_without_the_token</code></td>
+<td>Mutated registration bodies against the public <code>/fleet/v1/enroll:complete</code>, which takes no session: nothing registers without the minted token, and only the minted enrollment exists afterwards</td>
 </tr>
 </tbody>
 </table></div>

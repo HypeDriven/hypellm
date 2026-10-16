@@ -287,6 +287,7 @@ pub fn routing_decision(plan: Plan) -> ScenarioReport {
         tenant: &fixture.request.tenant,
         attempted: &attempted,
         now_millis: 0,
+        key: None,
     };
 
     let mut route = Samples::new("route", Unit::Micros, plan.iterations);

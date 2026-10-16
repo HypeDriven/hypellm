@@ -142,14 +142,14 @@ things:</p>
 <td>4, 9.1</td>
 </tr>
 <tr>
-<td>Client for the fleet agent</td>
+<td>Client for the fleet agent, including the <code>ENROLL</code> offer on a connection of its own (<code>FleetAgentClient::enroll</code>), which proceeds when the digests disagree and sends nothing after it, and <code>FleetSession::copy</code>, whose one non-identifier field is a validated <code>ImageId</code></td>
 <td><code>fleet</code></td>
-<td>26.2</td>
+<td>26.2, 26.8, 26.12</td>
 </tr>
 <tr>
-<td>A conformant simulated fleet agent, behind <code>test-harness</code></td>
+<td>A conformant simulated fleet agent, behind <code>test-harness</code>. It reports artifact placements with image IDs and serves <code>COPY</code>: a copy completes only when what the source "sent" hashes to the ID asked for, and then appears on the destination</td>
 <td><code>fleet_sim</code></td>
-<td>26.2</td>
+<td>26.2, 26.12</td>
 </tr>
 </tbody>
 </table></div>

@@ -4,6 +4,9 @@
  * Specification 15.3: "Create once, scope, expiry, last-used metadata, revoke;
  * secret never displayed again." Specification 16: `POST /admin/v1/keys` returns
  * a one-time secret and `DELETE /admin/v1/keys/{id}` revokes immediately.
+ * `PUT /admin/v1/keys/{id}/expiry` moves or removes an outstanding key's expiry,
+ * and `GET`/`PUT /admin/v1/keys/{id}/restrictions` narrow what one key may use
+ * within what its principal may use.
  *
  * Four decisions here are worth explaining, because each of them is a place
  * where the obvious implementation would be wrong:
@@ -244,7 +247,12 @@ export async function mount(container, ctx) {
     replace(tableRegion, [
       table({
         caption: `API keys — ${caption}`,
-        columns: columns(askRevoke, ctx.can('manage_key_budgets') ? askBudget : null),
+        columns: columns(
+          askRevoke,
+          askExpiry,
+          askAccess,
+          ctx.can('manage_key_budgets') ? askBudget : null,
+        ),
         rows,
         empty: emptyMessage(state),
       }),
@@ -274,6 +282,68 @@ export async function mount(container, ctx) {
             return;
           }
           replace(confirmRegion, []);
+          await refresh();
+        },
+      }),
+    );
+  }
+
+  /**
+   * Open the expiry editor for a key.
+   *
+   * @param {object} row
+   * @param {HTMLElement} trigger The button that opened the editor.
+   */
+  function askExpiry(row, trigger) {
+    const close = () => {
+      replace(confirmRegion, []);
+      if (trigger.isConnected) {
+        trigger.focus();
+      }
+    };
+    replace(
+      confirmRegion,
+      expiryEditor(ctx, row, {
+        onClose: close,
+        onChanged: async () => {
+          if (state.disposed) {
+            return;
+          }
+          replace(confirmRegion, []);
+          if (refreshButton.isConnected) {
+            refreshButton.focus();
+          }
+          await refresh();
+        },
+      }),
+    );
+  }
+
+  /**
+   * Open the access editor for a key.
+   *
+   * @param {object} row
+   * @param {HTMLElement} trigger The button that opened the editor.
+   */
+  function askAccess(row, trigger) {
+    const close = () => {
+      replace(confirmRegion, []);
+      if (trigger.isConnected) {
+        trigger.focus();
+      }
+    };
+    replace(
+      confirmRegion,
+      accessEditor(ctx, row, {
+        onClose: close,
+        onChanged: async () => {
+          if (state.disposed) {
+            return;
+          }
+          replace(confirmRegion, []);
+          if (refreshButton.isConnected) {
+            refreshButton.focus();
+          }
           await refresh();
         },
       }),
@@ -313,10 +383,10 @@ export async function mount(container, ctx) {
   /** @param {object} row */
   async function revoke(row) {
     try {
-      // No `If-Match`: `revoke_key` guards on nothing but tenant ownership and
-      // the router publishes no ETag for a key record. Sending a precondition
-      // the router does not check would be theatre, and specification 15.4 asks
-      // for `If-Match` where the resource is versioned, which this is not.
+      // No `If-Match`, deliberately: `revoke_key` checks none. Revocation is
+      // monotonic and idempotent, so there is no lost update to prevent, and a
+      // 412 from a concurrent revoke would refuse the one operation that should
+      // never be refused. The key's ETag exists for the expiry editor.
       await ctx.api.delete(`/keys/${encodeURIComponent(row.id)}`);
     } catch (error) {
       if (error instanceof ApiError && error.needsReauthentication) {
@@ -612,15 +682,460 @@ function budgetEditor(ctx, row, { onClose, onChanged }) {
 }
 
 /**
+ * The UTC calendar day of a millisecond time, as a date input holds it.
+ *
+ * @param {unknown} millis
+ * @returns {string} `YYYY-MM-DD`, or empty when there is no usable time.
+ */
+function utcDay(millis) {
+  if (typeof millis !== 'number' || !Number.isFinite(millis)) {
+    return '';
+  }
+  return new Date(millis).toISOString().slice(0, 10);
+}
+
+/**
+ * The expiry editor: a later day, an earlier one, or no expiry at all.
+ *
+ * Carries the key's ETag, so a change made against an expiry somebody else
+ * has since moved — or against a key revoked since the list was read — is
+ * refused rather than applied on top of it.
+ *
+ * When the session's key authority is break-glass alone, the router caps a
+ * key's expiry at the session's own end and refuses "no expiry", exactly as it
+ * does at creation: break-glass authority is meant to end with the session,
+ * and a key that outlived it would carry it on. A `key_manager` is not capped,
+ * even when it also holds break-glass. The router reports which applies as
+ * `keys_capped_to_session`; the editor says so up front instead of letting the
+ * operator discover it from a refusal.
+ *
+ * @param {object} ctx
+ * @param {object} row
+ * @param {{onClose: () => void, onChanged: () => Promise<void>}} handlers
+ * @returns {HTMLElement}
+ */
+function expiryEditor(ctx, row, { onClose, onChanged }) {
+  const capped = Boolean(ctx.session && ctx.session.keys_capped_to_session);
+  const current = typeof row.expires_at === 'number' ? row.expires_at : null;
+
+  const day = el('input', { type: 'date', value: utcDay(current) });
+  const never = el('input', {
+    type: 'checkbox',
+    id: 'key-expiry-never',
+    'aria-describedby': 'key-expiry-never-hint',
+  });
+  never.checked = current === null && !capped;
+  never.disabled = capped;
+  day.disabled = never.checked;
+  never.addEventListener('change', () => {
+    day.disabled = never.checked;
+  });
+
+  const status = el('p', { class: 'field__hint', role: 'status', 'aria-live': 'polite' });
+
+  const save = actionButton(
+    'Save expiry',
+    async () => {
+      status.textContent = '';
+      /** @type {number|null} */
+      let expiresAt = null;
+      if (!never.checked) {
+        if (!day.value) {
+          status.textContent = capped
+            ? 'Choose a day. On break-glass authority a key\u2019s expiry cannot be removed.'
+            : 'Choose a day, or tick \u201cNo expiry\u201d.';
+          day.focus();
+          return;
+        }
+        // UTC midnight, as at creation: the moment shown is the moment stored.
+        const parsed = Date.parse(`${day.value}T00:00:00Z`);
+        if (!Number.isFinite(parsed)) {
+          status.textContent = 'The date could not be read. Use the date picker or YYYY-MM-DD.';
+          day.focus();
+          return;
+        }
+        if (parsed <= Date.now()) {
+          status.textContent =
+            'That day is now or in the past. To stop the key working, revoke it instead.';
+          day.focus();
+          return;
+        }
+        expiresAt = parsed;
+      }
+      try {
+        await ctx.api.put(`/keys/${encodeURIComponent(row.id)}/expiry`, { expires_at: expiresAt }, row.etag);
+      } catch (error) {
+        if (error instanceof ApiError && error.needsReauthentication) {
+          status.textContent =
+            'Changing an expiry needs a recent sign-in. Sign out and back in, then try again \u2014 nothing was changed.';
+          return;
+        }
+        if (error instanceof ApiError && error.status === 412) {
+          status.textContent =
+            'The key changed while this editor was open, so nothing was applied. Close it and reopen from the refreshed list.';
+          return;
+        }
+        if (error instanceof ApiError && [400, 403, 409, 428].includes(error.status)) {
+          status.textContent = `${error.message}. Nothing was changed.`;
+          return;
+        }
+        throw error;
+      }
+      ctx.notify(
+        'ok',
+        expiresAt === null
+          ? `Key ${row.id} no longer expires.`
+          : `Key ${row.id} now expires ${formatTime(expiresAt)}.`,
+      );
+      await onChanged();
+    },
+    { busyLabel: 'Saving\u2026' },
+  );
+
+  const expired = current !== null && current <= Date.now();
+  return panel({
+    title: `Expiry \u2014 key ${row.id}`,
+    note: expired
+      ? 'This key has expired. A later expiry makes it authenticate again, with the same secret and scopes.'
+      : 'The key keeps its secret and scopes; only the moment it stops working moves.',
+    actions: [actionButton('Close', onClose, { tone: 'quiet' })],
+    content: [
+      definitionList([['Currently', current === null ? 'No expiry' : formatTime(current)]]),
+      field({
+        id: 'key-expiry-day',
+        label: 'Expires on',
+        hint: 'The key stops working at 00:00:00 UTC on this day.',
+        control: day,
+      }),
+      el('div', { class: 'checkset__item' }, [
+        never,
+        el('label', { for: 'key-expiry-never' }, 'No expiry'),
+        el('span', {
+          class: 'checkset__hint',
+          id: 'key-expiry-never-hint',
+          text: capped
+            ? 'Not available on break-glass authority: the router caps a key\u2019s expiry at this session\u2019s end. The key_manager role lifts that.'
+            : 'The key works until it is revoked.',
+        }),
+      ]),
+      buttonRow([save]),
+      status,
+    ],
+  });
+}
+
+/** Admission classes, served first to last. */
+const PRIORITIES = ['interactive', 'standard', 'batch'];
+
+/**
+ * A key's restrictions as one line for the table.
+ *
+ * @param {object|undefined} restrictions The listing's `restrictions` object.
+ * @returns {HTMLElement|string}
+ */
+function accessCell(restrictions) {
+  const r = restrictions || {};
+  const parts = [];
+  const count = (list, one, many) =>
+    Array.isArray(list) ? `${list.length} ${list.length === 1 ? one : many}` : null;
+  const models = count(r.models, 'model', 'models');
+  const targets = count(r.targets, 'target', 'targets');
+  const hosts = count(r.hosts, 'slave', 'slaves');
+  if (models) parts.push(models);
+  if (targets) parts.push(targets);
+  if (hosts) parts.push(hosts);
+  if (typeof r.priority === 'string') parts.push(r.priority);
+  if (parts.length === 0) {
+    return el('span', { class: 'empty', text: 'As its principal' });
+  }
+  const node = pill(`Narrowed: ${parts.join(' · ')}`, 'warn');
+  node.title = [
+    Array.isArray(r.models) ? `Models: ${r.models.join(', ')}` : 'Models: all of the principal\u2019s',
+    Array.isArray(r.targets) ? `Targets: ${r.targets.join(', ')}` : 'Targets: all of the principal\u2019s',
+    Array.isArray(r.hosts) ? `Slaves: ${r.hosts.join(', ')}` : 'Slaves: all of the principal\u2019s',
+    `Priority: ${typeof r.priority === 'string' ? r.priority : 'the principal\u2019s'}`,
+  ].join('\n');
+  return node;
+}
+
+/**
+ * A checkbox list that can be switched off as a whole.
+ *
+ * "No restriction" is a separate control rather than "every box ticked",
+ * because they mean different things to the router: ticking everything pins
+ * the key to today's list, and a model the principal is given tomorrow would
+ * stay out of reach of this key. `null` follows the principal.
+ *
+ * @param {object} options
+ * @param {string} options.id
+ * @param {string} options.legend
+ * @param {string} options.allLabel
+ * @param {{value: string, label: string, hint?: string, group?: string}[]} options.choices
+ * @param {string[]|null} options.current
+ * @returns {{element: HTMLElement, value: () => string[]|null, problem: () => string|null}}
+ */
+function allowlist({ id, legend, allLabel, choices, current }) {
+  const all = el('input', { type: 'checkbox', id: `${id}-all`, 'aria-label': allLabel });
+  all.checked = !Array.isArray(current);
+  const chosen = new Set(Array.isArray(current) ? current : []);
+  const offered = new Set(choices.map((c) => c.value));
+
+  const boxes = choices.map((choice, index) => {
+    const boxId = `${id}-${index}`;
+    const box = el('input', {
+      type: 'checkbox',
+      id: boxId,
+      value: choice.value,
+      'aria-label': `${legend}: ${choice.label}`,
+    });
+    box.checked = chosen.has(choice.value);
+    const label = choice.group ? `${choice.label} \u2014 ${choice.group}` : choice.label;
+    return {
+      box,
+      item: el('div', { class: 'checkset__item' }, [
+        box,
+        el('label', { for: boxId }, label),
+        choice.hint ? el('span', { class: 'checkset__hint', text: choice.hint }) : null,
+      ]),
+    };
+  });
+
+  // What the key was narrowed to that its principal can no longer use. The
+  // router refuses to save those, and ignores them meanwhile; say so instead
+  // of silently dropping them.
+  const gone = [...chosen].filter((value) => !offered.has(value));
+  const goneNote =
+    gone.length > 0
+      ? el('p', {
+          class: 'field__hint',
+          text: `No longer available to the principal, so already out of this key\u2019s reach and dropped on save: ${gone.join(', ')}.`,
+        })
+      : null;
+
+  const sync = () => {
+    for (const { box } of boxes) {
+      box.disabled = all.checked;
+    }
+  };
+  all.addEventListener('change', sync);
+  sync();
+
+  const element = el('fieldset', { class: 'checkset' }, [
+    el('legend', { class: 'checkset__legend' }, legend),
+    el('div', { class: 'checkset__item' }, [all, el('label', { for: `${id}-all` }, allLabel)]),
+    ...boxes.map((b) => b.item),
+    goneNote,
+    choices.length === 0
+      ? el('p', { class: 'field__hint', text: 'The principal may use none at the moment.' })
+      : null,
+  ]);
+
+  return {
+    element,
+    value: () => (all.checked ? null : boxes.filter((b) => b.box.checked).map((b) => b.box.value)),
+    problem: () =>
+      !all.checked && boxes.every((b) => !b.box.checked)
+        ? `${legend}: tick at least one, or allow all. A key that may use nothing should be revoked.`
+        : null,
+  };
+}
+
+/**
+ * The access editor: which models, targets and slaves one key may use, and
+ * the priority it queues at, within what its principal may.
+ *
+ * The choices come from `GET /keys/{id}/restrictions`, which computes the
+ * principal's ceiling from the active configuration. Only those are offered,
+ * because the router refuses anything else: a key can narrow its principal's
+ * access and never widen it. Changing the ceiling itself is a policy change,
+ * drafted and published elsewhere.
+ *
+ * @param {object} ctx
+ * @param {object} row
+ * @param {{onClose: () => void, onChanged: () => Promise<void>}} handlers
+ * @returns {HTMLElement}
+ */
+function accessEditor(ctx, row, { onClose, onChanged }) {
+  const body = el('div', {}, [el('p', { class: 'field__hint', text: 'Loading what this key\u2019s principal may use\u2026' })]);
+  const element = panel({
+    title: `Access \u2014 key ${row.id}`,
+    note: 'Narrows this key within its principal\u2019s access. Takes effect on the key\u2019s next request; no publication is needed, because nothing here can widen what the policy allows.',
+    actions: [actionButton('Close', onClose, { tone: 'quiet' })],
+    content: [body],
+  });
+
+  ctx.api
+    .get(`/keys/${encodeURIComponent(row.id)}/restrictions`)
+    .then(({ data, etag }) => {
+      if (!body.isConnected) {
+        return;
+      }
+      replace(body, accessForm(ctx, row, data, etag || row.etag, onChanged));
+    })
+    .catch((error) => {
+      const message =
+        error instanceof ApiError && error.needsReauthentication
+          ? 'Reading this key\u2019s access needs a recent sign-in. Sign out and back in, then try again.'
+          : `The key\u2019s access could not be read: ${error && error.message ? error.message : String(error)}`;
+      replace(body, [el('p', { class: 'field__hint', role: 'alert', text: message })]);
+    });
+
+  return element;
+}
+
+/**
+ * The form inside the access editor, once the ceiling has been read.
+ *
+ * @param {object} ctx
+ * @param {object} row
+ * @param {object} data The `GET /keys/{id}/restrictions` body.
+ * @param {string} etag
+ * @param {() => Promise<void>} onChanged
+ * @returns {HTMLElement[]}
+ */
+function accessForm(ctx, row, data, etag, onChanged) {
+  const ceiling = data.ceiling || {};
+  const current = data.restrictions || {};
+  const models = Array.isArray(ceiling.models) ? ceiling.models : [];
+  const targets = Array.isArray(ceiling.targets) ? ceiling.targets : [];
+  const hosts = Array.isArray(ceiling.hosts) ? ceiling.hosts : [];
+  const principalClass = PRIORITIES.includes(ceiling.priority) ? ceiling.priority : 'standard';
+
+  const modelList = allowlist({
+    id: 'key-access-models',
+    legend: 'Models',
+    allLabel: 'Every model the principal may use',
+    choices: models.map((m) => ({
+      value: String(m.id),
+      label: String(m.id),
+      hint: m.description ? String(m.description) : undefined,
+    })),
+    current: current.models,
+  });
+  const targetList = allowlist({
+    id: 'key-access-targets',
+    legend: 'Slaves and targets',
+    allLabel: 'Every target the principal may be served by',
+    choices: targets.map((t) => ({
+      value: String(t.id),
+      label: String(t.id),
+      group: t.host ? `slave ${t.host}` : t.provider ? `provider ${t.provider}` : undefined,
+    })),
+    current: current.targets,
+  });
+  // Fleet slaves only exist when the configuration declares a fleet; with
+  // none, a slave is a provider and the target list above already says it.
+  const hostList =
+    hosts.length > 0 || Array.isArray(current.hosts)
+      ? allowlist({
+          id: 'key-access-hosts',
+          legend: 'Fleet slaves',
+          allLabel: 'Every slave the principal may use',
+          choices: hosts.map((h) => ({ value: String(h), label: String(h) })),
+          current: current.hosts,
+        })
+      : null;
+
+  const priority = el('select', { id: 'key-access-priority' }, [
+    el('option', { value: '' }, `As the principal (${principalClass})`),
+    ...PRIORITIES.map((name) => {
+      const option = el('option', { value: name }, name);
+      // A key may lower its principal's class and never raise it.
+      if (PRIORITIES.indexOf(name) < PRIORITIES.indexOf(principalClass)) {
+        option.disabled = true;
+        option.textContent = `${name} \u2014 above the principal`;
+      }
+      return option;
+    }),
+  ]);
+  priority.value = typeof current.priority === 'string' ? current.priority : '';
+
+  const status = el('p', { class: 'field__hint', role: 'status', 'aria-live': 'polite' });
+
+  const save = actionButton(
+    'Save access',
+    async () => {
+      status.textContent = '';
+      const lists = [modelList, targetList, hostList].filter(Boolean);
+      const problem = lists.map((l) => l.problem()).find(Boolean);
+      if (problem) {
+        status.textContent = problem;
+        return;
+      }
+      const offeredModels = new Set(models.map((m) => String(m.id)));
+      const offeredTargets = new Set(targets.map((t) => String(t.id)));
+      const offeredHosts = new Set(hosts.map(String));
+      const keep = (list, offered) => (list === null ? null : list.filter((v) => offered.has(v)));
+      const payload = {
+        models: keep(modelList.value(), offeredModels),
+        targets: keep(targetList.value(), offeredTargets),
+        hosts: hostList ? keep(hostList.value(), offeredHosts) : null,
+        priority: priority.value === '' ? null : priority.value,
+      };
+      try {
+        await ctx.api.put(`/keys/${encodeURIComponent(row.id)}/restrictions`, payload, etag);
+      } catch (error) {
+        if (error instanceof ApiError && error.needsReauthentication) {
+          status.textContent =
+            'Changing a key\u2019s access needs a recent sign-in. Sign out and back in, then try again \u2014 nothing was changed.';
+          return;
+        }
+        if (error instanceof ApiError && error.status === 412) {
+          status.textContent =
+            'The key changed while this editor was open, so nothing was applied. Close it and reopen from the refreshed list.';
+          return;
+        }
+        if (error instanceof ApiError && [400, 403, 409, 422, 428].includes(error.status)) {
+          status.textContent = `${error.message}. Nothing was changed.`;
+          return;
+        }
+        throw error;
+      }
+      ctx.notify('ok', `Key ${row.id}\u2019s access is updated.`);
+      await onChanged();
+    },
+    { busyLabel: 'Saving\u2026' },
+  );
+
+  const shared = Number(data.keys_sharing_principal) || 0;
+  return [
+    definitionList([
+      ['Principal', String(data.principal || row.principal || '\u2014')],
+      ['Principal\u2019s priority', principalClass],
+    ]),
+    shared > 0
+      ? el('p', {
+          class: 'field__hint',
+          role: 'note',
+          text: `${shared} other active ${shared === 1 ? 'key signs' : 'keys sign'} in as this principal. They share its policy, so a change to that reaches them too; what you set here narrows this key only.`,
+        })
+      : null,
+    modelList.element,
+    targetList.element,
+    hostList ? hostList.element : null,
+    field({
+      id: 'key-access-priority',
+      label: 'Priority',
+      hint: 'Where this key\u2019s requests queue when a model is busy. A key can queue below its principal, never above.',
+      control: priority,
+    }),
+    buttonRow([save]),
+    status,
+  ];
+}
+
+/**
  * The columns of the key table.
  *
  * @param {(row: object, trigger: HTMLElement) => void} onRevoke
+ * @param {(row: object, trigger: HTMLElement) => void} onExpiry
+ * @param {(row: object, trigger: HTMLElement) => void} onAccess
  * @param {((row: object, trigger: HTMLElement) => void)|null} onBudget Null
  *   when the session may not manage budgets, in which case the column still
  *   shows them and offers no editor.
  * @returns {object[]}
  */
-function columns(onRevoke, onBudget) {
+function columns(onRevoke, onExpiry, onAccess, onBudget) {
   return [
     {
       label: 'Key id',
@@ -655,6 +1170,7 @@ function columns(onRevoke, onBudget) {
           ? 'No expiry'
           : formatTime(row.expires_at),
     },
+    { label: 'Access', cell: (row) => accessCell(row.restrictions) },
     {
       label: 'Action',
       cell: (row) => {
@@ -668,8 +1184,22 @@ function columns(onRevoke, onBudget) {
           },
           { tone: 'danger', title: `Revoke key ${row.id}` },
         );
+        const expiry = actionButton(
+          'Expiry',
+          () => {
+            onExpiry(row, expiry);
+          },
+          { tone: 'quiet', title: `Extend, shorten, or remove the expiry of key ${row.id}` },
+        );
+        const access = actionButton(
+          'Access',
+          () => {
+            onAccess(row, access);
+          },
+          { tone: 'quiet', title: `Narrow which models, targets and slaves key ${row.id} may use` },
+        );
         if (!onBudget) {
-          return button;
+          return buttonRow([expiry, access, button]);
         }
         const budget = actionButton(
           'Budget',
@@ -678,7 +1208,7 @@ function columns(onRevoke, onBudget) {
           },
           { tone: 'quiet', title: `Edit the token budget of key ${row.id}` },
         );
-        return buttonRow([budget, button]);
+        return buttonRow([expiry, access, budget, button]);
       },
     },
   ];

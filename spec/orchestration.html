@@ -564,6 +564,10 @@ a digest it has actually received.</p>
 <td>SHA-256, content-addressed. Verified before use.</td>
 </tr>
 <tr>
+<td><code>image_id</code></td>
+<td>Optional. The image's configuration digest, which survives <code>docker save</code>/<code>load</code> where <code>digest</code> does not. Pinned, it is the checksum every copy of the image is held to (§12.1); absent, the router learns one and keeps it.</td>
+</tr>
+<tr>
 <td><code>arch</code></td>
 <td>Must match the host. The Spark is <code>aarch64</code>.</td>
 </tr>
@@ -698,7 +702,11 @@ a digest it has actually received.</p>
 </tr>
 <tr>
 <td><code>activation_not_permitted</code></td>
-<td>Principal lacks <code>fleet.activate</code>, or deployment is not <code>autostart</code>.</td>
+<td>Deployment is not <code>autostart</code>, or the caller is not authorized for the alias. <strong>[as built]</strong> <code>fleet.activate</code> is no longer consulted on the data path: any caller the alias grant and the fleet grants admit may cause a start (router specification §26.10).</td>
+</tr>
+<tr>
+<td><code>activation_queued</code></td>
+<td><strong>[as built]</strong> The activation is waiting on demand batching or on another activation on the host. Transient: a request meeting only this parks (§9.3).</td>
 </tr>
 <tr>
 <td><code>artifact_unavailable</code></td>
@@ -830,6 +838,7 @@ a digest it has actually received.</p>
 <h3 id="93-demand-batching">9.3 Demand batching</h3>
 <p>Requests for a cold capability are held in a bounded per-capability queue rather than each triggering its own evaluation. A swap starts when accumulated demand reaches <code>activation_min_demand</code>, or the oldest queued request has waited <code>activation_max_wait_ms</code> — whichever comes first, and always before any request's deadline. All queued requests are then served by the one activation.</p>
 <p>This converts thrash into throughput. Ten music requests over two minutes should cost one swap, not ten. The queue is bounded, deadline-aware, and shares the spec §12 admission machinery rather than being a new unbounded structure.</p>
+<p><strong>[as built]</strong> &quot;Held&quot; was not true until router specification §26.10: a request the queue told to wait left it, failed over, and — having left — took its age with it, so the <code>activation_max_wait_ms</code> trigger could only be reached by a request arriving after it had elapsed. A request now <em>parks</em>: it stays counted in the queue for the whole wait, holds no admission reservation between rounds, and on each round re-routes, rides an activation somebody else began, takes a warm slot that has freed, or pays for the activation once the trigger is due. Parked requests are bounded by <code>settings max_parked_requests</code> (default 256) and by each request's deadline. A rider waits while the deployment is coming up <em>by lease</em> as well as by observation, which it previously did not: between commitment and the agent's first report it read <code>stopped</code> and gave up on an activation that was about to succeed.</p>
 <h3 id="94-cooldown-and-flap-backoff">9.4 Cooldown and flap backoff</h3>
 <p>After eviction, a deployment may not be re-activated on that accelerator for <code>reactivation_cooldown_ms</code> (default 120,000 ms). Repeated activate/evict cycles within <code>flap_window_ms</code> accrue an exponentially increasing cooldown capped at <code>max_flap_cooldown_ms</code> (default 1 hour), decaying after a quiet period.</p>
 <p>Backoff on repeated failure is the reflex spec §13's circuit breaker already applies to unhealthy targets. A flapping deployment is unhealthy in the same operational sense and deserves the same treatment.</p>
@@ -846,6 +855,18 @@ a digest it has actually received.</p>
 <p>Two constraints beyond the budget, both because the budget alone bounds the <em>rate</em> of damage rather than its <em>kind</em>: a pre-warm plan that would evict is abandoned rather than executed, and one that would fetch is too. Prediction that displaces running work is the failure this section warns about, and refusing those two plan shapes is what makes the feature safe to enable on a fleet that is already busy.</p>
 <h3 id="99-making-the-goal-falsifiable">9.9 Making the goal falsifiable</h3>
 <p><code>hypellm_fleet_thrash_ratio</code> — activations divided by requests served from activated deployments — decides whether any of this works. A healthy fleet trends toward zero as batching amortises each swap. A ratio near 1 means every request costs a swap and the configuration is wrong. Publishing it turns &quot;relatively intelligent about it&quot; from an aspiration into something an operator can check.</p>
+<h3 id="910-idle-stop--implemented-on-by-default">9.10 Idle stop — implemented, on by default</h3>
+<p><strong>[as built]</strong> The design brought models down only to make room for another. Router specification §26.10 adds the other half: a deployment nothing has used for <code>fleet_policy … idle_stop_ms</code> (default 900,000; 0 disables; otherwise at least 60,000) is stopped, so a slave's memory is not held by a model the fleet has stopped asking for. The predicate is <code>hypellm_fleet::idle</code>, pure like the planner, and every condition is a reason a model stays up: fresh belief; not pinned and evictable; router-owned unless <code>adopt_unmanaged</code>; no lease or eviction in flight; nothing dispatched, reported in flight, queued or parked for it; unused since its last request <em>ended</em> for the window; and resident for at least the window and its dwell floor. One stop per host per observation pass, the longest-idle first, and none on a host already performing an activation.</p>
+<p>A stop and a dispatch cannot pass each other: the stop claims the deployment under the lock that counts dispatches, a dispatch already counted refuses the claim, and a dispatch to a claimed deployment is refused before anything is sent — the request parks, and is served when the model is brought back. An idle stop is a deactivation like an eviction, so it accrues cooldown and flap backoff: a model stopped for idleness and asked for again a minute later is a flap, and is governed as one.</p>
+<h3 id="911-churn-aware-scheduling--implemented-on-by-default">9.11 Churn-aware scheduling — implemented, on by default</h3>
+<p><strong>[as built]</strong> Sections 9.1–9.5 bound how often a host may swap; none of them chose <em>which</em> waiting model a free host loads next, so interleaved demand — A, B, A, B on a one-slot host — swapped on nearly every request. Router specification §26.11 adds the choice, as <code>hypellm_fleet::schedule</code>, pure like the planner:</p>
+<ul>
+<li><strong>Next activation.</strong> A trigger the batching queue grants goes only when its deployment ranks first among everything parked for the same host: starving demand first, then waiting requests aged and divided by load cost. Demand is counted per deployment, from the parked requests of every alias that could use it, because two chat models share a capability and are exactly what must be told apart.</li>
+<li><strong>Warm hysteresis.</strong> A swap that would stop a model with a request in flight waits until that model is quiet.</li>
+<li><strong>Jobs.</strong> A free worker takes jobs whose model is loaded, then jobs for a model coming up, then cold jobs from the largest group, so one load serves the group.</li>
+<li><strong>The bound.</strong> <code>fleet_policy … max_reorder_wait_ms</code> (default 120,000; 0 restores arrival order; otherwise 5,000–3,600,000). Work that has waited that long goes first in age order, whatever it displaces.</li>
+</ul>
+<p>Measured on the property suite's adversarial case — two models strictly alternating, faster than a load, on one slot, 400 generated cases — arrival order made 6,194 loads and the scheduler 813. End to end, six alternating jobs load each model once instead of six times. <code>GET /admin/v1/fleet</code> shows each host's next activation and why, and <code>hypellm_fleet_schedule_decisions_total</code> counts the reorderings.</p>
 <hr />
 <h2 id="10-activation-lifecycle">10. Activation lifecycle</h2>
 <h3 id="101-state-machine">10.1 State machine</h3>
@@ -927,6 +948,12 @@ DELETE /v1/jobs/{id}        → cancel; releases reservations and any activation
 </tbody>
 </table></div>
 <p>Placement chooses among architecture-compatible hosts by free disk, accelerator fit, and whether the artifact is already partially present. <code>cache</code>, with ~5.9 TB free and no serious accelerator, is the natural artifact cache, and the model should let an operator say so.</p>
+<h3 id="121-copy-between-slaves">12.1 Copy between slaves, held to a kept checksum</h3>
+<p>Spec §26.12. When the missing artifact is already verified on another host, the plan copies it from there instead of fetching it: no registry, and no connection between the two slaves, because the fleet agent relays through its own machine. The controls above apply unchanged — <code>fleet.fetch</code>, <code>allow_fetch</code>, disk headroom, one transfer per destination host.</p>
+<p>What makes a copy safe to accept from a slave is the checksum the router keeps for each artifact: <code>image_id</code> when pinned, otherwise the ID the router learned from the first observation in which a host reported the image with its registry digest verified (unanimously, if several did), appended to the durable log before it is used. A host reporting any other ID is <strong>tampered</strong> — audited, never started with that image, never a copy source — and the planner re-acquires the real image there. The agent hashes the relayed archive's configuration and every layer against that ID, and loads on the destination only an archive rebuilt from the verified parts.</p>
+<p>A learned checksum is trust on first verified observation: it defends every later copy and every other host, not against the very first reporter lying. Pin <code>image_id</code> for an anchor independent of every slave.</p>
+<h3 id="122-containers-from-templates">12.2 Containers from templates</h3>
+<p>An agent deployment row with a <code>run</code> template is created on demand under the host's data directory (<code>&lt;data_dir&gt;/containers/&lt;deployment&gt;</code>) and recreated when its template changes, within the host shim's fixed <code>docker create</code> vocabulary. The router learns nothing new: the template, like every command, lives only in the agent's table.</p>
 <hr />
 <h2 id="13-configuration-grammar-additions">13. Configuration grammar additions</h2>
 <p>The spec §11.1 line-oriented grammar is extended with new record types and new fields on existing ones. No new syntax: same <code>type key=value</code> records, JSON-style quoted strings, <code>#</code> comments, unknown fields still errors, still no includes, environment expansion or templates.</p>
@@ -946,7 +973,8 @@ deployment id=spark-music3 target=spark:minimax-music3 accelerator=gb10 \
     readiness=http_ok
 
 artifact id=minimax-music3-arm64 kind=image arch=aarch64 \
-    size_bytes=21474836480 digest=&quot;sha256:…&quot; source=mirror-local
+    size_bytes=21474836480 digest=&quot;sha256:…&quot; source=mirror-local \
+    image_id=&quot;sha256:…&quot;   # optional: the checksum copies are held to (§12.1)
 
 capability id=text-to-music operations=jobs modalities=text
 
@@ -954,6 +982,11 @@ fleet_policy scope=host:spark max_activations_per_hour=12 \
     eviction_margin_permille=250 max_eviction_set=2 \
     activation_min_demand=1 activation_max_wait_ms=20000 \
     reactivation_cooldown_ms=120000 allow_fetch=false
+
+# Who may use which slave, and which model on it (spec §26.9).
+fleet_grant id=ci-off-spark scope=principal:svc:ci host=spark model=* allow=false
+fleet_grant id=ci-music scope=principal:svc:ci host=spark \
+    model=target:spark:minimax-music3 allow=true
 </code></pre>
 <p>Existing records gain <strong>optional fields only</strong>, so every current configuration stays valid:</p>
 <div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
@@ -974,12 +1007,13 @@ fleet_policy scope=host:spark max_activations_per_hour=12 \
 </tr>
 <tr>
 <td><code>settings</code></td>
-<td><code>fleet_enabled</code> (default false), <code>max_documents_per_request</code>, <code>max_document_bytes</code>, <code>max_inline_document_bytes</code>, <code>default_document_token_estimate</code></td>
+<td><code>fleet_enabled</code> (default false), <code>fleet_access_default</code> (<code>allow</code> or <code>deny</code>, default <code>allow</code>), <code>max_documents_per_request</code>, <code>max_document_bytes</code>, <code>max_inline_document_bytes</code>, <code>default_document_token_estimate</code></td>
 </tr>
 </tbody>
 </table></div>
 <p>Slave-hosted providers use <code>egress=private_network</code>, which <code>hypellm-core::netaddr::EgressProfile</code> already supports and <code>hypellm-net::egress</code> already enforces — private destinations are permitted only where an administrator declared the profile, and remain pinned and revalidated.</p>
-<p>Validation is off-path and fails closed on: a deployment whose <code>memory_bytes</code> exceeds its accelerator's pool; an artifact whose <code>arch</code> mismatches its host; a dangling reference; a <code>fleet_policy</code> whose budget underflows to zero; two deployments for one target; a capability required by an alias and declared by no target; an <code>effort_multipliers</code> entry for a tier absent from <code>reasoning_efforts</code>; a document limit set whose base64-encoded aggregate exceeds <code>max_body_bytes</code>.</p>
+<p>A <code>fleet_grant</code> is resolved as spec §26.9 describes: scope dominates (principal, group, tenant, global), an exact host and a specific model win within a scope, a tie is a deny, and no applicable grant means <code>fleet_access_default</code>. It is an eligibility filter; it never moves a score.</p>
+<p>Validation is off-path and fails closed on: a <code>fleet_grant</code> naming a host, tenant, group or alias that does not exist, or a <code>target:</code> with no deployment or on a different host than the one named; a deployment whose <code>memory_bytes</code> exceeds its accelerator's pool; an artifact whose <code>arch</code> mismatches its host; a dangling reference; a <code>fleet_policy</code> whose budget underflows to zero; two deployments for one target; a capability required by an alias and declared by no target; an <code>effort_multipliers</code> entry for a tier absent from <code>reasoning_efforts</code>; a document limit set whose base64-encoded aggregate exceeds <code>max_body_bytes</code>.</p>
 <hr />
 <h2 id="14-durable-state">14. Durable state</h2>
 <p>New record types in the <code>hypellm-store</code> append-only framed log, replayed at startup under existing integrity rules:</p>
@@ -988,6 +1022,7 @@ fleet_policy scope=host:spark max_activations_per_hour=12 \
 <li><strong>Activation history</strong> — bounded ring per deployment: outcome, duration, reason, decision id. Feeds the EWMA cost model (§8.2) and the &quot;why was this evicted&quot; view.</li>
 <li><strong>Flap counters</strong> (§9.4) — survive restart, so a router bounce does not reset accrued backoff and permit a fresh burst of thrash.</li>
 <li><strong>Fetch progress</strong> — resumable across restart.</li>
+<li><strong>Kept checksums</strong> (§12.1) — one protected record per learned image ID; the first per artifact wins on replay, so a later record cannot move an anchor.</li>
 </ul>
 <p>Demand EWMAs are advisory and are <strong>not</strong> persisted; they rebuild from traffic. Persisting an advisory statistic so it survives a restart is how a scheduler ends up acting confidently on data from before an outage.</p>
 <hr />
@@ -1044,6 +1079,14 @@ fleet_policy scope=host:spark max_activations_per_hour=12 \
 <tr>
 <td>Forged or malicious observation</td>
 <td>HMAC-authenticated handshake binding version and fleet digest, <code>wire-json</code> under explicit limits, unknown identifiers dropped and counted, numeric fields range-checked, partial updates rejected (§4.3).</td>
+</tr>
+<tr>
+<td>Compromised router enrolls a machine</td>
+<td>Enrollment (spec §26.8) lets the router <em>offer</em> a host, never command one. The agent adopts offers only when its own file opts in, only for addresses inside its own CIDR allowlist, with the registered host key pinned, and with no deployment. A router can at worst make the agent attempt SSH to an allowlisted address, or withdraw enrolled hosts.</td>
+</tr>
+<tr>
+<td>Hostile machine registers</td>
+<td>Registration needs a one-time, expiring token minted by an operator and shown once; failures are throttled and indistinguishable. Every reported field is validated against a closed alphabet before storage. A registered machine is not a member until an operator approves it and a second person publishes the drafted records.</td>
 </tr>
 <tr>
 <td>Replayed fleet verb</td>
@@ -1115,7 +1158,7 @@ fleet_policy scope=host:spark max_activations_per_hour=12 \
 <li>Plan execution — no interleaving of failures leaks a lease.</li>
 </ul>
 <p><strong>Integration</strong> against the simulated agent (§4.1): full eviction-and-start sequences, drain expiry, rollback, stale observation, divergence adoption, crash-and-recover with outstanding leases. Deterministic clock, no network — <code>cargo test --workspace --offline</code> stays honest.</p>
-<p><strong>Security tests</strong>: a prompt or document naming a deployment changes no plan; a principal without <code>fleet.activate</code> cannot cause activation by any request path; a principal without <code>fleet.fetch</code> cannot cause a byte to be downloaded; agent replies naming unknown deployments are dropped; data-plane errors leak no host identifier; a high-effort request cannot exceed its reserved token budget.</p>
+<p><strong>Security tests</strong>: a prompt or document naming a deployment changes no plan; a principal the fleet grants keep off a host cannot cause activation there by any request path, including one whose grant is withdrawn between routing and activation; a principal without <code>fleet.fetch</code> cannot cause a byte to be downloaded; agent replies naming unknown deployments are dropped; data-plane errors leak no host identifier; a high-effort request cannot exceed its reserved token budget.</p>
 <p><strong>Resilience</strong>: agent unavailable mid-activation, agent restart mid-activation, host reboot during drain, disk full during fetch, clock skew across lease expiry, two routers contending for one host.</p>
 <hr />
 <h2 id="17-management-api-and-spa">17. Management API and SPA</h2>
@@ -1153,14 +1196,35 @@ fleet_policy scope=host:spark max_activations_per_hour=12 \
 <td>Operator-initiated acquisition.</td>
 </tr>
 <tr>
+<td><code>POST /admin/v1/fleet/artifacts/{id}:copy</code></td>
+<td>Operator-initiated copy <code>{"from", "to"}</code>, verified against the kept checksum (§12.1). Needs <code>fleet_fetch</code>; refused when the source does not report that checksum or none is kept. <code>GET /admin/v1/fleet</code> lists, per visible artifact, the kept checksum, whether it was pinned or learned, and each visible host's reported ID as <code>verified</code>, <code>tampered</code> or <code>unverified</code>.</td>
+</tr>
+<tr>
 <td><code>GET /admin/v1/fleet/activations</code></td>
 <td>History with outcome and reason — the &quot;why was this evicted&quot; view.</td>
+</tr>
+<tr>
+<td><code>GET</code>/<code>POST /admin/v1/fleet/enrollments</code></td>
+<td>List enrollments; mint a one-time install command (<code>fleet_enroll</code>). Spec §26.8.</td>
+</tr>
+<tr>
+<td><code>POST /admin/v1/fleet/enrollments/{id}:approve|:reject|:revoke</code></td>
+<td>Decide a registration. Approval drafts the machine's records and publishes nothing.</td>
+</tr>
+<tr>
+<td><code>GET /admin/v1/fleet/access</code></td>
+<td>Hosts and models the caller's tenant can reach, the fleet grants that concern it, and the default (<code>read_fleet</code>); the tenant's principals are added for a caller who also holds <code>edit_policy</code>. Read-only: changes are drafts through <code>POST /admin/v1/policies:edit</code>. Spec §26.9.</td>
+</tr>
+<tr>
+<td><code>GET /fleet/v1/install.sh</code>, <code>POST /fleet/v1/enroll:begin|:complete</code></td>
+<td>Outside <code>/admin/v1</code> and reachable without a session: the host kit, and the token-authenticated registration a new machine performs. 404 unless <code>settings fleet_enroll_url</code> is set.</td>
 </tr>
 </tbody>
 </table></div>
 <p>SPA screens, first-party only, no <code>vendor/</code>, no inline handlers, DOM construction not HTML strings (spec §15):</p>
 <ul>
 <li><strong>Fleet</strong> — host cards with memory bars, resident sets, activation budget remaining, observation age, drift warnings.</li>
+<li><strong>Fleet → Slave access</strong> — for a chosen principal, group or tenant, allow / deny / inherit per slave, per "all models on this slave", and per model; the default toggle, which when switched to <code>deny</code> offers to grant every existing principal full access so existing credentials keep working. Every change is a draft.</li>
 <li><strong>Activations</strong> — a timeline of starts and stops, each with its reason code and the decision that caused it.</li>
 <li><strong>Decision explorer</strong> — extended with the capability contract (which axis excluded each candidate) and the plan (residency class, eviction set, estimated time-to-ready).</li>
 </ul>
@@ -1388,11 +1452,11 @@ fleet_policy scope=host:spark max_activations_per_hour=12 \
 <h3 id="222-eviction-under-memory-pressure">22.2 Eviction under memory pressure</h3>
 <p>The fleet-orchestration path, on real numbers.</p>
 <p><strong>State.</strong> <code>spark</code> (~140 GB unified, 17 GB reserved for the host) has <code>spark-qwen38</code> (chat, declared 26 GB, resident 40 minutes, dwell satisfied, steady harness demand) and <code>spark-h3</code> (audio-to-video, declared 48 GB, resident 6 minutes, idle 5 minutes). <code>spark-music3</code> (text-to-music, declared 64 GB) is cold; its artifact is present. Declared figures are the conservative reservations of §5.3 and exceed observed usage, which is why the three do not co-reside under the router's model even though a hand-tuned operator can squeeze them in.</p>
-<p><strong>Request.</strong> A principal with <code>fleet.activate</code> submits <code>POST /v1/jobs</code>, alias <code>music-standard</code>, capability <code>text-to-music</code>, <code>patience_ms=900000</code>.</p>
+<p><strong>Request.</strong> A principal authorized for the alias submits <code>POST /v1/jobs</code>, alias <code>music-standard</code>, capability <code>text-to-music</code>, <code>patience_ms=900000</code>.</p>
 <p><strong>Route.</strong> One target, <code>spark:minimax-music3</code>. Free pool memory ~49 GB against 64 GB required, so the class is <code>ColdRequiresEviction</code>. Time-to-ready is 30 s drain + 15 s stop + 180 s start + 10 s probe = 235 s, comfortably inside <code>patience_ms</code>. Affinity 8,000; it is the only candidate.</p>
 <p><strong>Admission.</strong> Tenant and principal reservations succeed and are held.</p>
 <p><strong>Plan.</strong> <code>spark-qwen38</code> is excluded — <code>pinned</code>, and independently holding in-flight work. <code>spark-h3</code> is still inside its dwell window, 6 minutes resident against a 10-minute <code>min_resident_ms</code>, so it is excluded too. No admissible eviction set remains; the plan returns <code>deployment_in_dwell</code>.</p>
-<p>That is the correct answer at that moment and worth dwelling on: the job is queued with an explicit reason and an ETA rather than the fleet tearing down a model that has been up for six minutes. Four minutes later the queued demand is re-evaluated. <code>spark-h3</code> is now past dwell, idle, with a low <code>retention_value</code> — no demand, no queue, poor recency — that the incoming demand exceeds by more than the 25% margin.</p>
+<p>That is the correct answer at that moment and worth dwelling on: the job is queued with an explicit reason and an ETA rather than the fleet tearing down a model that has been up for six minutes. Four minutes later the queued demand is re-evaluated. <strong>[as built]</strong> The job is re-queued with backoff rather than failed (router specification §26.10), up to sixteen passes — about ten minutes — within its patience. <code>spark-h3</code> is now past dwell, idle, with a low <code>retention_value</code> — no demand, no queue, poor recency — that the incoming demand exceeds by more than the 25% margin.</p>
 <p><strong>Execute.</strong> Lease written durably. <code>DEACTIVATE spark-h3</code> with a 30 s drain; no in-flight work, stops in 8 s. Observation confirms ~97 GB free. <code>ACTIVATE spark-music3</code>; <code>starting</code> → <code>probing</code> → <code>ready</code> in 174 s. The <code>host:spark</code> bucket goes 12 → 11; <code>spark-h3</code> enters a 120 s cooldown; <code>spark-music3</code> starts a 10-minute dwell.</p>
 <p><strong>Serve.</strong> The job dispatches to the now-warm target. Other music jobs queued during those 174 s are served by the same activation — one swap, several jobs.</p>
 <p><strong>Afterwards.</strong> The audit chain holds <code>fleet.evict</code> naming <code>spark-h3</code>, its retention value, the margin, and the displacing decision id. <code>hypellm_fleet_time_to_ready_ms</code> records 174,000. If an H3 request arrives 30 seconds later it does <strong>not</strong> swap back: music3 is inside its dwell window and H3 inside its cooldown. It waits, or fails with a reason an operator can read.</p>
@@ -1478,6 +1542,7 @@ fleet_policy scope=host:spark max_activations_per_hour=12 \
 <li class="toc-level-3"><a href="#97-operator-anchors">9.7 Operator anchors</a></li>
 <li class="toc-level-3"><a href="#98-predictive-pre-warm--implemented-off-by-default">9.8 Predictive pre-warm — implemented, off by default</a></li>
 <li class="toc-level-3"><a href="#99-making-the-goal-falsifiable">9.9 Making the goal falsifiable</a></li>
+<li class="toc-level-3"><a href="#910-idle-stop--implemented-on-by-default">9.10 Idle stop — implemented, on by default</a></li>
 <li class="toc-level-2"><a href="#10-activation-lifecycle">10. Activation lifecycle</a></li>
 <li class="toc-level-3"><a href="#101-state-machine">10.1 State machine</a></li>
 <li class="toc-level-3"><a href="#102-draining-is-not-optional">10.2 Draining is not optional</a></li>

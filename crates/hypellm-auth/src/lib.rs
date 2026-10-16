@@ -45,7 +45,10 @@ pub mod oidc;
 pub mod peer;
 pub mod session;
 
-pub use apikey::{KeyRecord, KeyRejection, KeyStore, NewKey, Scope, SourceRestriction};
+pub use apikey::{
+    ExpiryChange, KeyRecord, KeyRejection, KeyStore, NewKey, RestrictionChange, Scope,
+    SourceRestriction,
+};
 pub use oidc::{IdTokenClaims, OidcConfig, OidcError, TokenVerifier, TransactionStore};
 pub use peer::{PeerIdentity, TrustedEdge};
 pub use session::{
@@ -243,6 +246,7 @@ mod tests {
             description: None,
             revoked: false,
             created_by: None,
+            restrictions: hypellm_core::key_restriction::KeyRestriction::default(),
         };
         let principal = Principal::from_key(&key, Vec::new(), Vec::new());
         assert_eq!(principal.method, AuthMethod::ApiKey);

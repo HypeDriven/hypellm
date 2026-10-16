@@ -101,7 +101,7 @@ input/resource limits.</p>
 </tr>
 <tr>
 <td>Fuzz targets</td>
-<td>Implemented in <code>tests/fuzz.rs</code>: nine seeded mutation properties over the client protocol parsers and their trust boundaries.</td>
+<td>Implemented in <code>tests/fuzz.rs</code>: nine seeded mutation properties over the client protocol parsers and their trust boundaries, and one over the key-restriction records the router replays at startup.</td>
 </tr>
 </tbody>
 </table></div>
@@ -183,7 +183,23 @@ host, port, SNI, credential handle, file path, or socket (specification 10).
 A <code>data:</code> image URI is decomposed for the adapter; a non-<code>data:</code> URL is carried
 as opaque text and never fetched.</li>
 <li><strong>No management surface on the data plane.</strong> <code>/admin/v1</code> is only reachable
-through <code>AdminHandler</code> on the management listener (specification 3).</li>
+through <code>AdminHandler</code> on the management listener (specification 3). So are
+the enrollment endpoints under <code>/fleet/v1/</code> (specification 26.8): the install
+script, compiled in and served only when <code>settings fleet_enroll_url</code> is set,
+and the token-authenticated registration, which <code>AdminApi::handle_enrollment</code>
+answers.</li>
+<li><strong>No slave a caller is kept off.</strong> Routing filters on fleet grants
+(specification 26.9); <code>/v1/models</code> uses <code>servable_aliases</code>, and a request
+whose every exclusion is <code>not_authorized_for_alias</code> or <code>fleet_access_denied</code>
+gets the same <code>model_not_found</code> as an absent alias, naming no host.
+<code>pipeline::activate_for</code> asks <code>fleet_access_permits</code> again against the current
+snapshot before beginning an activation, so a publication between routing and
+activation is honoured before a model is loaded.</li>
+<li><strong>No host address the operator did not approve.</strong> <code>fleet::EnrollmentOfferer</code>
+offers an agent only enrollments that were approved and whose hosts are in the
+active configuration, on a connection of its own; with no fleet runtime
+(a fleet with no deployment yet) the housekeeping thread calls it every five
+seconds instead.</li>
 </ul>
 <h3 id="a-stated-concurrency-deviation">A stated concurrency deviation</h3>
 <p>Specification 3.2 requires &quot;a fixed set of event-loop workers&quot;. This crate uses
@@ -224,6 +240,44 @@ re-observes and checks the inventory before it believes an activation succeeded.
 <p>Activation failure occurs strictly before upstream acceptance, so specification
 6.5 failover applies unchanged: the pipeline records an exclusion, drops the
 reservation, and moves to the next candidate.</p>
+<p><strong>Demand-driven lifecycle (specification 26.10).</strong> Any caller the
+alias grant and the fleet grants admit may cause a start; the pipeline parks a
+request whose only obstacle is an activation that has not begun
+(<code>pipeline::await_activation</code>), counted in the batching queue for its whole
+wait and holding nothing between rounds; riders wait on a leased activation as
+well as an observed one; <code>FleetRuntime::enter_dispatch</code> and
+<code>leave_dispatch</code> count each dispatch against its deployment exactly once, and
+<code>FleetRuntime::idle_stop</code> claims a deployment under the same lock before
+stopping it, so a stop and a dispatch cannot pass each other. A job that finds
+no capacity is re-queued with backoff (<code>jobs::worker_loop</code>). Parked requests
+and riders wait on <code>FleetRuntime::wake_signal</code> through
+<code>Clock::wait_signal</code>, so a test clock drives them deterministically.</p>
+<p><strong>Churn-aware scheduling (specification 26.11).</strong>
+<code>FleetRuntime::admit_to_queue</code> and <code>poll_queue</code> take the plan and put every
+trigger the batching queue grants to <code>hypellm_fleet::schedule::gate</code>; a deferred
+trigger is withdrawn with <code>ActivationQueue::untrigger</code> and the request parks.
+Demand for the gate is counted per alias while a request is parked
+(<code>park_alias</code>/<code>unpark_alias</code>, exactly once each) and projected onto
+deployments through the routing snapshot in <code>adopt_policy</code>. A deployment whose
+gated activation is refused for anything but a busy host is left out of the
+ranking for a while (<code>note_refused</code>), and <code>leave_dispatch</code> wakes parked
+requests when a deployment goes quiet so a deferred swap goes at once. The job
+worker takes from the queue through <code>jobs::JobOrder</code>, implemented over the
+fleet, so warm jobs go before cold ones and cold ones by group; with no fleet,
+or <code>max_reorder_wait_ms=0</code>, the queue order is unchanged. Tested end to end in
+<code>tests/fleet_schedule.rs</code>.</p>
+<p><strong>Kept checksums and image copies (specification 26.12).</strong>
+<code>FleetRuntime::keep_checksums</code> runs on every adopted inventory: it learns an
+artifact's image ID from a verified, unanimous observation through
+<code>hypellm_fleet::checksum::learn</code>, appends <code>ArtifactChecksum</code> to the log
+<em>before</em> keeping it, audits <code>fleet.checksum_learned</code>, and audits each newly
+tampered (artifact, host) once (<code>fleet.artifact_tampered</code>), bounded at 1,024
+remembered pairs. <code>recover</code> restores the kept set with the first record winning.
+A <code>PlanStep::Copy</code> runs under the activation's lease like a fetch, sends
+<code>COPY</code> with the kept ID, and is believed only once the destination is observed
+holding it. <code>copy_artifact</code> is the operator path behind
+<code>POST /admin/v1/fleet/artifacts/{id}:copy</code>. Tested end to end in
+<code>tests/fleet_copy.rs</code>.</p>
 <p>The router still executes no process. Every fleet verb is a line on an
 owner-only Unix socket carrying opaque identifiers and bounded integers; the
 process that runs <code>ssh</code> and <code>docker</code> is <code>agent/</code>, outside this workspace.</p>
@@ -483,6 +537,30 @@ management listeners differ, so both are given.</p>
 <td>—</td>
 <td><code>Secrets::from_dir</code></td>
 </tr>
+<tr>
+<td>Requests parked for a cold model at once</td>
+<td>256 (<code>settings max_parked_requests</code>), and 256 per capability</td>
+<td>—</td>
+<td><code>pipeline::await_activation</code> against <code>RouterState::parked_requests</code>; <code>ActivationQueue::park</code></td>
+</tr>
+<tr>
+<td>How long a request stays parked</td>
+<td>its deadline; re-routed at least every 250 ms</td>
+<td>—</td>
+<td><code>pipeline::PARK_SLICE</code>, the request's <code>Deadline</code></td>
+</tr>
+<tr>
+<td>Passes one job makes through the pipeline</td>
+<td>16, backing off 1 s doubling to 60 s, within its deadline</td>
+<td>—</td>
+<td><code>jobs::MAX_JOB_ATTEMPTS</code></td>
+</tr>
+<tr>
+<td>Idle stops per host per observation pass</td>
+<td>1</td>
+<td>—</td>
+<td><code>hypellm_fleet::idle::idle_stops</code></td>
+</tr>
 </tbody>
 </table></div>
 <h3 id="limits-not-enforced">Limits not enforced</h3>
@@ -537,6 +615,10 @@ ceiling differs from the authenticated context, and no hint survives from a
 principal not permitted one. Each of those targets counts its own successful
 parses and fails if none were reached, because a property test that never
 reaches its assertion is decoration.</p>
+<p>A tenth target covers a record rather than a request: the <code>ApiKeyRestriction</code> frames
+<code>restore_keys</code> replays at every start. It asserts that whatever a mutated record decodes
+to, each field it decodes as unrestricted was written as an explicit <code>null</code>, and that
+what decodes re-encodes to the same restriction.</p>
 <p>The remaining targets below — the connection-level ones, and the stream
 renderers — are still requirements rather than facts:</p>
 <div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
@@ -571,6 +653,11 @@ renderers — are still requirements rather than facts:</p>
 <tr>
 <td>Prompt inertness</td>
 <td>Prompt-shaped destination and credential strings remain canonical content only</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
+<tr>
+<td>Key restriction records</td>
+<td>A mutated <code>ApiKeyRestriction</code> payload never decodes looser than it was written</td>
 <td>Implemented in <code>tests/fuzz.rs</code></td>
 </tr>
 </tbody>

@@ -26,6 +26,18 @@
 //! | Result bytes | `settings max_job_result_bytes` per job, held in memory |
 //! | Retention | `settings job_retention_ms` after reaching a terminal state |
 //! | Patience | `settings max_job_patience_ms`, the ceiling on what a caller may ask to wait |
+//! | Re-queues | [`MAX_JOB_ATTEMPTS`] passes per job, backing off, within the job's deadline |
+//!
+//! # Waiting for capacity
+//!
+//! A job that fails only because no slave could take it yet — the model it
+//! needs is queued to start, a host is busy activating something else, every
+//! warm target is at its concurrency limit — goes back to the end of the queue
+//! rather than failing (specification 26.10). Bounded three ways: at most
+//! [`MAX_JOB_ATTEMPTS`] passes, an exponential backoff between them, and the
+//! job's own deadline. A re-queued job is one the store already admitted, so it
+//! is not refused by `max_queued`; the queue therefore holds at most
+//! `max_queued` plus one per worker.
 //!
 //! The result spool is **memory, bounded and expiring**. The router is not
 //! becoming a blob store: specification 2.2's non-goals are not widened by this
@@ -44,6 +56,8 @@ use crate::dispatch::AccumulatingSink;
 use crate::pipeline;
 use crate::state::RouterState;
 use hypellm_core::canonical::{CanonicalRequest, ClientProtocol};
+use hypellm_core::decision::{AttemptOutcome, ExclusionReason};
+use hypellm_core::time::Clock;
 use hypellm_core::error::RouterError;
 use hypellm_core::ids::{GroupId, KeyId, TenantId};
 use hypellm_core::rbac::PermissionSet;
@@ -177,6 +191,15 @@ struct Job {
     revision: u64,
 }
 
+/// Passes one job may make through the pipeline, the first included.
+pub const MAX_JOB_ATTEMPTS: u32 = 16;
+
+/// The first re-queue backoff, doubling per pass.
+const FIRST_REQUEUE_BACKOFF_MS: u64 = 1_000;
+
+/// The longest re-queue backoff.
+const MAX_REQUEUE_BACKOFF_MS: u64 = 60_000;
+
 /// Work handed to a worker thread.
 #[derive(Debug)]
 struct Pending {
@@ -186,6 +209,31 @@ struct Pending {
     permissions: PermissionSet,
     key_id: Option<KeyId>,
     cancelled: Arc<AtomicBool>,
+    /// Passes already made.
+    attempts: u32,
+    /// Not to be taken before this, on the router's monotonic clock.
+    not_before_ms: u64,
+    /// Submission order, kept across re-queues (specification 26.11).
+    seq: u64,
+    /// When it was submitted, on the router's monotonic clock: the age the
+    /// reordering bound is measured from, so a job that waited for capacity
+    /// keeps the time it has already waited.
+    submitted_ms: u64,
+}
+
+/// How the job queue is ordered when a worker takes from it
+/// (specification 26.11).
+///
+/// Implemented by the router over its fleet. Absent, or with a bound of zero,
+/// jobs are taken in queue order as they always were.
+pub trait JobOrder {
+    /// The reordering bound, in milliseconds. Zero is queue order.
+    fn bound_ms(&self) -> u64;
+    /// How the request's model stands right now.
+    fn class(&self, request: &CanonicalRequest) -> hypellm_fleet::schedule::JobClass;
+    /// Note that a job was taken out of queue order: `job_reordered`, or
+    /// `job_starving` when the bound promoted it.
+    fn taken_out_of_order(&self, _outcome: &'static str) {}
 }
 
 /// Why a job could not be accepted.
@@ -253,6 +301,8 @@ pub struct JobStore {
     /// Monotonic revision source, so an events stream can resume from a cursor
     /// rather than replaying a job's whole history.
     revisions: AtomicU64,
+    /// Submission order source.
+    sequence: AtomicU64,
 }
 
 impl JobStore {
@@ -266,6 +316,7 @@ impl JobStore {
             limits,
             stopping: AtomicBool::new(false),
             revisions: AtomicU64::new(0),
+            sequence: AtomicU64::new(0),
         }
     }
 
@@ -356,6 +407,10 @@ impl JobStore {
                 permissions,
                 key_id,
                 cancelled,
+                attempts: 0,
+                not_before_ms: 0,
+                seq: self.sequence.fetch_add(1, Ordering::SeqCst),
+                submitted_ms: now_ms,
             });
         }
         self.work.notify_one();
@@ -455,15 +510,36 @@ impl JobStore {
         self.stopping.load(Ordering::SeqCst)
     }
 
-    /// Take the next job, blocking until one arrives or the store stops.
-    fn take(&self) -> Option<Pending> {
+    /// Take the next job that is due, blocking until one is or the store
+    /// stops.
+    ///
+    /// In queue order unless `order` reorders it (specification 26.11): jobs
+    /// whose model is loaded first, then jobs for a model being loaded, then
+    /// cold jobs grouped by model, all bounded by the reordering bound. A
+    /// re-queued job backing off is skipped, not waited for, so it holds no
+    /// worker and delays nothing behind it.
+    fn take(&self, clock: &dyn Clock, order: Option<&dyn JobOrder>) -> Option<Pending> {
         let mut queue = self.lock_queue();
         loop {
-            if let Some(pending) = queue.pop_front() {
-                return Some(pending);
+            let now = clock.now_millis();
+            if let Some(position) = Self::pick(&queue, now, order) {
+                if let Some(pending) = queue.remove(position) {
+                    return Some(pending);
+                }
             }
             if self.stopping.load(Ordering::SeqCst) {
                 return None;
+            }
+            if let Some(due) = queue.iter().map(|p| p.not_before_ms).min() {
+                // Only backing-off work is queued. Sleep on the router's clock
+                // until the first of it is due, a quarter second at most, so a
+                // new submission is not kept waiting long behind the sleep.
+                drop(queue);
+                clock.sleep(std::time::Duration::from_millis(
+                    due.saturating_sub(now).clamp(1, 250),
+                ));
+                queue = self.lock_queue();
+                continue;
             }
             // A timeout as well as the signal, so a worker cannot sleep through
             // a `shutdown` that raced with it going to sleep.
@@ -473,6 +549,85 @@ impl JobStore {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             queue = next;
         }
+    }
+
+    /// The queue position a worker should take, if any job is due.
+    fn pick(queue: &VecDeque<Pending>, now_ms: u64, order: Option<&dyn JobOrder>) -> Option<usize> {
+        let first_due = queue.iter().position(|p| p.not_before_ms <= now_ms);
+        let Some(order) = order else {
+            return first_due;
+        };
+        let bound = order.bound_ms();
+        if bound == 0 || first_due.is_none() {
+            return first_due;
+        }
+        let entries: Vec<hypellm_fleet::schedule::JobEntry> = queue
+            .iter()
+            .map(|p| {
+                let due = p.not_before_ms <= now_ms;
+                hypellm_fleet::schedule::JobEntry {
+                    seq: p.seq,
+                    submitted_ms: p.submitted_ms,
+                    due,
+                    // Only a due job can be taken, so only a due job needs
+                    // the fleet consulted about it.
+                    class: if due {
+                        order.class(&p.request)
+                    } else {
+                        hypellm_fleet::schedule::JobClass::Warm
+                    },
+                }
+            })
+            .collect();
+        let picked = hypellm_fleet::schedule::pick_job(&entries, now_ms, bound)?;
+        // "Out of order" against submission order among due jobs, which is
+        // what a caller would have expected.
+        let earliest = entries
+            .iter()
+            .filter(|e| e.due)
+            .map(|e| e.seq)
+            .min()
+            .unwrap_or(0);
+        let chosen = entries.get(picked)?;
+        if chosen.seq != earliest {
+            order.taken_out_of_order("job_reordered");
+        } else if now_ms.saturating_sub(chosen.submitted_ms) >= bound {
+            order.taken_out_of_order("job_starving");
+        }
+        Some(picked)
+    }
+
+    /// Put a job back at the end of the queue to try again after `backoff_ms`.
+    ///
+    /// Hands the job back, untouched, if it was cancelled or the store is
+    /// stopping; the caller then finishes it.
+    fn requeue(
+        &self,
+        mut pending: Pending,
+        backoff_ms: u64,
+        now_wall_ms: u64,
+        now_ms: u64,
+    ) -> Result<(), Box<Pending>> {
+        if self.stopping.load(Ordering::SeqCst) || pending.cancelled.load(Ordering::SeqCst) {
+            return Err(Box::new(pending));
+        }
+        {
+            let mut jobs = self.lock_jobs();
+            let Some(job) = jobs.get_mut(&pending.id) else {
+                return Err(Box::new(pending));
+            };
+            if job.view.state.is_terminal() {
+                return Err(Box::new(pending));
+            }
+            job.view.state = JobState::Queued;
+            job.view.eta_ms = backoff_ms;
+            job.view.updated_ms = now_wall_ms;
+            job.revision = self.revisions.fetch_add(1, Ordering::SeqCst);
+        }
+        pending.not_before_ms = now_ms.saturating_add(backoff_ms);
+        self.lock_queue().push_back(pending);
+        self.work.notify_one();
+        Ok(())
     }
 
     /// Move a job to `Running`, unless it was cancelled first.
@@ -564,7 +719,13 @@ pub fn worker_loop(state: &Arc<RouterState>) {
     let Some(jobs) = state.jobs() else {
         return;
     };
-    while let Some(pending) = jobs.take() {
+    let fleet_order = FleetJobOrder { state };
+    let order: Option<&dyn JobOrder> = if state.fleet().is_some() {
+        Some(&fleet_order)
+    } else {
+        None
+    };
+    while let Some(mut pending) = jobs.take(state.clock.as_ref(), order) {
         let now_wall = state.clock.wall_millis();
         if !jobs.begin(&pending.id, now_wall) {
             // Cancelled between submission and pickup. Nothing was reserved and
@@ -577,7 +738,7 @@ pub fn worker_loop(state: &Arc<RouterState>) {
             state,
             &pending.request,
             &pending.groups,
-            pending.permissions,
+            pending.permissions.clone(),
             pending.key_id.as_ref(),
             &mut sink,
         );
@@ -607,6 +768,28 @@ pub fn worker_loop(state: &Arc<RouterState>) {
                 now,
             );
             continue;
+        }
+
+        pending.attempts = pending.attempts.saturating_add(1);
+        if waits_for_capacity(&outcome)
+            && pending.attempts < MAX_JOB_ATTEMPTS
+            && !pending.request.limits.deadline.is_expired(state.clock.as_ref())
+        {
+            let backoff = requeue_backoff_ms(pending.attempts)
+                .min(u64::try_from(
+                    pending
+                        .request
+                        .limits
+                        .deadline
+                        .remaining(state.clock.as_ref())
+                        .as_millis(),
+                ).unwrap_or(u64::MAX));
+            match jobs.requeue(pending, backoff, now_wall, now) {
+                Ok(()) => continue,
+                // Cancelled or shutting down meanwhile: finished below, as
+                // any other failed pass is.
+                Err(back) => pending = *back,
+            }
         }
 
         match &outcome.error {
@@ -647,6 +830,81 @@ pub fn worker_loop(state: &Arc<RouterState>) {
             },
         }
     }
+}
+
+/// The router's job order: the fleet's view of each job's model
+/// (specification 26.11).
+struct FleetJobOrder<'a> {
+    state: &'a RouterState,
+}
+
+impl JobOrder for FleetJobOrder<'_> {
+    fn bound_ms(&self) -> u64 {
+        self.state
+            .fleet()
+            .map_or(0, |fleet| fleet.max_reorder_wait_ms())
+    }
+
+    fn class(&self, request: &CanonicalRequest) -> hypellm_fleet::schedule::JobClass {
+        let Some(fleet) = self.state.fleet() else {
+            return hypellm_fleet::schedule::JobClass::Warm;
+        };
+        let config = self.state.config();
+        config
+            .snapshot
+            .aliases
+            .get(&request.requested_model)
+            .map_or(hypellm_fleet::schedule::JobClass::Warm, |alias| {
+                fleet.job_class(&alias.permitted_targets)
+            })
+    }
+
+    fn taken_out_of_order(&self, outcome: &'static str) {
+        if let Some(fleet) = self.state.fleet() {
+            fleet.count_job_schedule(outcome);
+        }
+    }
+}
+
+/// Whether a failed pass failed only for want of capacity, so the job may wait
+/// for a slave to become available and try again.
+///
+/// Nothing may have been sent: every attempt failed before acceptance, or none
+/// was made. A key-budget refusal is not capacity (specification 12.2 ends the
+/// request), and neither is anything else the trace records.
+fn waits_for_capacity(outcome: &pipeline::Outcome) -> bool {
+    if outcome.is_success() || outcome.saw_output {
+        return false;
+    }
+    let before_acceptance = outcome
+        .trace
+        .attempts
+        .iter()
+        .all(|a| matches!(a.outcome, AttemptOutcome::FailedBeforeAcceptance(_)));
+    let exclusions = &outcome.trace.exclusions;
+    before_acceptance
+        && !exclusions
+            .iter()
+            .any(|e| e.reason == ExclusionReason::BudgetExceeded)
+        && exclusions.iter().any(|e| {
+            matches!(
+                e.reason,
+                ExclusionReason::ActivationQueued
+                    | ExclusionReason::CapacityExhausted
+                    | ExclusionReason::ActivationBudgetExhausted
+                    | ExclusionReason::HostCapacityInsufficient
+                    | ExclusionReason::DeploymentInDwell
+                    | ExclusionReason::EvictionValueInsufficient
+            )
+        })
+}
+
+/// The backoff before pass `attempts + 1`: doubling from one second, capped.
+fn requeue_backoff_ms(attempts: u32) -> u64 {
+    let shift = attempts.saturating_sub(1).min(16);
+    FIRST_REQUEUE_BACKOFF_MS
+        .saturating_mul(1_u64 << shift)
+        .min(MAX_REQUEUE_BACKOFF_MS)
 }
 
 /// Render a completed job's response in the dialect it was submitted in.

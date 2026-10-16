@@ -117,6 +117,7 @@ fn route_for(admin: &Harness, tenant: &str, principal: &str) -> RouteOutcome {
         tenant: &tenant,
         attempted: &attempted,
         now_millis: 0,
+        key: None,
     };
     admin
         .config()

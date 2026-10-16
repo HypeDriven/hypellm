@@ -28,7 +28,7 @@ use hypellm_core::ids::{
 use hypellm_core::target::Target;
 use hypellm_fleet::model::{
     Accelerator, AcceleratorKind, Arch, Artifact, ArtifactKind, Deployment, FleetAgent,
-    FleetConfig, FleetPolicy, Host, HostState, Readiness,
+    FleetConfig, FleetPolicy, Host, HostState, ImageId, Readiness,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -435,6 +435,19 @@ fn build_agent(f: &Fields<'_>) -> Result<FleetAgent, ConfigError> {
         observation_interval_ms,
         observation_max_age_ms,
         request_timeout_ms: f.u64_field("request_timeout_ms", 5_000)?,
+        ssh_public_key: match f.opt_str("ssh_public_key") {
+            None => None,
+            Some(raw) => Some(
+                hypellm_fleet::enroll::ssh_ed25519_line(raw)
+                    .ok_or_else(|| {
+                        f.error(
+                            "invalid_ssh_public_key",
+                            "ssh_public_key must be one 'ssh-ed25519 <base64>' public key",
+                        )
+                    })?
+                    .line(),
+            ),
+        },
     })
 }
 
@@ -528,12 +541,26 @@ fn build_artifact(f: &Fields<'_>) -> Result<Artifact, ConfigError> {
             "an artifact digest must be sha256: followed by 64 hex characters".to_owned(),
         ));
     }
+    // Optional, and checked as strictly as the digest: a pinned image ID is the
+    // trust anchor a copied image is verified against (specification 26.12),
+    // and a malformed one would make every copy fail closed for a typo.
+    let image_id = match f.opt_str("image_id") {
+        None => None,
+        Some(raw) => Some(ImageId::parse(raw).ok_or_else(|| {
+            f.error(
+                "invalid_digest",
+                "an artifact image_id must be sha256: followed by 64 lowercase hex characters"
+                    .to_owned(),
+            )
+        })?),
+    };
     Ok(Artifact {
         id,
         kind,
         arch,
         size_bytes: f.u64_field("size_bytes", 0)?,
         digest,
+        image_id,
         source: f.opt_str("source").unwrap_or("").to_owned(),
     })
 }
@@ -618,6 +645,8 @@ fn build_policy(f: &Fields<'_>, base: FleetPolicy) -> Result<FleetPolicy, Config
             base.prewarm_min_rate_per_minute,
         )?,
         adopt_unmanaged: f.bool_field("adopt_unmanaged", base.adopt_unmanaged)?,
+        idle_stop_ms: f.u64_field("idle_stop_ms", base.idle_stop_ms)?,
+        max_reorder_wait_ms: f.u64_field("max_reorder_wait_ms", base.max_reorder_wait_ms)?,
     };
     if policy.max_activations_per_hour == 0 {
         // A budget that underflows to zero is a fleet that can never start
@@ -647,5 +676,36 @@ fn build_policy(f: &Fields<'_>, base: FleetPolicy) -> Result<FleetPolicy, Config
                 .to_owned(),
         ));
     }
+    if policy.idle_stop_ms != 0 && policy.idle_stop_ms < MIN_IDLE_STOP_MS {
+        // An idle window shorter than a minute stops a model between two turns
+        // of one conversation, and the next turn pays a cold start for it.
+        return Err(f.error(
+            "invalid_interval",
+            format!(
+                "idle_stop_ms must be 0 (never stop an idle model) or at least \
+                 {MIN_IDLE_STOP_MS}"
+            ),
+        ));
+    }
+    if policy.max_reorder_wait_ms != 0
+        && !(hypellm_fleet::schedule::MIN_REORDER_WAIT_MS
+            ..=hypellm_fleet::schedule::MAX_REORDER_WAIT_MS)
+            .contains(&policy.max_reorder_wait_ms)
+    {
+        // The bound is what makes reordering safe: too short and everything is
+        // starving by the time a host frees, too long and "bounded delay" is
+        // no promise at all.
+        return Err(f.error(
+            "invalid_interval",
+            format!(
+                "max_reorder_wait_ms must be 0 (arrival order) or between {} and {}",
+                hypellm_fleet::schedule::MIN_REORDER_WAIT_MS,
+                hypellm_fleet::schedule::MAX_REORDER_WAIT_MS
+            ),
+        ));
+    }
     Ok(policy)
 }
+
+/// The shortest idle window `idle_stop_ms` may declare, other than zero.
+pub const MIN_IDLE_STOP_MS: u64 = 60_000;

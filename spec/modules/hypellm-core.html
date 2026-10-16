@@ -172,7 +172,7 @@ exclusion reasons; no I/O&quot;.</p>
 <td>10</td>
 </tr>
 <tr>
-<td>Monotonic clock, deadlines, bounded metrics</td>
+<td>Monotonic clock, deadlines, bounded metrics, and <code>Signal</code> — a generation-counted wake-up that <code>Clock::wait_signal</code> blocks on in production and steps through on a <code>TestClock</code></td>
 <td><code>time</code></td>
 <td>17, 18.2</td>
 </tr>
@@ -234,6 +234,18 @@ set stays a filter set. The realistic failure is an editor &quot;softening&quot;
 residency or allowlist check into a large negative weight to make a target
 selectable in an emergency; that would be a compliance bypass expressed as a
 tuning change.</p>
+<p><strong>Fleet access fails open in three quiet ways.</strong> <code>fleet_access::permits</code>
+(specification 26.9) defaults to <em>allow</em>, so anything that stops a grant from
+matching widens access: a global grant skipped for a non-inheriting tenant (the
+alias-grant rule, which is why fleet grants do not copy it), a reference that
+resolves to nothing (refused at load by <code>hypellm-config</code>), and a specificity
+that outranks scope (a tenant's exact allow reopening a principal's wildcard
+deny). Scope occupies the high digit of the level and specificity the low one
+for that last reason. <code>FleetAccessDenied</code> is a security filter, applied in
+<code>evaluate</code> beside the binding deny, and <code>tests/fleet_access.rs</code> asserts deny and
+allow monotonicity, sticky principal denies, tie-to-deny, the default in both
+directions, order independence, that the filter never reorders survivors, and
+that targets with no placement are untouched.</p>
 <p><strong>Rank inversion by weight.</strong> A rank-0 preference must beat any combination of
 optimization terms. That holds only because <code>MAX_NON_RANK_MAGNITUDE</code> (400,999)
 stays strictly below <code>RANK_UNIT</code> (1,000,000), and because <code>ScoreTerms::clamped</code>
@@ -257,6 +269,20 @@ a global and a tenant slot on every attempt — and a busy router rejects a grea
 deal. Specification 18.2 is explicit that <code>Drop</code> is not relied upon for
 <em>accounting</em>: the reconciled numbers come from <code>commit</code>, and <code>Drop</code> only
 guarantees <em>capacity</em>.</p>
+<p><strong>Reconfiguration keeps the accounting.</strong> <code>AdmissionController::apply</code>
+takes an <code>AdmissionPlan</code> and reconfigures each scope in place with
+<code>Scope::reconfigure</code> rather than replacing it. In-flight and queued counts,
+the conservation counters, the budget ledger and its period start, and each
+rate bucket's level and debt carry over: a retune refills up to <code>now</code> at the old
+rate, then clamps the level to the new capacity and never raises it, so
+re-publishing a limit hands nobody a fresh burst. Lowering a concurrency or
+queue limit below what is present refuses new arrivals and cancels nothing; a
+reconfiguration wakes waiters, so a raised limit admits them at once. A tenant
+or principal the plan no longer names falls back to the default limits and keeps
+its scope (so removing and restoring a budget does not return what was spent);
+a target or alias scope is dropped from the lookup, and requests already holding
+it release against it. <code>tests/admission_reconfigure.rs</code> holds the 400-case
+property over interleaved reservations, releases, spend and reconfigurations.</p>
 <p><strong>Actual usage reconciles against the reservation timestamp.</strong> When provider
 usage exceeds the pre-admission estimate, <code>Scope::release</code> charges the overage
 without advancing the token bucket's refill clock into the future. Property and
@@ -348,6 +374,11 @@ gate.</p>
 <td>Identifier alphabet</td>
 <td><code>[A-Za-z0-9._:-]</code>, non-empty</td>
 <td><code>ids::validate</code></td>
+</tr>
+<tr>
+<td>Fleet grants per snapshot</td>
+<td>1,024</td>
+<td><code>fleet_access::MAX_FLEET_GRANTS</code>, checked by <code>hypellm-config</code> at load</td>
 </tr>
 <tr>
 <td><code>RequestId</code> text form</td>
@@ -518,7 +549,7 @@ reproducible by number rather than by corpus file.</p>
 <code>spec/deferred-issues.html</code>, <code>DI-002</code>, for the table.</p>
 <p>This crate's obligation under specification 18.2 is the <em>property</em> half —
 &quot;router selection has property tests for determinism, precedence, deny/pin
-behavior, and overflow&quot; — and that layer exists: <code>tests/properties.rs</code>, 14
+behavior, and overflow&quot; — and that layer exists: <code>tests/properties.rs</code>, 16
 properties over Appendix B, each run across 400 seeded cases from a
 deterministic generator. <code>tests/capability.rs</code> adds sixteen more over the
 specification 26.1 contract and the 26.4 warmth ladder — the document-modality
@@ -737,12 +768,36 @@ reports everything healthy and is what policy simulation uses.</li>
 <li><code>rbac::Role</code> is re-exported as <code>ManagementRole</code> because <code>canonical::Role</code> is a
 message role. The two would read identically at a call site and mean entirely
 different things.</li>
+<li><code>rbac::Role::KeyManager</code> (<code>key_manager</code>) is an addition to
+specification 9.3: <code>ManageKeys</code> without break-glass, so a key's lifetime is
+not capped at the minting session's end. See spec/deferred-issues.html.</li>
+<li><code>key_restriction::KeyRestriction</code> is one API key's narrowing of its
+principal's access — alias, target and slave allowlists and an admission-class cap — and
+<code>RoutingContext::key</code> carries it. Every predicate that reads it is an additional
+condition: <code>authorizes</code> refuses an alias outside it (so <code>route</code>, <code>visible_aliases</code>
+and <code>servable_aliases</code> all agree a restricted alias looks ungranted), <code>route</code>
+excludes a target or slave outside it as <code>key_restricted</code> — a security filter, never a
+score — and <code>fleet_access_permits</code> repeats the slave check for the activation path.
+<code>cap_priority</code> returns the lower of the key's class and the principal's. Callers pass
+<code>key: None</code> for anything not made with a key. <code>tests/properties.rs</code> asserts that a
+restriction removes exactly what it names and adds or reorders nothing.</li>
+<li><code>rbac::Permission::FleetEnroll</code> (specification 26.8) is held by
+<code>operator</code> and <code>break_glass_admin</code> and needs a fresh authentication: minting an
+enrollment token hands out a credential.</li>
+<li><code>fleet_access::{permits, FleetGrant, FleetAccessDefault}</code> is specification
+26.9. Callers should use <code>PolicySnapshot::fleet_access_permits</code>, which applies it
+to a target through the snapshot's <code>fleet_placement</code> and passes any target with
+no placement. <code>servable_aliases</code> is <code>visible_aliases</code> less aliases the caller
+can be served by on no slave, for <code>/v1/models</code>; the management views keep
+using <code>visible_aliases</code>, because an operator's own fleet grants must not shrink
+what their tenant administers.</li>
 <li>Nothing in the public surface can hold a secret. <code>Sensitive&lt;T&gt;</code> is provided so
 that callers which do can render safely by default.</li>
 <li><code>AdmissionController::reserve</code> never waits; <code>reserve_queued</code> may, and is what
 the request path uses. Both return the same rejections, so a caller that does
 not want to block loses nothing but the queue. <code>PriorityClass</code> and
-<code>set_class</code>/<code>class_for</code> carry specification 12's queue ordering; the class is
+<code>set_class</code>/<code>class_for</code> carry specification 12's queue ordering, and
+<code>from_plan</code>/<code>apply</code> install and re-install a configuration's limits; the class is
 a property of the <em>requests</em> a scope covers, which is why it is stored beside
 the scopes rather than inside them.</li>
 <li><code>HealthRegistry::set_queue_allowance</code> must be kept in step with the target

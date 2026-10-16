@@ -428,13 +428,52 @@ can report a parse failure differently from a validation failure:</p>
 set and strict typed field access. Booleans accept only <code>true</code>/<code>false</code>; <code>yes</code>,
 <code>on</code>, and <code>1</code> are errors, so <code>enabled=yse</code> cannot silently read as false.</li>
 <li><code>build::{build, ValidatedConfig, Settings, …}</code> — reference resolution,
-invariants, canonical text, digest.</li>
+invariants, canonical text, digest. <code>build::enroll_origin</code> normalises
+<code>settings fleet_enroll_url</code> to a bare <code>https://host[:port]</code> and refuses
+anything else, because the value is pasted into a shell command on another
+machine (specification 26.8). <code>fleet_agent ssh_public_key</code> must be one
+<code>ssh-ed25519</code> key; its comment is dropped. <code>fleet_grant</code> (specification
+26.9) is built into <code>PolicySnapshot::fleet_grants</code>, with the target-to-host
+placement from deployments in <code>fleet_placement</code>; every reference must resolve —
+host, tenant, group, exact alias, and for <code>target:</code> a deployed target on the
+named host — because a grant that matches nothing is a deny that denies nothing.
+<code>allow</code> is required and must be <code>true</code> or <code>false</code>; <code>settings
+fleet_access_default</code> is <code>allow</code> (default) or <code>deny</code>. <code>fleet_policy
+idle_stop_ms</code> (specification 26.10) is 0 or at least 60000
+(<code>fleet::MIN_IDLE_STOP_MS</code>), default 900000; <code>fleet_policy
+max_reorder_wait_ms</code> (specification 26.11) is 0 or between 5000 and 3600000
+(<code>hypellm_fleet::schedule::{MIN,MAX}_REORDER_WAIT_MS</code>), default 120000;
+<code>settings max_parked_requests</code> defaults to 256.</li>
 <li><code>edit::{apply, Edit, Identity}</code> — structured record edits over a document,
 for the management API's <code>policies:edit</code>. Field names are checked against
 the schema (they are written bare) and values are quoted on rendering, so an
-edit changes fields and never adds a record; only routing and fleet kinds are
-editable, and of <code>settings</code> only <code>fleet_enabled</code>. At most 64 edits a batch,
-applied all or nothing.</li>
+edit changes fields and never adds a record; only routing, fleet and access kinds are
+editable, and of <code>settings</code> only <code>fleet_enabled</code> and <code>fleet_access_default</code>. At most 64 edits a batch,
+applied all or nothing, and a field named twice in one edit is refused (the check
+would read one value and the record get the other).
+<code>grant</code> and <code>quota</code> are editable only by <code>id</code>, which is optional on both,
+inert at runtime and unique per kind; a record written without one stays policy
+text. Their scope is fixed at creation and must be <code>principal:</code> or
+<code>group:</code> for a grant and <code>principal:</code> for a quota, so an edit can decide only
+for its subject (<code>edit::scope_rule</code>). Of a principal's quota the scope, class
+and every limit are reachable (<code>edit::QUOTA_EDITABLE</code>: <code>concurrency</code>,
+<code>queued</code>, <code>rps</code>, <code>burst</code>, <code>tpm</code>, <code>token_burst</code>, <code>budget</code>,
+<code>budget_period</code>), and it may be removed. Raising a limit widens what a principal
+may consume; the control on that is the draft's review and the second person
+who publishes it, not this list. The byte rates stay out (specification 12 puts
+them at the Global layer only) and so does <code>operation</code> (it qualifies an
+<code>alias:</code> quota). Tenant, global, target and alias quotas throttle many callers or a
+shared machine and stay policy text.</li>
+<li><strong><code>ValidatedConfig::admission_plan</code></strong> is the one translation from
+<code>quota</code> records to an <code>AdmissionPlan</code>: the global default of 10,000 concurrent
+requests when no global quota exists, and a target's own <code>max_concurrency</code> with
+<code>default_target_queued</code> when it has no quota. Startup and every activation use
+it, so they cannot disagree.</li>
+<li><strong>One quota per scope.</strong> Two quotas over one scope (and operation) are a
+<code>duplicate_quota</code> error. They used to be applied in order, the later
+replacing the earlier's limits, so a limit-free second quota lifted the first.
+A configuration that relied on that order no longer loads; merge the two
+records.</li>
 </ul>
 <p><code>load(text, version)</code> composes all three. The surface is intentionally narrow:
 no partial builds, no lenient mode, no merge or overlay of documents, and no

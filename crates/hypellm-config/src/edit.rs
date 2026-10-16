@@ -16,10 +16,12 @@
 //!   at rendering, which escapes quotes, backslashes and control characters, so
 //!   no value can end its record early.
 //!
-//! Only the record kinds a routing or fleet screen needs are editable. Keys,
-//! credentials, local users, role bindings and quotas are not: each has its
-//! own endpoint with its own checks, and an edit here must not become a way
-//! around them.
+//! Only the record kinds a routing, fleet or access screen needs are editable.
+//! `grant` and `quota` are editable narrowly — see [`scope_rule`] — so that a
+//! principal's ceiling — its models, queue class and limits — can be drafted
+//! without hand-authoring policy text. Keys, credentials, local users, role
+//! bindings, and tenant, global, target and alias quotas are not: each has its
+//! own endpoint or reviewer, and an edit here must not become a way around them.
 
 use crate::parse::{Document, ParseLimits, Position, Record, parse};
 use crate::schema::schema_for;
@@ -37,12 +39,45 @@ pub const EDITABLE_KINDS: &[&str] = &[
     "deployment",
     "artifact",
     "fleet_policy",
+    "fleet_grant",
+    "grant",
+    "quota",
     "settings",
+];
+
+/// The `quota` fields an edit may touch on a principal's quota: its scope,
+/// when it is created, its admission-queue class, and its limits.
+///
+/// A limit is a capacity and cost control, and raising or removing one widens
+/// what a principal may consume. That is a policy decision like any other here:
+/// the edit produces a draft, the draft validates, and a second person reviews
+/// and publishes it — the author cannot (`DraftStore`). The control is that
+/// review, not this list. The list is limited to one subject at a time —
+/// [`scope_rule`] keeps tenant, global, alias and target quotas, which throttle
+/// many callers or a shared machine, in the policy text.
+///
+/// Two quota fields stay out:
+///
+/// - the byte rates (`input_bytes_*`, `output_bytes_*`), which specification 12
+///   places at the Global layer only and the loader refuses anywhere else;
+/// - `operation`, which qualifies an `alias:` quota and means nothing on a
+///   principal's.
+pub const QUOTA_EDITABLE: &[&str] = &[
+    "scope",
+    "class",
+    "concurrency",
+    "queued",
+    "rps",
+    "burst",
+    "tpm",
+    "token_burst",
+    "budget",
+    "budget_period",
 ];
 
 /// The `settings` fields an edit may touch. The rest of `settings` governs
 /// listeners, identity and limits, and belongs to the policy text itself.
-pub const EDITABLE_SETTINGS: &[&str] = &["fleet_enabled"];
+pub const EDITABLE_SETTINGS: &[&str] = &["fleet_enabled", "fleet_access_default"];
 
 /// The most edits one request may carry.
 pub const MAX_EDITS: usize = 64;
@@ -130,7 +165,20 @@ pub fn apply(text: &str, edits: &[Edit]) -> Result<Applied, EditError> {
             }
         };
         check_identity(kind, identity).map_err(fail)?;
+        if let Edit::Set { fields, .. } = edit {
+            // A field named twice is applied twice, last value winning, while
+            // any check of it reads one of them. Refused for every kind.
+            for (at, (name, _)) in fields.iter().enumerate() {
+                if fields.iter().skip(at + 1).any(|(other, _)| other == name) {
+                    return Err(fail(format!("'{}' is named more than once", name.escape_debug())));
+                }
+            }
+        }
         let position = find(&document, kind, identity);
+        if let Some(prefixes) = scope_rule(kind) {
+            let existing = position.and_then(|at| document.records.get(at));
+            check_scoped(kind, prefixes, existing, edit).map_err(fail)?;
+        }
 
         match edit {
             Edit::Remove { .. } => {
@@ -211,6 +259,91 @@ fn check_identity(kind: &str, identity: &Identity) -> Result<(), String> {
         (_, Identity::Id(id)) if is_token(id) => Ok(()),
         (_, Identity::Id(id)) => Err(format!("'{}' is not a valid identifier", id.escape_debug())),
         _ => Err(format!("a {kind} is identified by 'id'")),
+    }
+}
+
+/// The scopes at which records of `kind` may be edited, for the kinds that are
+/// editable only at some.
+///
+/// A `grant` at `tenant:` or `global` decides what everyone in a tenant may
+/// use, and a `quota` there throttles all of them; those stay policy text. A
+/// principal's or a group's record decides only for its subject, which is what
+/// an access screen edits.
+fn scope_rule(kind: &str) -> Option<&'static [&'static str]> {
+    match kind {
+        "grant" => Some(&["principal:", "group:"]),
+        // There is no `group:` quota scope in the grammar.
+        "quota" => Some(&["principal:"]),
+        _ => None,
+    }
+}
+
+/// Refuse an edit to a scoped kind that would reach past its subject.
+///
+/// The scope is fixed at creation: moving a principal's grant to a tenant would
+/// widen it to everyone there, so a different subject is a different record.
+fn check_scoped(
+    kind: &str,
+    prefixes: &[&str],
+    existing: Option<&Record>,
+    edit: &Edit,
+) -> Result<(), String> {
+    let narrow = |scope: &str| prefixes.iter().any(|p| scope.starts_with(p));
+    let allowed = prefixes.join(" or ");
+    if let Some(record) = existing {
+        let scope = record.get("scope").unwrap_or("");
+        if !narrow(scope) {
+            return Err(format!(
+                "{kind} at scope '{}' cannot be edited here; only {allowed} scopes can",
+                scope.escape_debug()
+            ));
+        }
+    }
+    match edit {
+        Edit::Remove { .. } => {
+            // A principal's quota carries nothing this path cannot also set,
+            // so removing one is the same decision as clearing its fields —
+            // and like every edit here it is reviewed before it applies.
+            if kind == "quota" {
+                if let Some(record) = existing {
+                    if let Some((name, _)) = record
+                        .fields
+                        .iter()
+                        .find(|(name, _)| name != "id" && !QUOTA_EDITABLE.contains(&name.as_str()))
+                    {
+                        return Err(format!(
+                            "this quota also sets '{name}', which cannot be edited here; \
+                             removing the record would drop it too, so edit the policy text instead"
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        Edit::Set { fields, .. } => {
+            if kind == "quota" {
+                if let Some((name, _)) = fields.iter().find(|(n, _)| !QUOTA_EDITABLE.contains(&n.as_str())) {
+                    return Err(format!(
+                        "quota field '{}' cannot be edited here; only {} can",
+                        name.escape_debug(),
+                        QUOTA_EDITABLE.join(" and ")
+                    ));
+                }
+            }
+            let scope = fields.iter().find(|(n, _)| n == "scope").map(|(_, v)| v);
+            match (existing, scope) {
+                (Some(_), Some(_)) => Err(format!(
+                    "a {kind}'s scope is fixed when it is created; remove it and add a new one"
+                )),
+                (Some(_), None) => Ok(()),
+                (None, Some(Some(scope))) if narrow(scope) => Ok(()),
+                (None, Some(Some(scope))) => Err(format!(
+                    "a {kind} created here must have a {allowed} scope, not '{}'",
+                    scope.escape_debug()
+                )),
+                (None, _) => Err(format!("a new {kind} needs a 'scope'")),
+            }
+        }
     }
 }
 
@@ -316,7 +449,7 @@ mod tests {
 
     #[test]
     fn kinds_with_their_own_endpoints_are_not_editable() {
-        for kind in ["local_user", "role_binding", "credential", "quota", "grant", "identity"] {
+        for kind in ["local_user", "role_binding", "credential", "identity"] {
             assert!(apply(BASE, &[set(kind, "x", &[])]).is_err(), "{kind} was editable");
         }
         let settings = Edit::Set {
@@ -325,6 +458,157 @@ mod tests {
             fields: vec![("admin_listen".to_owned(), Some("0.0.0.0:1".to_owned()))],
         };
         assert!(apply(BASE, &[settings]).is_err(), "a listener was editable");
+    }
+
+    const ACCESS: &str = "grant scope=tenant:local model=* allow=true\n\
+        grant id=g-mine scope=principal:svc:dsh model=agent allow=true\n\
+        quota scope=tenant:local concurrency=4 class=standard\n\
+        quota id=q-limited scope=principal:svc:ci concurrency=2 class=batch\n\
+        quota id=q-class scope=principal:svc:dsh class=batch\n";
+
+    #[test]
+    fn a_principal_grant_and_class_round_trip_through_an_edit() {
+        let applied = apply(
+            ACCESS,
+            &[
+                set("grant", "g-new", &[
+                    ("scope", Some("principal:svc:dsh")),
+                    ("model", Some("chat-standard")),
+                    ("allow", Some("false")),
+                ]),
+                set("grant", "g-mine", &[("allow", Some("false"))]),
+                set("quota", "q-class", &[("class", Some("interactive"))]),
+                set("quota", "q-new", &[("scope", Some("principal:svc:new")), ("class", Some("batch"))]),
+            ],
+        )
+        .expect("applies");
+        assert_eq!(applied.changed, 4);
+        let doc = parse(&applied.text, &ParseLimits::DEFAULT).expect("parses");
+        let grant = |id: &str| doc.of_kind("grant").find(|r| r.get("id") == Some(id)).expect(id);
+        assert_eq!(grant("g-new").get("model"), Some("chat-standard"));
+        assert_eq!(grant("g-new").get("allow"), Some("false"));
+        assert_eq!(grant("g-mine").get("allow"), Some("false"));
+        assert_eq!(grant("g-mine").get("model"), Some("agent"), "a merge keeps unnamed fields");
+        let quota = |id: &str| doc.of_kind("quota").find(|r| r.get("id") == Some(id)).expect(id);
+        assert_eq!(quota("q-class").get("class"), Some("interactive"));
+        assert_eq!(quota("q-new").get("scope"), Some("principal:svc:new"));
+        // The tenant-wide records are untouched and still id-less.
+        assert_eq!(doc.of_kind("grant").filter(|r| r.get("id").is_none()).count(), 1);
+        assert_eq!(doc.of_kind("quota").filter(|r| r.get("id").is_none()).count(), 1);
+    }
+
+    #[test]
+    fn a_grant_or_quota_cannot_reach_past_its_subject() {
+        let refused = [
+            // A tenant- or global-wide record decides for everyone.
+            set("grant", "g-t", &[("scope", Some("tenant:local")), ("model", Some("*"))]),
+            set("grant", "g-g", &[("scope", Some("global")), ("model", Some("*"))]),
+            set("quota", "q-t", &[("scope", Some("tenant:local")), ("class", Some("batch"))]),
+            // Moving a principal's record to a tenant would widen it.
+            set("grant", "g-mine", &[("scope", Some("tenant:local"))]),
+            set("quota", "q-class", &[("scope", Some("principal:svc:other"))]),
+            // A new record must say whose it is.
+            set("grant", "g-none", &[("model", Some("agent"))]),
+            set("quota", "q-none", &[("class", Some("batch"))]),
+            // Fields that mean nothing on a principal's quota stay out.
+            set("quota", "q-limited", &[("input_bytes_per_second", Some("1000"))]),
+            set("quota", "q-new", &[("scope", Some("principal:svc:x")), ("operation", Some("chat"))]),
+            // The check reads one `scope`; the record would get the other.
+            set("grant", "g-two", &[("scope", Some("principal:svc:x")), ("scope", Some("tenant:local"))]),
+        ];
+        for edit in refused {
+            assert!(apply(ACCESS, std::slice::from_ref(&edit)).is_err(), "{edit:?} was accepted");
+        }
+        let remove = |kind: &str, id: &str| Edit::Remove { kind: kind.to_owned(), identity: Identity::Id(id.to_owned()) };
+        let removed = apply(ACCESS, &[remove("quota", "q-class"), remove("grant", "g-mine")]).expect("class-only");
+        assert!(!removed.text.contains("q-class") && !removed.text.contains("g-mine"));
+    }
+
+    #[test]
+    fn a_principals_quota_limits_are_editable_and_a_tenants_are_not() {
+        // The concrete need: cap one person's concurrency, queue, rates and
+        // spend without hand-editing policy text.
+        let applied = apply(
+            ACCESS,
+            &[
+                set("quota", "q-new", &[
+                    ("scope", Some("principal:mikiyas.mulugeta")),
+                    ("concurrency", Some("1")),
+                    ("queued", Some("4")),
+                    ("rps", Some("2")),
+                    ("burst", Some("4")),
+                    ("tpm", Some("60000")),
+                    ("token_burst", Some("8000")),
+                    ("budget", Some("500")),
+                    ("budget_period", Some("monthly")),
+                ]),
+                // An existing limit raised, another cleared.
+                set("quota", "q-limited", &[("concurrency", Some("8")), ("class", None)]),
+            ],
+        )
+        .expect("applies");
+        let doc = parse(&applied.text, &ParseLimits::DEFAULT).expect("parses");
+        let quota = |id: &str| doc.of_kind("quota").find(|r| r.get("id") == Some(id)).expect(id);
+        assert_eq!(quota("q-new").get("scope"), Some("principal:mikiyas.mulugeta"));
+        assert_eq!(quota("q-new").get("budget_period"), Some("monthly"));
+        assert_eq!(quota("q-limited").get("concurrency"), Some("8"));
+        assert_eq!(quota("q-limited").get("class"), None);
+        // The quotas still load, so the limits are real ones.
+        let quotas: String = applied.text.lines().filter(|l| l.starts_with("quota ")).map(|l| format!("{l}\n")).collect();
+        let config = crate::load(&format!("settings state_dir=/tmp/x\ntenant id=local\n{quotas}"), 1)
+            .expect("the edited quotas load");
+        let mikiyas = config
+            .quotas
+            .iter()
+            .find(|q| q.scope == crate::QuotaScope::Principal(hypellm_core::ids::PrincipalId::new("mikiyas.mulugeta").unwrap()))
+            .expect("principal:mikiyas.mulugeta is a quota scope");
+        assert_eq!(mikiyas.limits.max_concurrency, 1);
+        assert_eq!(mikiyas.limits.budget_minor_units, 500);
+
+        // A limited principal quota can now be removed: it is one subject's
+        // record, and the removal is reviewed like any other edit.
+        let remove = Edit::Remove { kind: "quota".to_owned(), identity: Identity::Id("q-limited".to_owned()) };
+        let removed = apply(ACCESS, &[remove]).expect("a principal's limited quota is removable");
+        assert!(!removed.text.contains("q-limited"));
+
+        // The tenant's quota throttles everyone in it, so its limits stay text.
+        for edit in [
+            set("quota", "q-t", &[("scope", Some("tenant:local")), ("concurrency", Some("100"))]),
+            set("quota", "q-g", &[("scope", Some("global")), ("concurrency", Some("1"))]),
+            set("quota", "q-x", &[("scope", Some("target:spark:q")), ("concurrency", Some("1"))]),
+            set("quota", "q-a", &[("scope", Some("alias:agent")), ("concurrency", Some("1"))]),
+        ] {
+            assert!(apply(ACCESS, std::slice::from_ref(&edit)).is_err(), "{edit:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn an_id_less_grant_or_quota_cannot_be_addressed() {
+        // The tenant-wide records have no id: an edit naming any id either
+        // creates a new record or finds nothing, and never reaches them.
+        let remove = |kind: &str| Edit::Remove { kind: kind.to_owned(), identity: Identity::Id("local".to_owned()) };
+        assert!(apply(ACCESS, &[remove("grant")]).is_err());
+        assert!(apply(ACCESS, &[remove("quota")]).is_err());
+        let by_scope = Edit::Set {
+            kind: "grant".to_owned(),
+            identity: Identity::Scope("tenant:local".to_owned()),
+            fields: vec![("allow".to_owned(), Some("false".to_owned()))],
+        };
+        assert!(apply(ACCESS, &[by_scope]).is_err(), "a grant was addressed by scope");
+    }
+
+    #[test]
+    fn a_grant_field_outside_the_schema_or_a_hostile_value_is_contained() {
+        for name in ["allow x=y", "limit", "id"] {
+            assert!(
+                apply(ACCESS, &[set("grant", "g-mine", &[(name, Some("v"))])]).is_err(),
+                "field name {name:?} was accepted"
+            );
+        }
+        let hostile = "agent\nrole_binding subject=principal:mallory role=break_glass_admin";
+        let applied = apply(ACCESS, &[set("grant", "g-mine", &[("model", Some(hostile))])]).expect("applies");
+        let doc = parse(&applied.text, &ParseLimits::DEFAULT).expect("parses");
+        assert_eq!(doc.of_kind("role_binding").count(), 0);
     }
 
     #[test]

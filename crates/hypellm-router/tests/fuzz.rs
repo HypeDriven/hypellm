@@ -357,3 +357,53 @@ fn random_bytes_are_rejected_without_panicking() {
         }
     }
 }
+
+// -- Key restriction records ---------------------------------------------------
+//
+// Not a client parser, but read by the router at every start: `restore_keys`
+// replays `ApiKeyRestriction` frames, and a frame that decoded looser than it
+// was written would hand a narrowed key back its principal's whole access. The
+// property: whatever a mutated record decodes to, every field it decodes as
+// "no restriction" was written as an explicit `null` — never inferred from a
+// missing, misspelled or mistyped field.
+
+#[test]
+fn a_restriction_record_never_decodes_looser_than_it_was_written() {
+    let seeds: &[&[u8]] = &[
+        br#"{"id":"0123456789abcdef","models":["agent","chat"],"targets":["spark:qwen"],"hosts":["spark-ef2f"],"priority":"batch"}"#,
+        br#"{"id":"0123456789abcdef","models":["agent"],"targets":null,"hosts":null,"priority":null}"#,
+        br#"{"id":"0123456789abcdef","models":null,"targets":null,"hosts":null,"priority":"standard"}"#,
+    ];
+    let explicit_null = |value: &wire_json::Value, field: &str| {
+        matches!(value.get(field), Some(wire_json::Value::Null))
+    };
+    let (accepted, rejected) = fuzz::sweep(seeds, ITERATIONS, 0x0c11_7e57, |case| {
+        let Some(change) = hypellm_auth::RestrictionChange::from_payload(case) else {
+            return false;
+        };
+        let value = wire_json::parse(case, &Limits::SMALL).expect("it decoded, so it parsed");
+        let r = &change.restrictions;
+        for (field, open) in [
+            ("models", r.models.is_none()),
+            ("targets", r.targets.is_none()),
+            ("hosts", r.hosts.is_none()),
+            ("priority", r.priority.is_none()),
+        ] {
+            assert_eq!(
+                open,
+                explicit_null(&value, field),
+                "'{field}' decoded as {} from {}",
+                if open { "unrestricted" } else { "restricted" },
+                String::from_utf8_lossy(case)
+            );
+        }
+        // And what decodes re-encodes to the same restriction.
+        assert_eq!(
+            hypellm_auth::RestrictionChange::from_payload(&change.to_payload()),
+            Some(change)
+        );
+        true
+    });
+    assert_eq!(accepted + rejected, ITERATIONS);
+    assert!(accepted > 0, "no mutated restriction record ever decoded");
+}

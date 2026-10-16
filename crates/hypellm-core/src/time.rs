@@ -69,6 +69,75 @@ pub trait Clock: Send + Sync + fmt::Debug {
     fn sleep(&self, duration: Duration) {
         std::thread::sleep(duration);
     }
+
+    /// Wait until `signal` moves past generation `seen`, or `timeout` passes.
+    ///
+    /// Returns the generation observed on return. A waiter that reads the
+    /// generation, checks its condition, and then waits for the generation it
+    /// read cannot miss a notification sent in between: the notification moved
+    /// the generation, so the wait returns at once.
+    ///
+    /// On the trait for the same reason as [`Clock::sleep`]: the production
+    /// clock blocks on the condition variable, and [`TestClock`] advances its
+    /// own reading by `timeout` instead of blocking when nothing has changed,
+    /// so a parked request's deadline arithmetic is exact in a test.
+    fn wait_signal(&self, signal: &Signal, seen: u64, timeout: Duration) -> u64 {
+        signal.wait_real(seen, timeout)
+    }
+}
+
+/// A broadcast wake-up with a generation counter.
+///
+/// Bounded and lossless in the sense that matters: each notification moves the
+/// generation, so a waiter compares generations rather than counting wakes, and
+/// a notification that arrives before the wait begins is not lost.
+#[derive(Debug, Default)]
+pub struct Signal {
+    generation: Mutex<u64>,
+    changed: std::sync::Condvar,
+}
+
+impl Signal {
+    /// A signal at generation zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The current generation.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        match self.generation.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    /// Move the generation on and wake every waiter.
+    pub fn notify(&self) {
+        let mut guard = match self.generation.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = guard.wrapping_add(1);
+        drop(guard);
+        self.changed.notify_all();
+    }
+
+    /// Block until the generation differs from `seen` or `timeout` passes.
+    fn wait_real(&self, seen: u64, timeout: Duration) -> u64 {
+        let guard = match self.generation.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let result = self
+            .changed
+            .wait_timeout_while(guard, timeout, |generation| *generation == seen);
+        match result {
+            Ok((guard, _)) => *guard,
+            Err(poisoned) => *poisoned.into_inner().0,
+        }
+    }
 }
 
 /// The production clock.
@@ -176,6 +245,19 @@ impl Clock for TestClock {
         // blocked. A poll loop therefore converges at full speed and a
         // deadline is reached exactly when the arithmetic says it is.
         self.advance(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+    }
+
+    fn wait_signal(&self, signal: &Signal, seen: u64, timeout: Duration) -> u64 {
+        // A change already made is returned at once, as the real clock would.
+        // Otherwise the whole timeout passes, instantly: nothing in a test
+        // notifies from another thread mid-wait, so blocking would only spend
+        // real time to reach the same answer.
+        let now = signal.generation();
+        if now != seen {
+            return now;
+        }
+        self.sleep(timeout);
+        signal.generation()
     }
 
     // Truncating microseconds to whole milliseconds is the intended unit

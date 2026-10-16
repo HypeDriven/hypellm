@@ -80,8 +80,10 @@ pub mod canonical;
 pub mod decision;
 pub mod error;
 pub mod event;
+pub mod fleet_access;
 pub mod health;
 pub mod ids;
+pub mod key_restriction;
 pub mod netaddr;
 pub mod policy;
 pub mod rbac;
@@ -99,6 +101,7 @@ pub use decision::{
     ScoreTerms,
 };
 pub use error::{ErrorCode, RouterError};
+pub use fleet_access::{FleetAccessDefault, FleetGrant, FleetModelSelector, HostSelector};
 pub use event::{
     CanonicalEvent, CanonicalUsage, FinishReason, ResponseAccumulator, ToolCallDelta, UpstreamError,
     UpstreamErrorClass, UsageSource,
@@ -270,6 +273,7 @@ mod invariant_tests {
             tenant: &tenant,
             attempted: &attempted,
             now_millis: 0,
+            key: None,
         };
 
         let outcome = snapshot.route(&ctx, &req, &IdealLiveState);
@@ -367,6 +371,8 @@ mod invariant_tests {
             ExclusionReason::CostCeilingExceeded,
             ExclusionReason::CapacityExhausted,
             ExclusionReason::DeniedByPolicy,
+            ExclusionReason::FleetAccessDenied,
+            ExclusionReason::KeyRestricted,
             ExclusionReason::NotPinnedTarget,
             ExclusionReason::LocalRequired,
             ExclusionReason::FamilyFailoverNotAllowed,

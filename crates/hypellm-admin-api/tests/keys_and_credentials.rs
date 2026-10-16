@@ -648,7 +648,7 @@ fn a_key_holds_no_session_to_log_out_of() {
 
 #[test]
 fn every_key_endpoint_refuses_a_caller_without_manage_keys() {
-    // Specification 9.3 puts `ManageKeys` on the break-glass role alone. A
+    // `ManageKeys` is on the break-glass and key_manager roles only. A
     // caller without it gets a refusal, not data and not a key.
     let admin = Harness::new();
     let (planted, _secret) = admin.issue_api_key(TENANT_A, "svc:planted");
@@ -1696,7 +1696,7 @@ fn a_credential_listing_reports_when_it_was_last_rotated() {
 
 #[test]
 fn break_glass_cannot_mint_a_management_key_carrying_a_role_it_holds_only_through_break_glass() {
-    // `ManageKeys` belongs to break-glass alone. Unrestricted, the recovery
+    // `ManageKeys` is otherwise break-glass authority. Unrestricted, the recovery
     // path could mint a permanent management key for any principal — an
     // editor, an approver, another break-glass holder — and so turn a
     // time-limited, reason-bound session into a string that outlives it.
@@ -1892,4 +1892,623 @@ fn a_key_cannot_approve_a_draft_written_by_the_person_who_minted_it() {
         .send();
     assert_eq!(published.status, 403, "{}", published.body);
     assert_eq!(admin.config().snapshot.version, version, "the draft was activated");
+}
+
+// -- Keys: expiry ------------------------------------------------------------
+
+/// Create a key expiring at `expires_at` and return its identifier and secret.
+fn create_expiring_key(
+    admin: &Harness,
+    session: &TestSession,
+    principal: &str,
+    expires_at: u64,
+) -> (String, String) {
+    let response = admin.post(
+        session,
+        "/admin/v1/keys",
+        &format!(r#"{{"principal":"{principal}","scopes":["inference"],"expires_at":{expires_at}}}"#),
+    );
+    assert_eq!(response.status, 201, "{}", response.body);
+    (response.str_field("id"), response.str_field("secret"))
+}
+
+/// The ETag a key's expiry change demands, as the listing discloses it.
+fn key_etag(admin: &Harness, session: &TestSession, id: &str) -> String {
+    admin
+        .get(session, "/admin/v1/keys")
+        .data()
+        .into_iter()
+        .find(|item| item.field_str("id").ok() == Some(id))
+        .unwrap_or_else(|| panic!("'{id}' is not in the key listing"))
+        .field_str("etag")
+        .expect("a key read must disclose its ETag")
+        .to_owned()
+}
+
+/// `PUT /admin/v1/keys/{id}/expiry`.
+fn put_expiry(
+    admin: &Harness,
+    session: &TestSession,
+    id: &str,
+    body: &str,
+    etag: Option<&str>,
+) -> harness::Response {
+    let request = admin
+        .request(Method::Put, &format!("/admin/v1/keys/{id}/expiry"))
+        .as_session(session)
+        .json(body);
+    match etag {
+        Some(etag) => request.if_match(etag).send(),
+        None => request.send(),
+    }
+}
+
+/// The session's end on the wall clock: the latest expiry break-glass may set.
+fn break_glass_bound(admin: &Harness, session: &TestSession) -> u64 {
+    admin.clock.wall_millis()
+        + session
+            .session
+            .absolute_expiry_millis
+            .saturating_sub(admin.clock.now_millis())
+}
+
+#[test]
+fn extending_an_expired_key_makes_the_same_secret_authenticate_again() {
+    // The response is not the evidence: the key that stopped working at its
+    // old expiry must work again, the change must be on disk, and the listing
+    // must show the moment the router will now enforce.
+    let admin = Harness::new();
+    let oncall = admin.break_glass();
+    let start = admin.clock.wall_millis();
+    let (id, secret) = create_expiring_key(&admin, &oncall, "svc:ci", start + 1_000);
+
+    admin.advance(2_000);
+    let now = admin.clock.wall_millis();
+    assert!(matches!(
+        admin.state.keys.verify(&secret, None, now),
+        Err(KeyRejection::Expired)
+    ));
+
+    let later = now + 60_000;
+    let etag = key_etag(&admin, &oncall, &id);
+    let response = put_expiry(&admin, &oncall, &id, &format!(r#"{{"expires_at":{later}}}"#), Some(&etag));
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert_eq!(response.json().get("expires_at").and_then(wire_json::Value::as_u64), Some(later));
+    assert_ne!(response.expect_etag(), etag, "the tag must move with the expiry");
+
+    assert!(
+        admin.state.keys.verify(&secret, None, now).is_ok(),
+        "an extended key must authenticate with the secret it was issued"
+    );
+    let listed = admin
+        .get(&oncall, "/admin/v1/keys")
+        .data()
+        .into_iter()
+        .find(|item| item.field_str("id").ok() == Some(id.as_str()))
+        .expect("listed");
+    assert_eq!(listed.get("expires_at").and_then(wire_json::Value::as_u64), Some(later));
+
+    let frames = durable_frames(&admin, RecordKind::ApiKeyExpiry);
+    assert_eq!(frames.len(), 1, "the change must reach the durable log");
+    let change = hypellm_auth::ExpiryChange::from_payload(&frames[0].payload).expect("decodes");
+    assert_eq!(change.id.as_str(), id);
+    assert_eq!(change.expires_at_millis, Some(later));
+    assert!(
+        durable_frames(&admin, RecordKind::ApiKey).len() == 1,
+        "an expiry change must not re-append the key record, which carries `revoked`"
+    );
+}
+
+#[test]
+fn an_expiry_change_is_visible_to_an_auditor_with_both_times() {
+    let admin = Harness::new();
+    let oncall = admin.break_glass();
+    let start = admin.clock.wall_millis();
+    let (id, _) = create_expiring_key(&admin, &oncall, "svc:ci", start + 1_000);
+    let etag = key_etag(&admin, &oncall, &id);
+    let later = start + 50_000;
+    let response = put_expiry(&admin, &oncall, &id, &format!(r#"{{"expires_at":{later}}}"#), Some(&etag));
+    assert_eq!(response.status, 200, "{}", response.body);
+
+    let audit = admin.get(&admin.auditor(), "/admin/v1/audit");
+    let entry = audit
+        .data()
+        .into_iter()
+        .find(|item| item.field_str("action").ok() == Some("key_expiry_changed"))
+        .expect("the expiry change is in the audit view");
+    assert_eq!(entry.field_str("object").ok(), Some(id.as_str()));
+    assert_eq!(entry.field_str("actor").ok(), Some(oncall.principal.as_str()));
+    let reason = entry.field_str("reason").expect("a reason");
+    assert!(
+        reason.contains(&(start + 1_000).to_string()) && reason.contains(&later.to_string()),
+        "the audit reason must name both expiries: {reason}"
+    );
+}
+
+#[test]
+fn an_expiry_change_without_a_current_etag_changes_nothing() {
+    let admin = Harness::new();
+    let oncall = admin.break_glass();
+    let start = admin.clock.wall_millis();
+    let (id, _) = create_expiring_key(&admin, &oncall, "svc:ci", start + 1_000);
+    let body = format!(r#"{{"expires_at":{}}}"#, start + 50_000);
+
+    let missing = put_expiry(&admin, &oncall, &id, &body, None);
+    assert_eq!(missing.status, 428, "{}", missing.body);
+    let stale = put_expiry(&admin, &oncall, &id, &body, Some(STALE_ETAG));
+    assert_eq!(stale.status, 412, "{}", stale.body);
+
+    // A tag read before a revocation no longer matches after it.
+    let before_revoke = key_etag(&admin, &oncall, &id);
+    assert_eq!(admin.delete(&oncall, &format!("/admin/v1/keys/{id}")).status, 204);
+    let raced = put_expiry(&admin, &oncall, &id, &body, Some(&before_revoke));
+    assert_eq!(raced.status, 412, "{}", raced.body);
+
+    let record = admin.state.keys.get(&KeyId::new(&id).unwrap()).unwrap();
+    assert_eq!(record.expires_at_millis, Some(start + 1_000));
+    assert!(durable_frames(&admin, RecordKind::ApiKeyExpiry).is_empty());
+}
+
+#[test]
+fn a_revoked_key_cannot_be_given_a_new_expiry() {
+    // There is no un-revoke, and an expiry change must not become one.
+    let admin = Harness::new();
+    let oncall = admin.break_glass();
+    let start = admin.clock.wall_millis();
+    let (id, secret) = create_expiring_key(&admin, &oncall, "svc:ci", start + 1_000);
+    assert_eq!(admin.delete(&oncall, &format!("/admin/v1/keys/{id}")).status, 204);
+
+    let response = put_expiry(
+        &admin,
+        &oncall,
+        &id,
+        &format!(r#"{{"expires_at":{}}}"#, start + 50_000),
+        Some(ANY_ETAG),
+    );
+    assert_eq!(response.status, 409, "{}", response.body);
+
+    let record = admin.state.keys.get(&KeyId::new(&id).unwrap()).unwrap();
+    assert!(record.revoked);
+    assert_eq!(record.expires_at_millis, Some(start + 1_000));
+    assert!(admin.state.keys.verify(&secret, None, start).is_err());
+    assert!(durable_frames(&admin, RecordKind::ApiKeyExpiry).is_empty());
+}
+
+#[test]
+fn break_glass_cannot_extend_a_key_past_its_own_session_or_remove_the_expiry() {
+    // Creation binds a break-glass key to the session that minted it. An
+    // expiry endpoint without the same bound would undo that one request later.
+    let admin = Harness::new();
+    let oncall = admin.break_glass();
+    let start = admin.clock.wall_millis();
+    let (id, _) = create_expiring_key(&admin, &oncall, "svc:ci", start + 1_000);
+    let bound = break_glass_bound(&admin, &oncall);
+
+    for body in [r#"{"expires_at":null}"#.to_owned(), format!(r#"{{"expires_at":{}}}"#, bound + 1)] {
+        let response = put_expiry(&admin, &oncall, &id, &body, Some(ANY_ETAG));
+        assert_eq!(response.status, 400, "{body}: {}", response.body);
+    }
+    let record = admin.state.keys.get(&KeyId::new(&id).unwrap()).unwrap();
+    assert_eq!(record.expires_at_millis, Some(start + 1_000));
+    assert!(durable_frames(&admin, RecordKind::ApiKeyExpiry).is_empty());
+
+    // Exactly the bound is allowed.
+    let response = put_expiry(&admin, &oncall, &id, &format!(r#"{{"expires_at":{bound}}}"#), Some(ANY_ETAG));
+    assert_eq!(response.status, 200, "{}", response.body);
+    let record = admin.state.keys.get(&KeyId::new(&id).unwrap()).unwrap();
+    assert_eq!(record.expires_at_millis, Some(bound));
+}
+
+#[test]
+fn a_key_manager_decides_a_keys_lifetime_beyond_its_own_session() {
+    // The reason `key_manager` exists: break-glass keys die with the session,
+    // so without a non-emergency holder of `ManageKeys` no key could outlive
+    // an hour. The adversarial case is the local profile's administrator, who
+    // holds break-glass too — `Session::is_break_glass` is true for them.
+    let admin = Harness::new();
+    let manager = admin.session_with_method(
+        "user:admin-acme",
+        TENANT_A,
+        &[Role::BreakGlassAdmin, Role::KeyManager],
+        hypellm_auth::AuthMethod::Password,
+    );
+    assert!(manager.session.is_break_glass(), "the fixture must be the hard case");
+    let bound = break_glass_bound(&admin, &manager);
+
+    let session = admin.get(&manager, "/admin/v1/session");
+    assert_eq!(session.json().opt_field_bool("keys_capped_to_session").ok().flatten(), Some(false));
+
+    // Minted without an expiry: it has none, rather than the session's.
+    let (id, secret) = create_key(&admin, &manager, "svc:ci");
+    let key = KeyId::new(&id).unwrap();
+    assert_eq!(admin.state.keys.get(&key).unwrap().expires_at_millis, None);
+
+    // Given one past the session's end, then relieved of it.
+    let later = bound + 30 * 24 * 3_600_000;
+    let etag = key_etag(&admin, &manager, &id);
+    let response = put_expiry(&admin, &manager, &id, &format!(r#"{{"expires_at":{later}}}"#), Some(&etag));
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert_eq!(admin.state.keys.get(&key).unwrap().expires_at_millis, Some(later));
+
+    let etag = key_etag(&admin, &manager, &id);
+    let response = put_expiry(&admin, &manager, &id, r#"{"expires_at":null}"#, Some(&etag));
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert_eq!(admin.state.keys.get(&key).unwrap().expires_at_millis, None);
+    assert_eq!(durable_frames(&admin, RecordKind::ApiKeyExpiry).len(), 2);
+
+    // Still working well after the session that set it would have ended.
+    assert!(admin.state.keys.verify(&secret, None, later + 1).is_ok());
+}
+
+#[test]
+fn the_offline_break_glass_token_stays_capped_even_for_a_key_manager() {
+    // `key_manager` lifts the cap on the role, not on the sign-in: a session
+    // opened with the offline token is the emergency path whatever else its
+    // principal holds, and a key it leaves behind must end with it.
+    let admin = Harness::new();
+    let token = admin.session_with_method(
+        "user:oncall-acme",
+        TENANT_A,
+        &[Role::BreakGlassAdmin, Role::KeyManager],
+        hypellm_auth::AuthMethod::BreakGlass,
+    );
+    let bound = break_glass_bound(&admin, &token);
+
+    let session = admin.get(&token, "/admin/v1/session");
+    assert_eq!(session.json().opt_field_bool("keys_capped_to_session").ok().flatten(), Some(true));
+
+    let (id, _) = create_key(&admin, &token, "svc:ci");
+    let key = KeyId::new(&id).unwrap();
+    assert_eq!(admin.state.keys.get(&key).unwrap().expires_at_millis, Some(bound));
+
+    let response = put_expiry(&admin, &token, &id, r#"{"expires_at":null}"#, Some(ANY_ETAG));
+    assert_eq!(response.status, 400, "{}", response.body);
+    assert_eq!(admin.state.keys.get(&key).unwrap().expires_at_millis, Some(bound));
+}
+
+#[test]
+fn a_key_manager_cannot_mint_a_management_key_for_a_break_glass_principal() {
+    // Holding `ManageKeys` in its own right does not make break-glass
+    // transferable: a key for the on-call principal would carry it.
+    let admin = Harness::new();
+    let manager = admin.session("user:keys-acme", TENANT_A, &[Role::KeyManager]);
+    let before = admin.state.keys.list().len();
+
+    let response = admin.post(
+        &manager,
+        "/admin/v1/keys",
+        &format!(r#"{{"principal":"{KEY_ONCALL_PRINCIPAL}","scopes":["management:read"]}}"#),
+    );
+    assert_eq!(response.status, 403, "{}", response.body);
+    assert_eq!(admin.state.keys.list().len(), before);
+}
+
+#[test]
+fn an_expiry_that_is_now_or_past_or_malformed_is_refused() {
+    let admin = Harness::new();
+    let oncall = admin.break_glass();
+    let start = admin.clock.wall_millis();
+    let (id, secret) = create_expiring_key(&admin, &oncall, "svc:ci", start + 10_000);
+
+    for body in [
+        format!(r#"{{"expires_at":{start}}}"#),
+        format!(r#"{{"expires_at":{}}}"#, start - 1),
+        r#"{"expires_at":-5}"#.to_owned(),
+        r#"{"expires_at":"tomorrow"}"#.to_owned(),
+        r#"{"expires_at":1.5}"#.to_owned(),
+        // Absent is not "no expiry": removing one has to be asked for.
+        r"{}".to_owned(),
+    ] {
+        let response = put_expiry(&admin, &oncall, &id, &body, Some(ANY_ETAG));
+        assert_eq!(response.status, 400, "{body}: {}", response.body);
+    }
+    let record = admin.state.keys.get(&KeyId::new(&id).unwrap()).unwrap();
+    assert_eq!(record.expires_at_millis, Some(start + 10_000));
+    assert!(admin.state.keys.verify(&secret, None, start).is_ok());
+    assert!(durable_frames(&admin, RecordKind::ApiKeyExpiry).is_empty());
+}
+
+#[test]
+fn a_management_key_cannot_be_prolonged_by_someone_who_could_not_mint_it() {
+    // Keeping a key alive is granting its authority again. A break-glass
+    // holder without the editor role could not mint an editor key, and must
+    // not be able to extend one either.
+    let admin = Harness::new();
+    let (key_id, _) = admin.issue_management_key(TENANT_A, KEY_EDITOR_PRINCIPAL, &["management:write"]);
+    let start = admin.clock.wall_millis();
+    assert!(admin.state.keys.set_expiry(&key_id, Some(start + 1_000)));
+    let body = format!(r#"{{"expires_at":{}}}"#, start + 50_000);
+
+    let recovery = admin.break_glass();
+    let refused = put_expiry(&admin, &recovery, key_id.as_str(), &body, Some(ANY_ETAG));
+    assert_eq!(refused.status, 403, "{}", refused.body);
+    assert_eq!(
+        admin.state.keys.get(&key_id).unwrap().expires_at_millis,
+        Some(start + 1_000)
+    );
+    assert!(durable_frames(&admin, RecordKind::ApiKeyExpiry).is_empty());
+
+    // Somebody who holds the role outside break-glass may.
+    let editor = admin.session_with_method(
+        "user:oncall-acme",
+        TENANT_A,
+        &[Role::BreakGlassAdmin, Role::PolicyEditor],
+        hypellm_auth::AuthMethod::BreakGlass,
+    );
+    let allowed = put_expiry(&admin, &editor, key_id.as_str(), &body, Some(ANY_ETAG));
+    assert_eq!(allowed.status, 200, "{}", allowed.body);
+    assert_eq!(
+        admin.state.keys.get(&key_id).unwrap().expires_at_millis,
+        Some(start + 50_000)
+    );
+}
+
+#[test]
+fn an_expiry_change_answers_for_the_callers_tenant_and_permission_only() {
+    let admin = Harness::new();
+    let start = admin.clock.wall_millis();
+    let (id, _) = create_expiring_key(&admin, &admin.break_glass(), "svc:ci", start + 1_000);
+    let body = format!(r#"{{"expires_at":{}}}"#, start + 50_000);
+
+    // Another tenant's key is indistinguishable from one that does not exist.
+    let elsewhere = put_expiry(&admin, &admin.break_glass_in(TENANT_B), &id, &body, Some(ANY_ETAG));
+    assert_eq!(elsewhere.status, 404, "{}", elsewhere.body);
+    let unknown = put_expiry(&admin, &admin.break_glass(), "00000000deadbeef", &body, Some(ANY_ETAG));
+    assert_eq!(unknown.status, 404, "{}", unknown.body);
+
+    for session in unprivileged_roles(&admin) {
+        let refused = put_expiry(&admin, &session, &id, &body, Some(ANY_ETAG));
+        assert_eq!(refused.status, 403, "{:?}: {}", session.roles, refused.body);
+    }
+    let anonymous = admin
+        .request(Method::Put, &format!("/admin/v1/keys/{id}/expiry"))
+        .json(&body)
+        .if_match(ANY_ETAG)
+        .send();
+    assert_eq!(anonymous.status, 401, "{}", anonymous.body);
+
+    let record = admin.state.keys.get(&KeyId::new(&id).unwrap()).unwrap();
+    assert_eq!(record.expires_at_millis, Some(start + 1_000));
+    assert!(durable_frames(&admin, RecordKind::ApiKeyExpiry).is_empty());
+}
+
+// -- Keys: restrictions -------------------------------------------------------
+
+/// The default configuration plus what a ceiling test needs: a second alias
+/// the tenant may use, an alias `svc:ci` is denied with its own target, and a
+/// batch queue class on `svc:ci`.
+fn restriction_config() -> String {
+    let mut text = harness::default_config();
+    text.push_str(
+        "\
+target id=local:other provider=local model=other-model local=true operations=chat \\
+       streaming=true context=100000 max_output=8192
+alias id=agent targets=local:model description=\"tools\"
+alias id=secret targets=local:other
+grant scope=principal:svc:ci model=secret allow=false
+quota scope=principal:svc:ci concurrency=8 class=batch
+",
+    );
+    text
+}
+
+/// `PUT /admin/v1/keys/{id}/restrictions`.
+fn put_restrictions(
+    admin: &Harness,
+    session: &TestSession,
+    id: &str,
+    body: &str,
+    etag: Option<&str>,
+) -> harness::Response {
+    let request = admin
+        .request(Method::Put, &format!("/admin/v1/keys/{id}/restrictions"))
+        .as_session(session)
+        .json(body);
+    match etag {
+        Some(etag) => request.if_match(etag).send(),
+        None => request.send(),
+    }
+}
+
+const NARROW_TO_AGENT: &str =
+    r#"{"models":["agent"],"targets":["local:model"],"hosts":null,"priority":"batch"}"#;
+
+#[test]
+fn restricting_a_key_changes_the_stored_key_durably_and_shows_in_the_listing() {
+    let admin = Harness::with_config(&restriction_config());
+    let oncall = admin.break_glass();
+    let (id, _) = create_key(&admin, &oncall, "svc:ci");
+    let key = KeyId::new(&id).unwrap();
+    assert!(admin.state.keys.get(&key).unwrap().restrictions.is_unrestricted());
+
+    let etag = key_etag(&admin, &oncall, &id);
+    let response = put_restrictions(&admin, &oncall, &id, NARROW_TO_AGENT, Some(&etag));
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert_ne!(response.expect_etag(), etag, "the tag must move with the restriction");
+
+    // The key the router consults is what changed, not only the answer.
+    let stored = admin.state.keys.get(&key).unwrap().restrictions;
+    assert_eq!(
+        stored.models.as_ref().map(|m| m.iter().map(|a| a.as_str().to_owned()).collect::<Vec<_>>()),
+        Some(vec!["agent".to_owned()])
+    );
+    assert_eq!(stored.priority, Some(hypellm_core::admission::PriorityClass::Batch));
+    assert!(stored.hosts.is_none());
+
+    let frames = durable_frames(&admin, RecordKind::ApiKeyRestriction);
+    assert_eq!(frames.len(), 1, "the change must reach the durable log");
+    let change = hypellm_auth::RestrictionChange::from_payload(&frames[0].payload).expect("decodes");
+    assert_eq!(change.restrictions, stored);
+    assert_eq!(
+        durable_frames(&admin, RecordKind::ApiKey).len(),
+        1,
+        "a restriction change must not re-append the key record, which carries `revoked`"
+    );
+
+    let listed = admin
+        .get(&oncall, "/admin/v1/keys")
+        .data()
+        .into_iter()
+        .find(|item| item.field_str("id").ok() == Some(id.as_str()))
+        .expect("listed");
+    let restrictions = listed.get("restrictions").expect("restrictions");
+    assert_eq!(restrictions.field_str("priority").unwrap(), "batch");
+    assert!(matches!(restrictions.get("hosts"), Some(wire_json::Value::Null)));
+
+    // Lifting it returns the key to its principal's policy.
+    let etag = key_etag(&admin, &oncall, &id);
+    let lifted = put_restrictions(
+        &admin,
+        &oncall,
+        &id,
+        r#"{"models":null,"targets":null,"hosts":null,"priority":null}"#,
+        Some(&etag),
+    );
+    assert_eq!(lifted.status, 200, "{}", lifted.body);
+    assert!(admin.state.keys.get(&key).unwrap().restrictions.is_unrestricted());
+}
+
+#[test]
+fn the_restriction_read_offers_exactly_the_principals_ceiling() {
+    let admin = Harness::with_config(&restriction_config());
+    let oncall = admin.break_glass();
+    let (id, _) = create_key(&admin, &oncall, "svc:ci");
+    let (_other, _) = create_key(&admin, &oncall, "svc:ci");
+
+    let response = admin.get(&oncall, &format!("/admin/v1/keys/{id}/restrictions"));
+    assert_eq!(response.status, 200, "{}", response.body);
+    let json = response.json();
+    let ceiling = json.get("ceiling").expect("ceiling");
+    let models: Vec<String> = ceiling
+        .field_array("models")
+        .unwrap()
+        .iter()
+        .map(|m| m.field_str("id").unwrap().to_owned())
+        .collect();
+    assert_eq!(models, vec!["agent".to_owned(), "test-alias".to_owned()], "'secret' is denied to svc:ci");
+    let targets: Vec<String> = ceiling
+        .field_array("targets")
+        .unwrap()
+        .iter()
+        .map(|t| t.field_str("id").unwrap().to_owned())
+        .collect();
+    assert!(!targets.contains(&"local:other".to_owned()), "{targets:?}");
+    assert_eq!(ceiling.field_str("priority").unwrap(), "batch");
+    assert_eq!(json.get("keys_sharing_principal").and_then(wire_json::Value::as_u64), Some(1));
+}
+
+#[test]
+fn a_restriction_outside_the_principals_ceiling_is_refused_and_changes_nothing() {
+    // The user-facing rule: a key's access is a subset of its principal's.
+    let admin = Harness::with_config(&restriction_config());
+    let oncall = admin.break_glass();
+    let (id, _) = create_key(&admin, &oncall, "svc:ci");
+    let key = KeyId::new(&id).unwrap();
+
+    let refused = [
+        // Denied to the principal by a grant.
+        (r#"{"models":["secret"],"targets":null,"hosts":null,"priority":null}"#, "secret"),
+        // Reachable only through that alias.
+        (r#"{"models":null,"targets":["local:other"],"hosts":null,"priority":null}"#, "local:other"),
+        // Above the principal's batch class.
+        (r#"{"models":null,"targets":null,"hosts":null,"priority":"standard"}"#, "lower its priority"),
+        (r#"{"models":null,"targets":null,"hosts":["spark-zz"],"priority":null}"#, "slave"),
+        // An empty list would allow nothing; that is what revocation is for.
+        (r#"{"models":[],"targets":null,"hosts":null,"priority":null}"#, "revoke"),
+        // Omitting a field must not be read as lifting it.
+        (r#"{"models":["agent"],"targets":null,"hosts":null}"#, "priority"),
+        (r#"{"models":null,"targets":null,"hosts":null,"priority":"urgent"}"#, "priority"),
+    ];
+    for (body, mentions) in refused {
+        let response = put_restrictions(&admin, &oncall, &id, body, Some(ANY_ETAG));
+        assert!(
+            response.status == 400 || response.status == 422,
+            "{body}: {} {}",
+            response.status,
+            response.body
+        );
+        assert!(response.body_contains(mentions), "{body}: {}", response.body);
+    }
+
+    // An unknown entry is refused by position and not echoed: it is as likely
+    // a pasted secret as a typo.
+    let pasted = "hypellmk_0123456789abcdef_c2VjcmV0";
+    let response = put_restrictions(
+        &admin,
+        &oncall,
+        &id,
+        &format!(r#"{{"models":["{pasted}"],"targets":null,"hosts":null,"priority":null}}"#),
+        Some(ANY_ETAG),
+    );
+    assert!(response.status == 400 || response.status == 422, "{}", response.body);
+    assert!(!response.body_contains("c2VjcmV0"), "{}", response.body);
+
+    assert!(admin.state.keys.get(&key).unwrap().restrictions.is_unrestricted());
+    assert!(durable_frames(&admin, RecordKind::ApiKeyRestriction).is_empty());
+}
+
+#[test]
+fn a_restriction_change_needs_a_current_tag_and_a_live_key() {
+    let admin = Harness::with_config(&restriction_config());
+    let oncall = admin.break_glass();
+    let (id, _) = create_key(&admin, &oncall, "svc:ci");
+
+    let missing = put_restrictions(&admin, &oncall, &id, NARROW_TO_AGENT, None);
+    assert_eq!(missing.status, 428, "{}", missing.body);
+
+    // A tag read before an expiry change is stale for a restriction change:
+    // one tag covers both, so neither edit can silently discard the other.
+    let before = key_etag(&admin, &oncall, &id);
+    let bound = break_glass_bound(&admin, &oncall);
+    // Earlier than the bound creation already gave the key, so it changes.
+    let earlier = bound - 60_000;
+    let moved = put_expiry(&admin, &oncall, &id, &format!(r#"{{"expires_at":{earlier}}}"#), Some(&before));
+    assert_eq!(moved.status, 200, "{}", moved.body);
+    let stale = put_restrictions(&admin, &oncall, &id, NARROW_TO_AGENT, Some(&before));
+    assert_eq!(stale.status, 412, "{}", stale.body);
+    let stale = put_restrictions(&admin, &oncall, &id, NARROW_TO_AGENT, Some(STALE_ETAG));
+    assert_eq!(stale.status, 412, "{}", stale.body);
+
+    // And the other way round: a restriction change moves the tag an expiry
+    // change demands.
+    let before = key_etag(&admin, &oncall, &id);
+    let narrowed = put_restrictions(&admin, &oncall, &id, NARROW_TO_AGENT, Some(&before));
+    assert_eq!(narrowed.status, 200, "{}", narrowed.body);
+    let stale = put_expiry(&admin, &oncall, &id, &format!(r#"{{"expires_at":{bound}}}"#), Some(&before));
+    assert_eq!(stale.status, 412, "{}", stale.body);
+
+    let revoked = admin
+        .request(Method::Delete, &format!("/admin/v1/keys/{id}"))
+        .as_session(&oncall)
+        .send();
+    assert_eq!(revoked.status, 204, "{}", revoked.body);
+    let response = put_restrictions(&admin, &oncall, &id, NARROW_TO_AGENT, Some(ANY_ETAG));
+    assert_eq!(response.status, 409, "{}", response.body);
+    assert!(admin.state.keys.get(&KeyId::new(&id).unwrap()).unwrap().revoked);
+    assert_eq!(
+        durable_frames(&admin, RecordKind::ApiKeyRestriction).len(),
+        1,
+        "only the change made before the revocation reached the log"
+    );
+}
+
+#[test]
+fn restrictions_answer_for_the_callers_tenant_and_permission_only() {
+    let admin = Harness::with_config(&restriction_config());
+    let oncall = admin.break_glass();
+    let (id, _) = create_key(&admin, &oncall, "svc:ci");
+
+    let stranger = admin.break_glass_in(TENANT_B);
+    assert_eq!(admin.get(&stranger, &format!("/admin/v1/keys/{id}/restrictions")).status, 404);
+    assert_eq!(put_restrictions(&admin, &stranger, &id, NARROW_TO_AGENT, Some(ANY_ETAG)).status, 404);
+
+    for session in unprivileged_roles(&admin) {
+        let read = admin.get(&session, &format!("/admin/v1/keys/{id}/restrictions"));
+        assert_eq!(read.status, 403, "{:?}: {}", session.roles, read.body);
+        let write = put_restrictions(&admin, &session, &id, NARROW_TO_AGENT, Some(ANY_ETAG));
+        assert_eq!(write.status, 403, "{:?}: {}", session.roles, write.body);
+    }
+    assert!(
+        admin.state.keys.get(&KeyId::new(&id).unwrap()).unwrap().restrictions.is_unrestricted()
+    );
 }

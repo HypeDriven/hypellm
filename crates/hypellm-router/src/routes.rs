@@ -1281,16 +1281,21 @@ fn list_models(
 
     let config = state.config();
     let attempted = Vec::new();
+    let restriction = pipeline::key_restriction(state, principal.key_id.as_ref());
     let context = RoutingContext {
         principal: &principal.id,
         groups: &principal.groups,
         tenant: &principal.tenant,
         attempted: &attempted,
         now_millis: 0,
+        key: restriction.as_ref(),
     };
 
-    // Appendix B: "The models endpoint reveals only authorized aliases."
-    let visible = config.snapshot.visible_aliases(&context, Operation::Chat);
+    // Appendix B: "The models endpoint reveals only authorized aliases." An
+    // alias the caller's fleet grants put out of reach on every slave is not
+    // one they are authorized to be served by, and neither is one the key it
+    // asked with is narrowed away from.
+    let visible = config.snapshot.servable_aliases(&context, Operation::Chat);
     let entries: Vec<(&str, Option<&str>)> = visible
         .iter()
         .map(|alias| (alias.id.as_str(), alias.description.as_deref()))

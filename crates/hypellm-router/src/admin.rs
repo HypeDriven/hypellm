@@ -168,6 +168,49 @@ impl AdminHandler {
     }
 }
 
+impl AdminHandler {
+    /// `GET /fleet/v1/install.sh` (specification 26.8).
+    ///
+    /// Public, like the static application, and for the same reason: it is
+    /// code, not data, and it carries no secret — the token arrives as an
+    /// argument on the machine that runs it. Served only when enrollment is
+    /// configured, so an unconfigured router exposes nothing new.
+    fn serve_install_script(
+        &self,
+        writer: &mut ClientWriter,
+        request_id: &str,
+    ) -> io::Result<Disposition> {
+        if self.api.state().config().settings.fleet_enroll_url.is_none() {
+            return write_error(
+                writer,
+                &ApiError::new(
+                    ApiErrorCode::NotFound,
+                    "fleet enrollment is not configured on this router",
+                ),
+                request_id,
+            );
+        }
+        let body = hypellm_admin_api::enroll::INSTALL_SCRIPT.as_bytes();
+        let mut builder = ResponseBuilder::new(200)
+            .header("Content-Type", "text/x-shellscript; charset=utf-8")
+            .map_err(|_| io::Error::other("response head"))?
+            .header("X-Request-Id", request_id)
+            .map_err(|_| io::Error::other("response head"))?;
+        for (name, value) in security_headers() {
+            builder = builder
+                .header(name, value)
+                .map_err(|_| io::Error::other("response head"))?;
+        }
+        let head = builder
+            .finish_with_length(body.len())
+            .map_err(|_| io::Error::other("response head"))?;
+        writer.write(&head)?;
+        writer.write(body)?;
+        writer.flush()?;
+        Ok(Disposition::KeepAlive)
+    }
+}
+
 impl Handler for AdminHandler {
     fn handle(
         &self,
@@ -218,7 +261,11 @@ impl Handler for AdminHandler {
             }
         }
 
-        if !head.path.starts_with("/admin/v1") {
+        let enrollment = head.path.starts_with("/fleet/v1/");
+        if enrollment && head.method == Method::Get && head.path == "/fleet/v1/install.sh" {
+            return self.serve_install_script(writer, &request_id);
+        }
+        if !enrollment && !head.path.starts_with("/admin/v1") {
             return self.serve_static(&head.path, head, writer);
         }
 
@@ -232,7 +279,12 @@ impl Handler for AdminHandler {
             request_id: request_id.clone(),
         };
 
-        match self.api.handle(&request) {
+        let outcome = if enrollment {
+            self.api.handle_enrollment(&request)
+        } else {
+            self.api.handle(&request)
+        };
+        match outcome {
             Ok(response) => write_response(writer, &response, &request_id, head.method == Method::Head),
             Err(error) => write_error(writer, &error, &request_id),
         }
@@ -415,6 +467,7 @@ pub fn admin_state_from(
         // `RouterState::install_fleet` fills it when the runtime starts, at
         // boot or after a publication first enables the fleet.
         fleet: Arc::clone(&router.admin_fleet),
+        enrollments: Arc::clone(&router.enrollments),
     }
 }
 
@@ -428,9 +481,12 @@ const STATIC_MODULES: &[&str] = &[
     "/views/targets.js",
     "/views/fleet.js",
     "/views/fleet-machines.js",
+    "/views/fleet-enroll.js",
+    "/views/fleet-access.js",
     "/views/routing-priority.js",
     "/views/activations.js",
     "/views/policies.js",
+    "/views/principal-access.js",
     "/views/access.js",
     "/views/keys.js",
     "/views/credentials.js",
@@ -595,6 +651,73 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_install_script_is_served_only_when_enrollment_is_configured() {
+        // Specification 26.8: an unconfigured router exposes nothing new. A
+        // configured one serves the script this build embeds, as a script, so
+        // `curl | sh` runs exactly what was tested.
+        use std::io::{Read as _, Write as _};
+
+        let upstream =
+            crate::testing::FakeUpstream::start(crate::testing::CannedResponse::json(200, "{}"));
+        let router = crate::testing::router_for(&upstream);
+        let state = std::sync::Arc::clone(&router.state);
+        let api = hypellm_admin_api::AdminApi::new(std::sync::Arc::new(admin_state_from(
+            &state,
+            hypellm_admin_api::CorsPolicy::with_origins(Vec::new()),
+            None,
+            None,
+            b"oidc-key-for-tests",
+            &[],
+        )));
+
+        let clock: std::sync::Arc<dyn hypellm_core::time::Clock> =
+            std::sync::Arc::clone(&state.clock);
+        let server = crate::server::Server::bind(
+            "127.0.0.1:0",
+            crate::server::ServerConfig::management(),
+            clock,
+        )
+        .expect("bind");
+        let address = server.local_addr().expect("address");
+        let shutdown = server.shutdown_handle();
+        let handler: std::sync::Arc<dyn crate::server::Handler> =
+            std::sync::Arc::new(AdminHandler::new(api));
+        let thread = std::thread::spawn(move || {
+            let _ = server.serve(handler);
+        });
+        let get = |path: &str| -> String {
+            let mut stream = std::net::TcpStream::connect(address).expect("connect");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("timeout");
+            let raw = format!("GET {path} HTTP/1.1\r\nHost: router.test\r\nConnection: close\r\n\r\n");
+            stream.write_all(raw.as_bytes()).expect("write");
+            let mut out = String::new();
+            let _ = stream.read_to_string(&mut out);
+            out
+        };
+
+        let unconfigured = get("/fleet/v1/install.sh");
+        assert!(unconfigured.starts_with("HTTP/1.1 404"), "{unconfigured}");
+
+        let config = state.config();
+        let text = config
+            .canonical
+            .replacen("settings ", "settings fleet_enroll_url=https://router.test ", 1);
+        assert_ne!(text, config.canonical, "the fixture has a settings record");
+        let next = hypellm_config::load(&text, config.snapshot.version + 1).expect("valid");
+        state.config.activate(next);
+
+        let served = get("/fleet/v1/install.sh");
+        assert!(served.starts_with("HTTP/1.1 200"), "{served}");
+        assert!(served.to_ascii_lowercase().contains("content-type: text/x-shellscript"));
+        assert!(served.contains(hypellm_admin_api::enroll::INSTALL_SCRIPT));
+
+        shutdown.shutdown();
+        let _ = thread.join();
     }
 
     #[test]

@@ -30,11 +30,11 @@
 
 use hypellm_core::decision::{ExclusionReason, ResidencyClass};
 use hypellm_core::ids::{
-    ActivationId, AgentId, DeploymentId, HostId, LeaseId, PoolId, TargetId,
+    ActivationId, AgentId, AliasId, ArtifactId, DeploymentId, HostId, LeaseId, PoolId, TargetId,
 };
 use hypellm_core::policy::PolicySnapshot;
 use hypellm_core::target::Capability;
-use hypellm_core::time::Clock;
+use hypellm_core::time::{Clock, Signal};
 use hypellm_fleet::activation::{
     ActivationLedger, ActivationOutcome, ActivationRecord, ActivationState, LeaseRelease,
     lease_for,
@@ -42,7 +42,7 @@ use hypellm_fleet::activation::{
 use hypellm_fleet::demand::{DemandSnapshot, DemandTracker};
 use hypellm_fleet::durable::{ActivationSummary, FlapRecord};
 use hypellm_fleet::governance::{ActivationQueue, Budgets, FlapCounter, QueueAdmission};
-use hypellm_fleet::model::{FleetConfig, FleetPolicy};
+use hypellm_fleet::model::{FleetConfig, FleetPolicy, ImageId};
 use hypellm_fleet::plan::{Plan, PlanContext, PlanOutcome, PlanStep};
 use hypellm_fleet::state::{FleetSnapshot, Inventory, Lease, ObservedState, Timings};
 use hypellm_net::fleet::{FleetAgentClient, FleetError, FleetSession};
@@ -68,6 +68,11 @@ const POLL_INTERVAL_MS: u64 = 1_000;
 /// the planner's feasibility check refuses first — so this is a floor on the
 /// value handed to the agent rather than a policy.
 const MIN_AGENT_DEADLINE_MS: u64 = 5_000;
+
+/// How many tampered (artifact, host) pairs, and how many conflicting
+/// artifacts, are remembered as already reported. Bounded so a fleet of
+/// liars cannot grow it; past the bound a pair is simply not re-audited.
+const MAX_REPORTED_ARTIFACT_PAIRS: usize = 1_024;
 
 /// Per-target fleet standing, computed once per routing decision.
 ///
@@ -206,6 +211,159 @@ pub struct FleetRuntime {
     telemetry: Arc<Telemetry>,
     /// Durable state.
     store: Arc<Store>,
+    /// Delivers approved, published enrollments to the agents
+    /// (specification 26.8).
+    enrollments: Option<Arc<EnrollmentOfferer>>,
+    /// Wakes parked requests when the fleet changes: a commitment taken or
+    /// released, an activation settled, an observation adopted, a stop done
+    /// (specification 26.10).
+    wake: Signal,
+    /// Requests dispatched to each deployment and not yet finished, and the
+    /// deployments an idle stop has claimed. One lock for both, which is what
+    /// makes an idle stop and a dispatch unable to pass each other.
+    dispatch: Mutex<DispatchBook>,
+    /// Capabilities whose last gated activation was refused, and until when
+    /// they are left out of the ranking (specification 26.11).
+    ///
+    /// A contender that cannot actually be activated — its plan refused for
+    /// budget, capacity or dwell — would otherwise sit at the top of the
+    /// ranking and hold every other capability waiting for the same host.
+    refused_until: Mutex<BTreeMap<DeploymentId, u64>>,
+    /// Requests parked per alias: how many, and since when the oldest
+    /// (specification 26.11). The demand the scheduler ranks, counted per
+    /// alias because an alias names the models a request could use; two chat
+    /// models share a capability and are exactly what it must tell apart.
+    parked_aliases: Mutex<BTreeMap<AliasId, (u32, u64)>>,
+    /// The deployments each alias's permitted targets resolve to, projected
+    /// from the routing snapshot like `capabilities`.
+    alias_deployments: RwLock<BTreeMap<AliasId, Vec<DeploymentId>>>,
+    /// Image IDs learned and kept, by artifact (specification 26.12).
+    ///
+    /// Written only after the learning record is durable, so what is held
+    /// here is never more than what a restart would restore.
+    checksums: RwLock<BTreeMap<ArtifactId, ImageId>>,
+    /// (artifact, host) pairs already audited as tampered, so a host that
+    /// stays tampered is reported once rather than every observation.
+    tampered_seen: Mutex<BTreeSet<(ArtifactId, HostId)>>,
+    /// Artifacts already reported as having disagreeing verified hosts.
+    conflicts_seen: Mutex<BTreeSet<ArtifactId>>,
+}
+
+/// Dispatches in flight against idle stops in progress.
+#[derive(Debug, Default)]
+struct DispatchBook {
+    in_flight: BTreeMap<DeploymentId, u32>,
+    stopping: BTreeSet<DeploymentId>,
+}
+
+/// A dispatch counted against a deployment, to be finished exactly once with
+/// [`FleetRuntime::leave_dispatch`].
+#[derive(Debug)]
+#[must_use = "a dispatch counted against a deployment must be finished, or the deployment is never idle"]
+pub struct DispatchHold {
+    deployment: DeploymentId,
+}
+
+/// Delivers each agent the hosts it should hold by enrollment
+/// (specification 26.8).
+///
+/// Separate from [`FleetRuntime`] because a fleet with no deployment yet has
+/// no runtime, and enrolling the first machine is exactly when that is true.
+/// The runtime calls it before each observation; with no runtime, the
+/// router's housekeeping does.
+#[derive(Debug)]
+pub struct EnrollmentOfferer {
+    registry: Arc<hypellm_fleet::enroll::EnrollmentRegistry>,
+    /// The digest of the last offer each agent accepted.
+    offered: Mutex<BTreeMap<AgentId, String>>,
+    telemetry: Arc<Telemetry>,
+}
+
+impl EnrollmentOfferer {
+    /// An offerer over `registry`.
+    #[must_use]
+    pub fn new(
+        registry: Arc<hypellm_fleet::enroll::EnrollmentRegistry>,
+        telemetry: Arc<Telemetry>,
+    ) -> Self {
+        Self {
+            registry,
+            offered: Mutex::new(BTreeMap::new()),
+            telemetry,
+        }
+    }
+
+    /// Offer each agent in `config` its enrolled hosts, returning the agents
+    /// that accepted an offer this call.
+    ///
+    /// Sent when the offer differs from the one the agent last accepted, or
+    /// whenever `agreed` is false — a newly published host is the usual cause
+    /// of a disagreement, and the offer is what resolves it. Never sent while
+    /// the agent agrees and nothing changed, so a quiet fleet costs nothing;
+    /// and never sent to an agent no enrollment was ever approved for, so a
+    /// router that does not use enrollment never speaks this verb.
+    ///
+    /// One connection per offer, closed after it: no mutating verb can follow
+    /// on a session whose digests disagree.
+    pub fn offer(&self, config: &FleetConfig, key: &[u8], agreed: bool) -> Vec<AgentId> {
+        let digest = config.digest();
+        let mut accepted_by = Vec::new();
+        for (agent_id, agent) in &config.agents {
+            let hosts = hypellm_fleet::enroll::offer_for_agent(
+                &self.registry.approved_for(agent_id),
+                config,
+                agent_id,
+            );
+            let Some(payload) = hypellm_fleet::enroll::encode_offer(&hosts) else {
+                continue;
+            };
+            let fingerprint = hypellm_fleet::enroll::offer_digest(&payload);
+            let last = self
+                .offered
+                .lock()
+                .map_or(None, |o| o.get(agent_id).cloned());
+            // An agent no enrollment was ever approved for has nothing to
+            // hear, whatever the digests say: its disagreement has another
+            // cause, and an empty offer would not resolve it.
+            if hosts.is_empty() && !self.registry.ever_approved_for(agent_id) {
+                continue;
+            }
+            if agreed && last.as_deref() == Some(fingerprint.as_str()) {
+                continue;
+            }
+            let client = FleetAgentClient::new(
+                agent.socket.clone(),
+                Duration::from_millis(agent.request_timeout_ms.max(1_000)),
+            );
+            match client.enroll(key, &digest, &payload) {
+                Ok(accepted) => {
+                    if let Ok(mut offered) = self.offered.lock() {
+                        offered.insert(agent_id.clone(), fingerprint);
+                    }
+                    let count = u64::try_from(hosts.len()).unwrap_or(u64::MAX);
+                    let event = if u64::from(accepted) < count {
+                        hypellm_telemetry::Event::warn("fleet.enrollment_partially_accepted")
+                    } else {
+                        hypellm_telemetry::Event::info("fleet.enrollment_offered")
+                    };
+                    self.telemetry.log(
+                        &event
+                            .str_field(Field::Component, agent_id.as_str())
+                            .int_field(Field::Count, u64::from(accepted)),
+                    );
+                    accepted_by.push(agent_id.clone());
+                }
+                Err(error) => {
+                    self.telemetry.log(
+                        &hypellm_telemetry::Event::warn("fleet.enrollment_offer_failed")
+                            .str_field(Field::Component, agent_id.as_str())
+                            .str_field(Field::Code, error.code()),
+                    );
+                }
+            }
+        }
+        accepted_by
+    }
 }
 
 /// One configured agent: how to reach it and the session currently open.
@@ -281,7 +439,24 @@ impl FleetRuntime {
             clock,
             telemetry,
             store,
+            enrollments: None,
+            wake: Signal::new(),
+            dispatch: Mutex::new(DispatchBook::default()),
+            refused_until: Mutex::new(BTreeMap::new()),
+            parked_aliases: Mutex::new(BTreeMap::new()),
+            alias_deployments: RwLock::new(BTreeMap::new()),
+            checksums: RwLock::new(BTreeMap::new()),
+            tampered_seen: Mutex::new(BTreeSet::new()),
+            conflicts_seen: Mutex::new(BTreeSet::new()),
         })
+    }
+
+    /// Offer approved, published enrollments to the agents on each
+    /// observation.
+    #[must_use]
+    pub fn with_enrollments(mut self, offerer: Arc<EnrollmentOfferer>) -> Self {
+        self.enrollments = Some(offerer);
+        self
     }
 
     /// The declared fleet.
@@ -362,6 +537,7 @@ impl FleetRuntime {
             next.evicting = self.ledger.evicting();
             *guard = Arc::new(next);
         }
+        self.wake.notify();
     }
 
     /// Record that a request asked for a capability.
@@ -398,6 +574,21 @@ impl FleetRuntime {
         }
         if let Ok(mut guard) = self.capabilities.write() {
             *guard = map;
+        }
+        let mut aliases = BTreeMap::new();
+        for alias in snapshot.aliases.values() {
+            let deployments: Vec<DeploymentId> = alias
+                .permitted_targets
+                .iter()
+                .filter_map(|target| config.deployment_for_target(target))
+                .map(|deployment| deployment.id.clone())
+                .collect();
+            if !deployments.is_empty() {
+                aliases.insert(alias.id.clone(), deployments);
+            }
+        }
+        if let Ok(mut guard) = self.alias_deployments.write() {
+            *guard = aliases;
         }
     }
 
@@ -468,6 +659,19 @@ impl FleetRuntime {
     /// the hosts it manages, and an agent that cannot be reached leaves its
     /// hosts unobserved, which ages out and fails closed on its own.
     pub fn observe(&self) {
+        if let Some(offerer) = &self.enrollments {
+            let agreed = self.digest_agreed.load(Ordering::SeqCst);
+            for agent in offerer.offer(&self.config(), &self.key, agreed) {
+                // The agent rewrote its table, and it closes any session
+                // authenticated against the old one. Dropping ours first saves
+                // this observation a refused verb.
+                if let Some(link) = self.links().get(&agent) {
+                    if let Ok(mut session) = link.session.lock() {
+                        *session = None;
+                    }
+                }
+            }
+        }
         let config = self.config();
         let digest = config.digest();
         let now = self.clock.now_millis();
@@ -521,6 +725,7 @@ impl FleetRuntime {
 
         self.adopt_inventory(merged, now, all_reachable, all_agree);
         self.publish_observation_metrics(now);
+        self.wake.notify();
     }
 
     /// Fold a fresh inventory into belief, detecting divergence and drift.
@@ -600,6 +805,7 @@ impl FleetRuntime {
             .read()
             .map(|c| c.clone())
             .unwrap_or_default();
+        next.learned_checksums = self.keep_checksums(&config, &next.inventory);
 
         // Memory drift is reported, not corrected: the planner already uses
         // the larger of the declared and observed figures, and an operator
@@ -982,6 +1188,7 @@ impl FleetRuntime {
         if let Some(capability) = self.capability_of(&plan.deployment) {
             self.queue.settle(capability);
         }
+        self.wake.notify();
         result
     }
 
@@ -1033,6 +1240,34 @@ impl FleetRuntime {
                         AuditOutcome::Success,
                         &plan.deployment,
                     );
+                }
+                PlanStep::Copy { artifact, from, to } => {
+                    self.ledger.transition(lease, ActivationState::Fetching);
+                    let image_id = self
+                        .snapshot()
+                        .kept_checksum(artifact)
+                        .cloned()
+                        .ok_or("fleet_unavailable")?;
+                    let agent = self.agent_for(to)?;
+                    let activation = self
+                        .call(&agent, |session| {
+                            session.copy(
+                                artifact,
+                                from,
+                                to,
+                                remaining(expiry, self.clock.now_millis()),
+                                &image_id,
+                            )
+                        })
+                        .map_err(|_| "fleet_unavailable")?;
+                    self.await_terminal(&agent, &activation, expiry)?;
+                    self.audit_copy(artifact, from, to, &image_id);
+                    // The copy is believed when the destination is *observed*
+                    // holding the kept image, not when the verb says so.
+                    self.observe();
+                    if !self.snapshot().artifact_ready(artifact, to) {
+                        return Err("fleet_activation_failed");
+                    }
                 }
                 PlanStep::Activate(deployment) => {
                     self.ledger.transition(lease, ActivationState::Starting);
@@ -1253,6 +1488,15 @@ impl FleetRuntime {
     /// so it takes no eviction decision and consults no demand — an operator
     /// asked, and the audit record says who.
     pub fn deactivate(&self, deployment: &DeploymentId) -> Result<(), &'static str> {
+        self.deactivate_because(deployment, None)
+    }
+
+    /// [`Self::deactivate`], with the reason recorded on its audit event.
+    fn deactivate_because(
+        &self,
+        deployment: &DeploymentId,
+        reason: Option<&'static str>,
+    ) -> Result<(), &'static str> {
         let config = self.config();
         let record = config
             .deployments
@@ -1336,12 +1580,27 @@ impl FleetRuntime {
         let now = self.clock.now_millis();
         let until = self.flap.record_eviction(deployment, &policy, now);
         self.persist_flap(deployment, until, now);
-        self.audit(
-            AuditAction::FleetDeactivate,
-            deployment.as_str(),
-            AuditOutcome::Success,
-            deployment,
-        );
+        match reason {
+            None => self.audit(
+                AuditAction::FleetDeactivate,
+                deployment.as_str(),
+                AuditOutcome::Success,
+                deployment,
+            ),
+            Some(reason) => {
+                let _ = self.store.append_audit(AuditEvent {
+                    timestamp_millis: self.clock.now_millis(),
+                    actor: "router".to_owned(),
+                    tenant: None,
+                    action: AuditAction::FleetDeactivate,
+                    object: Some(deployment.as_str().to_owned()),
+                    outcome: AuditOutcome::Success,
+                    reason: Some(hypellm_core::sensitive::Capped::new(reason, 512)),
+                    request_id: None,
+                    source: Some(deployment.as_str().to_owned()),
+                });
+            }
+        }
         self.observe();
         Ok(())
     }
@@ -1390,6 +1649,172 @@ impl FleetRuntime {
         Ok(activation.into_string())
     }
 
+    /// Copy an artifact between hosts on an operator's instruction
+    /// (specification 26.12).
+    ///
+    /// Held to the same rules as a planned copy: both hosts declared and of
+    /// the artifact's architecture, a kept checksum to verify against, a
+    /// source reporting exactly that checksum, fetch permitted by policy on
+    /// the destination, and room on its disk. The agent does the relaying and
+    /// the hashing; this only refuses what could not succeed.
+    pub fn copy_artifact(
+        &self,
+        artifact: &ArtifactId,
+        from: &HostId,
+        to: &HostId,
+    ) -> Result<String, &'static str> {
+        let config = self.config();
+        let declared = config.artifacts.get(artifact).ok_or("unknown_artifact")?;
+        let source = config.hosts.get(from).ok_or("unknown_host")?;
+        let destination = config.hosts.get(to).ok_or("unknown_host")?;
+        if from == to || declared.arch != source.arch || declared.arch != destination.arch {
+            return Err("unknown_host");
+        }
+        let policy = config.policy_for(to);
+        if !policy.allow_fetch {
+            return Err("fleet_disabled");
+        }
+        let snapshot = self.snapshot();
+        let image_id = snapshot
+            .kept_checksum(artifact)
+            .cloned()
+            .ok_or("checksum_unknown")?;
+        if !snapshot.artifact_ready(artifact, from) {
+            // Covers both "the source does not have it" and "the source has
+            // something else under its name": a tampered host is never a
+            // source, whoever asks.
+            return Err("copy_source_unverified");
+        }
+        let needed = declared
+            .size_bytes
+            .saturating_add(policy.fetch_disk_headroom_bytes);
+        if snapshot.free_disk_bytes(to) < needed {
+            return Err("fleet_unavailable");
+        }
+        let agent = self.agent_for(to)?;
+        let activation = self
+            .call(&agent, |session| {
+                session.copy(artifact, from, to, 3_600_000, &image_id)
+            })
+            .map_err(|_| "fleet_unavailable")?;
+        self.audit_copy(artifact, from, to, &image_id);
+        Ok(activation.into_string())
+    }
+
+    fn audit_copy(&self, artifact: &ArtifactId, from: &HostId, to: &HostId, image: &ImageId) {
+        let _ = self.store.append_audit(AuditEvent {
+            timestamp_millis: self.clock.now_millis(),
+            actor: "router".to_owned(),
+            tenant: None,
+            action: AuditAction::FleetCopy,
+            object: Some(artifact.as_str().to_owned()),
+            outcome: AuditOutcome::Success,
+            reason: Some(hypellm_core::sensitive::Capped::new(
+                &format!("from {from} to {to}, verified against {image}"),
+                512,
+            )),
+            request_id: None,
+            source: Some(to.as_str().to_owned()),
+        });
+    }
+
+    /// Learn, keep and police artifact checksums from one inventory
+    /// (specification 26.12), returning the learned set the snapshot carries.
+    ///
+    /// A learned checksum is appended to the log *before* it is kept: a
+    /// checksum held in memory but not on disk would be a trust anchor a
+    /// restart could silently replace with whatever the next host reports.
+    fn keep_checksums(
+        &self,
+        config: &FleetConfig,
+        inventory: &Inventory,
+    ) -> BTreeMap<ArtifactId, ImageId> {
+        let mut kept = self.checksums.read().map(|k| k.clone()).unwrap_or_default();
+        let learning = hypellm_fleet::checksum::learn(config, &kept, inventory);
+        for (artifact, image_id, host) in learning.learned {
+            let record = hypellm_fleet::checksum::ChecksumRecord {
+                artifact: artifact.clone(),
+                image_id: image_id.clone(),
+                host: host.clone(),
+                at_millis: self.clock.wall_millis(),
+            };
+            if self
+                .store
+                .append(
+                    RecordKind::ArtifactChecksum,
+                    &hypellm_fleet::checksum::encode_record(&record),
+                )
+                .is_err()
+            {
+                // Not kept, so not trusted: the next observation tries again.
+                continue;
+            }
+            let _ = self.store.append_audit(AuditEvent {
+                timestamp_millis: self.clock.wall_millis(),
+                actor: "router".to_owned(),
+                tenant: None,
+                action: AuditAction::FleetChecksumLearned,
+                object: Some(artifact.as_str().to_owned()),
+                outcome: AuditOutcome::Success,
+                reason: Some(hypellm_core::sensitive::Capped::new(
+                    &format!("{image_id}, first verified on {host}"),
+                    512,
+                )),
+                request_id: None,
+                source: Some(host.as_str().to_owned()),
+            });
+            kept.insert(artifact, image_id);
+        }
+        if let Ok(mut guard) = self.checksums.write() {
+            guard.clone_from(&kept);
+        }
+
+        if let Ok(mut seen) = self.conflicts_seen.lock() {
+            for artifact in learning.conflicts {
+                if seen.len() < MAX_REPORTED_ARTIFACT_PAIRS && seen.insert(artifact.clone()) {
+                    self.telemetry.log(
+                        &hypellm_telemetry::Event::warn("fleet.checksum_conflict")
+                            .str_field(Field::Component, artifact.as_str())
+                            .str_field(
+                                Field::Detail,
+                                "verified hosts report different image IDs for this artifact; \
+                                 none is kept until they agree or image_id is pinned",
+                            ),
+                    );
+                }
+            }
+        }
+
+        let tampered = hypellm_fleet::checksum::tampered(config, &kept, inventory);
+        if let Ok(mut seen) = self.tampered_seen.lock() {
+            seen.retain(|pair| tampered.contains(pair));
+            for (artifact, host) in &tampered {
+                if seen.len() >= MAX_REPORTED_ARTIFACT_PAIRS
+                    || !seen.insert((artifact.clone(), host.clone()))
+                {
+                    continue;
+                }
+                let _ = self.store.append_audit(AuditEvent {
+                    timestamp_millis: self.clock.wall_millis(),
+                    actor: "router".to_owned(),
+                    tenant: None,
+                    action: AuditAction::FleetArtifactTampered,
+                    object: Some(artifact.as_str().to_owned()),
+                    outcome: AuditOutcome::Failed,
+                    reason: Some(hypellm_core::sensitive::Capped::new(
+                        "the host reports an image under this artifact's name that does not \
+                         match the kept checksum; it is neither activated with it nor used as \
+                         a copy source",
+                        512,
+                    )),
+                    request_id: None,
+                    source: Some(host.as_str().to_owned()),
+                });
+            }
+        }
+        kept
+    }
+
     /// Wait for a deployment that is already coming up.
     ///
     /// This is what makes batching real rather than nominal. Without it, a
@@ -1409,20 +1834,38 @@ impl FleetRuntime {
         let started = self.clock.now_millis();
         let expiry = started.saturating_add(deadline_ms);
         loop {
-            let state = self.snapshot().state_of(&deployment.id);
-            if state.is_serving() {
+            let seen = self.wake.generation();
+            let snapshot = self.snapshot();
+            if snapshot.state_of(&deployment.id).is_serving() {
                 return Ok(self.clock.now_millis().saturating_sub(started));
             }
-            if !state.is_activating() {
+            // Coming up by observation *or by lease*: between the activation
+            // committing and the agent first reporting it, the inventory
+            // still says `stopped`, and a rider that read only the inventory
+            // gave up on an activation that was about to succeed.
+            if !snapshot.is_coming_up(&deployment.id) {
                 // It stopped, failed, or was cancelled while we waited. Not
                 // ready, and not going to be under this lease.
                 return Err("fleet_activation_failed");
             }
-            if self.clock.now_millis() >= expiry {
+            let now = self.clock.now_millis();
+            if now >= expiry {
                 return Err("fleet_activation_timeout");
             }
-            self.clock.sleep(Duration::from_millis(POLL_INTERVAL_MS));
-            self.observe();
+            // Woken early when the activation settles or belief changes, so a
+            // rider is served as soon as the one who paid for the start is.
+            //
+            // Observed only when nothing woke it. Every observation notifies,
+            // so riders that each observed on waking would wake one another
+            // into a loop of `OBSERVE` verbs.
+            let woke = self.clock.wait_signal(
+                &self.wake,
+                seen,
+                Duration::from_millis(POLL_INTERVAL_MS.min(expiry.saturating_sub(now))),
+            );
+            if woke == seen {
+                self.observe();
+            }
         }
     }
 
@@ -1430,18 +1873,549 @@ impl FleetRuntime {
     ///
     /// Ten music requests over two minutes should cost one swap, not ten. The
     /// queue is bounded and deadline-aware, and a request told to wait is told
-    /// how long it would be before the queue triggers on its own.
+    /// how long it would be before the queue triggers on its own. A trigger is
+    /// then put to the churn-aware gate (specification 26.11): it goes only if
+    /// it ranks first among everything waiting for the plan's host.
     #[must_use]
-    pub fn admit_to_queue(&self, capability: Capability, host: &HostId) -> QueueAdmission {
+    pub fn admit_to_queue(&self, capability: Capability, plan: &Plan) -> QueueAdmission {
         let config = self.config();
-        let policy = config.policy_for(host);
-        self.queue
-            .admit(capability, &policy, self.clock.now_millis())
+        let policy = config.policy_for(&plan.host);
+        let admission = self
+            .queue
+            .admit(capability, &policy, self.clock.now_millis());
+        self.gated(capability, plan, &policy, admission)
     }
 
     /// Note that a waiting request has stopped waiting, for any reason.
     pub fn leave_queue(&self, capability: Capability) {
         self.queue.leave(capability);
+    }
+
+    // -- Parking (specification 26.10) -------------------------------------
+
+    /// The signal parked requests wait on.
+    #[must_use]
+    pub const fn wake_signal(&self) -> &Signal {
+        &self.wake
+    }
+
+    /// Count a parked request as waiting for `capability` for as long as it
+    /// is parked. `false` when the capability's queue is full, in which case
+    /// [`Self::unpark`] must not be called.
+    #[must_use]
+    pub fn park(&self, capability: Capability) -> bool {
+        self.queue.park(capability, self.clock.now_millis())
+    }
+
+    /// Count a parked request as demand for `alias`, for the scheduler
+    /// (specification 26.11). Exactly once per successful [`Self::park`],
+    /// and undone with [`Self::unpark_alias`].
+    pub fn park_alias(&self, alias: &AliasId) {
+        let now = self.clock.now_millis();
+        let mut book = match self.parked_aliases.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let entry = book.entry(alias.clone()).or_insert((0, now));
+        if entry.0 == 0 {
+            entry.1 = now;
+        }
+        entry.0 = entry.0.saturating_add(1);
+    }
+
+    /// Stop counting a parked request against `alias`.
+    pub fn unpark_alias(&self, alias: &AliasId) {
+        let mut book = match self.parked_aliases.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(entry) = book.get_mut(alias) {
+            entry.0 = entry.0.saturating_sub(1);
+            if entry.0 == 0 {
+                book.remove(alias);
+            }
+        }
+    }
+
+    /// Stop counting a parked request. Exactly once per successful
+    /// [`Self::park`].
+    pub fn unpark(&self, capability: Capability) {
+        self.queue.leave(capability);
+        // Depth changed, which is an input to an idle stop and to the next
+        // parked request's trigger.
+        self.wake.notify();
+    }
+
+    /// Whether a parked request should now pay for its activation.
+    ///
+    /// [`Self::admit_to_queue`] without counting the caller again.
+    #[must_use]
+    pub fn poll_queue(&self, capability: Capability, plan: &Plan) -> QueueAdmission {
+        let config = self.config();
+        let policy = config.policy_for(&plan.host);
+        let admission = self.queue.poll(capability, &policy, self.clock.now_millis());
+        self.gated(capability, plan, &policy, admission)
+    }
+
+    // -- Churn-aware scheduling (specification 26.11) ----------------------
+
+    /// Put a trigger the batching queue granted to the scheduling gate.
+    ///
+    /// A deferred trigger is withdrawn from the queue, so no later request
+    /// reads "an activation is coming" when none is, and the caller is told to
+    /// wait: it parks, and the next round — woken when the host settles or
+    /// the loaded model goes quiet — asks the gate again.
+    fn gated(
+        &self,
+        capability: Capability,
+        plan: &Plan,
+        policy: &FleetPolicy,
+        admission: QueueAdmission,
+    ) -> QueueAdmission {
+        if admission != QueueAdmission::Activate {
+            return admission;
+        }
+        let now = self.clock.now_millis();
+        let snapshot = self.with_commitments();
+        let mut contenders = self.contenders(&plan.host, &snapshot, Some(&plan.deployment), now);
+        if !contenders.iter().any(|c| c.deployment == plan.deployment) {
+            // A request on its first attempt is not parked yet, so nothing has
+            // counted it. It is ranked as one request that has just arrived —
+            // not waved through as if nothing else were waiting.
+            contenders.push(hypellm_fleet::schedule::Contender {
+                deployment: plan.deployment.clone(),
+                waiting: 1,
+                oldest_ms: now,
+                restore_cost_ms: self.restore_cost(&snapshot, &plan.deployment),
+            });
+        }
+        let victims_busy = {
+            let in_flight = self.dispatches_in_flight();
+            plan.eviction_set().iter().any(|victim| {
+                in_flight.get(*victim).copied().unwrap_or(0) > 0 || snapshot.inflight(victim) > 0
+            })
+        };
+        let asking = hypellm_fleet::schedule::Asking {
+            deployment: &plan.deployment,
+            evicts: plan.evicts(),
+            victims_busy,
+        };
+        match hypellm_fleet::schedule::gate(&asking, &contenders, now, policy) {
+            hypellm_fleet::schedule::Verdict::Proceed(why) => {
+                if matches!(
+                    why,
+                    hypellm_fleet::schedule::Proceed::Ranked
+                        | hypellm_fleet::schedule::Proceed::Starving
+                ) {
+                    self.count_schedule(&plan.host, why.as_str());
+                }
+                QueueAdmission::Activate
+            }
+            hypellm_fleet::schedule::Verdict::Defer(why) => {
+                self.queue.untrigger(capability);
+                self.count_schedule(&plan.host, why.as_str());
+                QueueAdmission::Wait { retry_in_ms: 0 }
+            }
+        }
+    }
+
+    /// Every deployment requests are parked for on `host`, as the scheduler
+    /// sees it (specification 26.11).
+    ///
+    /// Demand is the parked requests per alias, summed over the deployments
+    /// on this host each alias could use that are not already serving or
+    /// coming up; age is the oldest of them. A deployment whose last gated
+    /// activation was refused is left out until its refusal lapses, except
+    /// when it is the one asking — it must still be able to try again. Built
+    /// from ordered maps, so the list's order is the deployments' order.
+    fn contenders(
+        &self,
+        host: &HostId,
+        snapshot: &FleetSnapshot,
+        asking: Option<&DeploymentId>,
+        now_ms: u64,
+    ) -> Vec<hypellm_fleet::schedule::Contender> {
+        let config = &snapshot.config;
+        let refused = match self.refused_until.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let parked = match self.parked_aliases.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let aliases = match self.alias_deployments.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let mut demand: BTreeMap<DeploymentId, (u32, u64)> = BTreeMap::new();
+        for (alias, (waiting, oldest_ms)) in &parked {
+            for deployment in aliases.get(alias).into_iter().flatten() {
+                let Some(declared) = config.deployments.get(deployment) else {
+                    continue;
+                };
+                if config.host_of(declared).map(|h| &h.id) != Some(host)
+                    || snapshot.state_of(deployment).is_serving()
+                    || snapshot.is_coming_up(deployment)
+                    || (Some(deployment) != asking
+                        && refused.get(deployment).is_some_and(|until| *until > now_ms))
+                {
+                    continue;
+                }
+                let entry = demand.entry(deployment.clone()).or_insert((0, *oldest_ms));
+                entry.0 = entry.0.saturating_add(*waiting);
+                entry.1 = entry.1.min(*oldest_ms);
+            }
+        }
+        demand
+            .into_iter()
+            .map(|(deployment, (waiting, oldest_ms))| hypellm_fleet::schedule::Contender {
+                restore_cost_ms: self.restore_cost(snapshot, &deployment),
+                deployment,
+                waiting,
+                oldest_ms,
+            })
+            .collect()
+    }
+
+    /// Expected milliseconds from deciding to load a deployment to its
+    /// serving: the start refined by observation, plus the declared probe.
+    fn restore_cost(&self, snapshot: &FleetSnapshot, deployment: &DeploymentId) -> u64 {
+        let Some(declared) = snapshot.config.deployments.get(deployment) else {
+            return 0;
+        };
+        let observed = snapshot.observed_timings.get(deployment).copied();
+        hypellm_fleet::state::refine_timing(declared.start_ms, observed.and_then(|t| t.start_ms))
+            .saturating_add(declared.probe_ms)
+    }
+
+    /// Note that an activation the gate let through was refused, so the
+    /// deployment stops outranking others for a while.
+    ///
+    /// For `activation_max_wait_ms`, at least a second: long enough for the
+    /// next contender to be gated through, short enough that a deployment
+    /// refused for a passing reason is soon back in line.
+    pub fn note_refused(&self, deployment: &DeploymentId, host: &HostId) {
+        let policy = self.config().policy_for(host);
+        let now = self.clock.now_millis();
+        let until = now.saturating_add(policy.activation_max_wait_ms.max(1_000));
+        let mut book = match self.refused_until.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        book.retain(|_, until| *until > now);
+        book.insert(deployment.clone(), until);
+        drop(book);
+        self.wake.notify();
+    }
+
+    /// What each host would load next, for the fleet view.
+    #[must_use]
+    pub fn next_activations(&self) -> Vec<hypellm_fleet::schedule::NextActivation> {
+        let config = self.config();
+        let snapshot = self.with_commitments();
+        let now = self.clock.now_millis();
+        let mut out = Vec::new();
+        for host in config.hosts.keys() {
+            let policy = config.policy_for(host);
+            let contenders = self.contenders(host, &snapshot, None, now);
+            let ready: Vec<_> = contenders
+                .iter()
+                .filter(|c| c.is_ready(now, &policy))
+                .cloned()
+                .collect();
+            let ranked = if policy.max_reorder_wait_ms == 0 {
+                // Arrival order: the oldest waiter.
+                let mut ordered: Vec<_> = ready.iter().collect();
+                ordered.sort_by(|a, b| {
+                    a.oldest_ms
+                        .cmp(&b.oldest_ms)
+                        .then_with(|| a.deployment.cmp(&b.deployment))
+                });
+                ordered
+            } else {
+                hypellm_fleet::schedule::rank(&ready, now, &policy)
+            };
+            let Some(first) = ranked.first() else {
+                continue;
+            };
+            let reason = if policy.max_reorder_wait_ms == 0 {
+                "arrival_order"
+            } else if first.is_starving(now, &policy) {
+                "starving"
+            } else if ranked.len() > 1 {
+                "ranked"
+            } else {
+                "uncontended"
+            };
+            out.push(hypellm_fleet::schedule::NextActivation {
+                host: host.clone(),
+                deployment: first.deployment.clone(),
+                waiting: first.waiting,
+                waited_ms: first.age_ms(now),
+                reason,
+                contenders: contenders.len(),
+            });
+        }
+        out
+    }
+
+    fn count_schedule(&self, host: &HostId, outcome: &str) {
+        self.telemetry.count(
+            names::FLEET_SCHEDULE_DECISIONS,
+            "Churn-aware scheduling decisions, by host and outcome.",
+            &Labels::one(LabelName::Host, host.as_str()).with(LabelName::Outcome, outcome),
+        );
+    }
+
+    /// Count a job taken out of queue order, `reordered` or `starving`.
+    pub fn count_job_schedule(&self, outcome: &str) {
+        self.telemetry.count(
+            names::FLEET_SCHEDULE_DECISIONS,
+            "Churn-aware scheduling decisions, by host and outcome.",
+            &Labels::one(LabelName::Outcome, outcome),
+        );
+    }
+
+    /// How a job's alias stands on the fleet right now, for job ordering.
+    ///
+    /// `Warm` when any of its targets is unmanaged or has a deployment
+    /// serving; `Activating` when one is coming up; otherwise `Cold`, keyed
+    /// by the first deployment in the alias's own target order, so jobs one
+    /// activation would serve group together.
+    #[must_use]
+    pub fn job_class(&self, targets: &[TargetId]) -> hypellm_fleet::schedule::JobClass {
+        let config = self.config();
+        let snapshot = self.with_commitments();
+        let mut activating = false;
+        let mut cold: Option<&DeploymentId> = None;
+        for target in targets {
+            let Some(deployment) = config.deployment_for_target(target) else {
+                return hypellm_fleet::schedule::JobClass::Warm;
+            };
+            if snapshot.state_of(&deployment.id).is_serving() {
+                return hypellm_fleet::schedule::JobClass::Warm;
+            }
+            if snapshot.is_coming_up(&deployment.id) {
+                activating = true;
+            } else if cold.is_none() {
+                cold = Some(&deployment.id);
+            }
+        }
+        if activating {
+            return hypellm_fleet::schedule::JobClass::Activating;
+        }
+        cold.map_or(hypellm_fleet::schedule::JobClass::Warm, |d| {
+            hypellm_fleet::schedule::JobClass::Cold(d.as_str().to_owned())
+        })
+    }
+
+    /// The fleet-wide reordering bound, for the job queue.
+    #[must_use]
+    pub fn max_reorder_wait_ms(&self) -> u64 {
+        self.config().default_policy.max_reorder_wait_ms
+    }
+
+    // -- Dispatch accounting and idle stop (specification 26.10) -----------
+
+    /// Count a dispatch against the deployment serving `target`.
+    ///
+    /// `Ok(None)` for a target with no deployment. `Err` when an idle stop
+    /// has claimed the deployment: the request must not be sent into a model
+    /// that is being taken down, and treats the target as draining.
+    pub fn enter_dispatch(&self, target: &TargetId) -> Result<Option<DispatchHold>, &'static str> {
+        let config = self.config();
+        let Some(deployment) = config.deployment_for_target(target) else {
+            return Ok(None);
+        };
+        let mut book = match self.dispatch.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if book.stopping.contains(&deployment.id) {
+            return Err("deployment_stopping");
+        }
+        let count = book.in_flight.entry(deployment.id.clone()).or_insert(0);
+        *count = count.saturating_add(1);
+        drop(book);
+        self.demand
+            .record_served(&deployment.id, self.clock.now_millis());
+        Ok(Some(DispatchHold {
+            deployment: deployment.id.clone(),
+        }))
+    }
+
+    /// Finish a dispatch counted by [`Self::enter_dispatch`].
+    ///
+    /// The deployment's idle clock restarts here, at the end of its last
+    /// request rather than the beginning: a model that has just spent ten
+    /// minutes streaming one answer has not been idle for ten minutes.
+    pub fn leave_dispatch(&self, hold: DispatchHold) {
+        let mut book = match self.dispatch.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut quiet = false;
+        if let Some(count) = book.in_flight.get_mut(&hold.deployment) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                book.in_flight.remove(&hold.deployment);
+                quiet = true;
+            }
+        }
+        drop(book);
+        self.demand
+            .record_served(&hold.deployment, self.clock.now_millis());
+        if quiet {
+            // A swap deferred because this model was carrying work
+            // (specification 26.11) may go now; wake whoever parked for it
+            // rather than leaving them to the next slice.
+            self.wake.notify();
+        }
+    }
+
+    /// Claim a deployment for a stop, unless a dispatch holds it.
+    ///
+    /// Taken under the lock [`Self::enter_dispatch`] takes, so exactly one of
+    /// the two wins: a dispatch already counted refuses the claim, and a claim
+    /// already taken refuses the dispatch.
+    pub(crate) fn claim_for_stop(&self, deployment: &DeploymentId) -> bool {
+        let mut book = match self.dispatch.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        book.in_flight.get(deployment).copied().unwrap_or(0) == 0
+            && book.stopping.insert(deployment.clone())
+    }
+
+    /// Release a claim taken by [`Self::claim_for_stop`].
+    pub(crate) fn release_stop_claim(&self, deployment: &DeploymentId) {
+        match self.dispatch.lock() {
+            Ok(mut book) => book.stopping.remove(deployment),
+            Err(poisoned) => poisoned.into_inner().stopping.remove(deployment),
+        };
+        self.wake.notify();
+    }
+
+    /// [`Self::claim_for_stop`], for tests of the race it settles.
+    #[cfg(any(test, feature = "test-harness"))]
+    pub fn claim_for_stop_for_test(&self, deployment: &DeploymentId) -> bool {
+        self.claim_for_stop(deployment)
+    }
+
+    /// [`Self::release_stop_claim`], for tests of the race it settles.
+    #[cfg(any(test, feature = "test-harness"))]
+    pub fn release_stop_claim_for_test(&self, deployment: &DeploymentId) {
+        self.release_stop_claim(deployment);
+    }
+
+    /// Requests dispatched and not finished, by deployment.
+    #[must_use]
+    pub fn dispatches_in_flight(&self) -> BTreeMap<DeploymentId, u32> {
+        match self.dispatch.lock() {
+            Ok(guard) => guard.in_flight.clone(),
+            Err(poisoned) => poisoned.into_inner().in_flight.clone(),
+        }
+    }
+
+    /// Requests parked or queued for a cold capability, in total.
+    #[must_use]
+    pub fn parked_total(&self) -> u32 {
+        self.queue
+            .depths()
+            .values()
+            .fold(0_u32, |sum, depth| sum.saturating_add(*depth))
+    }
+
+    /// Stop the deployments nothing is using, at most one per host.
+    ///
+    /// The predicate is `hypellm_fleet::idle`, over belief refreshed with the
+    /// ledger's commitments. Each stop then *claims* its deployment under the
+    /// same lock [`Self::enter_dispatch`] takes and re-checks that nothing was
+    /// dispatched to it since the predicate ran, so a request and a stop
+    /// cannot pass each other: whichever takes the lock first wins, and the
+    /// other sees it. Anything parked or queued for the capability after the
+    /// predicate ran is re-checked after the claim for the same reason.
+    ///
+    /// A host performing an activation is skipped: one plan per host at a
+    /// time. The stop is an ordinary deactivation — lease durable before the
+    /// verb, closed exactly once, flap backoff recorded — audited with the
+    /// reason `idle`.
+    pub fn idle_stop(&self) -> Vec<DeploymentId> {
+        let config = self.config();
+        let snapshot = self.with_commitments();
+        let demand = self.demand_snapshot();
+        let in_flight = self.dispatches_in_flight();
+        let now = self.clock.now_millis();
+        let max_age = config
+            .agents
+            .values()
+            .map(|a| a.observation_max_age_ms)
+            .min()
+            .unwrap_or(0);
+        let candidates = hypellm_fleet::idle::idle_stops(&hypellm_fleet::idle::IdleInputs {
+            snapshot: &snapshot,
+            demand: &demand,
+            in_flight: &in_flight,
+            max_observation_age_ms: max_age,
+            now_ms: now,
+        });
+
+        let mut stopped = Vec::new();
+        for deployment in candidates {
+            let Some(host) = config
+                .deployments
+                .get(&deployment)
+                .and_then(|record| config.accelerator_of(record))
+                .map(|accelerator| accelerator.host.clone())
+            else {
+                continue;
+            };
+            if self.ledger.slots_held(&host) > 0 {
+                continue;
+            }
+            if !self.claim_for_stop(&deployment) {
+                continue;
+            }
+            let waiting = self
+                .capability_of(&deployment)
+                .map_or(0, |capability| {
+                    self.queue.depths().get(&capability).copied().unwrap_or(0)
+                });
+            let result = if waiting > 0 {
+                Err("deployment_in_use")
+            } else {
+                self.deactivate_because(
+                    &deployment,
+                    Some("idle: nothing used the deployment for idle_stop_ms"),
+                )
+            };
+            self.release_stop_claim(&deployment);
+            match result {
+                Ok(()) => {
+                    self.telemetry.log(
+                        &hypellm_telemetry::Event::info("fleet.idle_stopped")
+                            .str_field(Field::Deployment, deployment.as_str())
+                            .str_field(
+                                Field::Detail,
+                                "stopped after idle_stop_ms with nothing in flight, queued \
+                                 or parked",
+                            ),
+                    );
+                    stopped.push(deployment);
+                }
+                Err(code) => {
+                    if code != "deployment_in_use" {
+                        self.telemetry.log(
+                            &hypellm_telemetry::Event::warn("fleet.idle_stop_failed")
+                                .str_field(Field::Deployment, deployment.as_str())
+                                .str_field(Field::Code, code),
+                        );
+                    }
+                }
+            }
+        }
+        stopped
     }
 
     // -- Recovery ----------------------------------------------------------
@@ -1458,9 +2432,11 @@ impl FleetRuntime {
             RecordKind::FleetLease,
             RecordKind::FleetActivation,
             RecordKind::FleetFlap,
+            RecordKind::ArtifactChecksum,
         ]) else {
             return;
         };
+        let mut kept: BTreeMap<ArtifactId, ImageId> = BTreeMap::new();
 
         let mut leases: BTreeMap<LeaseId, Lease> = BTreeMap::new();
         let mut flaps: BTreeMap<DeploymentId, FlapRecord> = BTreeMap::new();
@@ -1490,10 +2466,18 @@ impl FleetRuntime {
                         flaps.insert(record.deployment.clone(), record);
                     }
                 }
+                RecordKind::ArtifactChecksum => {
+                    if let Some(record) = hypellm_fleet::checksum::decode_record(&payload) {
+                        hypellm_fleet::checksum::restore(&mut kept, record);
+                    }
+                }
                 _ => {}
             }
         }
 
+        if let Ok(mut guard) = self.checksums.write() {
+            *guard = kept;
+        }
         for record in flaps.values() {
             self.flap.restore(
                 &record.deployment,
@@ -2016,6 +3000,14 @@ impl hypellm_admin_api::FleetControl for FleetControlAdapter {
         self.runtime.fetch_artifact(&artifact, &host)
     }
 
+    fn copy(&self, artifact: &str, from: &str, to: &str) -> Result<String, &'static str> {
+        let artifact =
+            hypellm_core::ids::ArtifactId::new(artifact).map_err(|_| "unknown_artifact")?;
+        let from = HostId::new(from).map_err(|_| "unknown_host")?;
+        let to = HostId::new(to).map_err(|_| "unknown_host")?;
+        self.runtime.copy_artifact(&artifact, &from, &to)
+    }
+
     fn patch(
         &self,
         deployment: &str,
@@ -2059,5 +3051,9 @@ impl hypellm_admin_api::FleetControl for FleetControlAdapter {
 
     fn now_ms(&self) -> u64 {
         self.runtime.clock.now_millis()
+    }
+
+    fn next_activations(&self) -> Vec<hypellm_fleet::schedule::NextActivation> {
+        self.runtime.next_activations()
     }
 }

@@ -1425,6 +1425,7 @@ alias id=a targets=t
             tenant: &tenant,
             attempted: &attempted,
             now_millis: 0,
+            key: None,
         };
 
         let req = CanonicalRequest {

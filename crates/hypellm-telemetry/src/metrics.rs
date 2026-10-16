@@ -847,6 +847,15 @@ pub mod names {
     pub const PENDING_REQUESTS: &str = "hypellm_pending_requests";
     /// Requests that waited for a target to recover, by alias and outcome.
     pub const RECOVERY_WAITS: &str = "hypellm_recovery_waits_total";
+    /// Requests that parked for a cold model to be started, by alias and
+    /// outcome (specification 26.10).
+    pub const PARKED_WAITS: &str = "hypellm_parked_requests_total";
+    /// Churn-aware scheduling decisions, by host and outcome (specification
+    /// 26.11): `ranked` and `starving` activations that went ahead of others
+    /// waiting for the same host, `outranked` and `warm_demand` activations
+    /// that were deferred, and `job_reordered` / `job_starving` jobs taken
+    /// out of queue order.
+    pub const FLEET_SCHEDULE_DECISIONS: &str = "hypellm_fleet_schedule_decisions_total";
 }
 
 /// Buckets for a rate in tokens per second.

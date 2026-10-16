@@ -101,7 +101,7 @@ input/resource limits.</p>
 </tr>
 <tr>
 <td>Fuzz targets</td>
-<td>Eight, in <code>tests/fuzz.rs</code>, over three surfaces. See <a href="#fuzz-targets">Fuzz targets</a>.</td>
+<td>Ten, in <code>tests/fuzz.rs</code>, over four surfaces. See <a href="#fuzz-targets">Fuzz targets</a>.</td>
 </tr>
 </tbody>
 </table></div>
@@ -155,9 +155,24 @@ eventually acquire a shortcut to it.</p>
 <td>extension 9</td>
 </tr>
 <tr>
+<td>Idle stop: which resident deployments nothing is using</td>
+<td><code>idle</code></td>
+<td>router specification 26.10</td>
+</tr>
+<tr>
+<td>Churn-aware scheduling: which waiting model a host loads next, and which job a worker takes</td>
+<td><code>schedule</code></td>
+<td>router specification 26.11</td>
+</tr>
+<tr>
 <td>The activation state machine and lease accounting</td>
 <td><code>activation</code></td>
 <td>extension 10</td>
+</tr>
+<tr>
+<td>Kept image checksums: learning, durable codec, tampered hosts</td>
+<td><code>checksum</code></td>
+<td>router specification 26.12</td>
 </tr>
 <tr>
 <td>The agent wire protocol, as a codec</td>
@@ -235,6 +250,15 @@ rests on is &quot;twelve swaps per host per hour regardless of the attacker's ra
 with in-flight work above <code>max_drainable_inflight</code> is not evictable, a pinned
 or non-evictable one never enters a candidate set, and <code>force_stop</code> is opt-in
 and audited by the caller.</li>
+<li><strong>A slave serving another image under a model's name.</strong> A slave's
+reported image ID is its own word. <code>checksum</code> holds each artifact to one ID —
+pinned in configuration, or learned once from a verified, unanimous observation
+and kept durably — and <code>FleetSnapshot::artifact_ready</code> and <code>copy_source</code>
+treat any other report as absent: never activated, never copied from. The
+<code>COPY</code> verb's image ID is validated as one token (<code>model::ImageId</code>) and can
+only narrow what the agent accepts; the agent hashes the relayed archive
+itself. A learned ID is trust on first verified observation, which
+<code>spec/deferred-issues.html</code> records.</li>
 <li><strong>Storage exhaustion via fetch.</strong> <code>plan::plan</code> refuses a fetch unless the
 host's policy allows it <em>and</em> the principal holds the separate permission
 <em>and</em> free disk exceeds size plus headroom <em>and</em> the architecture matches.
@@ -276,6 +300,31 @@ outage with no explanation.</li>
 </tr>
 </thead>
 <tbody>
+<tr>
+<td>Enrollment offer (<code>ENROLL</code>) payload / hosts</td>
+<td>64 KiB / 64</td>
+<td><code>enroll::MAX_OFFER_BYTES</code>, <code>enroll::MAX_OFFER_HOSTS</code>; an over-size offer is never sent</td>
+</tr>
+<tr>
+<td>Open enrollments / retained terminal enrollments</td>
+<td>64 / 256</td>
+<td><code>enroll::MAX_OPEN_ENROLLMENTS</code>, <code>enroll::MAX_RETAINED_ENROLLMENTS</code></td>
+</tr>
+<tr>
+<td>Enrollment token lifetime</td>
+<td>60 s to 24 h, default 30 min</td>
+<td><code>enroll::MIN_TTL_MS</code>, <code>MAX_TTL_MS</code>, <code>DEFAULT_TTL_MS</code></td>
+</tr>
+<tr>
+<td>Failed token presentations</td>
+<td>20 per minute, router-wide</td>
+<td><code>enroll::MAX_FAILED_ATTEMPTS</code>, <code>THROTTLE_WINDOW_MS</code></td>
+</tr>
+<tr>
+<td>Registered GPUs / data directory / hostname</td>
+<td>16 / 256 bytes / 64 characters</td>
+<td><code>enroll::parse_registration</code></td>
+</tr>
 <tr>
 <td>Inventory payload</td>
 <td>256 KiB</td>
@@ -450,6 +499,16 @@ no such dependency. Fuzzing is a seeded, deterministic mutation engine in
 <td>Refused</td>
 </tr>
 <tr>
+<td><code>no_accepted_registration_carries_a_value_that_escapes_a_file_or_a_shell</code></td>
+<td>Mutated registration bodies through <code>enroll::parse_registration</code></td>
+<td>Whatever parses has a data directory, login, host-key line and hostname that are safe in <code>known_hosts</code>, an SSH destination, a JSON table and a <code>docker -v</code> path</td>
+</tr>
+<tr>
+<td><code>no_copy_line_carries_anything_but_its_six_tokens</code></td>
+<td>Mutated image IDs through <code>ImageId::parse</code> and <code>protocol::encode_request</code></td>
+<td>A value either fails to become an image ID or crosses as one token: one line, six fields, within <code>MAX_LINE</code>. Every adopted inventory <code>image_id</code> is <code>sha256:</code> and 64 lowercase hex</td>
+</tr>
+<tr>
 <td><code>no_interleaving_of_lease_operations_leaks_a_lease</code></td>
 <td>Arbitrary interleavings of acquire, release, expiry, and spurious release against <code>ActivationLedger</code></td>
 <td>Acquisitions equal releases plus live leases; slots never diverge from live leases; a refused release returns no slot</td>
@@ -457,8 +516,14 @@ no such dependency. Fuzzing is a seeded, deterministic mutation engine in
 </tbody>
 </table></div>
 <p>The property layer lives in <code>tests/properties.rs</code>, in the style of the fourteen
-properties in <code>hypellm-core/tests/properties.rs</code>: twelve seeded properties over
-extension 23's invariant list, each across many generated fleets. The capability
+properties in <code>hypellm-core/tests/properties.rs</code>: nineteen seeded properties over
+extension 23's invariant list and router specification 26.10–26.12, each across many
+generated fleets. One is the copy planner's: a copy is planned only from a host
+reporting the kept checksum — never a tampered, silent or unreachable one, never
+with no checksum kept — and is preferred to a fetch whenever such a host exists. Four are the scheduler's: decisions independent of input order,
+nothing reordered past <code>max_reorder_wait_ms</code>, strictly fewer loads than arrival
+order on alternating two-model demand (a simulation driven through <code>gate</code>), and
+no overflow in the priority arithmetic. The capability
 contract's own properties are in <code>hypellm-core/tests/capability.rs</code>, and the
 end-to-end activation path is exercised in <code>hypellm-router/tests/fleet.rs</code>
 against a conformant simulated agent on a real socket.</p>
@@ -466,13 +531,23 @@ against a conformant simulated agent on a real socket.</p>
 <p>See <code>lib.rs</code>. The surface is the domain model (<code>FleetConfig</code> and its records),
 the snapshot (<code>FleetSnapshot</code>, <code>Inventory</code>, <code>Lease</code>), the planner (<code>plan</code>,
 <code>Plan</code>, <code>PlanOutcome</code>, <code>PlanContext</code>, <code>retention_value</code>), the governance state
-(<code>Budgets</code>, <code>FlapCounter</code>, <code>ActivationQueue</code>), the activation machine
-(<code>ActivationLedger</code>, <code>ActivationState</code>, <code>ActivationRecord</code>), and the protocol
-codec (<code>AgentRequest</code>, <code>AgentReply</code>, <code>encode_request</code>, <code>parse_reply</code>).</p>
+(<code>Budgets</code>, <code>FlapCounter</code>, <code>ActivationQueue</code>, whose <code>park</code> and
+<code>poll</code> keep a parked request counted for its whole wait), the idle-stop
+predicate (<code>idle</code>: <code>idle_hold</code>, <code>idle_stops</code>, <code>IdleInputs</code>, pure like the
+planner, specification 26.10), the scheduler (<code>schedule</code>: <code>gate</code>, <code>rank</code>,
+<code>pick_job</code>, <code>Contender</code>, <code>JobEntry</code>, pure and clock-free, specification 26.11;
+<code>ActivationQueue::untrigger</code> withdraws a trigger the gate refused), the activation machine
+(<code>ActivationLedger</code>, <code>ActivationState</code>, <code>ActivationRecord</code>), the protocol
+codec (<code>AgentRequest</code>, <code>AgentReply</code>, <code>encode_request</code>, <code>parse_reply</code>), and
+enrollment (<code>enroll</code>: <code>EnrollmentRegistry</code> and its journal trait, the
+registration parser, the drafted records, and the agent offer, specification
+26.8).</p>
 <p>The narrowness is the point. There is no function that takes a request, a
-prompt, a URL, a host address, a file path, or a command; no function that opens
-anything; and no way to construct an <code>AgentRequest</code> naming a deployment the
-caller did not already hold an identifier for. Widening any of those requires
+prompt, a URL, or a command; no function that opens anything; and no way to
+construct an <code>AgentRequest</code> naming a deployment the caller did not already hold
+an identifier for. The one place a host address appears is the enrollment offer,
+built only from approved registrations whose hosts are in the active
+configuration (<code>enroll::offer_for_agent</code>). Widening any of those requires
 two-person security review under 21.1, as do changes to the agent protocol, the
 lease accounting, and the eviction path.</p>
 

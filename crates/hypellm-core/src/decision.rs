@@ -64,6 +64,13 @@ pub enum ExclusionReason {
     CapacityExhausted,
     /// A higher-precedence binding denies this target.
     DeniedByPolicy,
+    /// Fleet grants do not let this caller use the slave the target runs on,
+    /// or that model on it.
+    FleetAccessDenied,
+    /// The API key the request was made with is restricted away from this
+    /// target, or from the slave it runs on. A narrowing of the principal's
+    /// access, never a widening (`hypellm_core::key_restriction`).
+    KeyRestricted,
     /// A hard pin selected a different target.
     NotPinnedTarget,
     /// The request required local inference and this target is remote.
@@ -88,6 +95,11 @@ pub enum ExclusionReason {
     ActivationExceedsDeadline,
     /// The host's activation budget for this period is exhausted.
     ActivationBudgetExhausted,
+    /// The activation this target needs is waiting: demand batching has not
+    /// reached its trigger, or the host is already performing another
+    /// activation. Transient, so a request that meets only this parks
+    /// (specification 26.10) rather than failing.
+    ActivationQueued,
     /// The principal may not cause activation, or the deployment is not
     /// `autostart`.
     ActivationNotPermitted,
@@ -137,6 +149,8 @@ impl ExclusionReason {
             Self::BudgetExceeded => "budget_exceeded",
             Self::CapacityExhausted => "capacity_exhausted",
             Self::DeniedByPolicy => "denied_by_policy",
+            Self::FleetAccessDenied => "fleet_access_denied",
+            Self::KeyRestricted => "key_restricted",
             Self::NotPinnedTarget => "not_pinned_target",
             Self::LocalRequired => "local_required",
             Self::FamilyFailoverNotAllowed => "family_failover_not_allowed",
@@ -147,6 +161,7 @@ impl ExclusionReason {
             Self::QualityFloorNotMet => "quality_floor_not_met",
             Self::ActivationExceedsDeadline => "activation_exceeds_deadline",
             Self::ActivationBudgetExhausted => "activation_budget_exhausted",
+            Self::ActivationQueued => "activation_queued",
             Self::ActivationNotPermitted => "activation_not_permitted",
             Self::ArtifactUnavailable => "artifact_unavailable",
             Self::HostCapacityInsufficient => "host_capacity_insufficient",
@@ -171,6 +186,7 @@ impl ExclusionReason {
             self,
             Self::ActivationExceedsDeadline
                 | Self::ActivationBudgetExhausted
+                | Self::ActivationQueued
                 | Self::ActivationNotPermitted
                 | Self::ArtifactUnavailable
                 | Self::HostCapacityInsufficient
@@ -194,6 +210,8 @@ impl ExclusionReason {
             self,
             Self::NotAuthorizedForAlias
                 | Self::DeniedByPolicy
+                | Self::FleetAccessDenied
+                | Self::KeyRestricted
                 | Self::ResidencyMismatch
                 | Self::EndpointNotAllowlisted
                 | Self::CredentialScopeMismatch
@@ -236,6 +254,8 @@ impl ExclusionReason {
             Self::BudgetExceeded,
             Self::CapacityExhausted,
             Self::DeniedByPolicy,
+            Self::FleetAccessDenied,
+            Self::KeyRestricted,
             Self::NotPinnedTarget,
             Self::LocalRequired,
             Self::FamilyFailoverNotAllowed,
@@ -246,6 +266,7 @@ impl ExclusionReason {
             Self::QualityFloorNotMet,
             Self::ActivationExceedsDeadline,
             Self::ActivationBudgetExhausted,
+            Self::ActivationQueued,
             Self::ActivationNotPermitted,
             Self::ArtifactUnavailable,
             Self::HostCapacityInsufficient,

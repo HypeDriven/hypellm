@@ -20,6 +20,7 @@ use hypellm_core::canonical::{
 use hypellm_core::ids::{
     AliasId, BindingId, CredentialRef, GroupId, PrincipalId, ProviderId, TargetId, TenantId,
 };
+use hypellm_core::fleet_access::FleetGrant;
 use hypellm_core::netaddr::{self, EgressProfile};
 use hypellm_core::policy::{
     AliasGrant, Binding, BindingScope, ModelSelector, PolicySnapshot, TargetPreference,
@@ -126,6 +127,11 @@ pub struct Settings {
     /// waiting existed: each waiter holds a connection, and an outage must not
     /// be able to occupy all of them.
     pub max_recovery_waiters: u32,
+    /// How many requests may be parked at once waiting for a cold model to be
+    /// started for them (specification 26.10). Past it, a request that would
+    /// park fails over as it did before parking existed. Like a recovery
+    /// waiter, a parked request holds a connection.
+    pub max_parked_requests: u32,
     /// The principal a break-glass sign-in authenticates as.
     ///
     /// Specification 22.4 requires a preprovisioned local break-glass method.
@@ -243,6 +249,17 @@ pub struct Settings {
     /// Directory holding durable fleet state: leases, activation history, and
     /// flap counters. Defaults to `fleet` inside the state directory.
     pub fleet_state_dir: Option<String>,
+    /// The tailnet HTTPS origin a new slave fetches the install script from
+    /// and registers with (specification 26.8).
+    ///
+    /// Absent disables enrollment: the public `/fleet/v1/` endpoints answer
+    /// "not configured" and no enrollment token can be minted. It is an
+    /// origin — scheme, host and optional port, nothing else — because it is
+    /// written into a shell command an operator pastes on another machine.
+    pub fleet_enroll_url: Option<String>,
+    /// What a caller no `fleet_grant` mentions may use: every slave and every
+    /// model (`allow`, the default) or none (`deny`).
+    pub fleet_access_default: hypellm_core::fleet_access::FleetAccessDefault,
     /// Maximum document parts one request may carry.
     pub max_documents_per_request: u32,
     /// Maximum decoded bytes of any one inline document part.
@@ -334,6 +351,7 @@ impl Default for Settings {
             queue_timeout_ms: 5_000,
             default_target_queued: 32,
             max_recovery_waiters: 256,
+            max_parked_requests: 256,
             max_connections: 0,
             quota_partitions: 0,
             budget_draw_tokens: hypellm_core::budget::DEFAULT_DRAW_TOKENS,
@@ -349,6 +367,8 @@ impl Default for Settings {
             break_glass_ttl_secs: 900,
             fleet_enabled: false,
             fleet_state_dir: None,
+            fleet_enroll_url: None,
+            fleet_access_default: hypellm_core::fleet_access::FleetAccessDefault::Allow,
             max_documents_per_request: 4,
             max_document_bytes: 4 * 1024 * 1024,
             // 8 MiB decoded is about 10.7 MiB encoded, which leaves headroom
@@ -734,6 +754,73 @@ impl ValidatedConfig {
     pub fn digest_short(&self) -> String {
         self.digest.short()
     }
+
+    /// The admission limits and classes this configuration declares.
+    ///
+    /// The one translation from `quota` records to the admission controller,
+    /// used at startup and on every publication and rollback, so the two
+    /// cannot disagree about what a configuration enforces.
+    ///
+    /// - The global scope defaults to 10,000 concurrent requests when no
+    ///   `quota scope=global` exists.
+    /// - A target with a declared `max_concurrency` but no quota of its own
+    ///   still gets that ceiling, with `settings default_target_queued`, so an
+    ///   undeclared quota does not mean unlimited.
+    #[must_use]
+    pub fn admission_plan(&self) -> hypellm_core::admission::AdmissionPlan {
+        use hypellm_core::admission::{AdmissionPlan, ByteRateLimits, ScopeLimits};
+
+        let global = self.quotas.iter().find(|q| q.scope == QuotaScope::Global);
+        let mut plan = AdmissionPlan::new(global.map_or(
+            ScopeLimits {
+                max_concurrency: 10_000,
+                ..ScopeLimits::UNLIMITED
+            },
+            |q| q.limits,
+        ));
+        if let Some(rates) = global.map(|q| q.byte_rates) {
+            plan.byte_rates = ByteRateLimits {
+                input_per_second: rates.input_per_second,
+                input_burst: rates.input_burst,
+                output_per_second: rates.output_per_second,
+                output_burst: rates.output_burst,
+            };
+        }
+        for quota in &self.quotas {
+            match &quota.scope {
+                QuotaScope::Global => {}
+                QuotaScope::Tenant(t) => {
+                    plan.tenants.insert(t.clone(), quota.limits);
+                    plan.classes.insert(format!("tenant:{t}"), quota.class);
+                }
+                QuotaScope::Principal(p) => {
+                    plan.principals.insert(p.clone(), quota.limits);
+                    plan.classes.insert(format!("principal:{p}"), quota.class);
+                }
+                QuotaScope::Target(t) => {
+                    plan.targets.insert(t.clone(), quota.limits);
+                }
+                QuotaScope::Alias { alias, operation } => {
+                    plan.aliases.insert((alias.clone(), *operation), quota.limits);
+                }
+            }
+        }
+        for (id, target) in &self.snapshot.targets {
+            if target.max_concurrency > 0 && !plan.targets.contains_key(id) {
+                plan.targets.insert(
+                    id.clone(),
+                    ScopeLimits {
+                        max_concurrency: target.max_concurrency,
+                        max_queued: self.settings.default_target_queued,
+                        requests_per_second: target.max_requests_per_second,
+                        request_burst: target.max_requests_per_second,
+                        ..ScopeLimits::UNLIMITED
+                    },
+                );
+            }
+        }
+        plan
+    }
 }
 
 /// Read a field and construct a validated identifier from it.
@@ -924,6 +1011,47 @@ pub fn build(document: &Document, version: u64) -> Result<ValidatedConfig, Vec<C
 
     let grants = collect(document, "grant", &mut errors, build_grant);
     let quotas = collect(document, "quota", &mut errors, build_quota);
+    // `grant` and `quota` carry an optional `id` for `edit::apply` alone. It
+    // decides nothing at runtime, but two records sharing one would make an
+    // edit addressed to it ambiguous, so it is held to the same rules as every
+    // other record identifier.
+    // Two quotas over one scope were applied in order, each replacing the
+    // last: a second, limit-free `quota scope=principal:x class=batch` lifted
+    // whatever the first enforced. One record per scope (and operation) makes
+    // the limit a property of the text rather than of record order.
+    let mut quota_scopes: BTreeSet<(&str, Option<&str>)> = BTreeSet::new();
+    for record in document.of_kind("quota") {
+        let Some(scope) = record.get("scope") else { continue };
+        if !quota_scopes.insert((scope, record.get("operation"))) {
+            errors.push(ConfigError::new(
+                "duplicate_quota",
+                format!(
+                    "a second quota for scope '{scope}'; one record per scope, or the later \
+                     replaces the earlier's limits"
+                ),
+                record.position,
+            ));
+        }
+    }
+    for kind in ["grant", "quota"] {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for record in document.of_kind(kind) {
+            let Some(id) = record.get("id") else { continue };
+            if BindingId::new(id).is_err() {
+                errors.push(ConfigError::new(
+                    "invalid_identifier",
+                    format!("{kind} id '{id}' is not a valid identifier"),
+                    record.position,
+                ));
+            } else if !seen.insert(id) {
+                errors.push(ConfigError::new(
+                    "duplicate_id",
+                    format!("duplicate {kind} '{id}'"),
+                    record.position,
+                ));
+            }
+        }
+    }
 
     // Specification 12's "conservative node partitions". Applied here rather
     // than at admission so that everything downstream — the router, the
@@ -1301,6 +1429,32 @@ pub fn build(document: &Document, version: u64) -> Result<ValidatedConfig, Vec<C
         return Err(errors);
     }
 
+    // Which slave each fleet-managed target runs on. Declared placement, not
+    // observed: a deployment says where a target runs whether or not
+    // orchestration is currently switched on, and access to that machine is
+    // decided by where it would run.
+    let fleet_placement: BTreeMap<TargetId, hypellm_core::ids::HostId> = fleet
+        .deployments
+        .values()
+        .filter_map(|d| fleet.host_of(d).map(|h| (d.target.clone(), h.id.clone())))
+        .collect();
+
+    let fleet_grants = collect(document, "fleet_grant", &mut errors, build_fleet_grant);
+    check_fleet_grants(
+        &fleet_grants,
+        &FleetGrantReferences {
+            tenants: &tenant_map,
+            groups: &seen_groups,
+            aliases: &aliases,
+            hosts: &fleet.hosts,
+            placement: &fleet_placement,
+        },
+        &mut errors,
+    );
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
     let canonical = document.to_canonical_string();
     let digest = hypellm_crypto::digest(canonical.as_bytes());
 
@@ -1318,6 +1472,9 @@ pub fn build(document: &Document, version: u64) -> Result<ValidatedConfig, Vec<C
         max_failure_percent: settings.max_failure_percent,
         default_document_token_estimate: settings.default_document_token_estimate,
         activation_effort_headroom_ms: settings.activation_effort_headroom_ms,
+        fleet_placement,
+        fleet_grants,
+        fleet_access_default: settings.fleet_access_default,
     };
 
     Ok(ValidatedConfig {
@@ -1374,6 +1531,36 @@ fn is_known_scope(name: &str) -> bool {
     ANONYMOUS_SCOPE_NAMES.contains(&name)
 }
 
+/// Normalise `fleet_enroll_url` to a bare `https://host[:port]` origin.
+///
+/// Strict because the value is pasted into a shell command on another
+/// machine: a character outside the host alphabet could end the argument,
+/// and a path would make the script fetch from somewhere the administrator
+/// did not name. A single trailing slash is tolerated and removed.
+pub fn enroll_origin(raw: &str) -> Option<String> {
+    let rest = raw.strip_prefix("https://")?;
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (rest, None),
+    };
+    let host_ok = !host.is_empty()
+        && host.len() <= 253
+        && host
+            .split('.')
+            .all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            });
+    let port_ok = port.is_none_or(|p| {
+        !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok_and(|n| n != 0)
+    });
+    (host_ok && port_ok).then(|| format!("https://{}", rest.to_ascii_lowercase()))
+}
+
 fn build_settings(document: &Document) -> Result<Settings, ConfigError> {
     let Some(record) = document.of_kind("settings").next() else {
         return Ok(Settings::default());
@@ -1424,6 +1611,7 @@ fn build_settings(document: &Document) -> Result<Settings, ConfigError> {
         queue_timeout_ms: f.u64_field("queue_timeout_ms", d.queue_timeout_ms)?,
         default_target_queued: f.u32_field("default_target_queued", d.default_target_queued)?,
         max_recovery_waiters: f.u32_field("max_recovery_waiters", d.max_recovery_waiters)?,
+        max_parked_requests: f.u32_field("max_parked_requests", d.max_parked_requests)?,
         max_connections: f.u64_field("max_connections", d.max_connections)?,
         quota_partitions: f.u32_field("quota_partitions", d.quota_partitions)?,
         budget_draw_tokens: f.u64_field("budget_draw_tokens", d.budget_draw_tokens)?,
@@ -1447,6 +1635,27 @@ fn build_settings(document: &Document) -> Result<Settings, ConfigError> {
         break_glass_ttl_secs: f.u64_field("break_glass_ttl_secs", d.break_glass_ttl_secs)?,
         fleet_enabled: f.bool_field("fleet_enabled", d.fleet_enabled)?,
         fleet_state_dir: f.opt_str("fleet_state_dir").map(str::to_owned),
+        fleet_enroll_url: match f.opt_str("fleet_enroll_url") {
+            None => None,
+            Some(raw) => Some(enroll_origin(raw).ok_or_else(|| {
+                f.error(
+                    "invalid_enroll_url",
+                    "fleet_enroll_url must be an https origin such as \
+                     https://router.example.ts.net, with no path, query or credentials",
+                )
+            })?),
+        },
+        fleet_access_default: match f.opt_str("fleet_access_default") {
+            None => d.fleet_access_default,
+            Some(raw) => hypellm_core::fleet_access::FleetAccessDefault::parse(raw).ok_or_else(
+                || {
+                    f.error(
+                        "invalid_value",
+                        "fleet_access_default must be allow or deny",
+                    )
+                },
+            )?,
+        },
         max_documents_per_request: f
             .u32_field("max_documents_per_request", d.max_documents_per_request)?,
         max_document_bytes: f.u64_field("max_document_bytes", d.max_document_bytes)?,
@@ -2176,6 +2385,148 @@ fn build_grant(f: &Fields<'_>) -> Result<AliasGrant, ConfigError> {
         operations,
         allow: f.bool_field("allow", true)?,
     })
+}
+
+/// Build one `fleet_grant`.
+///
+/// Every field is required, `allow` included. A grant is a decision about a
+/// machine, and a record that left its direction to a default would read the
+/// same whether its author meant to open the machine or to close it.
+fn build_fleet_grant(f: &Fields<'_>) -> Result<FleetGrant, ConfigError> {
+    use hypellm_core::fleet_access::{FleetModelSelector, HostSelector};
+
+    let id = id_field!(f, "id", BindingId)?;
+    let scope = parse_binding_scope(f, f.str_field("scope")?)?;
+    let host_raw = f.str_field("host")?;
+    let host = if host_raw == "*" {
+        HostSelector::Any
+    } else {
+        HostSelector::Exact(hypellm_core::ids::HostId::new(host_raw).map_err(|e| {
+            f.error("invalid_identifier", format!("host '{host_raw}': {e}"))
+        })?)
+    };
+    let model_raw = f.str_field("model")?;
+    let model = match model_raw.strip_prefix("target:") {
+        Some(target) => FleetModelSelector::Target(TargetId::new(target).map_err(|e| {
+            f.error("invalid_identifier", format!("target '{target}': {e}"))
+        })?),
+        None => FleetModelSelector::Alias(parse_model_selector(f, Some(model_raw))?),
+    };
+    let allow_raw = f.str_field("allow")?;
+    let allow = match allow_raw {
+        "true" => true,
+        "false" => false,
+        _ => {
+            return Err(f.error(
+                "invalid_value",
+                format!("fleet_grant allow must be true or false, not '{allow_raw}'"),
+            ));
+        }
+    };
+    Ok(FleetGrant {
+        id,
+        scope,
+        host,
+        model,
+        allow,
+    })
+}
+
+/// What a `fleet_grant` may refer to.
+struct FleetGrantReferences<'a> {
+    tenants: &'a BTreeMap<TenantId, TenantConfig>,
+    groups: &'a BTreeSet<&'a GroupId>,
+    aliases: &'a BTreeMap<AliasId, Alias>,
+    hosts: &'a BTreeMap<hypellm_core::ids::HostId, hypellm_fleet::model::Host>,
+    placement: &'a BTreeMap<TargetId, hypellm_core::ids::HostId>,
+}
+
+/// Every reference a fleet grant makes must resolve.
+///
+/// The reason is the one the alias-grant check gives: a grant naming a host,
+/// tenant, group, alias or target that does not exist never matches, and for a
+/// deny that is a policy that silently fails open. A `target:` selector must
+/// also name a fleet-managed target, because a target with no deployment runs
+/// on no slave and no fleet grant can ever apply to it — and when the grant
+/// names an exact host too, the target must run on that host, or the grant is
+/// a cell of the matrix that does not exist.
+fn check_fleet_grants(
+    grants: &[FleetGrant],
+    refs: &FleetGrantReferences<'_>,
+    errors: &mut Vec<ConfigError>,
+) {
+    use hypellm_core::fleet_access::{FleetModelSelector, HostSelector, MAX_FLEET_GRANTS};
+
+    let at = Position { line: 0, column: 0 };
+    if grants.len() > MAX_FLEET_GRANTS {
+        errors.push(ConfigError::new(
+            "too_many_records",
+            format!(
+                "{} fleet_grant records exceed the limit of {MAX_FLEET_GRANTS}",
+                grants.len()
+            ),
+            at,
+        ));
+    }
+    let mut seen: BTreeSet<&BindingId> = BTreeSet::new();
+    for grant in grants {
+        let id = &grant.id;
+        if !seen.insert(id) {
+            errors.push(ConfigError::new(
+                "duplicate_record",
+                format!("fleet_grant '{id}' is defined more than once"),
+                at,
+            ));
+        }
+        let unresolved = |what: String| {
+            ConfigError::new(
+                "unresolved_reference",
+                format!("fleet_grant '{id}' names {what}, which is not defined"),
+                at,
+            )
+        };
+        match &grant.scope {
+            BindingScope::Tenant(t) if !refs.tenants.contains_key(t) => {
+                errors.push(unresolved(format!("tenant '{t}'")));
+            }
+            BindingScope::Group(g) if !refs.groups.contains(g) => {
+                errors.push(unresolved(format!("group '{g}'")));
+            }
+            _ => {}
+        }
+        if let HostSelector::Exact(h) = &grant.host {
+            if !refs.hosts.contains_key(h) {
+                errors.push(unresolved(format!("host '{h}'")));
+            }
+        }
+        match &grant.model {
+            FleetModelSelector::Alias(ModelSelector::Exact(a)) if !refs.aliases.contains_key(a) => {
+                errors.push(unresolved(format!("alias '{a}'")));
+            }
+            FleetModelSelector::Target(t) => match (refs.placement.get(t), &grant.host) {
+                (None, _) => errors.push(ConfigError::new(
+                    "unresolved_reference",
+                    format!(
+                        "fleet_grant '{id}' names target '{t}', which has no deployment and so \
+                         runs on no slave"
+                    ),
+                    at,
+                )),
+                (Some(on), HostSelector::Exact(h)) if on != h => {
+                    errors.push(ConfigError::new(
+                        "unresolved_reference",
+                        format!(
+                            "fleet_grant '{id}' names target '{t}' on host '{h}', but that \
+                             target runs on '{on}'"
+                        ),
+                        at,
+                    ));
+                }
+                _ => {}
+            },
+            FleetModelSelector::Alias(_) => {}
+        }
+    }
 }
 
 fn build_quota(f: &Fields<'_>) -> Result<Quota, ConfigError> {

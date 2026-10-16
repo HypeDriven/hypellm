@@ -312,14 +312,16 @@ impl Rejection {
 /// remainder in `BucketState`.
 #[derive(Debug)]
 pub struct TokenBucket {
-    capacity_milli: u64,
-    /// Refill in thousandths of a unit per millisecond.
-    refill_milli_per_ms: u64,
     state: Mutex<BucketState>,
 }
 
 #[derive(Debug)]
 struct BucketState {
+    /// Held under the same lock as the level, so a retune between a refill
+    /// and a take cannot be observed half-applied.
+    capacity_milli: u64,
+    /// Refill in thousandths of a unit per millisecond.
+    refill_milli_per_ms: u64,
     level_milli: u64,
     last_ms: u64,
     /// Units admitted beyond the bucket's capacity and not yet paid for.
@@ -333,61 +335,98 @@ struct BucketState {
 
 impl BucketState {
     /// Credit `amount` thousandths: pay down debt first, then raise the level.
-    fn credit(&mut self, amount: u64, capacity_milli: u64) {
+    fn credit(&mut self, amount: u64) {
         let paid = amount.min(self.debt_milli);
         self.debt_milli -= paid;
         self.level_milli = self
             .level_milli
             .saturating_add(amount - paid)
-            .min(capacity_milli);
+            .min(self.capacity_milli);
     }
 }
 
-impl TokenBucket {
-    /// Create a bucket with a per-second rate and a burst capacity.
-    #[must_use]
-    pub fn per_second(rate: u64, burst: u64, now_ms: u64) -> Self {
+/// A bucket's shape: capacity and refill, in its fixed-point units.
+struct BucketShape {
+    capacity_milli: u64,
+    refill_milli_per_ms: u64,
+}
+
+impl BucketShape {
+    fn per_second(rate: u64, burst: u64) -> Self {
         let capacity = burst.max(rate).max(1);
         Self {
             capacity_milli: capacity.saturating_mul(1000),
             refill_milli_per_ms: rate, // rate/sec * 1000 milli / 1000 ms
-            state: Mutex::new(BucketState {
-                level_milli: capacity.saturating_mul(1000),
-                last_ms: now_ms,
-                debt_milli: 0,
-            }),
         }
     }
 
-    /// Create a bucket with a per-minute rate and a burst capacity.
     // The refill rate is fixed-point in thousandths of a unit per millisecond,
     // so converting a per-minute rate is an integer division by 60_000. It
     // truncates: rates below 60 units per minute floor to a zero refill rate.
     #[allow(clippy::integer_division)]
-    #[must_use]
-    pub fn per_minute(rate: u64, burst: u64, now_ms: u64) -> Self {
+    fn per_minute(rate: u64, burst: u64) -> Self {
         let capacity = burst.max(rate.div_ceil(60)).max(1);
         Self {
             capacity_milli: capacity.saturating_mul(1000),
             // rate/min * 1000 milli / 60_000 ms
             refill_milli_per_ms: rate.saturating_mul(1000) / 60_000,
+        }
+    }
+}
+
+impl TokenBucket {
+    fn full(shape: &BucketShape, now_ms: u64) -> Self {
+        Self {
             state: Mutex::new(BucketState {
-                level_milli: capacity.saturating_mul(1000),
+                capacity_milli: shape.capacity_milli,
+                refill_milli_per_ms: shape.refill_milli_per_ms,
+                level_milli: shape.capacity_milli,
                 last_ms: now_ms,
                 debt_milli: 0,
             }),
         }
     }
 
-    fn refill_locked(&self, state: &mut BucketState, now_ms: u64) {
+    /// Create a bucket with a per-second rate and a burst capacity.
+    #[must_use]
+    pub fn per_second(rate: u64, burst: u64, now_ms: u64) -> Self {
+        Self::full(&BucketShape::per_second(rate, burst), now_ms)
+    }
+
+    /// Create a bucket with a per-minute rate and a burst capacity.
+    #[must_use]
+    pub fn per_minute(rate: u64, burst: u64, now_ms: u64) -> Self {
+        Self::full(&BucketShape::per_minute(rate, burst), now_ms)
+    }
+
+    /// Change the rate and capacity, keeping what has been drawn.
+    ///
+    /// For a published quota change. Time up to `now_ms` is refilled at the
+    /// *old* rate first, so the change is not applied retroactively. The level
+    /// is then clamped to the new capacity and never raised: a retune is not a
+    /// refill, and one that topped the bucket up would let an operator who
+    /// re-published the same limits hand every caller a fresh burst. Debt is
+    /// kept, so a request admitted beyond the old capacity is still paid for.
+    fn retune(&self, shape: &BucketShape, now_ms: u64) {
+        let mut state = match self.state.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        Self::refill_locked(&mut state, now_ms);
+        state.capacity_milli = shape.capacity_milli;
+        state.refill_milli_per_ms = shape.refill_milli_per_ms;
+        state.level_milli = state.level_milli.min(shape.capacity_milli);
+    }
+
+    fn refill_locked(state: &mut BucketState, now_ms: u64) {
         // Monotonic clock: `now_ms` never goes backwards, so this cannot
         // credit time that did not pass.
         let elapsed = now_ms.saturating_sub(state.last_ms);
         if elapsed == 0 {
             return;
         }
-        let credit = elapsed.saturating_mul(self.refill_milli_per_ms);
-        state.credit(credit, self.capacity_milli);
+        let credit = elapsed.saturating_mul(state.refill_milli_per_ms);
+        state.credit(credit);
         state.last_ms = now_ms;
     }
 
@@ -416,13 +455,13 @@ impl TokenBucket {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        self.refill_locked(&mut state, now_ms);
+        Self::refill_locked(&mut state, now_ms);
         let want = amount.saturating_mul(1000);
         if state.debt_milli > 0 {
             return false;
         }
-        if want > self.capacity_milli {
-            if state.level_milli < self.capacity_milli {
+        if want > state.capacity_milli {
+            if state.level_milli < state.capacity_milli {
                 return false;
             }
             state.debt_milli = want - state.level_milli;
@@ -448,7 +487,7 @@ impl TokenBucket {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        state.credit(amount.saturating_mul(1000), self.capacity_milli);
+        state.credit(amount.saturating_mul(1000));
     }
 
     /// Deduct `amount` units, draining to empty when the level is short.
@@ -465,7 +504,7 @@ impl TokenBucket {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        self.refill_locked(&mut state, now_ms);
+        Self::refill_locked(&mut state, now_ms);
         state.level_milli = state.level_milli.saturating_sub(amount.saturating_mul(1000));
     }
 
@@ -588,11 +627,14 @@ impl QueueState {
 pub struct Scope {
     /// A stable name for metrics and rejection traces.
     pub name: String,
-    limits: ScopeLimits,
+    /// What this scope enforces. Behind a lock because a published policy
+    /// changes it in place ([`Scope::reconfigure`]): replacing the scope would
+    /// forget what it has admitted and spent.
+    limits: RwLock<ScopeLimits>,
     in_flight: AtomicU32,
     queued: AtomicU32,
-    request_bucket: Option<TokenBucket>,
-    token_bucket: Option<TokenBucket>,
+    request_bucket: RwLock<Option<TokenBucket>>,
+    token_bucket: RwLock<Option<TokenBucket>>,
     /// Cumulative counters, for the conservation invariant.
     acquired: AtomicU64,
     released: AtomicU64,
@@ -614,19 +656,15 @@ impl Scope {
     pub fn new(name: impl Into<String>, limits: ScopeLimits, now_ms: u64) -> Self {
         Self {
             name: name.into(),
-            limits,
+            limits: RwLock::new(limits),
             in_flight: AtomicU32::new(0),
             queued: AtomicU32::new(0),
-            request_bucket: (limits.requests_per_second > 0).then(|| {
-                TokenBucket::per_second(
-                    u64::from(limits.requests_per_second),
-                    u64::from(limits.request_burst),
-                    now_ms,
-                )
-            }),
-            token_bucket: (limits.tokens_per_minute > 0).then(|| {
-                TokenBucket::per_minute(limits.tokens_per_minute, limits.token_burst, now_ms)
-            }),
+            request_bucket: RwLock::new(
+                request_shape(&limits).map(|shape| TokenBucket::full(&shape, now_ms)),
+            ),
+            token_bucket: RwLock::new(
+                token_shape(&limits).map(|shape| TokenBucket::full(&shape, now_ms)),
+            ),
             acquired: AtomicU64::new(0),
             released: AtomicU64::new(0),
             spent: AtomicU64::new(0),
@@ -646,8 +684,44 @@ impl Scope {
     /// utilisation figure needs the denominator, and the denominator is not
     /// otherwise reachable from outside this module.
     #[must_use]
-    pub const fn limits(&self) -> ScopeLimits {
-        self.limits
+    pub fn limits(&self) -> ScopeLimits {
+        match self.limits.read() {
+            Ok(limits) => *limits,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    /// Change what this scope enforces, keeping everything it has counted.
+    ///
+    /// For a published or rolled-back policy. In-flight requests, queued
+    /// waiters, the conservation counters, the budget ledger and its period
+    /// start, and the level and debt of each rate bucket all carry over, so a
+    /// reconfiguration neither returns spent credit nor briefly over-admits.
+    /// It never cancels anything: lowering `max_concurrency` below what is in
+    /// flight refuses new admissions until enough finish, and lowering
+    /// `max_queued` below the waiters present refuses new arrivals while the
+    /// ones already in line keep their places.
+    ///
+    /// A bucket that newly appears starts full, exactly as at startup; one that
+    /// disappears is dropped. A reservation taken before a bucket appeared is
+    /// still reconciled against it on release — a refund is capped at the
+    /// capacity, so that can never grant burst, and an overage is charged,
+    /// which is the conservative direction.
+    pub fn reconfigure(&self, limits: ScopeLimits, now_ms: u64) {
+        reshape(&self.request_bucket, request_shape(&limits), now_ms);
+        reshape(&self.token_bucket, token_shape(&limits), now_ms);
+        match self.limits.write() {
+            Ok(mut current) => *current = limits,
+            Err(poisoned) => *poisoned.into_inner() = limits,
+        }
+        // A raised concurrency limit, or a queue that went away, may let a
+        // waiter proceed, and nothing else would wake it.
+        self.slot_freed.notify_all();
+    }
+
+    /// Whether any waiter is in line or a queue is configured.
+    fn wakes_waiters(&self) -> bool {
+        self.limits().max_queued > 0 || self.queued() > 0
     }
 
     /// Requests currently in flight.
@@ -685,7 +759,8 @@ impl Scope {
     /// Whether any concurrency slot remains.
     #[must_use]
     pub fn has_capacity(&self) -> bool {
-        self.limits.max_concurrency == 0 || self.in_flight() < self.limits.max_concurrency
+        let max = self.limits().max_concurrency;
+        max == 0 || self.in_flight() < max
     }
 
     /// Total acquisitions and releases, which must be equal once idle.
@@ -715,7 +790,7 @@ impl Scope {
     /// here, and a period that only advanced when something else ran would
     /// leave a scope refused indefinitely after traffic stopped.
     fn spend_in_period(&self, now_ms: u64) -> u64 {
-        let period = self.limits.budget_period.millis();
+        let period = self.limits().budget_period.millis();
         let start = self.period_start.load(Ordering::SeqCst);
         if now_ms.saturating_sub(start) >= period {
             // `compare_exchange` so concurrent callers roll the window once.
@@ -769,7 +844,7 @@ impl Scope {
     /// and leaves the roll to the next request.
     #[must_use]
     pub fn observed_spend(&self, now_ms: u64) -> u64 {
-        let period = self.limits.budget_period.millis();
+        let period = self.limits().budget_period.millis();
         let start = self.period_start.load(Ordering::SeqCst);
         if now_ms.saturating_sub(start) >= period {
             return 0;
@@ -783,16 +858,21 @@ impl Scope {
         now_ms: u64,
         ticket: Option<u64>,
     ) -> Result<(), Rejection> {
+        // One read, so every check below judges against the same limits even
+        // if a publication lands mid-acquisition.
+        let limits = self.limits();
         // Before any bookkeeping: a scope past its budget is refused for the
         // rest of the period, and taking a slot first would mean releasing it
         // again on every request until the period rolls.
-        if self.limits.budget_minor_units > 0
-            && self.spend_in_period(now_ms) >= self.limits.budget_minor_units
+        if limits.budget_minor_units > 0
+            && self.spend_in_period(now_ms) >= limits.budget_minor_units
         {
             return Err(Rejection::BudgetExhausted);
         }
 
-        if self.limits.max_queued > 0 {
+        // Waiters keep their order even after a publication removes the
+        // queue: an arrival must not barge past people already in line.
+        if limits.max_queued > 0 || self.queued() > 0 {
             let head = match self.queue.lock() {
                 Ok(q) => q.head(),
                 Err(poisoned) => poisoned.into_inner().head(),
@@ -806,10 +886,10 @@ impl Scope {
 
         // Concurrency first: it is the cheapest check and the one most likely
         // to fail under load.
-        if self.limits.max_concurrency > 0 {
+        if limits.max_concurrency > 0 {
             let mut current = self.in_flight.load(Ordering::SeqCst);
             loop {
-                if current >= self.limits.max_concurrency {
+                if current >= limits.max_concurrency {
                     return Err(Rejection::ConcurrencyExhausted);
                 }
                 match self.in_flight.compare_exchange_weak(
@@ -826,22 +906,19 @@ impl Scope {
             self.in_flight.fetch_add(1, Ordering::SeqCst);
         }
 
-        if let Some(bucket) = &self.request_bucket {
-            if !bucket.try_take(1, now_ms) {
-                self.in_flight.fetch_sub(1, Ordering::SeqCst);
-                return Err(Rejection::RequestRateExceeded);
-            }
+        if !with_bucket(&self.request_bucket, |bucket| bucket.try_take(1, now_ms)) {
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            return Err(Rejection::RequestRateExceeded);
         }
 
-        if let Some(bucket) = &self.token_bucket {
-            if !bucket.try_take(tokens, now_ms) {
-                // Roll back both prior acquisitions.
-                if let Some(rb) = &self.request_bucket {
-                    rb.refund(1);
-                }
-                self.in_flight.fetch_sub(1, Ordering::SeqCst);
-                return Err(Rejection::TokenRateExceeded);
-            }
+        if !with_bucket(&self.token_bucket, |bucket| bucket.try_take(tokens, now_ms)) {
+            // Roll back both prior acquisitions.
+            with_bucket(&self.request_bucket, |rb| {
+                rb.refund(1);
+                true
+            });
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            return Err(Rejection::TokenRateExceeded);
         }
 
         self.acquired.fetch_add(1, Ordering::SeqCst);
@@ -859,7 +936,7 @@ impl Scope {
     /// scope never refills again.
     fn release(&self, reserved: u64, actual: u64, now_ms: u64) {
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        if let Some(bucket) = &self.token_bucket {
+        with_bucket(&self.token_bucket, |bucket| {
             if actual < reserved {
                 // Refund the unused estimate. The bucket caps at capacity, so
                 // a refund can never grant more burst than the configuration
@@ -871,13 +948,14 @@ impl Scope {
                 // simply means the next request waits.
                 bucket.charge(actual - reserved, now_ms);
             }
-        }
+            true
+        });
         self.released.fetch_add(1, Ordering::SeqCst);
         // A slot came free. Waking every waiter rather than one is deliberate:
         // which of them may proceed is decided by `QueueState::head`, not by
         // wake order, and a targeted wake would have to duplicate that decision
         // in a second place where it could disagree.
-        if self.limits.max_queued > 0 {
+        if self.wakes_waiters() {
             self.slot_freed.notify_all();
         }
     }
@@ -894,14 +972,16 @@ impl Scope {
     /// target.
     fn rollback(&self, tokens: u64) {
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        if let Some(bucket) = &self.request_bucket {
+        with_bucket(&self.request_bucket, |bucket| {
             bucket.refund(1);
-        }
-        if let Some(bucket) = &self.token_bucket {
+            true
+        });
+        with_bucket(&self.token_bucket, |bucket| {
             bucket.refund(tokens);
-        }
+            true
+        });
         self.released.fetch_add(1, Ordering::SeqCst);
-        if self.limits.max_queued > 0 {
+        if self.wakes_waiters() {
             self.slot_freed.notify_all();
         }
     }
@@ -912,14 +992,15 @@ impl Scope {
     /// to report. A scope with `max_queued == 0` always rejects, which is what
     /// makes queueing opt-in per scope.
     fn join_queue(&self, class: PriorityClass, tenant: &TenantId) -> Result<u64, Rejection> {
-        if self.limits.max_queued == 0 {
+        let max_queued = self.limits().max_queued;
+        if max_queued == 0 {
             return Err(Rejection::ConcurrencyExhausted);
         }
         let mut state = match self.queue.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if u32::try_from(state.waiting.len()).unwrap_or(u32::MAX) >= self.limits.max_queued {
+        if u32::try_from(state.waiting.len()).unwrap_or(u32::MAX) >= max_queued {
             return Err(Rejection::QueueFull);
         }
         let seq = state.next_seq;
@@ -991,6 +1072,44 @@ impl Scope {
         }
     }
 
+}
+
+/// The request-rate bucket shape `limits` asks for, if any.
+fn request_shape(limits: &ScopeLimits) -> Option<BucketShape> {
+    (limits.requests_per_second > 0).then(|| {
+        BucketShape::per_second(
+            u64::from(limits.requests_per_second),
+            u64::from(limits.request_burst),
+        )
+    })
+}
+
+/// The token-rate bucket shape `limits` asks for, if any.
+fn token_shape(limits: &ScopeLimits) -> Option<BucketShape> {
+    (limits.tokens_per_minute > 0)
+        .then(|| BucketShape::per_minute(limits.tokens_per_minute, limits.token_burst))
+}
+
+/// Retune, create or drop the bucket in `slot` to match `shape`.
+fn reshape(slot: &RwLock<Option<TokenBucket>>, shape: Option<BucketShape>, now_ms: u64) {
+    let mut slot = match slot.write() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match (slot.as_ref(), shape) {
+        (Some(bucket), Some(shape)) => bucket.retune(&shape, now_ms),
+        (None, Some(shape)) => *slot = Some(TokenBucket::full(&shape, now_ms)),
+        (_, None) => *slot = None,
+    }
+}
+
+/// Run `f` on the bucket in `slot`; an absent bucket admits everything.
+fn with_bucket(slot: &RwLock<Option<TokenBucket>>, f: impl FnOnce(&TokenBucket) -> bool) -> bool {
+    let slot = match slot.read() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    slot.as_ref().is_none_or(f)
 }
 
 /// A held reservation across the whole scope hierarchy.
@@ -1068,6 +1187,65 @@ impl Drop for Reservation {
 /// Alias scopes, keyed by alias and optional operation qualifier.
 type AliasScopes = BTreeMap<(AliasId, Option<Operation>), Arc<Scope>>;
 
+/// Global byte-rate limits (specification 12's Global layer). Zero means
+/// unlimited in that direction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ByteRateLimits {
+    /// Bytes per second read from clients.
+    pub input_per_second: u64,
+    /// Burst allowance for the input bucket, in bytes.
+    pub input_burst: u64,
+    /// Bytes per second written to clients.
+    pub output_per_second: u64,
+    /// Burst allowance for the output bucket, in bytes.
+    pub output_burst: u64,
+}
+
+/// Every limit and class a configuration gives the admission controller.
+///
+/// One value, built from a configuration in one place
+/// (`hypellm_config::ValidatedConfig::admission_plan`), so startup and a
+/// publication cannot disagree about which quotas apply. Ordered maps, so
+/// applying the same plan twice does the same thing in the same order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionPlan {
+    /// The global scope's limits.
+    pub global: ScopeLimits,
+    /// The global byte rates.
+    pub byte_rates: ByteRateLimits,
+    /// Tenants with an explicit quota.
+    pub tenants: BTreeMap<TenantId, ScopeLimits>,
+    /// Principals with an explicit quota.
+    pub principals: BTreeMap<PrincipalId, ScopeLimits>,
+    /// Alias scopes, by alias and optional operation.
+    pub aliases: BTreeMap<(AliasId, Option<Operation>), ScopeLimits>,
+    /// Target scopes.
+    pub targets: BTreeMap<TargetId, ScopeLimits>,
+    /// Admission-queue classes by scope name.
+    pub classes: BTreeMap<String, PriorityClass>,
+}
+
+impl AdmissionPlan {
+    /// A plan with the given global limits and nothing else.
+    #[must_use]
+    pub const fn new(global: ScopeLimits) -> Self {
+        Self {
+            global,
+            byte_rates: ByteRateLimits {
+                input_per_second: 0,
+                input_burst: 0,
+                output_per_second: 0,
+                output_burst: 0,
+            },
+            tenants: BTreeMap::new(),
+            principals: BTreeMap::new(),
+            aliases: BTreeMap::new(),
+            targets: BTreeMap::new(),
+            classes: BTreeMap::new(),
+        }
+    }
+}
+
 /// The hierarchical admission controller.
 ///
 /// Layers follow specification 12: global, tenant, principal, alias, target.
@@ -1118,10 +1296,99 @@ impl AdmissionController {
         }
     }
 
+    /// A controller enforcing `plan`.
+    #[must_use]
+    pub fn from_plan(clock: Arc<dyn Clock>, plan: &AdmissionPlan) -> Self {
+        let controller = Self::new(clock, plan.global);
+        controller.apply(plan);
+        controller
+    }
+
+    /// Make the controller enforce `plan`, in place.
+    ///
+    /// For startup and for every publication or rollback, so a published
+    /// quota is enforced at once rather than at the next restart.
+    ///
+    /// Scopes are reconfigured, never replaced ([`Scope::reconfigure`]): what a
+    /// scope has admitted, queued and spent survives, so a publication can
+    /// neither return a spent budget nor open a window in which a limit is
+    /// briefly not counted. A reservation holds its scopes by reference, so it
+    /// is released against exactly the objects it reserved on whatever has
+    /// happened to the configuration since.
+    ///
+    /// What the plan no longer mentions:
+    ///
+    /// - a **tenant or principal** falls back to the default limits but keeps
+    ///   its scope, so its counters and ledger carry on — removing a budget and
+    ///   restoring it does not hand back what was spent;
+    /// - a **target or alias** scope is dropped from the lookup. Nothing new is
+    ///   admitted through it; requests already holding it still release it.
+    ///
+    /// The maps therefore hold only what the active configuration names plus
+    /// the tenants and principals that have made requests — the same bound as
+    /// before, so repeated publications do not grow them.
+    pub fn apply(&self, plan: &AdmissionPlan) {
+        let now = self.clock.now_millis();
+        self.global.reconfigure(plan.global, now);
+        let rates = plan.byte_rates;
+        reshape(
+            &self.inbound_bytes,
+            (rates.input_per_second > 0)
+                .then(|| BucketShape::per_second(rates.input_per_second, rates.input_burst)),
+            now,
+        );
+        reshape(
+            &self.outbound_bytes,
+            (rates.output_per_second > 0)
+                .then(|| BucketShape::per_second(rates.output_per_second, rates.output_burst)),
+            now,
+        );
+        apply_layer(
+            &self.tenants,
+            &plan.tenants,
+            Some(self.default_tenant_limits),
+            |t| format!("tenant:{t}"),
+            now,
+        );
+        apply_layer(
+            &self.principals,
+            &plan.principals,
+            Some(self.default_principal_limits),
+            |p| format!("principal:{p}"),
+            now,
+        );
+        apply_layer(&self.targets, &plan.targets, None, |t| format!("target:{t}"), now);
+        apply_layer(
+            &self.aliases,
+            &plan.aliases,
+            None,
+            |(alias, operation)| {
+                operation.map_or_else(
+                    || format!("alias:{alias}"),
+                    |op| format!("alias:{alias}:{}", op.as_str()),
+                )
+            },
+            now,
+        );
+        self.replace_classes(plan.classes.clone());
+    }
+
     /// Record the admission-queue class of a named scope.
     pub fn set_class(&self, scope_name: &str, class: PriorityClass) {
         if let Ok(mut map) = self.classes.write() {
             map.insert(scope_name.to_owned(), class);
+        }
+    }
+
+    /// Replace every recorded class with `classes`, at once.
+    ///
+    /// For a configuration activation: the classes come from the new
+    /// configuration's quotas, and one that is no longer declared must stop
+    /// applying rather than outlive its record. Scope limits are not touched;
+    /// they are built once, at startup.
+    pub fn replace_classes(&self, classes: BTreeMap<String, PriorityClass>) {
+        if let Ok(mut map) = self.classes.write() {
+            *map = classes;
         }
     }
 
@@ -1362,6 +1629,14 @@ impl AdmissionController {
         self.tenants.read().ok()?.get(tenant).cloned()
     }
 
+    /// A principal's scope, if one exists yet.
+    ///
+    /// Like [`Self::configured_tenant_scope`], a read that never creates one.
+    #[must_use]
+    pub fn configured_principal_scope(&self, principal: &PrincipalId) -> Option<Arc<Scope>> {
+        self.principals.read().ok()?.get(principal).cloned()
+    }
+
     /// The limits a tenant with no explicit configuration is admitted under.
     #[must_use]
     pub const fn default_tenant_limits(&self) -> ScopeLimits {
@@ -1572,7 +1847,7 @@ impl AdmissionController {
                 let Some(scope) = self.scope_named(&name, tenant, principal, alias, target) else {
                     return Err((Rejection::ConcurrencyExhausted, name));
                 };
-                if scope.limits.max_queued == 0 || budget.is_zero() {
+                if scope.limits().max_queued == 0 || budget.is_zero() {
                     return Err((Rejection::ConcurrencyExhausted, name));
                 }
                 let ticket = match scope.join_queue(class, tenant) {
@@ -1636,6 +1911,41 @@ impl AdmissionController {
         self.chain(tenant, principal, alias, target)
             .into_iter()
             .find(|scope| scope.name == name)
+    }
+}
+
+/// Bring one layer's scopes in line with `planned`.
+///
+/// `fallback` is what a scope the plan no longer names is reconfigured to;
+/// `None` drops it from the lookup instead.
+fn apply_layer<K: Ord + Clone>(
+    layer: &RwLock<BTreeMap<K, Arc<Scope>>>,
+    planned: &BTreeMap<K, ScopeLimits>,
+    fallback: Option<ScopeLimits>,
+    name: impl Fn(&K) -> String,
+    now_ms: u64,
+) {
+    let mut map = match layer.write() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match fallback {
+        Some(limits) => {
+            for (key, scope) in map.iter() {
+                if !planned.contains_key(key) {
+                    scope.reconfigure(limits, now_ms);
+                }
+            }
+        }
+        None => map.retain(|key, _| planned.contains_key(key)),
+    }
+    for (key, limits) in planned {
+        match map.get(key) {
+            Some(scope) => scope.reconfigure(*limits, now_ms),
+            None => {
+                map.insert(key.clone(), Arc::new(Scope::new(name(key), *limits, now_ms)));
+            }
+        }
     }
 }
 
@@ -2715,7 +3025,7 @@ mod tests {
         let r = c.reserve(&tenant(), &principal(), &target(), 1000).unwrap();
         r.commit(100);
         // The bucket should now hold roughly the refund.
-        assert!(c.global().request_bucket.is_none());
+        assert!(c.global().request_bucket.read().unwrap().is_none());
         // Another 900-token request fits immediately.
         assert!(c.reserve(&tenant(), &principal(), &target(), 900).is_ok());
     }

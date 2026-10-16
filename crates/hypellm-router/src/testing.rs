@@ -580,6 +580,11 @@ pub fn router_with_config(_upstream: &FakeUpstream, config_text: &str) -> TestRo
         credentials.set(&credential.id, b"test-provider-secret".to_vec());
     }
 
+    let enrollments = Arc::new(hypellm_fleet::enroll::EnrollmentRegistry::new(Arc::new(
+        hypellm_admin_api::enroll::StoreJournal::new(Arc::clone(&store)),
+    )));
+    let telemetry = Arc::new(telemetry);
+    let enrollment_telemetry = Arc::clone(&telemetry);
     let state = RouterState {
         // The harness enables jobs unconditionally, so a test that exercises
         // `/v1/jobs` does not have to remember to turn it on in its fixture.
@@ -597,7 +602,7 @@ pub fn router_with_config(_upstream: &FakeUpstream, config_text: &str) -> TestRo
         health,
         admission: Arc::new(admission),
         egress,
-        telemetry: Arc::new(telemetry),
+        telemetry,
         store,
         clock,
         trusted_edge: TrustedEdge::none(),
@@ -607,6 +612,12 @@ pub fn router_with_config(_upstream: &FakeUpstream, config_text: &str) -> TestRo
         fleet: std::sync::OnceLock::new(),
         admin_fleet: hypellm_admin_api::FleetSlot::default(),
         recovery_waiters: std::sync::atomic::AtomicU32::new(0),
+        parked_requests: std::sync::atomic::AtomicU32::new(0),
+        enrollment_offers: Arc::new(crate::fleet::EnrollmentOfferer::new(
+            Arc::clone(&enrollments),
+            Arc::clone(&enrollment_telemetry),
+        )),
+        enrollments,
     };
 
     TestRouter {

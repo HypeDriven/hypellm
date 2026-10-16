@@ -79,6 +79,7 @@ fn spark(socket: &str) -> FleetConfig {
             observation_interval_ms: 5_000,
             observation_max_age_ms: 30_000,
             request_timeout_ms: 2_000,
+            ssh_public_key: None,
         },
     );
     fleet.hosts.insert(
@@ -726,6 +727,7 @@ fn a_missing_artifact_is_refused_rather_than_fetched_without_permission() {
             arch: Arch::Aarch64,
             size_bytes: 20 * GIB,
             digest: format!("sha256:{}", "0".repeat(64)),
+            image_id: None,
             source: "mirror-local".to_owned(),
         },
     );

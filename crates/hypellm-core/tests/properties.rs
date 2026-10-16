@@ -29,8 +29,11 @@ use hypellm_core::canonical::{
     CanonicalRequest, ClientProtocol, CostClass, Message, Modality, Operation, RequestLimits,
     Role, RoutingHints, Sampling, StreamOptions,
 };
-use hypellm_core::decision::Candidate;
-use hypellm_core::ids::{AliasId, GroupId, PrincipalId, ProviderId, RequestId, TargetId, TenantId};
+use hypellm_core::decision::{Candidate, ExclusionReason};
+use hypellm_core::key_restriction::KeyRestriction;
+use hypellm_core::ids::{
+    AliasId, GroupId, HostId, PrincipalId, ProviderId, RequestId, TargetId, TenantId,
+};
 use hypellm_core::policy::{
     Binding, BindingScope, IdealLiveState, ModelSelector, PolicySnapshot, RouteOutcome,
     RoutingContext, TargetPreference, TargetSelector,
@@ -273,6 +276,7 @@ fn route(s: &PolicySnapshot, req: &CanonicalRequest) -> RouteOutcome {
         tenant: &req.tenant,
         attempted: &attempted,
         now_millis: 0,
+        key: None,
     };
     s.route(&ctx, req, &IdealLiveState)
 }
@@ -632,6 +636,174 @@ fn every_permitted_target_is_either_a_candidate_or_carries_an_exclusion() {
                 if is_candidate && is_excluded { "doubly " } else { "un" }
             );
         }
+    }
+}
+
+// -- Key restrictions --------------------------------------------------------
+
+/// Route as a caller holding a key with `restriction`.
+fn route_with_key(
+    s: &PolicySnapshot,
+    req: &CanonicalRequest,
+    restriction: &KeyRestriction,
+) -> RouteOutcome {
+    let groups: Vec<GroupId> = Vec::new();
+    let attempted: Vec<TargetId> = Vec::new();
+    let ctx = RoutingContext {
+        principal: &req.principal,
+        groups: &groups,
+        tenant: &req.tenant,
+        attempted: &attempted,
+        now_millis: 0,
+        key: Some(restriction),
+    };
+    s.route(&ctx, req, &IdealLiveState)
+}
+
+const HOST_NAMES: &[&str] = &["spark-a", "spark-b"];
+
+/// A random restriction over the generator's alias, targets and slaves, with
+/// some targets placed on slaves so the host half is exercised too.
+fn restriction(rng: &mut Rng, s: &mut PolicySnapshot) -> KeyRestriction {
+    for name in TARGET_NAMES {
+        if rng.bool() {
+            let host = HOST_NAMES[rng.below(HOST_NAMES.len())];
+            s.fleet_placement
+                .insert(tid(name), HostId::new(host).expect("host id"));
+        }
+    }
+    let subset = |rng: &mut Rng, names: &[&str]| -> Vec<String> {
+        names
+            .iter()
+            .filter(|_| rng.bool())
+            .map(|n| (*n).to_owned())
+            .collect()
+    };
+    KeyRestriction {
+        models: rng.bool().then(|| {
+            let mut models = std::collections::BTreeSet::new();
+            models.insert(if rng.bool() {
+                alias()
+            } else {
+                AliasId::new("other").expect("alias id")
+            });
+            models
+        }),
+        targets: rng
+            .bool()
+            .then(|| subset(rng, TARGET_NAMES).iter().map(|n| tid(n)).collect()),
+        hosts: rng.bool().then(|| {
+            subset(rng, HOST_NAMES)
+                .iter()
+                .map(|h| HostId::new(h).expect("host id"))
+                .collect()
+        }),
+        priority: None,
+    }
+}
+
+#[test]
+fn a_key_restriction_removes_exactly_what_it_names_and_adds_nothing() {
+    // The principal's policy is the ceiling and a key may only narrow it. So
+    // with a restriction the candidates must be the unrestricted candidates
+    // less those it names, in the same order: never one more, never one
+    // fewer, never reordered. A restriction that shifted a score would show
+    // up here as a reordering.
+    for seed in 0..CASES {
+        let mut rng = Rng::new(u64::from(seed) ^ 0x6b65_7900);
+        let mut s = snapshot(&mut rng);
+        let restriction = restriction(&mut rng, &mut s);
+        let req = request(&mut rng);
+
+        let before = route(&s, &req);
+        let after = route_with_key(&s, &req, &restriction);
+
+        let permitted = |target: &TargetId| {
+            restriction.permits_alias(&req.requested_model)
+                && restriction.permits_target(target)
+                && s.fleet_placement
+                    .get(target)
+                    .is_none_or(|host| restriction.permits_host(host))
+        };
+        let expected: Vec<String> = before
+            .candidates
+            .iter()
+            .filter(|c| permitted(&c.target))
+            .map(|c| c.target.as_str().to_owned())
+            .collect();
+        assert_eq!(order(&after), expected, "seed {seed}: {restriction:?}");
+        assert_eq!(
+            after.candidates.iter().map(Candidate::score).collect::<Vec<_>>(),
+            before
+                .candidates
+                .iter()
+                .filter(|c| permitted(&c.target))
+                .map(Candidate::score)
+                .collect::<Vec<_>>(),
+            "seed {seed}: a restriction changed a surviving score"
+        );
+
+        // Whatever it removed, it says why, and the reason is its own (or the
+        // alias refusal, which is how a restricted alias must look).
+        for c in &before.candidates {
+            if !permitted(&c.target) {
+                let reason = after
+                    .exclusions
+                    .iter()
+                    .find(|e| e.target == c.target)
+                    .map(|e| e.reason);
+                assert!(
+                    matches!(
+                        reason,
+                        Some(ExclusionReason::KeyRestricted | ExclusionReason::NotAuthorizedForAlias)
+                    ),
+                    "seed {seed}: {} was removed as {reason:?}",
+                    c.target
+                );
+            }
+        }
+
+        // Deterministic, like every other routing input.
+        assert_eq!(order(&route_with_key(&s, &req, &restriction)), order(&after), "seed {seed}");
+
+        // And the models list only ever shrinks.
+        let groups: Vec<GroupId> = Vec::new();
+        let open = RoutingContext {
+            principal: &req.principal,
+            groups: &groups,
+            tenant: &req.tenant,
+            attempted: &[],
+            now_millis: 0,
+            key: None,
+        };
+        let keyed = RoutingContext { key: Some(&restriction), ..open };
+        let visible_open: Vec<&AliasId> =
+            s.servable_aliases(&open, Operation::Chat).iter().map(|a| &a.id).collect();
+        for alias in s.servable_aliases(&keyed, Operation::Chat) {
+            assert!(visible_open.contains(&&alias.id), "seed {seed}: a restriction revealed {}", alias.id);
+        }
+    }
+}
+
+#[test]
+fn a_key_never_raises_its_principals_priority() {
+    use hypellm_core::admission::PriorityClass::{Batch, Interactive, Standard};
+    for seed in 0..CASES {
+        let mut rng = Rng::new(u64::from(seed) ^ 0x7072_696f);
+        let classes = [Interactive, Standard, Batch];
+        let principal_class = classes[rng.below(3)];
+        let restriction = KeyRestriction {
+            priority: rng.bool().then(|| classes[rng.below(3)]),
+            ..KeyRestriction::default()
+        };
+        let effective = restriction.cap_priority(principal_class);
+        // `PriorityClass` orders interactive first; served first means smaller.
+        assert!(effective >= principal_class, "seed {seed}: {restriction:?} raised {principal_class:?}");
+        assert_eq!(
+            effective,
+            restriction.priority.map_or(principal_class, |key| key.max(principal_class)),
+            "seed {seed}"
+        );
     }
 }
 

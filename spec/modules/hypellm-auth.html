@@ -235,7 +235,8 @@ record. Subsequent verification fails closed.</li>
 <li><code>KeyStore::revoke</code> returns <code>false</code>. Specification 22.3 requires revocation to
 take effect &quot;immediately&quot;; a caller that ignores this return value believes a
 compromised key was revoked when it was not. <strong>The return value is
-load-bearing and must be checked.</strong></li>
+load-bearing and must be checked.</strong> <code>KeyStore::set_expiry</code> returns
+<code>false</code> the same way.</li>
 <li><code>SessionStore::validate</code> returns <code>SessionRejection::Unknown</code>, and <code>sweep</code> /
 <code>invalidate_principal</code> return 0.</li>
 </ul>
@@ -302,6 +303,18 @@ accountable one, and is what separation-of-duty checks compare.</li>
 is persisted in the durable key record; a record written before the field
 existed decodes with <code>None</code>, and a present but unreadable value drops the
 record like any other damaged one. <code>KeyStore::create</code> leaves it <code>None</code>.</li>
+<li><code>KeyStore::set_expiry</code> replaces a key's expiry and touches nothing else, so a
+revoked key stays revoked. <code>ExpiryChange</code> is its durable codec: the key id and
+the expiry, with <code>expires_at_millis</code> required as a number or <code>null</code>. An absent
+or unreadable expiry decodes as no change at all, not as &quot;never expires&quot;.</li>
+<li><code>KeyRecord::restrictions</code> is the key's
+<code>hypellm_core::key_restriction::KeyRestriction</code>, unrestricted by default and not part of
+the key record's own payload. <code>KeyStore::set_restrictions</code> replaces it whole and touches
+nothing else, so a revoked key stays revoked. <code>RestrictionChange</code> is its durable codec:
+<code>id</code>, <code>models</code>, <code>targets</code>, <code>hosts</code> and <code>priority</code>, every field required as
+<code>null</code> or a well-formed value, lists non-empty, duplicate-free and at most
+<code>MAX_RESTRICTION_ENTRIES</code> long. Anything else decodes as no change at all, never as an
+unrestricted key.</li>
 </ul>
 <h3 id="audit-trail-fidelity">Audit-trail fidelity</h3>
 <p><code>Principal::from_key</code> sets <code>method: AuthMethod::LocalPeer</code> for every

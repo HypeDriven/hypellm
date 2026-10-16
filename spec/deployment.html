@@ -496,15 +496,47 @@ panel reorders alias targets and binding preferences. Each change becomes a
 through the usual workflow; a published configuration survives restarts, and
 a fleet it first enables starts within one housekeeping interval, without a
 restart, provided <code>&lt;secrets&gt;/fleet.key</code> exists.</p>
-<p>The agent's allowlist is the one part the dashboard cannot write: specification
-26.2 makes it the trust boundary, so a compromised router cannot add a command.
-To add a machine:</p>
+<p>The agent's commands are the one part the dashboard cannot write:
+specification 26.2 makes the agent's file the trust boundary, so a compromised
+router cannot add a command. There are two ways to add a machine.</p>
+<p><strong>Enroll it</strong> (specification 26.8). Once, on the router: set
+<code>settings fleet_enroll_url=https://&lt;tailnet name&gt;</code> and give the
+<code>fleet_agent</code> record <code>ssh_public_key=&quot;ssh-ed25519 …&quot;</code> (the agent's own public
+key); on the agent, set <code>enrollment.accept</code> and the networks it may reach (see
+<a href="components/fleet-agent.html#enrolled-hosts">fleet-agent.html</a>). Then, per machine:</p>
+<ol>
+<li>On the Fleet screen, <em>Enroll a machine</em> mints a one-time command. Run it on
+the new machine as the account that will own its data directory. It checks
+dependencies, asks where containers live (<code>~/.hypellm</code> by default), shows
+every change, and makes them only when you agree.</li>
+<li>Compare the SSH and device fingerprints the script printed with the ones
+on the Fleet screen, then <em>Approve</em>. That drafts the machine's host and
+accelerator records.</li>
+<li>A policy approver publishes the draft. The router then offers the machine
+to the agent, which pins its host key and adds it.</li>
+<li>Add its deployments: rows in the agent's file, and the router-side records
+from the Machines panel. The panel's agent-side entry writes each row as a
+<code>run</code> template, so the agent creates the container itself, with its state in
+<code>&lt;data_dir&gt;/containers/&lt;deployment&gt;</code> (specification 26.12); nothing has to be
+created on the machine by hand.</li>
+</ol>
+<p>A machine enrolled with host kit 1.0 cannot create containers or take part in
+image copies. Mint a fresh command and run it again on that machine to upgrade
+it to 1.1; its data directory, device key and registration are kept.</p>
+<p><strong>Images between machines.</strong> With a <code>transfer</code> block in the agent's file,
+a machine missing an image gets it copied from one that has it, through the
+agent's machine, instead of from a registry — verified against the checksum the
+router keeps for the image (Fleet screen, <em>Images</em>). Pin that checksum with
+<code>image_id=&quot;sha256:…&quot;</code> on the <code>artifact</code> record for an anchor no slave
+supplied; otherwise the router learns it from the first machine whose copy
+matched its registry digest.</p>
+<p><strong>Or add it by hand:</strong></p>
 <ol>
 <li>Add the host to the agent's JSON (the panel shows the entry to paste; <code>ssh</code>
 takes a hostname). The agent reloads the file on change.</li>
 <li>Publish the router-side records from the Machines panel.</li>
 </ol>
-<p>Between the two steps the digests differ and orchestration pauses with
+<p>Between the steps the digests differ and orchestration pauses with
 <code>fleet_configuration_mismatch</code>; it resumes once both sides agree. See
 <a href="orchestration.html">orchestration.html</a> for the design and
 <a href="runbooks.html#225-fleet-incidents">runbooks.html 22.5</a> for what to do when they do.</p>
@@ -960,6 +992,38 @@ already in flight when the budget is crossed still complete.</p>
 not calendar months. Exhaustion reports <code>budget_exhausted</code>, separately from the
 rate limits, because it does not clear when load drops; it clears when the
 period rolls. Both partition under <code>quota_partitions</code>.</p>
+<h3 id="a-principals-access-ceiling">A principal's access ceiling</h3>
+<p>Every API key authenticates as a principal, and every policy record names a
+principal, a group or a tenant. The <strong>Principal access</strong> screen drafts the
+records that bound one principal, and therefore every key it holds:</p>
+<pre><code class="language-text">grant   id=pg-… scope=principal:svc:dsh model=chat-standard allow=false   # a model it may not use
+binding id=pa-… scope=principal:svc:dsh model=* deny=spark-q8kp:qwen38    # a slave that may not serve it
+quota   id=pq-… scope=principal:mikiyas.mulugeta class=standard \
+        concurrency=2 queued=4 rps=5 tpm=60000 budget=500 budget_period=monthly
+</code></pre>
+<ul>
+<li><strong>Models.</strong> Grants are default deny, and the most specific matching grant
+wins, so a principal grant outranks the tenant's <code>model=*</code>. The screen's
+outcome column is the router's own simulation for that principal, alias by
+alias — of the active configuration, and of the new draft once one exists.</li>
+<li><strong>Slaves.</strong> Unticked targets become the binding's <code>deny</code> list. A deny is an
+eligibility filter and sticky downward. The screen writes no <code>allow</code>, because a
+principal-level allow would overturn a tenant-level deny. A target added to the
+configuration later is allowed until it is denied here.</li>
+<li><strong>Priority and limits.</strong> Under contention <code>interactive</code> is admitted before
+<code>standard</code>, and <code>standard</code> before <code>batch</code>. The limits are concurrent requests,
+queue depth, request rate and burst, token rate and burst, and a spend budget
+over a fixed daily or 30-day window. They cover every key the principal holds,
+together. The tenant's limits bind as well and are shown beside them,
+read-only. A published change is enforced at once, without a restart, keeping
+what is in flight and what has been spent; a lowered limit refuses new requests
+and cancels none. A spend budget is charged at the configured <code>price</code> schedule,
+so with no prices it never refuses.</li>
+</ul>
+<p>Everything is a draft and must be published by a different person — with only
+one administrator account, open a break-glass session to publish. Records written
+without an <code>id</code> are shown and left alone. A key may be narrowed further, never
+widened, from the Keys screen (see <a href="#per-key-token-budgets">keys</a> below).</p>
 <h3 id="per-key-token-budgets">Per-key token budgets</h3>
 <p>Separate from every quota above. A <code>quota</code> is a rate or a rolling spend limit
 on a scope and lives in the configuration; a <strong>token budget</strong> is a cumulative
@@ -1046,6 +1110,18 @@ connection worker.</li>
 <li>It is set per provider (one machine's endpoint) and editable from the
 dashboard's Machines panel.</li>
 </ul>
+<h3 id="waiting-for-a-cold-model">Waiting for a cold model</h3>
+<p>When a request needs a model that is not running, the router starts it for any caller the alias grant and the fleet grants admit — no management role is needed (specification §26.10). If the fleet's demand batching (<code>activation_min_demand</code>, <code>activation_max_wait_ms</code>) says to wait, or the host is busy starting something else, the request <strong>parks</strong> instead of failing:</p>
+<ul>
+<li>it re-routes each time the fleet changes, and at least every 250 ms, so it takes a warm slot that frees up, rides a start another request paid for, or pays for the start itself once batching says so;</li>
+<li>it holds no admission reservation while it waits, but it does hold its connection, so at most <code>settings max_parked_requests</code> (default 256) park at once;</li>
+<li>it gives up at its deadline (<code>default_deadline_ms</code>, or the caller's own). For work that may wait minutes, use <code>/v1/jobs</code>: a job that finds no capacity goes back in the queue with backoff, up to sixteen passes, instead of failing.</li>
+</ul>
+<p>Models nothing is using are stopped after <code>fleet_policy … idle_stop_ms</code> (default 900000, fifteen minutes; <code>0</code> never stops one). Pinned and non-evictable deployments, and containers the router did not start, are never stopped for idleness. Every idle stop is in the audit log as <code>fleet.deactivate</code> with reason <code>idle</code>, and the Fleet screen shows each deployment's idle time and requests waiting for it.</p>
+<pre><code class="language-text">fleet_policy scope=fleet activation_min_demand=1 activation_max_wait_ms=20000 idle_stop_ms=900000
+fleet_policy scope=host:spark idle_stop_ms=0   # never stop an idle model on this machine
+</code></pre>
+<p>When requests for several models wait for one machine, the router loads the model with the most waiting work per second of load first, keeps a loaded model serving while it has requests in flight rather than swapping it out, and lets <code>/v1/jobs</code> workers take jobs for loaded models before cold ones (router specification §26.11). <code>fleet_policy … max_reorder_wait_ms</code> (default 120000, two minutes) is the longest any work is put behind other models'; past it, work goes in arrival order. <code>0</code> turns reordering off. The Fleet screen shows each machine's next model to load and why.</p>
 <h3 id="metrics-for-prometheus">Metrics for Prometheus</h3>
 <p><code>GET /metrics</code> serves the Prometheus text exposition. It is unauthenticated on
 the management listener, or on its own address with <code>settings metrics_listen=</code>
@@ -1081,13 +1157,23 @@ the management listener, or on its own address with <code>settings metrics_liste
 </tr>
 <tr>
 <td><code>hypellm_pending_requests{alias,reason}</code></td>
-<td>Requests waiting for a model right now: <code>capacity</code> (admission queue), <code>activation</code> (a cold model starting), <code>recovery</code> (an outage wait)</td>
+<td>Requests waiting for a model right now: <code>capacity</code> (admission queue), <code>activation</code> (a cold model starting), <code>parked</code> (waiting for a cold model to be started), <code>recovery</code> (an outage wait)</td>
 <td><code>sum by (alias) (hypellm_pending_requests)</code></td>
 </tr>
 <tr>
 <td><code>hypellm_recovery_waits_total{alias,outcome}</code></td>
 <td>Outage waits ended <code>recovered</code>, <code>failed</code>, <code>expired</code>, <code>client_gone</code> or <code>refused</code></td>
 <td></td>
+</tr>
+<tr>
+<td><code>hypellm_parked_requests_total{alias,outcome}</code></td>
+<td>Parked waits for a cold model ended <code>served</code>, <code>failed</code>, <code>expired</code>, <code>client_gone</code> or <code>refused</code></td>
+<td><code>sum by (outcome) (rate(hypellm_parked_requests_total[15m]))</code></td>
+</tr>
+<tr>
+<td><code>hypellm_fleet_schedule_decisions_total{host,outcome}</code></td>
+<td>Churn-aware scheduling (router specification §26.11): activations that went <code>ranked</code> or <code>starving</code> ahead of others, ones deferred as <code>outranked</code> or <code>warm_demand</code>, and jobs taken <code>job_reordered</code> or <code>job_starving</code> (no <code>host</code> label)</td>
+<td><code>sum by (outcome) (rate(hypellm_fleet_schedule_decisions_total[15m]))</code></td>
 </tr>
 </tbody>
 </table></div>

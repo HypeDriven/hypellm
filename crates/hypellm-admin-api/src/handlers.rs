@@ -543,6 +543,13 @@ pub struct AdminState {
     ///
     /// Empty until the router starts a fleet, which may be after startup.
     pub fleet: crate::fleet::FleetSlot,
+    /// Slave enrollments (specification 26.8).
+    ///
+    /// Independent of `fleet`: a machine is enrolled before any fleet need be
+    /// running, and the first enrolled machine is often what a fleet is
+    /// switched on for. The router shares the same registry, and offers what
+    /// is approved and published to the fleet agent.
+    pub enrollments: Arc<hypellm_fleet::enroll::EnrollmentRegistry>,
 }
 
 /// Somewhere a provider credential can be put.
@@ -1020,6 +1027,128 @@ impl AdminApi {
         &self.state
     }
 
+    /// Serve one of the public enrollment endpoints under `/fleet/v1/`.
+    ///
+    /// Reached with no session and no key: the caller is a machine running
+    /// the install script, and the one-time token in the body is its only
+    /// credential (specification 26.8). That makes these the narrowest
+    /// endpoints on the listener, deliberately:
+    ///
+    /// - **No browser.** A request carrying `Origin` is refused. `curl` sends
+    ///   none, and a page that could POST here would be a page the token was
+    ///   pasted into.
+    /// - **Off unless configured.** Without `settings fleet_enroll_url` both
+    ///   answer 404, so an unconfigured router exposes nothing new.
+    /// - **One answer for every bad token**, throttled globally.
+    pub fn handle_enrollment(&self, request: &AdminRequest<'_>) -> Result<ApiResponse, ApiError> {
+        if request.origin().is_some() {
+            return Err(ApiError::new(
+                ApiErrorCode::OriginNotPermitted,
+                "enrollment endpoints are not for browsers",
+            ));
+        }
+        let config = self.state.config();
+        if config.settings.fleet_enroll_url.is_none() {
+            return Err(ApiError::new(
+                ApiErrorCode::NotFound,
+                "fleet enrollment is not configured on this router",
+            ));
+        }
+        match (request.method, request.path) {
+            (Method::Post, "/fleet/v1/enroll:begin") => self.enroll_begin(request),
+            (Method::Post, "/fleet/v1/enroll:complete") => self.enroll_complete(request),
+            _ => Err(ApiError::new(ApiErrorCode::NotFound, "no such endpoint")),
+        }
+    }
+
+    fn enrollment_token(body: &Value) -> Result<&str, ApiError> {
+        body.get("token").and_then(Value::as_str).ok_or_else(|| {
+            ApiError::new(ApiErrorCode::InvalidRequest, "a 'token' is required")
+        })
+    }
+
+    /// `POST /fleet/v1/enroll:begin` — what the script needs before it asks
+    /// the operator anything: which host it will be, and the key to trust.
+    /// Does not consume the token.
+    fn enroll_begin(&self, request: &AdminRequest<'_>) -> Result<ApiResponse, ApiError> {
+        let body = request.json(&Limits::SMALL.with_max_input_bytes(4 * 1024))?;
+        let token = Self::enrollment_token(&body)?;
+        let enrollment = self
+            .state
+            .enrollments
+            .redeem_peek(token, self.state.clock.wall_millis())
+            .map_err(crate::enroll::enroll_error)?;
+        let config = self.state.config();
+        let key = config
+            .fleet
+            .agents
+            .get(&enrollment.agent)
+            .and_then(|a| a.ssh_public_key.clone())
+            .ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::Conflict,
+                    "the fleet agent this machine would join no longer declares an SSH key; \
+                     ask an administrator",
+                )
+            })?;
+        let mut root = Object::new();
+        root.push("host", Value::from(enrollment.host.as_str()));
+        root.push("agent", Value::from(enrollment.agent.as_str()));
+        root.push("agent_ssh_key", Value::from(key));
+        root.push(
+            "kit_version",
+            Value::from(hypellm_fleet::enroll::HOST_KIT_VERSION),
+        );
+        root.push("expires_at", Value::from(enrollment.expires_at_ms));
+        Ok(ApiResponse::ok(&Value::Object(root)))
+    }
+
+    /// `POST /fleet/v1/enroll:complete` — the slave's report. Consumes the
+    /// token. The slave is registered, not admitted: an administrator decides.
+    fn enroll_complete(&self, request: &AdminRequest<'_>) -> Result<ApiResponse, ApiError> {
+        let body = request.json(&Limits::SMALL.with_max_input_bytes(16 * 1024))?;
+        let token = Self::enrollment_token(&body)?;
+        let registration = hypellm_fleet::enroll::parse_registration(&body)
+            .map_err(|e| ApiError::new(ApiErrorCode::InvalidRequest, e.to_string()))?;
+        let now = self.state.clock.wall_millis();
+        let enrollment = self
+            .state
+            .enrollments
+            .register(token, registration, now)
+            .map_err(crate::enroll::enroll_error)?;
+        // After the effect, because the token was the only thing standing
+        // between an anonymous caller and a durable record; bounded, because
+        // each token registers at most once and open enrollments are capped.
+        let _ = self.record_audit_after_effect(
+            AuditEvent::new(
+                now,
+                format!("slave:{}", enrollment.host),
+                AuditAction::FleetEnrollmentRegistered,
+            )
+            .with_object(enrollment.id.as_str())
+            .with_source(
+                request
+                    .peer
+                    .map_or_else(|| "unknown".to_owned(), |p| p.to_string()),
+            ),
+        );
+        let mut root = Object::new();
+        root.push("id", Value::from(enrollment.id.as_str()));
+        root.push("host", Value::from(enrollment.host.as_str()));
+        root.push("state", Value::from(enrollment.state.as_str()));
+        if let Some(registration) = &enrollment.registration {
+            root.push(
+                "ssh_host_key_fingerprint",
+                Value::from(registration.host_key.fingerprint()),
+            );
+            root.push(
+                "device_key_fingerprint",
+                Value::from(registration.device_key.fingerprint()),
+            );
+        }
+        Ok(ApiResponse::created(&Value::Object(root)))
+    }
+
     /// Serve a management request.
     ///
     /// The cross-origin grant is applied here, on the way out, rather than at
@@ -1352,8 +1481,25 @@ impl AdminApi {
 
             (Method::Get, "/admin/v1/usage") => self.list_usage(session),
 
+            (Method::Get, "/admin/v1/fleet/enrollments") => self.list_enrollments(session),
+            (Method::Post, "/admin/v1/fleet/enrollments") => {
+                self.issue_enrollment(request, session)
+            }
+            (Method::Post, _) if path.starts_with("/admin/v1/fleet/enrollments/") => {
+                let rest = suffix(path, "/admin/v1/fleet/enrollments/")?;
+                match rest.split_once(':') {
+                    Some((id, "approve")) => self.approve_enrollment(session, id),
+                    Some((id, "reject")) => self.decide_enrollment(session, id, false),
+                    Some((id, "revoke")) => self.decide_enrollment(session, id, true),
+                    _ => Err(ApiError::new(
+                        ApiErrorCode::NotFound,
+                        "no such enrollment action; expected :approve, :reject, or :revoke",
+                    )),
+                }
+            }
             (Method::Get, "/admin/v1/fleet") => self.fleet_overview(session),
             (Method::Get, "/admin/v1/fleet/activations") => self.fleet_activations(session),
+            (Method::Get, "/admin/v1/fleet/access") => self.fleet_access(session),
             (Method::Post, "/admin/v1/fleet:simulate") => self.fleet_simulate(request, session),
             (Method::Patch, _) if path.starts_with("/admin/v1/fleet/deployments/") => {
                 let id = suffix(path, "/admin/v1/fleet/deployments/")?;
@@ -1374,9 +1520,10 @@ impl AdminApi {
                 let rest = suffix(path, "/admin/v1/fleet/artifacts/")?;
                 match rest.split_once(':') {
                     Some((id, "fetch")) => self.fleet_fetch(request, session, id),
+                    Some((id, "copy")) => self.fleet_copy(request, session, id),
                     _ => Err(ApiError::new(
                         ApiErrorCode::NotFound,
-                        "no such artifact action; expected :fetch",
+                        "no such artifact action; expected :fetch or :copy",
                     )),
                 }
             }
@@ -1400,6 +1547,18 @@ impl AdminApi {
             (Method::Post, _) if budget_route(path).is_some_and(|(_, credit)| credit) => {
                 let (id, _) = budget_route(path).unwrap_or_default();
                 self.credit_key_budget(request, session, id)
+            }
+            (Method::Put, _) if expiry_route(path).is_some() => {
+                let id = expiry_route(path).unwrap_or_default();
+                self.set_key_expiry(request, session, id)
+            }
+            (Method::Get, _) if restrictions_route(path).is_some() => {
+                let id = restrictions_route(path).unwrap_or_default();
+                self.key_restrictions(session, id)
+            }
+            (Method::Put, _) if restrictions_route(path).is_some() => {
+                let id = restrictions_route(path).unwrap_or_default();
+                self.set_key_restrictions(request, session, id)
             }
             (Method::Delete, _) if path.starts_with("/admin/v1/keys/") => {
                 let id = suffix(path, "/admin/v1/keys/")?;
@@ -1499,6 +1658,13 @@ impl AdminApi {
         root.push(
             "break_glass",
             Value::from(!by_key && session.is_break_glass()),
+        );
+        // Whether a key this session mints or edits is capped at the
+        // session's end — which `break_glass` alone does not say, because a
+        // break-glass principal may also hold `key_manager`.
+        root.push(
+            "keys_capped_to_session",
+            Value::from(!by_key && Self::keys_capped_to_session(session)),
         );
         root.push(
             "authenticated_at",
@@ -3850,6 +4016,7 @@ impl AdminApi {
             tenant: &scenario.tenant,
             attempted: &attempted,
             now_millis: 0,
+            key: None,
         };
 
         let ideal = hypellm_core::policy::IdealLiveState;
@@ -4034,7 +4201,9 @@ impl AdminApi {
             ));
         }
 
+        let plan = restored.admission_plan();
         self.state.config.activate(restored);
+        self.apply_admission(&plan);
         let activated = active_etag(&self.state.config());
         // Loud, because a rollback is an incident action by definition.
         self.state.telemetry.log(
@@ -4316,7 +4485,9 @@ impl AdminApi {
         );
         self.state.drafts.close(draft_id);
 
+        let plan = config.admission_plan();
         self.state.config.activate(config);
+        self.apply_admission(&plan);
         // The tag of what is now active — which is what the next publish will be
         // compared against. Tagging the reply body instead handed the approver
         // something the server would refuse with 412, forcing every real client
@@ -4343,49 +4514,129 @@ impl AdminApi {
             .list()
             .iter()
             .filter(|record| record.tenant == session.tenant)
-            .map(|record| {
-                let mut object = Object::new();
-                object.push("id", Value::from(record.id.as_str()));
-                object.push("principal", Value::from(record.principal.as_str()));
-                object.push("tenant", Value::from(record.tenant.as_str()));
-                object.push("revoked", Value::from(record.revoked));
-                object.push("created_at", Value::from(record.created_at_millis));
-                object.push_opt("expires_at", record.expires_at_millis.map(Value::from));
-                object.push_opt(
-                    "description",
-                    record.description.as_deref().map(Value::from),
-                );
-                object.push(
-                    "scopes",
-                    Value::Array(
-                        record
-                            .scopes
-                            .iter()
-                            .map(|s| Value::from(s.as_str()))
-                            .collect(),
-                    ),
-                );
-                // Null when the key is unrestricted, so a listing distinguishes
-                // "usable from anywhere" from "restricted to nothing" — which
-                // an empty array would not.
-                object.push(
-                    "source_networks",
-                    render_source_restriction(&record.source),
-                );
-                object.push(
-                    "budget",
-                    crate::budget::budget_value(
-                        &record.id,
-                        &self.state.budgets.view(&record.id),
-                        tenant_payment.as_ref(),
-                    ),
-                );
-                // The verifier is never returned: it is not the secret, but it
-                // is key-derived material with no reason to leave the process.
-                Value::Object(object)
-            })
+            .map(|record| self.key_value(record, tenant_payment.as_ref()))
             .collect();
         Ok(ApiResponse::ok(&list_envelope(items, None)))
+    }
+
+    /// One key as the listing and the expiry endpoint render it.
+    fn key_value(
+        &self,
+        record: &hypellm_auth::KeyRecord,
+        tenant_payment: Option<&hypellm_core::budget::PaymentInstructions>,
+    ) -> Value {
+        let mut object = Object::new();
+        object.push("id", Value::from(record.id.as_str()));
+        object.push("principal", Value::from(record.principal.as_str()));
+        object.push("tenant", Value::from(record.tenant.as_str()));
+        object.push("revoked", Value::from(record.revoked));
+        object.push("created_at", Value::from(record.created_at_millis));
+        object.push_opt("expires_at", record.expires_at_millis.map(Value::from));
+        object.push_opt(
+            "description",
+            record.description.as_deref().map(Value::from),
+        );
+        object.push(
+            "scopes",
+            Value::Array(
+                record
+                    .scopes
+                    .iter()
+                    .map(|s| Value::from(s.as_str()))
+                    .collect(),
+            ),
+        );
+        // Null when the key is unrestricted, so a listing distinguishes
+        // "usable from anywhere" from "restricted to nothing" — which
+        // an empty array would not.
+        object.push(
+            "source_networks",
+            render_source_restriction(&record.source),
+        );
+        object.push(
+            "budget",
+            crate::budget::budget_value(
+                &record.id,
+                &self.state.budgets.view(&record.id),
+                tenant_payment,
+            ),
+        );
+        // Null fields narrow nothing; see `restrictions_value`.
+        object.push("restrictions", restrictions_value(&record.restrictions));
+        // The tag the expiry and restriction endpoints require in `If-Match`.
+        object.push("etag", Value::from(key_etag(record)));
+        // The verifier is never returned: it is not the secret, but it
+        // is key-derived material with no reason to leave the process.
+        Value::Object(object)
+    }
+
+    /// Refuse a management-scoped key whose roles the caller does not hold
+    /// outside break-glass.
+    ///
+    /// The roles are resolved for `principal` in the caller's tenant, as the
+    /// key will resolve them. Used at creation and again when an expiry is
+    /// extended or removed: keeping a key alive longer is granting its
+    /// authority again, and a caller who could not mint the key must not be
+    /// able to prolong it either.
+    fn refuse_widened_management_key(
+        &self,
+        session: &Session,
+        principal: &PrincipalId,
+        scopes: &[hypellm_auth::Scope],
+    ) -> Result<(), ApiError> {
+        let management = scopes.iter().any(|scope| {
+            matches!(
+                scope,
+                hypellm_auth::Scope::ManagementRead | hypellm_auth::Scope::ManagementWrite
+            )
+        });
+        if !management {
+            return Ok(());
+        }
+        let config = self.state.config();
+        let held: Vec<hypellm_core::rbac::Role> = session
+            .roles
+            .iter()
+            .copied()
+            .filter(|role| !role.is_break_glass())
+            .collect();
+        let widened = management_roles_for(&config, principal, &session.tenant)
+            .into_iter()
+            .any(|role| !held.contains(&role));
+        if widened {
+            return Err(ApiError::new(
+                ApiErrorCode::Forbidden,
+                "a management key may not carry a role its creator does not hold \
+                 outside break-glass",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The latest wall-clock time a key may expire at when `session` is a
+    /// break-glass session: the session's own end.
+    fn break_glass_key_bound(&self, session: &Session) -> u64 {
+        let now = self.state.clock.now_millis();
+        self.state
+            .clock
+            .wall_millis()
+            .saturating_add(session.absolute_expiry_millis.saturating_sub(now))
+    }
+
+    /// Whether a key this session mints or edits must expire with the session.
+    ///
+    /// True when the session's `ManageKeys` is break-glass authority: it was
+    /// opened with the offline break-glass token, or no role it holds other
+    /// than `break_glass_admin` grants the permission. A `key_manager` holds
+    /// key authority in its own right, so its keys' lifetimes are its own to
+    /// choose — even when the same principal also holds break-glass, as the
+    /// local profile's `user:admin` does.
+    fn keys_capped_to_session(session: &Session) -> bool {
+        session.method == hypellm_auth::AuthMethod::BreakGlass
+            || !session
+                .roles
+                .iter()
+                .any(|role| !role.is_break_glass() && role.grants(Permission::ManageKeys))
     }
 
     fn create_key(
@@ -4440,8 +4691,8 @@ impl AdminApi {
             .and_then(|v| u64::try_from(v).ok());
 
         // A key must not carry more authority than the person minting it.
-        // `ManageKeys` belongs to break-glass alone, so without this the
-        // recovery path could mint a management key for any principal —
+        // `ManageKeys` belongs to break-glass and `key_manager`, so without
+        // this the recovery path could mint a management key for any principal —
         // including an editor and an approver, and then review its own change
         // — and the result would outlive the incident indefinitely.
         //
@@ -4449,42 +4700,13 @@ impl AdminApi {
         //    key will be) must be a subset of the minter's roles *other than*
         //    `break_glass_admin`. Break-glass authority is the offline token
         //    and a short lifetime; it is not transferable into a string.
-        let management = scopes.iter().any(|scope| {
-            matches!(
-                scope,
-                hypellm_auth::Scope::ManagementRead | hypellm_auth::Scope::ManagementWrite
-            )
-        });
-        if management {
-            let config = self.state.config();
-            let held: Vec<hypellm_core::rbac::Role> = session
-                .roles
-                .iter()
-                .copied()
-                .filter(|role| !role.is_break_glass())
-                .collect();
-            let widened = management_roles_for(&config, &principal, &session.tenant)
-                .into_iter()
-                .any(|role| !held.contains(&role));
-            if widened {
-                return Err(ApiError::new(
-                    ApiErrorCode::Forbidden,
-                    "a management key may not carry a role its creator does not hold \
-                     outside break-glass",
-                ));
-            }
-        }
+        self.refuse_widened_management_key(session, &principal, &scopes)?;
 
-        // 2. A key minted under break-glass expires with the session that
-        //    minted it. An absent expiry takes that bound; a later one is
+        // 2. A key minted on break-glass authority expires with the session
+        //    that minted it. An absent expiry takes that bound; a later one is
         //    refused rather than silently shortened.
-        let expires_at = if session.is_break_glass() {
-            let now = self.state.clock.now_millis();
-            let bound = self
-                .state
-                .clock
-                .wall_millis()
-                .saturating_add(session.absolute_expiry_millis.saturating_sub(now));
+        let expires_at = if Self::keys_capped_to_session(session) {
+            let bound = self.break_glass_key_bound(session);
             match expires_at {
                 None => Some(bound),
                 Some(requested) if requested <= bound => Some(requested),
@@ -4691,6 +4913,409 @@ impl AdminApi {
         )?;
 
         Ok(ApiResponse::no_content())
+    }
+
+    /// `PUT /admin/v1/keys/{id}/expiry`: extend, shorten or remove a key's
+    /// expiry. The body is `{"expires_at": <milliseconds> | null}`.
+    ///
+    /// Unlike revocation this carries `If-Match`: two administrators setting
+    /// different expiries is exactly the lost update the precondition exists
+    /// for. An expired key may be given a later expiry, which brings it back;
+    /// a revoked one may not, because there is no un-revoke.
+    ///
+    /// The change is its own record kind, never a re-appended key record. A
+    /// revocation can land between this handler's read and its append, and a
+    /// replayed full record would carry the `revoked: false` read before it.
+    fn set_key_expiry(
+        &self,
+        request: &AdminRequest<'_>,
+        session: &Session,
+        raw_id: &str,
+    ) -> Result<ApiResponse, ApiError> {
+        self.require(session, Permission::ManageKeys)?;
+        let key_id = hypellm_core::ids::KeyId::new(raw_id)
+            .map_err(|_| ApiError::not_found("key"))?;
+        let record = self
+            .state
+            .keys
+            .get(&key_id)
+            .filter(|record| record.tenant == session.tenant)
+            .ok_or_else(|| ApiError::not_found("key"))?;
+        if_match_satisfied(request.if_match(), &key_etag(&record))?;
+
+        if record.revoked {
+            return Err(ApiError::new(
+                ApiErrorCode::Conflict,
+                "the key is revoked; a revoked key cannot be given a new expiry",
+            ));
+        }
+
+        let body = request.json(&Limits::SMALL)?;
+        let expires_at = match body.get("expires_at") {
+            None => {
+                return Err(ApiError::new(
+                    ApiErrorCode::InvalidRequest,
+                    "an expiry change requires 'expires_at': milliseconds since the epoch, \
+                     or null for no expiry",
+                ));
+            }
+            Some(Value::Null) => None,
+            Some(value) => Some(value.as_u64().ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::ValidationFailed,
+                    "'expires_at' must be a non-negative integer of milliseconds, or null",
+                )
+            })?),
+        };
+        let wall = self.state.clock.wall_millis();
+        if expires_at.is_some_and(|at| at <= wall) {
+            return Err(ApiError::new(
+                ApiErrorCode::ValidationFailed,
+                "that expiry is now or in the past; to stop a key working, revoke it",
+            ));
+        }
+
+        self.refuse_widened_management_key(session, &record.principal, &record.scopes)?;
+
+        // Break-glass authority may not leave behind a key that outlives it —
+        // the same bound creation applies, and for the same reason.
+        if Self::keys_capped_to_session(session) {
+            let bound = self.break_glass_key_bound(session);
+            if expires_at.is_none_or(|at| at > bound) {
+                return Err(ApiError::new(
+                    ApiErrorCode::InvalidRequest,
+                    format!(
+                        "under break-glass a key's expiry may be set no later than {bound}, \
+                         when the break-glass session ends"
+                    ),
+                ));
+            }
+        }
+
+        let describe = |at: Option<u64>| at.map_or_else(|| "none".to_owned(), |at| at.to_string());
+        let event = AuditEvent::new(
+            wall,
+            session.principal.as_str(),
+            AuditAction::KeyExpiryChanged,
+        )
+        .with_object(key_id.as_str())
+        .with_tenant(session.tenant.as_str())
+        .with_request_id(request.request_id.as_str())
+        .with_reason(&format!(
+            "expires_at {} -> {}",
+            describe(record.expires_at_millis),
+            describe(expires_at)
+        ));
+        self.record_audit(event.clone())?;
+
+        let change = hypellm_auth::ExpiryChange {
+            id: key_id.clone(),
+            expires_at_millis: expires_at,
+        };
+        if self
+            .state
+            .store
+            .append(hypellm_store::RecordKind::ApiKeyExpiry, &change.to_payload())
+            .is_err()
+        {
+            self.record_abandoned(event, "the expiry change could not be written durably");
+            return Err(ApiError::new(
+                ApiErrorCode::InternalFault,
+                "the expiry change could not be recorded durably and was not applied",
+            ));
+        }
+        self.state.keys.set_expiry(&key_id, expires_at);
+
+        let updated = self
+            .state
+            .keys
+            .get(&key_id)
+            .ok_or_else(|| ApiError::not_found("key"))?;
+        let mut response = ApiResponse::ok(
+            &self.key_value(&updated, self.tenant_payment(&session.tenant).as_ref()),
+        );
+        response.etag = Some(key_etag(&updated));
+        Ok(response)
+    }
+
+    /// Resolve a key the caller may manage, in the caller's tenant.
+    fn managed_key(
+        &self,
+        session: &Session,
+        raw_id: &str,
+    ) -> Result<(hypellm_core::ids::KeyId, hypellm_auth::KeyRecord), ApiError> {
+        self.require(session, Permission::ManageKeys)?;
+        let key_id = hypellm_core::ids::KeyId::new(raw_id)
+            .map_err(|_| ApiError::not_found("key"))?;
+        let record = self
+            .state
+            .keys
+            .get(&key_id)
+            .filter(|record| record.tenant == session.tenant)
+            .ok_or_else(|| ApiError::not_found("key"))?;
+        Ok((key_id, record))
+    }
+
+    /// `GET /admin/v1/keys/{id}/restrictions`: the key's restrictions beside
+    /// the ceiling they narrow — what its principal may use under the active
+    /// configuration — and how many other live keys share that principal.
+    ///
+    /// The ceiling is what the Keys screen offers as choices. It is
+    /// recomputed from the active configuration on every read, as enforcement
+    /// is on every request.
+    fn key_restrictions(&self, session: &Session, raw_id: &str) -> Result<ApiResponse, ApiError> {
+        let (key_id, record) = self.managed_key(session, raw_id)?;
+        let config = self.state.config();
+        let ceiling = principal_ceiling(&config, &record.principal, &record.tenant);
+
+        let mut models = Vec::new();
+        for (alias, targets) in &ceiling.alias_targets {
+            let mut entry = Object::new();
+            entry.push("id", Value::from(alias.as_str()));
+            entry.push_opt(
+                "description",
+                config
+                    .snapshot
+                    .aliases
+                    .get(alias)
+                    .and_then(|a| a.description.as_deref())
+                    .map(Value::from),
+            );
+            entry.push(
+                "targets",
+                Value::Array(targets.iter().map(|t| Value::from(t.as_str())).collect()),
+            );
+            models.push(Value::Object(entry));
+        }
+        let targets: Vec<Value> = ceiling
+            .targets
+            .iter()
+            .map(|target| {
+                let mut entry = Object::new();
+                entry.push("id", Value::from(target.as_str()));
+                entry.push_opt(
+                    "provider",
+                    config
+                        .snapshot
+                        .targets
+                        .get(target)
+                        .map(|t| Value::from(t.provider_id.as_str())),
+                );
+                entry.push_opt(
+                    "host",
+                    config
+                        .snapshot
+                        .fleet_placement
+                        .get(target)
+                        .map(|h| Value::from(h.as_str())),
+                );
+                Value::Object(entry)
+            })
+            .collect();
+
+        let mut limits = Object::new();
+        limits.push("models", Value::Array(models));
+        limits.push("targets", Value::Array(targets));
+        limits.push(
+            "hosts",
+            Value::Array(ceiling.hosts.iter().map(|h| Value::from(h.as_str())).collect()),
+        );
+        limits.push("priority", Value::from(ceiling.class.as_str()));
+
+        let shared = self
+            .state
+            .keys
+            .list()
+            .iter()
+            .filter(|other| {
+                other.id != key_id
+                    && !other.revoked
+                    && other.tenant == record.tenant
+                    && other.principal == record.principal
+            })
+            .count();
+
+        let mut root = Object::new();
+        root.push("id", Value::from(key_id.as_str()));
+        root.push("principal", Value::from(record.principal.as_str()));
+        root.push("restrictions", restrictions_value(&record.restrictions));
+        root.push("ceiling", Value::Object(limits));
+        root.push(
+            "keys_sharing_principal",
+            Value::from(u64::try_from(shared).unwrap_or(u64::MAX)),
+        );
+        let mut response = ApiResponse::ok(&Value::Object(root));
+        response.etag = Some(key_etag(&record));
+        Ok(response)
+    }
+
+    /// `PUT /admin/v1/keys/{id}/restrictions`: replace a key's restrictions
+    /// whole. The body names all four of `models`, `targets`, `hosts` and
+    /// `priority`; `null` narrows nothing.
+    ///
+    /// A key's restrictions are a subset of its principal's access, so every
+    /// entry is checked against the ceiling the active configuration gives the
+    /// principal and refused if it lies outside. That check is a courtesy to
+    /// the operator, not the guarantee: routing intersects the restriction
+    /// with the live policy on every request, so a later publication that
+    /// shrinks the principal's access shrinks the key's with it.
+    ///
+    /// No second person is involved, unlike a policy change, because nothing
+    /// here can widen what the principal's policy allows. Lifting a
+    /// restriction returns the key to that policy and no further.
+    fn set_key_restrictions(
+        &self,
+        request: &AdminRequest<'_>,
+        session: &Session,
+        raw_id: &str,
+    ) -> Result<ApiResponse, ApiError> {
+        use hypellm_core::ids::{AliasId, HostId};
+        let (key_id, record) = self.managed_key(session, raw_id)?;
+        if_match_satisfied(request.if_match(), &key_etag(&record))?;
+        if record.revoked {
+            return Err(ApiError::new(
+                ApiErrorCode::Conflict,
+                "the key is revoked; a revoked key cannot be given restrictions",
+            ));
+        }
+
+        let body = request.json(&Limits::SMALL)?;
+        if body.as_object().is_none() {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidRequest,
+                "a restriction change is a JSON object",
+            ));
+        }
+        let models = restriction_list(&body, "models", |s| AliasId::new(s).ok())?;
+        let targets = restriction_list(&body, "targets", |s| TargetId::new(s).ok())?;
+        let hosts = restriction_list(&body, "hosts", |s| HostId::new(s).ok())?;
+        let priority = match body.get("priority") {
+            None => {
+                return Err(ApiError::new(
+                    ApiErrorCode::InvalidRequest,
+                    "a restriction change requires 'priority': interactive, standard, batch,                      or null to keep the principal's",
+                ));
+            }
+            Some(Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .and_then(hypellm_core::admission::PriorityClass::parse)
+                    .ok_or_else(|| {
+                        ApiError::new(
+                            ApiErrorCode::ValidationFailed,
+                            "'priority' must be interactive, standard, batch, or null",
+                        )
+                    })?,
+            ),
+        };
+
+        let config = self.state.config();
+        let ceiling = principal_ceiling(&config, &record.principal, &record.tenant);
+        // A name the configuration declares is the operator's own and safe to
+        // repeat. One it does not is caller input, refused without echoing it:
+        // an identifier-shaped string is as likely a pasted key as a typo.
+        let outside = |what: &str, name: &str, exists: bool| {
+            ApiError::new(
+                ApiErrorCode::ValidationFailed,
+                if exists {
+                    format!(
+                        "{what} '{name}' is outside what principal '{}' may use; a key can                          only narrow its principal's access",
+                        record.principal
+                    )
+                } else {
+                    format!("an entry names a {what} the active configuration does not declare")
+                },
+            )
+        };
+        for alias in models.iter().flatten() {
+            if !ceiling.models.contains(alias) {
+                return Err(outside(
+                    "alias",
+                    alias.as_str(),
+                    config.snapshot.aliases.contains_key(alias),
+                ));
+            }
+        }
+        for target in targets.iter().flatten() {
+            if !ceiling.targets.contains(target) {
+                return Err(outside(
+                    "target",
+                    target.as_str(),
+                    config.snapshot.targets.contains_key(target),
+                ));
+            }
+        }
+        for host in hosts.iter().flatten() {
+            if !ceiling.hosts.contains(host) {
+                return Err(outside("slave", host.as_str(), config.fleet.hosts.contains_key(host)));
+            }
+        }
+        // `PriorityClass` orders interactive first, so a smaller value is a
+        // higher priority than the principal holds.
+        if priority.is_some_and(|class| class < ceiling.class) {
+            return Err(ApiError::new(
+                ApiErrorCode::ValidationFailed,
+                format!(
+                    "principal '{}' queues at '{}'; a key may lower its priority but not                      raise it",
+                    record.principal,
+                    ceiling.class.as_str()
+                ),
+            ));
+        }
+
+        let restrictions = hypellm_core::key_restriction::KeyRestriction {
+            models,
+            targets,
+            hosts,
+            priority,
+        };
+        let event = AuditEvent::new(
+            self.state.clock.wall_millis(),
+            session.principal.as_str(),
+            AuditAction::KeyRestrictionsChanged,
+        )
+        .with_object(key_id.as_str())
+        .with_tenant(session.tenant.as_str())
+        .with_request_id(request.request_id.as_str())
+        .with_reason(&format!(
+            "{} -> {}",
+            describe_restriction(&record.restrictions),
+            describe_restriction(&restrictions)
+        ));
+        self.record_audit(event.clone())?;
+
+        let change = hypellm_auth::RestrictionChange {
+            id: key_id.clone(),
+            restrictions: restrictions.clone(),
+        };
+        if self
+            .state
+            .store
+            .append(
+                hypellm_store::RecordKind::ApiKeyRestriction,
+                &change.to_payload(),
+            )
+            .is_err()
+        {
+            self.record_abandoned(event, "the restriction change could not be written durably");
+            return Err(ApiError::new(
+                ApiErrorCode::InternalFault,
+                "the restriction change could not be recorded durably and was not applied",
+            ));
+        }
+        self.state.keys.set_restrictions(&key_id, restrictions);
+
+        let updated = self
+            .state
+            .keys
+            .get(&key_id)
+            .ok_or_else(|| ApiError::not_found("key"))?;
+        let mut response = ApiResponse::ok(
+            &self.key_value(&updated, self.tenant_payment(&session.tenant).as_ref()),
+        );
+        response.etag = Some(key_etag(&updated));
+        Ok(response)
     }
 
     // -- Key budgets -------------------------------------------------------
@@ -5852,6 +6477,36 @@ impl AdminApi {
         )))
     }
 
+    /// `GET /admin/v1/fleet/access` — who may use which slave and model.
+    ///
+    /// `ReadFleet` for the matrix and the grants; the principal list is added
+    /// only for a caller who also holds `EditPolicy`, the permission needed to
+    /// turn what this shows into a draft. Answers from configuration, so it
+    /// works with no fleet runtime running.
+    fn fleet_access(&self, session: &Session) -> Result<ApiResponse, ApiError> {
+        self.require(session, Permission::ReadFleet)?;
+        let config = self.state.config();
+        let visible = visible_targets(&config, session);
+        let key_principals: Vec<hypellm_core::ids::PrincipalId> = self
+            .state
+            .keys
+            .list()
+            .into_iter()
+            .filter(|record| record.tenant == session.tenant && !record.revoked)
+            .map(|record| record.principal)
+            .collect();
+        let principals =
+            crate::fleet_access::tenant_principals(&config, &session.tenant, key_principals);
+        let may_author = self.require(session, Permission::EditPolicy).is_ok();
+        Ok(ApiResponse::ok(&crate::fleet_access::render_access(
+            &config,
+            &session.tenant,
+            &visible,
+            may_author.then_some(&principals),
+            &principals,
+        )))
+    }
+
     /// `POST /admin/v1/fleet:simulate` — what would you do, and why.
     ///
     /// Requires only `SimulatePolicy`, the permission that already governs
@@ -5888,6 +6543,294 @@ impl AdminApi {
             .map_err(crate::fleet::control_error)?;
         let shown = crate::fleet::visible_deployments(fleet.as_ref(), &visible);
         Ok(ApiResponse::ok(&crate::fleet::render_plan(&outcome, &shown)))
+    }
+
+    // -- Enrollment (specification 26.8) --------------------------------------
+
+    /// `GET /admin/v1/fleet/enrollments`.
+    ///
+    /// Not filtered by tenant, unlike the fleet views: an enrollment names a
+    /// machine that serves no tenant yet, and the people who decide whether it
+    /// joins the fleet are the people who run the fleet.
+    fn list_enrollments(&self, session: &Session) -> Result<ApiResponse, ApiError> {
+        self.require(session, Permission::FleetEnroll)
+            .or_else(|_| self.require(session, Permission::ReadFleet))?;
+        let now = self.state.clock.wall_millis();
+        let items = self
+            .state
+            .enrollments
+            .list()
+            .iter()
+            .map(|e| crate::enroll::enrollment_value(e, now))
+            .collect();
+        let mut root = Object::new();
+        root.push("items", Value::Array(items));
+        root.push(
+            "configured",
+            Value::from(self.state.config().settings.fleet_enroll_url.is_some()),
+        );
+        root.push(
+            "kit_version",
+            Value::from(hypellm_fleet::enroll::HOST_KIT_VERSION),
+        );
+        Ok(ApiResponse::ok(&Value::Object(root)))
+    }
+
+    /// `POST /admin/v1/fleet/enrollments` — mint a one-time token.
+    ///
+    /// The token is in this response and nowhere else: the registry holds its
+    /// digest, the audit record names the enrollment, and a lost token is
+    /// replaced by rejecting the enrollment and minting another.
+    fn issue_enrollment(
+        &self,
+        request: &AdminRequest<'_>,
+        session: &Session,
+    ) -> Result<ApiResponse, ApiError> {
+        self.require(session, Permission::FleetEnroll)?;
+        let config = self.state.config();
+        let Some(origin) = config.settings.fleet_enroll_url.clone() else {
+            return Err(ApiError::new(
+                ApiErrorCode::Conflict,
+                "enrollment is not configured; set settings fleet_enroll_url to the https \
+                 origin new machines can reach",
+            ));
+        };
+        let body = request.json(&Limits::SMALL)?;
+        let invalid = |m: &str| ApiError::new(ApiErrorCode::InvalidRequest, m.to_owned());
+        let host = body
+            .get("host")
+            .and_then(Value::as_str)
+            .filter(|h| is_configuration_token(h) && !h.contains('/'))
+            .and_then(|h| hypellm_core::ids::HostId::new(h).ok())
+            .ok_or_else(|| invalid("'host' must be a host identifier ([A-Za-z0-9._:-])"))?;
+        let agent = body
+            .get("agent")
+            .and_then(Value::as_str)
+            .and_then(|a| hypellm_core::ids::AgentId::new(a).ok())
+            .ok_or_else(|| invalid("'agent' must name a configured fleet_agent"))?;
+        let ttl_seconds = match body.get("ttl_seconds") {
+            None | Some(Value::Null) => hypellm_fleet::enroll::DEFAULT_TTL_SECS,
+            Some(v) => v
+                .as_u64()
+                .filter(|t| {
+                    (hypellm_fleet::enroll::MIN_TTL_SECS..=hypellm_fleet::enroll::MAX_TTL_SECS)
+                        .contains(t)
+                })
+                .ok_or_else(|| invalid("'ttl_seconds' must be between 60 and 86400"))?,
+        };
+
+        match config.fleet.agents.get(&agent) {
+            None => return Err(invalid("'agent' must name a configured fleet_agent")),
+            Some(declared) if declared.ssh_public_key.is_none() => {
+                return Err(ApiError::new(
+                    ApiErrorCode::Conflict,
+                    "that fleet_agent declares no ssh_public_key, so a new machine would have \
+                     no key to trust; add one to its record first",
+                ));
+            }
+            Some(_) => {}
+        }
+        if config.fleet.hosts.contains_key(&host) {
+            return Err(ApiError::new(
+                ApiErrorCode::Conflict,
+                "a host with that identifier is already configured",
+            ));
+        }
+
+        let random = |what: &str| {
+            ApiError::new(
+                ApiErrorCode::InternalFault,
+                format!("no randomness was available for the {what}; nothing was issued"),
+            )
+        };
+        let token = hypellm_crypto::hex::encode(
+            &hypellm_crypto::random::secret_256().map_err(|_| random("token"))?,
+        );
+        let id = hypellm_crypto::hex::encode(
+            &hypellm_crypto::random::bytes::<8>().map_err(|_| random("identifier"))?,
+        );
+        let now = self.state.clock.wall_millis();
+        let event = self
+            .fleet_event(session, AuditAction::FleetEnrollmentIssued, &id)
+            .with_reason(&format!("host {host} via agent {agent}"));
+        self.record_audit(event.clone())?;
+        let enrollment = match self.state.enrollments.issue(
+            hypellm_fleet::enroll::NewEnrollment {
+                id,
+                host,
+                agent,
+                token_digest: hypellm_fleet::enroll::token_digest(&token),
+                issued_by: session.principal.as_str().to_owned(),
+                ttl_ms: ttl_seconds.saturating_mul(1000),
+            },
+            now,
+        ) {
+            Ok(enrollment) => enrollment,
+            Err(error) => {
+                self.record_abandoned(event, error.code());
+                return Err(crate::enroll::enroll_error(error));
+            }
+        };
+
+        let mut root = Object::new();
+        root.push("id", Value::from(enrollment.id.as_str()));
+        root.push("host", Value::from(enrollment.host.as_str()));
+        root.push("agent", Value::from(enrollment.agent.as_str()));
+        root.push("token", Value::from(token.as_str()));
+        root.push("expires_at", Value::from(enrollment.expires_at_ms));
+        root.push(
+            "command",
+            Value::from(crate::enroll::install_command(&origin, &token)),
+        );
+        root.push(
+            "kit_version",
+            Value::from(hypellm_fleet::enroll::HOST_KIT_VERSION),
+        );
+        Ok(ApiResponse::created(&Value::Object(root)))
+    }
+
+    /// `POST /admin/v1/fleet/enrollments/{id}:approve`.
+    ///
+    /// Approval drafts the slave's `host` and `accelerator` records; it does
+    /// not publish them. The slave stays out of routing — and out of the
+    /// agent's allowlist — until a second person publishes that draft, which
+    /// is the same separation of duties every other configuration change
+    /// keeps.
+    fn approve_enrollment(&self, session: &Session, id: &str) -> Result<ApiResponse, ApiError> {
+        use hypellm_config::edit::{Edit, Identity};
+        self.require(session, Permission::FleetEnroll)?;
+        self.require(session, Permission::EditPolicy)
+            .map_err(|_| {
+                ApiError::new(
+                    ApiErrorCode::Forbidden,
+                    "approving an enrollment drafts configuration, which needs edit_policy too",
+                )
+            })?;
+        let now = self.state.clock.wall_millis();
+        let enrollment = self
+            .state
+            .enrollments
+            .get(id)
+            .ok_or_else(|| ApiError::not_found("enrollment"))?;
+        if enrollment.state_at(now) != hypellm_fleet::enroll::EnrollmentState::Registered {
+            return Err(crate::enroll::enroll_error(
+                hypellm_fleet::enroll::EnrollError::WrongState,
+            ));
+        }
+        let Some(registration) = enrollment.registration.as_ref() else {
+            return Err(crate::enroll::enroll_error(
+                hypellm_fleet::enroll::EnrollError::WrongState,
+            ));
+        };
+        let config = self.state.config();
+        if config.fleet.hosts.contains_key(&enrollment.host) {
+            return Err(ApiError::new(
+                ApiErrorCode::Conflict,
+                "a host with that identifier is already configured",
+            ));
+        }
+
+        let edits: Vec<Edit> = hypellm_fleet::enroll::drafted_records(&enrollment, registration)
+            .into_iter()
+            .map(|(kind, record, fields)| Edit::Set {
+                kind: kind.to_owned(),
+                identity: Identity::Id(record),
+                fields: fields.into_iter().map(|(k, v)| (k, Some(v))).collect(),
+            })
+            .collect();
+        let applied = hypellm_config::edit::apply(&config.canonical, &edits).map_err(|e| {
+            ApiError::new(ApiErrorCode::Conflict, echo(&e.to_string()))
+        })?;
+
+        let event = self.fleet_event(session, AuditAction::FleetEnrollmentApproved, id);
+        self.record_audit(event.clone())?;
+        let draft = self.state.drafts.create_by(
+            applied.text,
+            session.principal.clone(),
+            session.accountable.clone(),
+            session.tenant.clone(),
+            now,
+        );
+        if self
+            .state
+            .store
+            .append(hypellm_store::RecordKind::PolicyDraft, &draft.to_payload())
+            .is_err()
+        {
+            self.state.drafts.close(&draft.id);
+            self.record_abandoned(event, "the draft could not be recorded durably");
+            return Err(ApiError::new(
+                ApiErrorCode::InternalFault,
+                "the draft could not be recorded durably; the enrollment was not approved",
+            ));
+        }
+        if let Err(error) =
+            self.state
+                .enrollments
+                .approve(id, session.principal.as_str(), now, draft.id.clone())
+        {
+            // The draft would add a machine nobody approved. Close it, and say
+            // so durably, so replay does not bring it back.
+            let _ = self.state.store.append(
+                hypellm_store::RecordKind::PolicyDraftClosed,
+                draft.id.as_bytes(),
+            );
+            self.state.drafts.close(&draft.id);
+            self.record_abandoned(event, error.code());
+            return Err(crate::enroll::enroll_error(error));
+        }
+        let _ = self.record_audit(
+            AuditEvent::new(now, session.principal.as_str(), AuditAction::PolicyDrafted)
+                .with_object(draft.id.as_str())
+                .with_tenant(session.tenant.as_str())
+                .with_reason(&format!("enrollment {id}")),
+        );
+
+        let mut root = Object::new();
+        root.push("id", Value::from(id));
+        root.push("state", Value::from("approved"));
+        root.push("draft_id", Value::from(draft.id.as_str()));
+        root.push("changed", Value::from(applied.changed));
+        // Stated so a client cannot read an approval as the machine joining.
+        root.push("published", Value::from(false));
+        Ok(ApiResponse::ok(&Value::Object(root)))
+    }
+
+    /// `POST .../{id}:reject` and `.../{id}:revoke`.
+    fn decide_enrollment(
+        &self,
+        session: &Session,
+        id: &str,
+        revoke: bool,
+    ) -> Result<ApiResponse, ApiError> {
+        self.require(session, Permission::FleetEnroll)?;
+        if self.state.enrollments.get(id).is_none() {
+            return Err(ApiError::not_found("enrollment"));
+        }
+        let action = if revoke {
+            AuditAction::FleetEnrollmentRevoked
+        } else {
+            AuditAction::FleetEnrollmentRejected
+        };
+        let event = self.fleet_event(session, action, id);
+        self.record_audit(event.clone())?;
+        let now = self.state.clock.wall_millis();
+        let actor = session.principal.as_str();
+        let result = if revoke {
+            self.state.enrollments.revoke(id, actor, now)
+        } else {
+            self.state.enrollments.reject(id, actor, now)
+        };
+        match result {
+            Ok(enrollment) => Ok(ApiResponse::ok(&crate::enroll::enrollment_value(
+                &enrollment,
+                now,
+            ))),
+            Err(error) => {
+                self.record_abandoned(event, error.code());
+                Err(crate::enroll::enroll_error(error))
+            }
+        }
     }
 
     fn fleet_activate(&self, session: &Session, deployment: &str) -> Result<ApiResponse, ApiError> {
@@ -5953,6 +6896,37 @@ impl AdminApi {
         self.record_audit_after_effect(self.fleet_event(
             session,
             AuditAction::FleetFetch,
+            artifact,
+        ))?;
+        Ok(crate::fleet::render_accepted(&activation))
+    }
+
+    /// Copy an artifact from a host holding a verified copy to another
+    /// (specification 26.12).
+    ///
+    /// The same permission as a fetch, for the same reason: it commits a host
+    /// to gigabytes of disk and the fleet to the bandwidth of moving them.
+    fn fleet_copy(
+        &self,
+        request: &AdminRequest<'_>,
+        session: &Session,
+        artifact: &str,
+    ) -> Result<ApiResponse, ApiError> {
+        self.require(session, Permission::FleetFetch)?;
+        let body = request.json(&Limits::SMALL)?;
+        let (Ok(from), Ok(to)) = (body.field_str("from"), body.field_str("to")) else {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidRequest,
+                "a copy requires 'from', the host holding a verified copy, and 'to'",
+            ));
+        };
+        let activation = self
+            .fleet()?
+            .copy(artifact, from, to)
+            .map_err(crate::fleet::control_error)?;
+        self.record_audit_after_effect(self.fleet_event(
+            session,
+            AuditAction::FleetCopy,
             artifact,
         ))?;
         Ok(crate::fleet::render_accepted(&activation))
@@ -6078,6 +7052,19 @@ impl AdminApi {
     /// Best effort: the intent record is durable, and this one exists so that
     /// the chain does not read as though an abandoned change took effect. If it
     /// cannot be written either, the refusal the caller returns is still true.
+    /// Hand an activated configuration's quotas — limits and queue classes —
+    /// to the admission controller.
+    ///
+    /// Without this a published quota changed nothing until the next restart
+    /// while the Policies screen reported it active. The controller
+    /// reconfigures its scopes in place (`AdmissionController::apply`), so
+    /// what each has admitted and spent carries over.
+    fn apply_admission(&self, plan: &hypellm_core::admission::AdmissionPlan) {
+        if let Some(admission) = self.state.admission.as_ref() {
+            admission.apply(plan);
+        }
+    }
+
     fn record_abandoned(&self, mut event: AuditEvent, why: &str) {
         event.timestamp_millis = self.state.clock.wall_millis();
         let event = event
@@ -6110,6 +7097,8 @@ struct Scenario {
     request: hypellm_core::canonical::CanonicalRequest,
 }
 
+/// The admission-queue class of every tenant and principal quota, keyed as
+/// `AdmissionController::set_class` keys them at startup.
 fn build_scenario(
     body: &Value,
     session: &Session,
@@ -6274,6 +7263,7 @@ fn visible_targets(
         tenant: &session.tenant,
         attempted: &attempted,
         now_millis: 0,
+        key: None,
     };
 
     let mut visible = std::collections::BTreeSet::new();
@@ -6741,6 +7731,198 @@ fn budget_route(path: &str) -> Option<(&str, bool)> {
         None => (rest.strip_suffix("/budget")?, false),
     };
     (!id.is_empty() && !id.contains('/') && id.len() <= 256).then_some((id, credit))
+}
+
+/// The key identifier in `/admin/v1/keys/{id}/expiry`, as written.
+fn expiry_route(path: &str) -> Option<&str> {
+    let id = path.strip_prefix("/admin/v1/keys/")?.strip_suffix("/expiry")?;
+    (!id.is_empty() && !id.contains('/') && id.len() <= 256).then_some(id)
+}
+
+fn restrictions_route(path: &str) -> Option<&str> {
+    let id = path.strip_prefix("/admin/v1/keys/")?.strip_suffix("/restrictions")?;
+    (!id.is_empty() && !id.contains('/') && id.len() <= 256).then_some(id)
+}
+
+/// A key's `ETag`: over what the expiry and restriction changes read and
+/// write.
+///
+/// One tag for both, so an expiry edit and a restriction edit made from two
+/// stale screens cannot each overwrite the other's view. `revoked` is in it so
+/// that a tag read before a revocation no longer matches after one, and the
+/// caller re-reads before deciding anything.
+fn key_etag(record: &hypellm_auth::KeyRecord) -> String {
+    let mut object = Object::new();
+    object.push("id", Value::from(record.id.as_str()));
+    object.push(
+        "expires_at",
+        record.expires_at_millis.map_or(Value::Null, Value::from),
+    );
+    object.push("revoked", Value::from(record.revoked));
+    object.push("restrictions", restrictions_value(&record.restrictions));
+    etag_for(&Value::Object(object))
+}
+
+/// A key restriction as the management API renders it: each field `null`
+/// when it narrows nothing, an array of identifiers or a class name when it
+/// does.
+fn restrictions_value(restriction: &hypellm_core::key_restriction::KeyRestriction) -> Value {
+    fn list<T: AsRef<str>>(items: Option<&std::collections::BTreeSet<T>>) -> Value {
+        items.map_or(Value::Null, |items| {
+            Value::Array(items.iter().map(|item| Value::from(item.as_ref())).collect())
+        })
+    }
+    let mut object = Object::new();
+    object.push("models", list(restriction.models.as_ref()));
+    object.push("targets", list(restriction.targets.as_ref()));
+    object.push("hosts", list(restriction.hosts.as_ref()));
+    object.push(
+        "priority",
+        restriction
+            .priority
+            .map_or(Value::Null, |class| Value::from(class.as_str())),
+    );
+    Value::Object(object)
+}
+
+/// For the audit reason: `*` for a field that narrows nothing.
+fn describe_restriction(restriction: &hypellm_core::key_restriction::KeyRestriction) -> String {
+    fn list<T: AsRef<str>>(items: Option<&std::collections::BTreeSet<T>>) -> String {
+        items.map_or_else(
+            || "*".to_owned(),
+            |items| {
+                let names: Vec<&str> = items.iter().map(AsRef::as_ref).collect();
+                format!("[{}]", names.join(","))
+            },
+        )
+    }
+    format!(
+        "models {}; targets {}; hosts {}; priority {}",
+        list(restriction.models.as_ref()),
+        list(restriction.targets.as_ref()),
+        list(restriction.hosts.as_ref()),
+        restriction.priority.map_or("inherit", |class| class.as_str()),
+    )
+}
+
+/// What a principal may use under the active configuration: the ceiling a
+/// key held by that principal is narrowed within.
+struct PrincipalCeiling {
+    /// Aliases the principal is granted for at least one operation.
+    models: Vec<hypellm_core::ids::AliasId>,
+    /// For each of those aliases, the targets its fleet grants let it be
+    /// served by, in alias order.
+    alias_targets: Vec<(hypellm_core::ids::AliasId, Vec<TargetId>)>,
+    /// Every target in `alias_targets`.
+    targets: std::collections::BTreeSet<TargetId>,
+    /// The fleet slaves those targets are placed on.
+    hosts: std::collections::BTreeSet<hypellm_core::ids::HostId>,
+    /// The principal's admission class: its own quota's, else its tenant's,
+    /// else `standard` — the order `AdmissionController::class_for` uses.
+    class: hypellm_core::admission::PriorityClass,
+}
+
+fn principal_ceiling(
+    config: &ValidatedConfig,
+    principal: &PrincipalId,
+    tenant: &TenantId,
+) -> PrincipalCeiling {
+    let snapshot = &config.snapshot;
+    let groups: Vec<hypellm_core::ids::GroupId> = config
+        .groups
+        .iter()
+        .filter(|group| group.tenant == *tenant && group.members.contains(principal))
+        .map(|group| group.id.clone())
+        .collect();
+    let context = RoutingContext {
+        principal,
+        groups: &groups,
+        tenant,
+        attempted: &[],
+        now_millis: 0,
+        key: None,
+    };
+    let mut ceiling = PrincipalCeiling {
+        models: Vec::new(),
+        alias_targets: Vec::new(),
+        targets: std::collections::BTreeSet::new(),
+        hosts: std::collections::BTreeSet::new(),
+        class: hypellm_core::admission::PriorityClass::Standard,
+    };
+    for alias in snapshot.aliases.values() {
+        let granted = hypellm_core::canonical::Operation::all()
+            .iter()
+            .any(|operation| snapshot.authorizes(&context, &alias.id, *operation));
+        if !granted {
+            continue;
+        }
+        let targets: Vec<TargetId> = alias
+            .permitted_targets
+            .iter()
+            .filter(|target| snapshot.fleet_access_permits(&context, &alias.id, target))
+            .cloned()
+            .collect();
+        for target in &targets {
+            if let Some(host) = snapshot.fleet_placement.get(target) {
+                ceiling.hosts.insert(host.clone());
+            }
+            ceiling.targets.insert(target.clone());
+        }
+        ceiling.models.push(alias.id.clone());
+        ceiling.alias_targets.push((alias.id.clone(), targets));
+    }
+    let classes = config.admission_plan().classes;
+    ceiling.class = classes
+        .get(&format!("principal:{principal}"))
+        .or_else(|| classes.get(&format!("tenant:{tenant}")))
+        .copied()
+        .unwrap_or_default();
+    ceiling
+}
+
+/// Read one allowlist field of a restriction body.
+///
+/// `null` is "narrow nothing". An array must be non-empty: a list that allows
+/// nothing is a key that can do nothing, and the way to say that is to revoke
+/// it. Entries the router does not recognise are refused by position, never
+/// echoed — an unrecognised value is as likely a pasted secret as a typo.
+fn restriction_list<T: Ord>(
+    body: &Value,
+    field: &str,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Result<Option<std::collections::BTreeSet<T>>, ApiError> {
+    let invalid = |detail: String| ApiError::new(ApiErrorCode::ValidationFailed, detail);
+    match body.get(field) {
+        None => Err(ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            format!(
+                "a restriction change requires '{field}': a list, or null to narrow nothing"
+            ),
+        )),
+        Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => {
+            if items.is_empty() {
+                return Err(invalid(format!(
+                    "'{field}' is empty, which would allow nothing; to stop a key working,                      revoke it"
+                )));
+            }
+            if items.len() > hypellm_core::key_restriction::MAX_RESTRICTION_ENTRIES {
+                return Err(invalid(format!(
+                    "'{field}' may hold at most {} entries",
+                    hypellm_core::key_restriction::MAX_RESTRICTION_ENTRIES
+                )));
+            }
+            let mut set = std::collections::BTreeSet::new();
+            for (index, item) in items.iter().enumerate() {
+                let parsed = item.as_str().and_then(&parse).ok_or_else(|| {
+                    invalid(format!("'{field}' entry {index} is not a valid identifier"))
+                })?;
+                set.insert(parsed);
+            }
+            Ok(Some(set))
+        }
+        Some(_) => Err(invalid(format!("'{field}' must be a list or null"))),
+    }
 }
 
 fn suffix(path: &str, prefix: &str) -> Result<String, ApiError> {

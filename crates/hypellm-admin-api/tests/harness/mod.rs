@@ -819,7 +819,7 @@ impl Harness {
 
     /// A break-glass administrator in tenant A.
     ///
-    /// The only role carrying `ManageKeys`, so the key endpoints need one
+    /// One of the two roles carrying `ManageKeys` (with `key_manager`), so the key endpoints need one
     /// (specification 9.3).
     #[must_use]
     pub fn break_glass(&self) -> TestSession {
@@ -1324,6 +1324,7 @@ impl HarnessBuilder {
         let (store, recovery) =
             Store::open(dir.path(), b"harness-store-mac-key", 0).expect("open the store");
         let store = Arc::new(store);
+        let enrollment_store = Arc::clone(&store);
         let (budgets, _) = hypellm_admin_api::budget::restore(
             &store,
             &recovery,
@@ -1423,6 +1424,9 @@ impl HarnessBuilder {
                 }
                 slot
             },
+            enrollments: Arc::new(hypellm_fleet::enroll::EnrollmentRegistry::new(Arc::new(
+                hypellm_admin_api::enroll::StoreJournal::new(Arc::clone(&enrollment_store)),
+            ))),
         });
 
         Harness {

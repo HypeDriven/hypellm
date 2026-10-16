@@ -110,6 +110,31 @@ pub enum RecordKind {
     ///
     /// Last frame per key wins on replay; receipts accumulate.
     KeyBudget,
+    /// One slave enrollment (specification 26.8): the token's digest, the
+    /// slave's registration, and the administrator's decision.
+    ///
+    /// Last frame per enrollment id wins on replay.
+    FleetEnrollment,
+    /// The image ID the router learned and keeps for an artifact whose
+    /// configuration pins none (specification 26.12).
+    ///
+    /// First frame per artifact wins on replay: the first verified
+    /// observation is the trust anchor, and a later frame must not be able to
+    /// move it.
+    ArtifactChecksum,
+    /// A change to one API key's expiry: the key identifier and the new
+    /// expiry, nothing else.
+    ///
+    /// Applied in sequence with [`Self::ApiKey`] and [`Self::ApiKeyRevocation`]
+    /// on replay. It is not a re-appended key record, because a full record
+    /// carries `revoked` and one written while a revocation raced it would
+    /// un-revoke the key when replayed.
+    ApiKeyExpiry,
+    /// A change to one API key's restrictions — the aliases, targets, slaves
+    /// and admission class it is narrowed to — replacing the previous ones
+    /// whole. Applied in sequence on replay, and not a re-appended key record,
+    /// for the reason [`Self::ApiKeyExpiry`] is not.
+    ApiKeyRestriction,
     /// An unrecognised kind, preserved so that a newer writer's records survive
     /// a rollback to an older reader rather than being dropped.
     Unknown(u16),
@@ -136,6 +161,10 @@ impl RecordKind {
             Self::FleetFlap => 14,
             Self::AnonymousAccess => 15,
             Self::KeyBudget => 16,
+            Self::FleetEnrollment => 17,
+            Self::ArtifactChecksum => 18,
+            Self::ApiKeyExpiry => 19,
+            Self::ApiKeyRestriction => 20,
             Self::Unknown(v) => v,
         }
     }
@@ -160,6 +189,10 @@ impl RecordKind {
             14 => Self::FleetFlap,
             15 => Self::AnonymousAccess,
             16 => Self::KeyBudget,
+            17 => Self::FleetEnrollment,
+            18 => Self::ArtifactChecksum,
+            19 => Self::ApiKeyExpiry,
+            20 => Self::ApiKeyRestriction,
             other => Self::Unknown(other),
         }
     }
@@ -202,6 +235,23 @@ impl RecordKind {
                 // A purchased allowance. An unprotected record could be
                 // rewritten on disk to raise a limit or forget consumption.
                 | Self::KeyBudget
+                // An approval is what lets the agent add a host to its
+                // allowlist. An unprotected record could be appended on disk
+                // to approve a machine nobody reviewed, or to pin a host key
+                // the slave never presented.
+                | Self::FleetEnrollment
+                // The checksum every copied image is verified against. An
+                // unprotected record could be appended on disk to make a
+                // tampered image the one the fleet trusts.
+                | Self::ArtifactChecksum
+                // Extending an expiry keeps a credential alive. An unprotected
+                // record could be appended on disk to un-expire a key nobody
+                // chose to extend.
+                | Self::ApiKeyExpiry
+                // Lifting a restriction widens what a credential reaches. An
+                // unprotected record could be appended on disk to un-narrow a
+                // key somebody narrowed deliberately.
+                | Self::ApiKeyRestriction
         )
     }
 
@@ -225,6 +275,10 @@ impl RecordKind {
             Self::FleetFlap => "fleet_flap",
             Self::AnonymousAccess => "anonymous_access",
             Self::KeyBudget => "key_budget",
+            Self::FleetEnrollment => "fleet_enrollment",
+            Self::ArtifactChecksum => "artifact_checksum",
+            Self::ApiKeyExpiry => "api_key_expiry",
+            Self::ApiKeyRestriction => "api_key_restriction",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -249,6 +303,10 @@ impl RecordKind {
             Self::FleetFlap,
             Self::AnonymousAccess,
             Self::KeyBudget,
+            Self::FleetEnrollment,
+            Self::ArtifactChecksum,
+            Self::ApiKeyExpiry,
+            Self::ApiKeyRestriction,
         ]
     }
 }
@@ -717,9 +775,13 @@ mod tests {
             RecordKind::AuditCheckpoint,
             RecordKind::ApiKey,
             RecordKind::ApiKeyRevocation,
+            RecordKind::ApiKeyExpiry,
+            RecordKind::ApiKeyRestriction,
             RecordKind::CredentialMeta,
             RecordKind::Session,
             RecordKind::KeyBudget,
+            RecordKind::FleetEnrollment,
+            RecordKind::ArtifactChecksum,
         ] {
             assert!(kind.is_protected(), "{kind:?} must be protected");
         }

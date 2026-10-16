@@ -37,6 +37,8 @@ import {
   toolbar,
 } from '../components/layout.js';
 import { card, grid, pageHeader, render, stat, table } from '../components/table.js';
+import { accessPanel } from './fleet-access.js';
+import { enrollmentPanel } from './fleet-enroll.js';
 import { machinesPanel } from './fleet-machines.js';
 
 /** Screen metadata, read by the shell to build navigation. */
@@ -112,6 +114,60 @@ function memoryBar(used, capacity) {
 }
 
 /**
+ * Requests queued or parked for a deployment's model (specification 26.10).
+ *
+ * A whole-fleet figure: the demand waiting for this model, from every tenant.
+ */
+function waitingCell(deployment) {
+  const waiting = Number(deployment.waiting || 0);
+  return waiting > 0 ? pill(`${formatCount(waiting)} waiting`, 'warn') : '—';
+}
+
+/**
+ * How long the deployment has gone unused, against when it would be stopped.
+ *
+ * Nothing is inferred: with no idle window the cell says so, and a model that
+ * has never served reads as such rather than as a number.
+ */
+function idleCell(deployment) {
+  const idle = deployment.idle_ms === null || deployment.idle_ms === undefined
+    ? 'never used'
+    : formatDuration(Number(deployment.idle_ms));
+  if (deployment.idle_stop_ms === null || deployment.idle_stop_ms === undefined) {
+    return `${idle} · never stopped`;
+  }
+  return `${idle} · stops after ${formatDuration(Number(deployment.idle_stop_ms))}`;
+}
+
+/** What each scheduling reason means, in the operator's words (specification 26.11). */
+const NEXT_REASONS = {
+  ranked: 'most waiting demand per second of load',
+  starving: 'waited past the reordering bound',
+  uncontended: 'the only model waiting',
+  arrival_order: 'reordering off; oldest first',
+};
+
+/**
+ * The line saying what this host would load next, or nothing when no model the
+ * caller can see is waiting for it.
+ *
+ * @param {object} host
+ * @returns {HTMLElement|null}
+ */
+function nextActivation(host) {
+  const next = host.next_activation;
+  if (!next) {
+    return null;
+  }
+  const why = NEXT_REASONS[next.reason] || next.reason;
+  return el('p', { class: 'muted' }, [
+    'Next to load: ',
+    el('strong', { text: next.deployment }),
+    ` — ${formatCount(next.waiting)} waiting for ${formatDuration(Number(next.waited_ms))} (${why})`,
+  ]);
+}
+
+/**
  * The freshness line.
  *
  * @param {object} fleet
@@ -169,7 +225,9 @@ export async function mount(container, ctx) {
             'agent, hosts and deployments below — or in the configuration file — and enable ' +
             'orchestration.',
         ),
+        enrollmentPanel(ctx),
         machinesPanel(ctx, null),
+        accessPanel(ctx),
       ],
     );
     return () => {
@@ -192,7 +250,9 @@ export async function mount(container, ctx) {
     confirmBox,
     body,
     // Outside `body`, so a refresh does not discard a half-filled form.
+    enrollmentPanel(ctx),
     machinesPanel(ctx, fleet),
+    accessPanel(ctx),
   ]);
   paint();
 
@@ -271,8 +331,9 @@ export async function mount(container, ctx) {
             ),
             host.reachable === false ? pill('unreachable', 'bad') : null,
           ].filter(Boolean)),
+          nextActivation(host),
           ...accelerators,
-        ]),
+        ].filter(Boolean)),
       );
     });
 
@@ -305,13 +366,56 @@ export async function mount(container, ctx) {
           : '—',
         deployment.pinned ? pill('pinned', 'warn') : deployment.evictable ? 'yes' : 'no',
         deployment.router_owned ? 'router' : 'adopted',
+        waitingCell(deployment),
+        idleCell(deployment),
         el('div', { class: 'panel__actions' }, controls),
       ];
     });
 
+    const mayTransfer = (ctx.session.permissions || []).includes('fleet_fetch');
+    const artifactRows = [];
+    for (const artifact of fleet.artifacts || []) {
+      const placed = new Map((artifact.placements || []).map((p) => [p.host, p]));
+      const source = (artifact.placements || []).find((p) => p.state === 'verified');
+      for (const host of fleet.hosts || []) {
+        if (host.arch !== artifact.arch) continue;
+        const placement = placed.get(host.id);
+        const state = placement ? placement.state : 'absent';
+        const controls = [];
+        if (mayTransfer && source && state !== 'verified' && artifact.checksum) {
+          controls.push(
+            actionButton('Copy here', () => copy(artifact, source.host, host.id), {
+              tone: 'quiet',
+              title: `Relay the image from ${source.host} through the fleet agent, verified ` +
+                'against the kept checksum before it is loaded.',
+            }),
+          );
+        }
+        artifactRows.push([
+          artifact.id,
+          host.id,
+          pill(state, state === 'verified' ? 'good' : state === 'tampered' ? 'bad' : 'neutral'),
+          placement && placement.image_id ? placement.image_id.slice(0, 19) : '—',
+          el('div', { class: 'panel__actions' }, controls),
+        ]);
+      }
+    }
+    const artifactHeadings = ['Artifact', 'Host', 'State', 'Image ID', 'Actions'];
+    const artifactColumns = artifactHeadings.map((label, index) => ({
+      label,
+      cell: (row) => row[index],
+    }));
+    const checksums = (fleet.artifacts || []).map((artifact) =>
+      el('p', {
+        text: artifact.checksum
+          ? `${artifact.id}: kept ${artifact.checksum.slice(0, 19)}… (${artifact.checksum_source})`
+          : `${artifact.id}: no checksum kept yet, so it cannot be copied between hosts.`,
+      }),
+    );
+
     // `table` takes column objects and row objects; each row here is the list
     // of cells, so column `i` renders cell `i`.
-    const headings = ['Deployment', 'Target', 'State', 'Memory', 'Resident for', 'Evictable', 'Owner', 'Actions'];
+    const headings = ['Deployment', 'Target', 'State', 'Memory', 'Resident for', 'Evictable', 'Owner', 'Waiting', 'Idle', 'Actions'];
     const columns = headings.map((label, index) => ({ label, cell: (row) => row[index] }));
 
     render(body, [
@@ -332,7 +436,50 @@ export async function mount(container, ctx) {
           empty: 'No deployments are declared.',
         }),
       }),
+      panel({
+        title: 'Images',
+        note:
+          'Each image is held to one checksum: pinned in the configuration, or learned from ' +
+          'the first host whose copy matched its registry digest. A host reporting anything ' +
+          'else is marked tampered and is never started with that image or copied from.',
+        content: el('div', { class: 'policy-stack' }, [
+          ...checksums,
+          table({
+            caption: 'Images on hosts',
+            columns: artifactColumns,
+            rows: artifactRows,
+            empty: 'No deployment you can see uses a declared image.',
+          }),
+        ]),
+      }),
     ]);
+  }
+
+  function copy(artifact, from, to) {
+    const prompt = confirmPrompt({
+      message: `Copy ${artifact.id} from ${from} to ${to}?`,
+      detail:
+        'The fleet agent saves the image on the source, hashes every layer against the kept ' +
+        'checksum, and loads a rebuilt archive on the destination only if all of it matches. ' +
+        'It uses disk on both machines and the agent machine while it runs.',
+      confirmLabel: 'Copy it',
+      onConfirm: async () => {
+        dismiss();
+        try {
+          await ctx.api.post(`/fleet/artifacts/${encodeURIComponent(artifact.id)}:copy`, {
+            from,
+            to,
+          });
+          ctx.notify('good', `Copying ${artifact.id} to ${to}.`);
+        } catch (error) {
+          ctx.notify('bad', error instanceof ApiError ? error.message : String(error));
+        }
+        await reload();
+      },
+      onCancel: dismiss,
+    });
+    confirmBox.hidden = false;
+    render(confirmBox, [prompt]);
   }
 
   function act(deployment) {

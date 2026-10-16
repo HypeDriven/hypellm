@@ -26,7 +26,9 @@
 //! The stored value is `HMAC(server_key, secret)`, not the secret. A database
 //! disclosure yields verifier values that cannot be replayed as keys.
 
-use hypellm_core::ids::{KeyId, PrincipalId, TenantId};
+use hypellm_core::admission::PriorityClass;
+use hypellm_core::ids::{AliasId, HostId, KeyId, PrincipalId, TargetId, TenantId};
+use hypellm_core::key_restriction::{KeyRestriction, MAX_RESTRICTION_ENTRIES};
 use hypellm_crypto::{Digest, base64, ct, hex, hmac_sha256_parts, random};
 use core::fmt;
 use std::collections::BTreeMap;
@@ -194,6 +196,13 @@ pub struct KeyRecord {
     /// it. Separation-of-duty checks compare both, so a person who mints a key
     /// for another principal does not thereby become a second approver.
     pub created_by: Option<PrincipalId>,
+    /// The key's narrowing of its principal's access.
+    ///
+    /// Not part of [`Self::to_payload`]: it is changed only by a
+    /// [`RestrictionChange`], which is its own durable record for the reason
+    /// [`ExpiryChange`] is. A key record always decodes unrestricted, and the
+    /// restriction frames that follow it in the log narrow it again.
+    pub restrictions: KeyRestriction,
 }
 
 impl KeyRecord {
@@ -208,6 +217,137 @@ impl KeyRecord {
     pub fn is_expired(&self, now_wall_millis: u64) -> bool {
         self.expires_at_millis
             .is_some_and(|e| now_wall_millis >= e)
+    }
+}
+
+/// A change to one key's expiry, as the durable log carries it.
+///
+/// A record of its own rather than a re-appended [`KeyRecord`]: a full record
+/// carries `revoked`, so one written by an expiry change that raced a
+/// revocation would, on replay, un-revoke the key. This carries the expiry and
+/// nothing else, so replaying it can never touch anything but the expiry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpiryChange {
+    /// The key whose expiry changed.
+    pub id: KeyId,
+    /// The new wall-clock expiry in milliseconds; `None` for no expiry.
+    pub expires_at_millis: Option<u64>,
+}
+
+impl ExpiryChange {
+    /// Encode for the durable log.
+    #[must_use]
+    pub fn to_payload(&self) -> Vec<u8> {
+        let mut object = wire_json::Object::new();
+        object.push("id", wire_json::Value::from(self.id.as_str()));
+        object.push(
+            "expires_at_millis",
+            self.expires_at_millis
+                .map_or(wire_json::Value::Null, wire_json::Value::from),
+        );
+        wire_json::to_string(&wire_json::Value::Object(object)).into_bytes()
+    }
+
+    /// Decode a change recovered from the durable log.
+    ///
+    /// `expires_at_millis` must be present, as a number or `null`. An absent
+    /// or unreadable field is a damaged record and decodes as `None`, not as
+    /// "no expiry": removing a key's expiry is the direction not to guess in.
+    #[must_use]
+    pub fn from_payload(payload: &[u8]) -> Option<Self> {
+        let value = wire_json::parse(payload, &wire_json::Limits::SMALL).ok()?;
+        let expires_at_millis = match value.get("expires_at_millis")? {
+            wire_json::Value::Null => None,
+            other => Some(other.as_u64()?),
+        };
+        Some(Self {
+            id: KeyId::new(value.get("id")?.as_str()?).ok()?,
+            expires_at_millis,
+        })
+    }
+}
+
+/// A change to one key's restrictions, as the durable log carries it.
+///
+/// Its own record, never a re-appended [`KeyRecord`], for the reason
+/// [`ExpiryChange`] is: a full record carries `revoked`, and one that raced a
+/// revocation would un-revoke the key on replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestrictionChange {
+    /// The key whose restrictions changed.
+    pub id: KeyId,
+    /// The restrictions it now has, replacing the previous ones whole.
+    pub restrictions: KeyRestriction,
+}
+
+impl RestrictionChange {
+    /// Encode for the durable log. Every field is written, `null` when absent.
+    #[must_use]
+    pub fn to_payload(&self) -> Vec<u8> {
+        fn list<T: AsRef<str>>(items: Option<&std::collections::BTreeSet<T>>) -> wire_json::Value {
+            items.map_or(wire_json::Value::Null, |items| {
+                wire_json::Value::Array(
+                    items.iter().map(|item| wire_json::Value::from(item.as_ref())).collect(),
+                )
+            })
+        }
+        let r = &self.restrictions;
+        let mut object = wire_json::Object::new();
+        object.push("id", wire_json::Value::from(self.id.as_str()));
+        object.push("models", list(r.models.as_ref()));
+        object.push("targets", list(r.targets.as_ref()));
+        object.push("hosts", list(r.hosts.as_ref()));
+        object.push(
+            "priority",
+            r.priority
+                .map_or(wire_json::Value::Null, |class| wire_json::Value::from(class.as_str())),
+        );
+        wire_json::to_string(&wire_json::Value::Object(object)).into_bytes()
+    }
+
+    /// Decode a change recovered from the durable log.
+    ///
+    /// All four fields must be present, each as `null` or a well-formed value.
+    /// Anything else decodes as `None` — the frame is damaged and changes
+    /// nothing — and never as an unrestricted key: lifting a restriction is
+    /// the direction not to guess in.
+    #[must_use]
+    pub fn from_payload(payload: &[u8]) -> Option<Self> {
+        fn list<T: Ord>(
+            value: &wire_json::Value,
+            parse: impl Fn(&str) -> Option<T>,
+        ) -> Option<Option<std::collections::BTreeSet<T>>> {
+            match value {
+                wire_json::Value::Null => Some(None),
+                wire_json::Value::Array(items) => {
+                    if items.is_empty() || items.len() > MAX_RESTRICTION_ENTRIES {
+                        return None;
+                    }
+                    let set = items
+                        .iter()
+                        .map(|item| item.as_str().and_then(&parse))
+                        .collect::<Option<std::collections::BTreeSet<T>>>()?;
+                    // A duplicate would have collapsed; a record whose list
+                    // shrank on reading is not the one that was written.
+                    (set.len() == items.len()).then_some(Some(set))
+                }
+                _ => None,
+            }
+        }
+        let value = wire_json::parse(payload, &wire_json::Limits::SMALL).ok()?;
+        let priority = match value.get("priority")? {
+            wire_json::Value::Null => None,
+            other => Some(PriorityClass::parse(other.as_str()?)?),
+        };
+        Some(Self {
+            id: KeyId::new(value.get("id")?.as_str()?).ok()?,
+            restrictions: KeyRestriction {
+                models: list(value.get("models")?, |s| AliasId::new(s).ok())?,
+                targets: list(value.get("targets")?, |s| TargetId::new(s).ok())?,
+                hosts: list(value.get("hosts")?, |s| HostId::new(s).ok())?,
+                priority,
+            },
+        })
     }
 }
 
@@ -294,6 +434,7 @@ impl KeyRecord {
                 None | Some(wire_json::Value::Null) => None,
                 Some(v) => Some(PrincipalId::new(v.as_str()?).ok()?),
             },
+            restrictions: KeyRestriction::default(),
         })
     }
 }
@@ -564,6 +705,41 @@ impl KeyStore {
         }
     }
 
+    /// Replace a key's expiry. `None` means the key never expires.
+    ///
+    /// Touches the expiry alone: a revoked key stays revoked, because
+    /// [`Self::verify`] refuses revocation before it looks at expiry. Returns
+    /// whether the key exists.
+    pub fn set_expiry(&self, id: &KeyId, expires_at_millis: Option<u64>) -> bool {
+        match self.records.write() {
+            Ok(mut map) => match map.get_mut(id) {
+                Some(record) => {
+                    record.expires_at_millis = expires_at_millis;
+                    true
+                }
+                None => false,
+            },
+            Err(_) => false,
+        }
+    }
+
+    /// Replace a key's restrictions whole.
+    ///
+    /// Touches the restrictions alone, so a revoked key stays revoked. Returns
+    /// whether the key exists.
+    pub fn set_restrictions(&self, id: &KeyId, restrictions: KeyRestriction) -> bool {
+        match self.records.write() {
+            Ok(mut map) => match map.get_mut(id) {
+                Some(record) => {
+                    record.restrictions = restrictions;
+                    true
+                }
+                None => false,
+            },
+            Err(_) => false,
+        }
+    }
+
     /// Create a new key.
     ///
     /// # Errors
@@ -630,6 +806,7 @@ impl KeyStore {
             description,
             revoked: false,
             created_by,
+            restrictions: KeyRestriction::default(),
         };
         self.insert(record.clone());
 
@@ -828,6 +1005,92 @@ mod tests {
 
         let decoded = KeyRecord::from_payload(&record.to_payload()).expect("decodes");
         assert!(decoded.revoked, "a revocation must survive a restart");
+    }
+
+    #[test]
+    fn an_expiry_change_moves_the_expiry_and_leaves_a_revocation_alone() {
+        let store = store();
+        let id = create(&store).id().clone();
+        assert!(store.set_expiry(&id, Some(42)));
+        assert_eq!(store.get(&id).expect("record").expires_at_millis, Some(42));
+        assert!(store.set_expiry(&id, None));
+        assert_eq!(store.get(&id).expect("record").expires_at_millis, None);
+
+        assert!(store.revoke(&id));
+        assert!(store.set_expiry(&id, Some(u64::MAX)));
+        assert!(store.get(&id).expect("record").revoked, "an expiry change must not un-revoke");
+        assert!(!store.set_expiry(&KeyId::new("00000000deadbeef").unwrap(), None));
+    }
+
+    #[test]
+    fn an_expiry_change_round_trips_and_a_damaged_one_does_not_mean_no_expiry() {
+        let id = KeyId::new("0123456789abcdef").unwrap();
+        for expires_at_millis in [None, Some(0), Some(1_700_000_000_000)] {
+            let change = ExpiryChange { id: id.clone(), expires_at_millis };
+            assert_eq!(ExpiryChange::from_payload(&change.to_payload()), Some(change));
+        }
+        // Absent is damage, not "never expires".
+        assert!(ExpiryChange::from_payload(br#"{"id":"0123456789abcdef"}"#).is_none());
+        assert!(
+            ExpiryChange::from_payload(br#"{"id":"0123456789abcdef","expires_at_millis":"soon"}"#)
+                .is_none()
+        );
+        assert!(ExpiryChange::from_payload(br#"{"expires_at_millis":null}"#).is_none());
+        assert!(ExpiryChange::from_payload(b"not json").is_none());
+    }
+
+    #[test]
+    fn a_restriction_change_narrows_and_leaves_a_revocation_alone() {
+        let store = store();
+        let id = create(&store).id().clone();
+        let narrowed = KeyRestriction {
+            models: Some([AliasId::new("agent").unwrap()].into_iter().collect()),
+            priority: Some(PriorityClass::Batch),
+            ..KeyRestriction::default()
+        };
+        assert!(store.set_restrictions(&id, narrowed.clone()));
+        assert_eq!(store.get(&id).expect("record").restrictions, narrowed);
+
+        assert!(store.revoke(&id));
+        assert!(store.set_restrictions(&id, KeyRestriction::default()));
+        assert!(store.get(&id).expect("record").revoked, "a restriction change must not un-revoke");
+        assert!(!store.set_restrictions(&KeyId::new("00000000deadbeef").unwrap(), narrowed));
+    }
+
+    #[test]
+    fn a_restriction_change_round_trips_and_a_damaged_one_never_lifts_a_restriction() {
+        let id = KeyId::new("0123456789abcdef").unwrap();
+        let full = KeyRestriction {
+            models: Some([AliasId::new("agent").unwrap(), AliasId::new("chat").unwrap()].into_iter().collect()),
+            targets: Some([TargetId::new("spark:qwen").unwrap()].into_iter().collect()),
+            hosts: Some([HostId::new("spark-ef2f").unwrap()].into_iter().collect()),
+            priority: Some(PriorityClass::Standard),
+        };
+        for restrictions in [KeyRestriction::default(), full] {
+            let change = RestrictionChange { id: id.clone(), restrictions };
+            assert_eq!(RestrictionChange::from_payload(&change.to_payload()), Some(change));
+        }
+
+        // Every one of these would be "unrestricted" if a missing or
+        // unreadable field were read as absent. Each must change nothing.
+        let damaged: [&[u8]; 9] = [
+            br#"{"id":"0123456789abcdef","targets":null,"hosts":null,"priority":null}"#,
+            br#"{"id":"0123456789abcdef","models":"agent","targets":null,"hosts":null,"priority":null}"#,
+            br#"{"id":"0123456789abcdef","models":[],"targets":null,"hosts":null,"priority":null}"#,
+            br#"{"id":"0123456789abcdef","models":[7],"targets":null,"hosts":null,"priority":null}"#,
+            br#"{"id":"0123456789abcdef","models":["a","a"],"targets":null,"hosts":null,"priority":null}"#,
+            br#"{"id":"0123456789abcdef","models":null,"targets":null,"hosts":null,"priority":"urgent"}"#,
+            br#"{"id":"0123456789abcdef","models":null,"targets":null,"hosts":null}"#,
+            br#"{"models":null,"targets":null,"hosts":null,"priority":null}"#,
+            b"not json",
+        ];
+        for payload in damaged {
+            assert!(
+                RestrictionChange::from_payload(payload).is_none(),
+                "{}",
+                String::from_utf8_lossy(payload)
+            );
+        }
     }
 
     #[test]

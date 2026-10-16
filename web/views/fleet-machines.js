@@ -80,6 +80,8 @@ const FIELDS = {
     { name: 'reactivation_cooldown_ms', label: 'Reactivation cooldown (ms)', type: 'number' },
     { name: 'activation_max_wait_ms', label: 'Max activation wait (ms)', type: 'number' },
     { name: 'prewarm_min_rate_per_minute', label: 'Prewarm rate (per minute)', type: 'number' },
+    { name: 'idle_stop_ms', label: 'Stop idle models after (ms)', type: 'number', hint: '0 never stops an idle model; otherwise at least 60000. Default 900000 (15 minutes).' },
+    { name: 'max_reorder_wait_ms', label: 'Max reordering delay (ms)', type: 'number', hint: 'How long waiting work may be put behind work for a loaded model. 0 is arrival order; otherwise 5000 to 3600000. Default 120000.' },
     { name: 'allow_fetch', label: 'Allow artifact fetch', type: 'bool' },
     { name: 'adopt_unmanaged', label: 'Evict adopted models', type: 'bool' },
   ],
@@ -275,12 +277,17 @@ function agentEntry(host, records) {
     }
   }
 
+  // Specification 26.12: the agent creates each container from a `run`
+  // template, with its state under the host's data directory, so nothing has
+  // to be created by hand on the slave. An enrolled host's agent entry already
+  // carries the data directory it registered; a hand-written one names it here.
+  const portNumber = Number(port) || 8080;
   const entry = {
     host: {
       id: host.id,
       arch: host.arch,
       ssh: `hypellm@${machine}`,
-      disk_path: '/',
+      data_dir: '/home/hypellm/.hypellm',
       max_activations_per_hour: Number(policy?.max_activations_per_hour || 6),
       accelerators: accelerators.map((a, index) => ({ id: a.id, index })),
     },
@@ -288,13 +295,28 @@ function agentEntry(host, records) {
       id: d.id,
       host: host.id,
       accelerator: d.accelerator,
-      container: 'CONTAINER',
-      start: ['docker', 'start', 'CONTAINER'],
-      stop: ['docker', 'stop', '--timeout', '30', 'CONTAINER'],
+      run: {
+        image: d.artifact || 'ARTIFACT',
+        ports: [{ bind: /^[0-9.]+$/.test(machine) ? machine : '127.0.0.1', host: portNumber, container: portNumber }],
+        args: [],
+        env: [],
+        state_path: '/state',
+      },
       // Assembled, not written as a URL literal: depscan's first-party rule
       // reads any scheme-prefixed string in the application as a remote fetch.
-      probe: ['curl', '-fsS', '--max-time', '5', ['http:', '', `127.0.0.1:${port}`, 'v1', 'models'].join('/')],
+      probe: ['curl', '-fsS', '--max-time', '5', ['http:', '', `127.0.0.1:${portNumber}`, 'v1', 'models'].join('/')],
     })),
+    // The images the templates name. `image` is the reference on the host;
+    // `image_id`, when the router's record pins one, is what a copy must hash to.
+    artifacts: recordsOf(records, 'artifact')
+      .filter((a) => deployments.some((d) => d.artifact === a.id))
+      .map((a) => ({
+        id: a.id,
+        arch: a.arch,
+        digest: a.digest,
+        image: 'IMAGE_REFERENCE',
+        ...(a.image_id ? { image_id: a.image_id } : {}),
+      })),
   };
   return JSON.stringify(entry, null, 2);
 }
