@@ -114,6 +114,11 @@ It owns the authorization gate for management actions and five bounded
 in-memory views (<code>DecisionCache</code>, <code>AuditIndex</code>, <code>UsageAggregate</code>,
 <code>TrafficWindow</code>, <code>DraftStore</code>) that the admin screens of specification 15.3
 read.</p>
+<p>Publication and rollback are checked against the active configuration's ETag. Both
+<code>GET /admin/v1/policies/active</code> (<code>EditPolicy</code>) and the drafts listing
+<code>GET /admin/v1/policies</code> (<code>SimulatePolicy</code> or <code>EditPolicy</code>) carry it,
+so an approver, who holds no <code>EditPolicy</code>, can publish against the tag it read and
+a concurrent publication is refused with 412 rather than replaced.</p>
 <p>What it deliberately does <strong>not</strong> do is at least as important, because the crate
 sits at the point where an operator's browser meets the router's most privileged
 operations:</p>

@@ -1098,6 +1098,36 @@ fn publishing_without_an_if_match_is_refused_and_changes_nothing() {
 }
 
 #[test]
+fn an_approver_publishing_against_the_listed_tag_cannot_overwrite_a_concurrent_publication() {
+    // The approver role cannot read `/policies/active`, so the tag it can see
+    // is the one on the drafts listing. Two approvers read it, the first
+    // publishes, and the second's publication must then be refused rather than
+    // silently replacing what the first one activated.
+    let admin = Harness::new();
+    let editor = admin.policy_editor();
+    let first = admin.policy_approver();
+    let second = admin.session("user:approver-two", TENANT_A, &[hypellm_core::rbac::Role::PolicyApprover]);
+    let a = validated_draft(&admin, &editor, &amended_config());
+    let b = validated_draft(&admin, &editor, &amended_config());
+
+    let listed = admin.get(&second, "/admin/v1/policies");
+    assert_eq!(listed.status, 200, "{}", listed.body);
+    let tag = listed.expect_etag();
+
+    let published = admin.post_if_match(&first, &format!("/admin/v1/policies/{a}:publish"), "{}", &tag);
+    assert_eq!(published.status, 200, "{}", published.body);
+    let after_first = admin.config();
+
+    // A publication re-resolves sessions against the new configuration, so the
+    // second approver signs in again — still holding the tag read before it.
+    let second = admin.session("user:approver-two", TENANT_A, &[hypellm_core::rbac::Role::PolicyApprover]);
+    let refused = admin.post_if_match(&second, &format!("/admin/v1/policies/{b}:publish"), "{}", &tag);
+    assert_eq!(refused.status, 412, "{}", refused.body);
+    assert_eq!(admin.config().snapshot.version, after_first.snapshot.version);
+    assert_ne!(admin.get(&second, "/admin/v1/policies").expect_etag(), tag, "the listing must carry the new tag");
+}
+
+#[test]
 fn publishing_with_a_stale_if_match_is_refused_and_changes_nothing() {
     let admin = Harness::new();
     let editor = admin.policy_editor();

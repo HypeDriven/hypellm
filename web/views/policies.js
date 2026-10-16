@@ -135,6 +135,8 @@ export async function mount(container, ctx) {
   const state = {
     /** @type {object[]} The `data` of the last `GET /policies`. */
     drafts: [],
+    /** @type {string|null} The active configuration's ETag from that same read. */
+    activeEtag: null,
     /** @type {string|null} A message when that list could not be read. */
     listError: null,
     /** @type {string|null} The draft every action below operates on. */
@@ -197,8 +199,10 @@ export async function mount(container, ctx) {
   /** Read the drafts the router is holding. */
   async function loadDrafts() {
     try {
-      const { data } = await ctx.api.get('/policies');
+      const { data, etag } = await ctx.api.get('/policies');
       state.drafts = Array.isArray(data.data) ? data.data : [];
+      // The active configuration's tag: what a publication is checked against.
+      state.activeEtag = etag;
       state.listError = null;
     } catch (error) {
       if (isAbort(error)) {
@@ -784,15 +788,20 @@ export async function mount(container, ctx) {
     try {
       // Specification 15.4 requires `If-Match` on mutation, and the router
       // enforces it against a tag derived from the active configuration's
-      // version and digest. No read endpoint returns that tag today, so the
-      // only precondition this screen can honestly present is RFC 9110's `*`.
-      // It asserts that a configuration exists; it cannot detect a concurrent
-      // publication. The panel says so rather than implying a guard that is not
-      // there, and this becomes the tag that was read the moment the management
-      // API exposes one.
+      // version and digest. The drafts listing carries that tag, so this sends
+      // the one read with the list: a publication someone else made since is
+      // refused with 412 instead of being replaced. Without a tag nothing is
+      // sent, rather than falling back to `*`, which would guard nothing.
+      if (!state.activeEtag) {
+        state.publishError =
+          'The router did not say which configuration is active, so this screen cannot publish safely. Refresh the drafts and try again.';
+        publishStatus.textContent = 'Nothing was published.';
+        renderPublish();
+        return;
+      }
       const { data } = await ctx.api.request('POST', `/policies/${encodeURIComponent(id)}:publish`, {
         body: {},
-        ifMatch: '*',
+        ifMatch: state.activeEtag,
       });
       state.published = data;
       state.publishError = null;
@@ -814,7 +823,10 @@ export async function mount(container, ctx) {
       if (isAbort(error)) {
         return;
       }
-      state.publishError = problem(error);
+      state.publishError =
+        error instanceof ApiError && error.status === 412
+          ? 'Another publication changed the active configuration since this list was read, so this one was refused. Refresh the drafts, check the active version, and publish again if it is still wanted.'
+          : problem(error);
       publishStatus.textContent = 'The publication was refused. Nothing changed.';
     }
     renderPublish();
@@ -868,7 +880,7 @@ export async function mount(container, ctx) {
           confirmPrompt({
             message: `Publish draft ${id} and make it the active routing configuration.`,
             detail:
-              'Activation is atomic and takes effect for every request that starts after it; requests already in flight keep the configuration they began with. There is no rollback endpoint — returning to the previous configuration means submitting it again as a new draft and publishing that.',
+              'Activation is atomic and takes effect for every request that starts after it; requests already in flight keep the configuration they began with. To undo it, POST /admin/v1/policies:rollback restores the previous configuration as a new, audited activation; this screen does not offer that yet.',
             confirmLabel: 'Publish now',
             phrase: id,
             onConfirm: async () => {
@@ -901,7 +913,7 @@ export async function mount(container, ctx) {
       el('p', {
         class: 'field__hint',
         text:
-          'Publication is sent with the precondition If-Match: *. The management API does not yet return an entity tag for the active configuration, so this screen cannot detect a publication made by someone else in the meantime. Confirm the active version above before you continue.',
+          'Publication is checked against the active configuration as of the last time the drafts were listed. If someone else publishes in the meantime, the router refuses this one rather than replacing theirs.',
       }),
       state.published
         ? definitionList(
@@ -966,7 +978,7 @@ export async function mount(container, ctx) {
       title: 'Draft comparison and rollback',
       content: notAvailable(
         'Draft diff and rollback',
-        'A draft\'s configuration text is never returned by the management API, and the active configuration is not readable as text, so there is nothing this screen could honestly diff. There is likewise no rollback endpoint: an earlier configuration is restored by submitting it as a new draft and publishing that, which keeps every activation in the audit log.',
+        'A draft\'s configuration text is never returned by the management API, so there is nothing this screen could honestly diff against the active configuration (which GET /admin/v1/policies/active does return as text). Rollback exists in the API — POST /admin/v1/policies:rollback, with a recorded reason, as a new audited activation — but is not offered on this screen yet.',
       ),
     }),
   ]);

@@ -33,30 +33,6 @@ spec:
       enableServiceLinks: false
       # hypellm-init drains over the control socket on SIGTERM; the inference drain deadline is 30 s.
       terminationGracePeriodSeconds: 45
-      initContainers:
-        # docker/hypellm.conf binds management and metrics to 10.89.7.2, the Compose bridge address.
-        # Here that becomes the pod IP: reachable from the node's publisher, not bound on tailscale0.
-        - name: render-config
-          image: hypellm-router:local
-          imagePullPolicy: Never
-          command:
-            - /bin/sh
-            - -c
-            - |
-              sed "s/10\.89\.7\.2/$POD_IP/g" /src/hypellm.conf > /out/hypellm.conf
-              sed "s/10\.89\.7\.2/$POD_IP/g" /src/serve.json > /out/serve.json
-          env:
-            - name: POD_IP
-              valueFrom: {fieldRef: {fieldPath: status.podIP}}
-          securityContext:
-            runAsUser: 1000
-            runAsGroup: 1000
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities: {drop: [ALL]}
-          volumeMounts:
-            - {name: config-src, mountPath: /src, readOnly: true}
-            - {name: config, mountPath: /out}
       containers:
         - name: tailscale
           image: tailscale/tailscale:stable
@@ -80,7 +56,7 @@ spec:
             timeoutSeconds: 3
           volumeMounts:
             - {name: tailscale-state, mountPath: /var/lib/tailscale}
-            - {name: config, mountPath: /etc/tailscale/serve.json, subPath: serve.json, readOnly: true}
+            - {name: config-src, mountPath: /etc/tailscale/serve.json, subPath: serve.json, readOnly: true}
         - name: router
           image: hypellm-router:local
           imagePullPolicy: Never
@@ -106,7 +82,7 @@ spec:
             httpGet: {path: /health/live, port: 18000}
             periodSeconds: 3
           volumeMounts:
-            - {name: config, mountPath: /etc/hypellm/hypellm.conf, subPath: hypellm.conf, readOnly: true}
+            - {name: config-src, mountPath: /etc/hypellm/hypellm.conf, subPath: hypellm.conf, readOnly: true}
             - {name: secrets, mountPath: /etc/hypellm/secrets}
             - {name: state, mountPath: /var/lib/hypellm}
             - {name: verify, mountPath: /run/hypellm}
@@ -139,11 +115,35 @@ spec:
           volumeMounts:
             - {name: tls-helper, mountPath: /opt/hypellm-tls-helper, readOnly: true}
             - {name: tls-socket, mountPath: /run/hypellm-tls}
+        # Management and metrics bind 127.0.0.1 in docker/hypellm.conf, so the configuration names
+        # no pod address: a policy published through the management API snapshots that text, and a
+        # snapshot naming this pod's IP would fail to bind in the next pod. These relays put the two
+        # planes on the pod IP — for k8s/publish.yaml on the node — and nowhere else; neither the
+        # router nor a relay listens on tailscale0. The tailscale sidecar reaches the admin listener
+        # on loopback directly, since the pod has one network namespace.
+        - name: admin-relay
+          image: alpine/socat:1.8.0.3
+          args: ["TCP-LISTEN:18001,bind=$(POD_IP),fork,reuseaddr", "TCP:127.0.0.1:18001"]
+          env:
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+          securityContext: &relay-security
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+            seccompProfile: {type: RuntimeDefault}
+        - name: metrics-relay
+          image: alpine/socat:1.8.0.3
+          args: ["TCP-LISTEN:18002,bind=$(POD_IP),fork,reuseaddr", "TCP:127.0.0.1:18002"]
+          env:
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+          securityContext: *relay-security
       volumes:
         - name: config-src
           configMap: {name: hypellm-config}
-        - name: config
-          emptyDir: {}
         - name: tailscale-state
           hostPath: {path: "${PROJECT_DIR}/run/tailscale", type: Directory}
         - name: secrets

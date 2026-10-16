@@ -3868,7 +3868,14 @@ impl AdminApi {
                 Value::Object(object)
             })
             .collect();
-        Ok(ApiResponse::ok(&list_envelope(items, None)))
+        // The active configuration's tag, which publication and rollback are
+        // checked against. `GET /policies/active` also carries it but needs
+        // `EditPolicy`, which an approver lacks by design; without it here the
+        // one role that publishes could only send `If-Match: *`, and a second
+        // approver's publication in the meantime would be silently replaced.
+        let mut response = ApiResponse::ok(&list_envelope(items, None));
+        response.etag = Some(active_etag(&self.state.config()));
+        Ok(response)
     }
 
     /// Propose a new target, as a policy draft.

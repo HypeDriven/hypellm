@@ -410,6 +410,32 @@ down:
 # Graceful stop and start, picking up an edited docker/hypellm.conf.
 restart: down up
 
+# Once any policy has been published through the management API, the router
+# resumes the last published version on every start and ignores this file —
+# a reviewed policy must not vanish on a restart (spec/deployment.html,
+# "Startup"). This makes docker/hypellm.conf the active configuration again:
+# one start with `--adopt-config`, whose reason goes into the audit chain, then
+# the normal arguments back. Anything published since that is not also in the
+# file is replaced, so copy it into the file first.
+[doc('Make docker/hypellm.conf the active configuration again, with a recorded reason')]
+adopt reason:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ -n "{{reason}}" ] || { echo "a reason is required; it is recorded" >&2; exit 1; }
+    kstack apply {{ns}} >/dev/null
+    index=$({{kubectl}} get deploy/hypellm -o json | jq '[.spec.template.spec.containers[].name] | index("router")')
+    jq -nc --arg reason "{{reason}}" --argjson i "$index" \
+        '[{op:"add", path:"/spec/template/spec/containers/\($i)/args/-", value:"--adopt-config"},
+          {op:"add", path:"/spec/template/spec/containers/\($i)/args/-", value:$reason}]' \
+        | {{kubectl}} patch deploy/hypellm --type=json --patch-file=/dev/stdin >/dev/null
+    {{kubectl}} rollout status deploy/hypellm --timeout=180s
+    {{kubectl}} logs deploy/hypellm -c router | grep -m1 '"config.adopted_from_file"' \
+        || { echo "the router did not report adopting the file" >&2; exit 1; }
+    # Back to the manifest's arguments; this start resumes the adopted version.
+    kstack apply {{ns}} >/dev/null
+    {{kubectl}} rollout status deploy/hypellm --timeout=180s
+    just _wait
+
 # The router's log is line-delimited JSON; pipe through jq to read it:
 # `just logs | jq -c`. `just logs tailscale` follows the tailnet node instead,
 # which is where a login URL or a routing problem shows up; `just logs

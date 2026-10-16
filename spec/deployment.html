@@ -212,17 +212,22 @@ on it and a listener bound to a specific address does not. That is the whole
 control, it is visible in <code>netstat</code>, and it fails closed — unlike an ACL or a
 firewall rule maintained somewhere else.</p>
 <pre><code>settings inference_listen=0.0.0.0:18000 \
-         admin_listen=10.89.7.2:18001 \
-         metrics_listen=10.89.7.2:18002
+         admin_listen=127.0.0.1:18001 \
+         metrics_listen=127.0.0.1:18002
 </code></pre>
 <p>Here the inference plane is reachable over the overlay and the management and
-metrics planes are not, while all three stay reachable at the namespace's other
-addresses. Reaching a listener is not authenticating to it: inference still
+metrics planes are not. Bind to a stable address — loopback, or a fixed bridge
+address — rather than one that is only true of one container or pod: a policy
+published through the management API snapshots the configuration text, settings
+included, and the router resumes that snapshot on restart, so an address that
+changes with the pod would fail to bind in the next one. The worked example
+below relays the pod address to loopback with two in-pod socat containers, so the
+pod IP appears only in its manifest. Reaching a listener is not authenticating to it: inference still
 requires a router API key, and being on the tailnet grants nothing by itself.</p>
 <p>A plane bound off the overlay can still be published on it deliberately, by a
 proxy that runs in the same namespace. The worked example below serves the
 admin SPA this way: <code>tailscale serve</code> terminates TLS for the node's MagicDNS
-name and proxies to the bridge-bound management listener, so the listener stays
+name and proxies to the loopback-bound management listener, so the listener stays
 unbound on the overlay and the exposure is one reviewable file
 (<a href="../docker/tailscale-serve.json"><code>docker/tailscale-serve.json</code></a>). Two
 constraints shape it. It must be HTTPS, because the session cookie is
