@@ -62,6 +62,8 @@ pub enum LabelName {
     Capability,
     /// A reasoning tier. Five values, closed.
     Effort,
+    /// A priority class: `interactive`, `standard` or `batch`. Closed.
+    Class,
     /// Reserved: marks the series that absorbed a cardinality overflow.
     ///
     /// Its own name rather than a value of [`LabelName::Outcome`], because an
@@ -95,6 +97,7 @@ impl LabelName {
             Self::Agent => "agent",
             Self::Capability => "capability",
             Self::Effort => "effort",
+            Self::Class => "class",
             Self::Overflow => "hypellm_overflow",
         }
     }
@@ -121,6 +124,7 @@ impl LabelName {
             Self::Agent,
             Self::Capability,
             Self::Effort,
+            Self::Class,
             Self::Overflow,
         ]
     }
@@ -857,9 +861,12 @@ pub mod names {
     /// Churn-aware scheduling decisions, by host and outcome (specification
     /// 26.11): `ranked` and `starving` activations that went ahead of others
     /// waiting for the same host, `outranked` and `warm_demand` activations
-    /// that were deferred, and `job_reordered` / `job_starving` jobs taken
-    /// out of queue order.
+    /// that were deferred, and jobs taken out of submission order —
+    /// `job_by_class`, `job_by_share`, `job_reordered` and `job_starving`.
     pub const FLEET_SCHEDULE_DECISIONS: &str = "hypellm_fleet_schedule_decisions_total";
+    /// Jobs whose patience ran out before they finished, by priority class
+    /// (orchestration §11.9).
+    pub const JOBS_EXPIRED_WAITING: &str = "hypellm_jobs_expired_waiting_total";
 }
 
 /// Buckets for a rate in tokens per second.

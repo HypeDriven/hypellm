@@ -107,7 +107,11 @@ impl Adapter for SemIfAdapter {
             // Named individually rather than caught by a wildcard, so that a
             // new operation is a compile error here and somebody decides
             // whether a scorer can serve it.
-            Operation::Chat | Operation::Responses | Operation::Embeddings | Operation::Tokenize => {
+            Operation::Chat
+            | Operation::Responses
+            | Operation::Embeddings
+            | Operation::Tokenize
+            | Operation::Job => {
                 Err(ValidationFailure::new(
                     "operation_unsupported",
                     "a SemIf scorer serves rerank only; it generates no tokens",

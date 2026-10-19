@@ -42,6 +42,7 @@
 <li><a href="components/fleet-agent.html">Fleet agent</a></li>
 <li><a href="components/identity-verifier.html">Identity verifier</a></li>
 <li><a href="components/tls-helper.html">Outbound TLS helper</a></li>
+<li><a href="components/job-shim.html">Job shim</a></li>
 <li><a href="components/container-init.html">Container init</a></li>
 <li><a href="components/tray-monitor.html">Windows tray monitor</a></li>
 </ul></details>
@@ -1154,13 +1155,13 @@ dashboard's Machines panel.</li>
 <ul>
 <li>it re-routes each time the fleet changes, and at least every 250 ms, so it takes a warm slot that frees up, rides a start another request paid for, or pays for the start itself once batching says so;</li>
 <li>it holds no admission reservation while it waits, but it does hold its connection, so at most <code>settings max_parked_requests</code> (default 256) park at once;</li>
-<li>it gives up at its deadline (<code>default_deadline_ms</code>, or the caller's own). For work that may wait minutes, use <code>/v1/jobs</code>: a job that finds no capacity goes back in the queue with backoff, up to sixteen passes, instead of failing.</li>
+<li>it gives up at its deadline (<code>default_deadline_ms</code>, or the caller's own). For work that may wait minutes, use <code>/v1/jobs</code>: a job that finds no free slot, or a model still to be started, keeps its place in the job queue until its deadline, holding no connection and no worker.</li>
 </ul>
 <p>Models nothing is using are stopped after <code>fleet_policy … idle_stop_ms</code> (default 900000, fifteen minutes; <code>0</code> never stops one). Pinned and non-evictable deployments, and containers the router did not start, are never stopped for idleness. Every idle stop is in the audit log as <code>fleet.deactivate</code> with reason <code>idle</code>, and the Fleet screen shows each deployment's idle time and requests waiting for it.</p>
 <pre><code class="language-text">fleet_policy scope=fleet activation_min_demand=1 activation_max_wait_ms=20000 idle_stop_ms=900000
 fleet_policy scope=host:spark idle_stop_ms=0   # never stop an idle model on this machine
 </code></pre>
-<p>When requests for several models wait for one machine, the router loads the model with the most waiting work per second of load first, keeps a loaded model serving while it has requests in flight rather than swapping it out, and lets <code>/v1/jobs</code> workers take jobs for loaded models before cold ones (router specification §26.11). <code>fleet_policy … max_reorder_wait_ms</code> (default 120000, two minutes) is the longest any work is put behind other models'; past it, work goes in arrival order. <code>0</code> turns reordering off. The Fleet screen shows each machine's next model to load and why.</p>
+<p>When requests for several models wait for one machine, the router loads the model with the most waiting work per second of load first, keeps a loaded model serving while it has requests in flight rather than swapping it out, and lets <code>/v1/jobs</code> workers take jobs for loaded models before cold ones (router specification §26.11). <code>fleet_policy … max_reorder_wait_ms</code> (default 120000, two minutes) is the longest any work is put behind other models' in its priority class; past it, work goes in arrival order. <code>0</code> turns reordering off. Priority classes come first in both decisions: a model an interactive job or request waits for is loaded before one only batch work waits for. The Fleet screen shows each machine's next model to load and why.</p>
 <h3 id="metrics-for-prometheus">Metrics for Prometheus</h3>
 <p><code>GET /metrics</code> serves the Prometheus text exposition. It is unauthenticated on
 the management listener, or on its own address with <code>settings metrics_listen=</code>
@@ -1211,8 +1212,13 @@ the management listener, or on its own address with <code>settings metrics_liste
 </tr>
 <tr>
 <td><code>hypellm_fleet_schedule_decisions_total{host,outcome}</code></td>
-<td>Churn-aware scheduling (router specification §26.11): activations that went <code>ranked</code> or <code>starving</code> ahead of others, ones deferred as <code>outranked</code> or <code>warm_demand</code>, and jobs taken <code>job_reordered</code> or <code>job_starving</code> (no <code>host</code> label)</td>
+<td>Churn-aware scheduling (router specification §26.11): activations that went <code>ranked</code> or <code>starving</code> ahead of others, ones deferred as <code>outranked</code> or <code>warm_demand</code>, and jobs taken out of submission order, <code>job_by_class</code>, <code>job_by_share</code>, <code>job_reordered</code> or <code>job_starving</code> (no <code>host</code> label)</td>
 <td><code>sum by (outcome) (rate(hypellm_fleet_schedule_decisions_total[15m]))</code></td>
+</tr>
+<tr>
+<td><code>hypellm_jobs_expired_waiting_total{class}</code></td>
+<td>Jobs whose deadline passed before they finished, by priority class. Batch counts climbing while interactive ones do not means interactive demand is holding batch work out (orchestration §11.9)</td>
+<td><code>sum by (class) (increase(hypellm_jobs_expired_waiting_total[1h]))</code></td>
 </tr>
 </tbody>
 </table></div>
@@ -1255,8 +1261,35 @@ bounds how much long-running generation the router carries at once, and it is
 separate from <code>max_connections</code>: that is the point of the endpoint. See
 <a href="deferred-issues.html#jobs-are-in-memory-and-a-restart-loses-them">current limitations</a>
 before relying on a job identifier across a restart. The bounds are
-<code>max_jobs_per_tenant</code>, <code>max_queued_jobs</code>, <code>max_job_result_bytes</code> and
+<code>max_jobs_per_tenant</code>, <code>max_queued_jobs</code>, <code>max_queued_batch_jobs</code>
+(default half of <code>max_queued_jobs</code>), <code>max_job_result_bytes</code> and
 <code>job_retention_ms</code>.</p>
+<p>Jobs are taken by the caller's priority class — the <code>class</code> on its
+<code>principal:</code> or <code>tenant:</code> quota, which a key may lower — then fairly between
+principals, so one caller's backlog holds another's job behind at most one of its
+own (orchestration §11.9). A <code>quota</code>'s <code>jobs</code> caps what one principal or tenant
+may hold:</p>
+<pre><code class="language-text">quota scope=principal:user:alice class=interactive jobs=8
+quota scope=principal:svc:renders class=batch jobs=32
+</code></pre>
+<p><code>GET /admin/v1/jobs</code> (<code>read_tenant_usage</code>) shows the tenant's queue and why each job waits.</p>
+<p><strong>Artifact jobs through a job shim</strong> (orchestration §11.3). A generative
+service sits behind a shim — a small server speaking the router's job protocol — and the
+shim is declared as a provider of <code>family=job</code>. It must carry a <code>credential</code>, which
+the router sends as a bearer on every request; put the service itself on a network only
+the shim can reach:</p>
+<pre><code class="language-text">credential id=cred_trellis
+provider id=trellis family=job scheme=http host=10.0.0.21 port=7871 egress=private_network credential=cred_trellis
+target id=trellis:img3d provider=trellis model=trellis operations=job capabilities=image-to-3d concurrency=1
+alias id=mesh capability=image-to-3d targets=trellis:img3d
+settings … job_poll_ms=2000 max_job_part_bytes=1073741824 max_job_spool_bytes=4294967296
+</code></pre>
+<p>Parts are written under <code>&lt;state_dir&gt;/jobs/</code>, which is emptied at startup;
+size the state volume for <code>max_job_spool_bytes</code>. The reference shim,
+<a href="components/job-shim.html"><code>job-shim/</code></a>, serves a service that can be run as a command, and
+reaches FLUX.2, TRELLIS, YuE2 in ComfyUI, MiniMax-H3 in Gradio and Kimodo through a
+backend each in <code>job-shim/backends/</code>; run one shim per service, beside it. See
+<a href="deferred-issues.html#artifact-jobs-what-the-shims-do-not-do">current limitations</a>.</p>
 <p>Related active settings:</p>
 <ul>
 <li><code>settings keepalive_interval_ms</code> controls the SSE keepalive cadence. A stream

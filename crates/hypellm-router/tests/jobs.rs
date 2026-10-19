@@ -7,6 +7,7 @@
 //! security property rather than a resource one — a job identifier that is not
 //! a capability across tenants.
 
+use hypellm_core::admission::PriorityClass;
 use hypellm_core::canonical::{
     CanonicalRequest, ClientProtocol, Message, Operation, ReasoningEffort, RequestLimits, Role,
     RoutingHints, Sampling, StreamOptions,
@@ -14,7 +15,7 @@ use hypellm_core::canonical::{
 use hypellm_core::ids::{AliasId, PrincipalId, RequestId, TenantId};
 use hypellm_core::rbac::PermissionSet;
 use hypellm_core::time::{Deadline, TestClock};
-use hypellm_router::jobs::{JobId, JobLimits, JobState, JobStore, SubmitRefusal};
+use hypellm_router::jobs::{JobId, JobLimits, JobState, JobStore, SubmitRefusal, SubmitTerms};
 use std::time::Duration;
 
 fn tenant(id: &str) -> TenantId {
@@ -58,12 +59,25 @@ fn store(limits: JobLimits) -> JobStore {
 }
 
 fn submit(store: &JobStore, tenant_id: &str, n: u128) -> Result<JobId, SubmitRefusal> {
+    submit_as(store, tenant_id, n, PriorityClass::Standard)
+}
+
+fn submit_as(
+    store: &JobStore,
+    tenant_id: &str,
+    n: u128,
+    class: PriorityClass,
+) -> Result<JobId, SubmitRefusal> {
     store
         .submit(
             request(tenant_id, n),
             Vec::new(),
             PermissionSet::default(),
             None,
+            SubmitTerms {
+                class,
+                ..SubmitTerms::default()
+            },
             1_000 + u64::try_from(n).unwrap_or(0),
             1_000 + u64::try_from(n).unwrap_or(0),
         )
@@ -148,6 +162,71 @@ fn a_full_queue_refuses_rather_than_growing() {
         store.list(&tenant("acme"), 100, 1_000).len(),
         2,
         "a refused submission left a job record"
+    );
+}
+
+#[test]
+fn batch_submissions_never_hold_more_than_their_share_of_the_queue() {
+    // Orchestration §11.9: a batch never fills the queue against interactive
+    // work. The batch share is full while the queue as a whole is not, and
+    // only batch work is refused there.
+    let limits = JobLimits {
+        max_per_tenant: 100,
+        max_queued: 4,
+        max_queued_batch: 2,
+        ..JobLimits::DEFAULT
+    };
+    let store = store(limits);
+
+    submit_as(&store, "acme", 0, PriorityClass::Batch).expect("first batch job");
+    submit_as(&store, "acme", 1, PriorityClass::Batch).expect("second batch job");
+    assert_eq!(
+        submit_as(&store, "acme", 2, PriorityClass::Batch).err(),
+        Some(SubmitRefusal::QueueFull),
+        "a third batch job took room the other classes are owed"
+    );
+    submit_as(&store, "acme", 3, PriorityClass::Interactive).expect("interactive still fits");
+    submit_as(&store, "acme", 4, PriorityClass::Standard).expect("standard still fits");
+    // The queue's own bound still holds for every class.
+    assert_eq!(
+        submit_as(&store, "acme", 5, PriorityClass::Interactive).err(),
+        Some(SubmitRefusal::QueueFull)
+    );
+    // And nothing queued was displaced to make room.
+    assert_eq!(store.list(&tenant("acme"), 100, 1_000).len(), 4);
+}
+
+#[test]
+fn a_principal_cannot_hold_more_jobs_than_its_quota_and_its_tenant_still_can() {
+    // Orchestration §11.9: in a one-tenant deployment the tenant cap is the
+    // whole router's, so one principal could fill it. Its own cap stops that,
+    // and stops only that principal.
+    let store = store(JobLimits::DEFAULT);
+    let capped = SubmitTerms {
+        principal_cap: Some(2),
+        ..SubmitTerms::default()
+    };
+    let as_principal = |principal: &str, n: u128, terms: SubmitTerms| {
+        let mut request = request("acme", n);
+        request.principal = PrincipalId::new(principal).unwrap();
+        store.submit(request, Vec::new(), PermissionSet::default(), None, terms, 1_000, 1_000)
+    };
+    as_principal("svc:bulk", 0, capped.clone()).expect("first");
+    as_principal("svc:bulk", 1, capped.clone()).expect("second");
+    assert_eq!(
+        as_principal("svc:bulk", 2, capped.clone()).err(),
+        Some(SubmitRefusal::PrincipalAtCapacity)
+    );
+    as_principal("svc:other", 3, capped).expect("another principal has its own cap");
+
+    // A tenant cap from a quota overrides the store's default.
+    let tight = SubmitTerms {
+        tenant_cap: Some(3),
+        ..SubmitTerms::default()
+    };
+    assert_eq!(
+        as_principal("svc:third", 4, tight).err(),
+        Some(SubmitRefusal::TenantAtCapacity)
     );
 }
 

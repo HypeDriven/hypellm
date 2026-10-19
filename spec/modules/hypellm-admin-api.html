@@ -42,6 +42,7 @@
 <li><a href="../components/fleet-agent.html">Fleet agent</a></li>
 <li><a href="../components/identity-verifier.html">Identity verifier</a></li>
 <li><a href="../components/tls-helper.html">Outbound TLS helper</a></li>
+<li><a href="../components/job-shim.html">Job shim</a></li>
 <li><a href="../components/container-init.html">Container init</a></li>
 <li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
 </ul></details>
@@ -392,6 +393,10 @@ than forbidden, so the response does not confirm that a request with that
 identifier exists. <code>UsageAggregate::rows</code> and <code>UsageAggregate::window</code>
 never cross a tenant boundary and refuse to attribute an overflow row to any
 principal, so <code>ReadOwnUsage</code> can never surface another principal's tokens.
+<code>GET /admin/v1/jobs</code> requires <code>ReadTenantUsage</code> and asks the router's
+<code>JobQueue</code> (a trait, for the reason <code>FleetControl</code> is one) for the caller's
+tenant only; it lists principals, aliases, classes and states, never a prompt,
+and answers 404 on a router that runs no jobs rather than an empty queue.
 <code>GET /admin/v1/usage/principals</code> answers a principal-scoped reader with its own
 principal and keys only; a <code>principal=</code> filter naming anyone else returns an
 empty result rather than a refusal, so the endpoint does not confirm the name. <code>list_keys</code> filters by

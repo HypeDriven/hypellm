@@ -99,7 +99,7 @@ impl Scope {
     pub const fn for_operation(op: hypellm_core::canonical::Operation) -> Self {
         use hypellm_core::canonical::Operation as O;
         match op {
-            O::Chat | O::Responses | O::Rerank => Self::Inference,
+            O::Chat | O::Responses | O::Rerank | O::Job => Self::Inference,
             O::Embeddings => Self::Embeddings,
             O::Tokenize => Self::Tokenize,
         }

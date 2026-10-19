@@ -42,6 +42,7 @@
 <li><a href="../components/fleet-agent.html">Fleet agent</a></li>
 <li><a href="../components/identity-verifier.html">Identity verifier</a></li>
 <li><a href="../components/tls-helper.html">Outbound TLS helper</a></li>
+<li><a href="../components/job-shim.html">Job shim</a></li>
 <li><a href="../components/container-init.html">Container init</a></li>
 <li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
 </ul></details>
@@ -102,7 +103,7 @@ input/resource limits.</p>
 </tr>
 <tr>
 <td>Fuzz targets</td>
-<td>Implemented in <code>tests/fuzz.rs</code>: nine seeded mutation properties over the client protocol parsers and their trust boundaries, and one over the key-restriction records the router replays at startup.</td>
+<td>Implemented in <code>tests/fuzz.rs</code>: nine seeded mutation properties over the client protocol parsers and their trust boundaries, one over the artifact-job body, and one over the key-restriction records the router replays at startup.</td>
 </tr>
 </tbody>
 </table></div>
@@ -249,24 +250,33 @@ wait and holding nothing between rounds; riders wait on a leased activation as
 well as an observed one; <code>FleetRuntime::enter_dispatch</code> and
 <code>leave_dispatch</code> count each dispatch against its deployment exactly once, and
 <code>FleetRuntime::idle_stop</code> claims a deployment under the same lock before
-stopping it, so a stop and a dispatch cannot pass each other. A job that finds
-no capacity is re-queued with backoff (<code>jobs::worker_loop</code>). Parked requests
+stopping it, so a stop and a dispatch cannot pass each other; <code>ensure_ready</code>
+claims every idle victim of a committed plan the same way until the plan
+finishes. A job never parks: one that finds no slot, or a model still to be
+started, keeps its place in the job queue (<code>jobs::run_pass</code>,
+<code>pipeline::execute_job_pass</code>), counted as parked demand from submission within half of the capability's
+batching queue (<code>jobs::park</code>, <code>FleetRuntime::park_job</code>, released exactly
+once when it leaves the queue), and only a
+governance refusal backs off. Parked requests
 and riders wait on <code>FleetRuntime::wake_signal</code> through
 <code>Clock::wait_signal</code>, so a test clock drives them deterministically.</p>
 <p><strong>Churn-aware scheduling (specification 26.11).</strong>
 <code>FleetRuntime::admit_to_queue</code> and <code>poll_queue</code> take the plan and put every
 trigger the batching queue grants to <code>hypellm_fleet::schedule::gate</code>; a deferred
 trigger is withdrawn with <code>ActivationQueue::untrigger</code> and the request parks.
-Demand for the gate is counted per alias while a request is parked
-(<code>park_alias</code>/<code>unpark_alias</code>, exactly once each) and projected onto
-deployments through the routing snapshot in <code>adopt_policy</code>. A deployment whose
+Demand for the gate is counted per alias and priority class while a request is
+parked or a job queued (<code>park_alias</code>/<code>unpark_alias</code>, exactly once each, at
+the same class) and projected onto deployments through the routing snapshot in
+<code>adopt_policy</code>; the gate ranks the highest class first. A deployment whose
 gated activation is refused for anything but a busy host is left out of the
 ranking for a while (<code>note_refused</code>), and <code>leave_dispatch</code> wakes parked
 requests when a deployment goes quiet so a deferred swap goes at once. The job
-worker takes from the queue through <code>jobs::JobOrder</code>, implemented over the
-fleet, so warm jobs go before cold ones and cold ones by group; with no fleet,
-or <code>max_reorder_wait_ms=0</code>, the queue order is unchanged. Tested end to end in
-<code>tests/fleet_schedule.rs</code>.</p>
+worker takes the highest priority class first (orchestration §11.9), then, through
+<code>jobs::JobOrder</code> implemented over the fleet, warm jobs before cold ones and cold
+ones by group, and within each by share between principals; with no fleet, or
+<code>max_reorder_wait_ms=0</code>, class and share alone. The class is stamped at
+submission by <code>pipeline::priority_class</code>, the resolution admission uses. Tested
+end to end in <code>tests/fleet_schedule.rs</code> and <code>tests/job_priority.rs</code>.</p>
 <p><strong>Kept checksums and image copies (specification 26.12).</strong>
 <code>FleetRuntime::keep_checksums</code> runs on every adopted inventory: it learns an
 artifact's image ID from a verified, unanimous observation through
@@ -510,15 +520,51 @@ management listeners differ, so both are given.</p>
 </tr>
 <tr>
 <td>Live jobs per tenant</td>
-<td><code>settings max_jobs_per_tenant</code>, default 32; counts retained jobs until they expire</td>
+<td><code>settings max_jobs_per_tenant</code>, default 32, or a <code>tenant:</code> quota's <code>jobs</code>; counts retained jobs until they expire</td>
+<td>—</td>
+<td><code>JobStore::submit</code>, checked under the insert lock</td>
+</tr>
+<tr>
+<td>Live jobs per principal</td>
+<td>a <code>principal:</code> quota's <code>jobs</code>; none by default</td>
 <td>—</td>
 <td><code>JobStore::submit</code>, checked under the insert lock</td>
 </tr>
 <tr>
 <td>Queued jobs</td>
-<td><code>settings max_queued_jobs</code>, default 64, fleet-wide</td>
+<td><code>settings max_queued_jobs</code>, default 64, fleet-wide, a job being tried included; <code>max_queued_batch_jobs</code>, default half of it, for batch-class jobs</td>
 <td>—</td>
 <td><code>JobStore::submit</code>; a full queue is a <code>429</code>, never growth</td>
+</tr>
+<tr>
+<td>A job's wait for capacity</td>
+<td>its deadline; tried again when a job leaves the queue or every 250 ms, with at most one unstarted pass per alias at a time; governance refusals back off, at most 16 passes</td>
+<td>—</td>
+<td><code>JobStore::take</code>, <code>run_pass</code> in <code>jobs.rs</code></td>
+</tr>
+<tr>
+<td>An artifact part on disk</td>
+<td><code>settings max_job_part_bytes</code>, default 1 GiB; the fetch is held to the part's declared length exactly</td>
+<td>—</td>
+<td><code>job_exchange::fetch_parts</code>, and the body decoder's <code>max_body_bytes</code> in <code>fetch_part</code></td>
+</tr>
+<tr>
+<td>Artifact parts on disk, every job</td>
+<td><code>settings max_job_spool_bytes</code>, default 4 GiB, reserved for all of a job's parts before the first fetch</td>
+<td>—</td>
+<td><code>Spool::reserve</code></td>
+</tr>
+<tr>
+<td>A shim's control reply</td>
+<td>64 KiB read, then <code>hypellm_adapters::job</code>'s 16 KiB, depth-4 parse</td>
+<td>—</td>
+<td><code>job_exchange::MAX_REPLY_BYTES</code></td>
+</tr>
+<tr>
+<td>Status polls of one artifact job</td>
+<td>one per <code>settings job_poll_ms</code> (default 2000, never under 250); five unreachable in a row fail the job</td>
+<td>—</td>
+<td><code>job_exchange::MIN_POLL_MS</code>, <code>MAX_POLL_FAILURES</code></td>
 </tr>
 <tr>
 <td>Job result spool</td>
@@ -557,8 +603,8 @@ management listeners differ, so both are given.</p>
 <td><code>pipeline::PARK_SLICE</code>, the request's <code>Deadline</code></td>
 </tr>
 <tr>
-<td>Passes one job makes through the pipeline</td>
-<td>16, backing off 1 s doubling to 60 s, within its deadline</td>
+<td>Governance refusals one job may have</td>
+<td>16, backing off 1 s doubling to 60 s, within its deadline; a wait for a slot or a start is not one</td>
 <td>—</td>
 <td><code>jobs::MAX_JOB_ATTEMPTS</code></td>
 </tr>
@@ -626,6 +672,11 @@ reaches its assertion is decoration.</p>
 <code>restore_keys</code> replays at every start. It asserts that whatever a mutated record decodes
 to, each field it decodes as unrestricted was written as an explicit <code>null</code>, and that
 what decodes re-encodes to the same restriction.</p>
+<p>An eleventh covers the artifact-job body of <code>/v1/jobs</code> (<code>protocol::job</code>,
+orchestration §11.5): whatever a mutated body parses to, every input name is an
+identifier that cannot change a path, every input is base64 rather than a reference,
+every bounded param is within its bound, <code>options</code> nest no deeper than four, and
+the request it routes by keeps the authenticated identity and estimates zero tokens.</p>
 <p>The remaining targets below — the connection-level ones, and the stream
 renderers — are still requirements rather than facts:</p>
 <div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
@@ -667,6 +718,11 @@ renderers — are still requirements rather than facts:</p>
 <td>A mutated <code>ApiKeyRestriction</code> payload never decodes looser than it was written</td>
 <td>Implemented in <code>tests/fuzz.rs</code></td>
 </tr>
+<tr>
+<td>Artifact-job bodies</td>
+<td>No mutated body yields an input name that could change a path, an input that is not inline base64, a param past its bound, or options past four levels</td>
+<td>Implemented in <code>tests/fuzz.rs</code></td>
+</tr>
 </tbody>
 </table></div>
 <p>Every target must assert bounded work and a stable error, per specification 21.1:
@@ -695,6 +751,18 @@ enabled, because a stopped container there is a cold target, not a dead one
 <code>hypellm_target_probes_total{target,outcome}</code>, with <code>outcome</code> one of <code>ok</code> and
 <code>failed</code>, and logs only the edges <code>target.probe_unreachable</code> and
 <code>target.probe_reachable</code>.</p>
+<p>Artifact jobs (orchestration §11.3–§11.5) add three modules. <code>protocol::job</code>
+parses a <code>/v1/jobs</code> body naming a <code>verb</code> into the request it is routed by —
+<code>Operation::Job</code>, the prompt as its one message — and the <code>ArtifactSpec</code> the shim is
+sent. <code>job_exchange::run</code> is called by the pipeline in place of
+<code>dispatch::attempt</code> for such a job, once every reservation is held, and only
+against a <code>family=job</code> provider: submit, poll every <code>job_poll_ms</code>, cancel once if
+asked, and fetch every part into the <code>spool::Spool</code> — all or nothing, each part
+held to its declared type and length, hashed as written, and deleted if anything
+fails. The spool lives under <code>&lt;state_dir&gt;/jobs/</code>, is bounded per part and in
+total, is emptied at startup, and loses a job's parts when the job's record expires.
+<code>testing::SimulatedShim</code> is a scripted shim for the integration suite
+(<code>tests/artifact_jobs.rs</code>).</p>
 <p><code>server::ListenerMetrics</code> is optional and per-plane. A <code>Server</code> without one is
 still correct; it simply publishes no connection or byte counters, which is the
 right default for the benchmark harness and for tests that assert on behaviour

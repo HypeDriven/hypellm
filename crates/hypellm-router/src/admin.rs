@@ -468,6 +468,10 @@ pub fn admin_state_from(
         // boot or after a publication first enables the fleet.
         fleet: Arc::clone(&router.admin_fleet),
         enrollments: Arc::clone(&router.enrollments),
+        jobs: router.jobs().map(|store| {
+            let queue: Arc<dyn hypellm_admin_api::JobQueue> = store.clone();
+            queue
+        }),
     }
 }
 

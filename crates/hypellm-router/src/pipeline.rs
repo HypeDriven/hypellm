@@ -28,6 +28,7 @@
 //! one asks for any.
 
 use hypellm_adapters::adapter_for;
+use hypellm_core::admission::PriorityClass;
 use hypellm_core::canonical::CanonicalRequest;
 use hypellm_core::decision::{Attempt, AttemptOutcome, DecisionTrace, ExclusionReason};
 use hypellm_core::error::{ErrorCode, RouterError};
@@ -125,7 +126,7 @@ pub fn execute_for_key(
             request
         });
     let request = with_usage.as_ref().unwrap_or(request);
-    let mut first = execute_once(state, &config, request, groups, &permissions, key, sink, false);
+    let mut first = execute_once(state, &config, request, groups, &permissions, key, sink, Pass::INTERACTIVE);
     if awaits_activation(&first) {
         first = await_activation(state, &config, request, groups, &permissions, key, sink, first);
     }
@@ -133,7 +134,95 @@ pub fn execute_for_key(
     if budget.is_zero() || !awaits_recovery(&first) {
         return first;
     }
-    await_recovery(state, &config, request, groups, &permissions, key, sink, first, budget)
+    await_recovery(state, &config, request, groups, &permissions, key, sink, first, budget, Pass::INTERACTIVE)
+}
+
+/// One pass of a queued job (orchestration §11.9).
+///
+/// [`execute_for_key`] without its two waits for capacity. A job waits in the
+/// job queue and nowhere else: it never joins the admission queue, so a
+/// refusal for a full slot comes back at once, and it never parks, so a model
+/// still to be started comes back as `activation_queued`. The job queue puts
+/// it back in its place either way, and a worker is free for a job a slave
+/// can take now.
+///
+/// `parked` is whether the job queue already counts this job as parked demand
+/// for its capability (specification 26.10): it re-asks the batching queue
+/// without being counted again, as a parked request does. A wait for a target
+/// to recover from an outage is unchanged — that is not capacity, and the job
+/// queue has nothing better to do with it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a pass of one job, fully specified; a struct here would only move the arguments"
+)]
+pub fn execute_job_pass(
+    state: &RouterState,
+    request: &CanonicalRequest,
+    groups: &[GroupId],
+    permissions: hypellm_core::rbac::PermissionSet,
+    key: Option<&KeyId>,
+    sink: &mut dyn EventSink,
+    parked: bool,
+    artifact: Option<&crate::job_exchange::ArtifactRun<'_>>,
+) -> Outcome {
+    let config = state.config();
+    let with_alias_sampling = alias_sampling(&config, request);
+    let request = with_alias_sampling.as_ref().unwrap_or(request);
+    let pass = Pass {
+        parked,
+        queue_wait: false,
+        artifact,
+    };
+    let first = execute_once(state, &config, request, groups, &permissions, key, sink, pass);
+    let budget = recovery_budget(&config, request);
+    if budget.is_zero() || !awaits_recovery(&first) {
+        return first;
+    }
+    await_recovery(state, &config, request, groups, &permissions, key, sink, first, budget, pass)
+}
+
+/// The queue class a request from this caller belongs to.
+///
+/// The principal's class, else its tenant's (`AdmissionController::class_for`),
+/// which a key may lower and never raise. One function, so the admission queue
+/// and the job queue cannot disagree about who a caller is.
+#[must_use]
+pub fn priority_class(state: &RouterState, request: &CanonicalRequest, key: Option<&KeyId>) -> PriorityClass {
+    let principal_class = state
+        .admission
+        .class_for(&request.tenant, &request.principal);
+    key_restriction(state, key)
+        .as_ref()
+        .map_or(principal_class, |r| r.cap_priority(principal_class))
+}
+
+/// How one pass through the pipeline may wait, and what it sends.
+#[derive(Debug, Clone, Copy)]
+struct Pass<'a> {
+    /// Already counted in the batching queue for the whole of its wait
+    /// (specification 26.10), so it re-asks without being counted again.
+    parked: bool,
+    /// May wait in the admission queue for a slot. A job may not: it waits in
+    /// the job queue instead, in that queue's order.
+    queue_wait: bool,
+    /// An artifact job, run against a shim in place of one exchange
+    /// (orchestration §11.5).
+    artifact: Option<&'a crate::job_exchange::ArtifactRun<'a>>,
+}
+
+impl Pass<'static> {
+    /// A request holding its connection, on its first pass.
+    const INTERACTIVE: Self = Self {
+        parked: false,
+        queue_wait: true,
+        artifact: None,
+    };
+    /// A parked request's later passes.
+    const PARKED: Self = Self {
+        parked: true,
+        queue_wait: true,
+        artifact: None,
+    };
 }
 
 /// One routing pass decided under `config`, whatever the router's current
@@ -152,7 +241,7 @@ pub fn execute_under(
     permissions: &hypellm_core::rbac::PermissionSet,
     sink: &mut dyn EventSink,
 ) -> Outcome {
-    execute_once(state, config, request, groups, permissions, None, sink, false)
+    execute_once(state, config, request, groups, permissions, None, sink, Pass::INTERACTIVE)
 }
 
 /// The request with its alias's llama.cpp sampler defaults filled in, or
@@ -269,6 +358,7 @@ fn await_recovery(
     sink: &mut dyn EventSink,
     first: Outcome,
     budget: Duration,
+    pass: Pass<'_>,
 ) -> Outcome {
     const FIRST_DELAY: Duration = Duration::from_millis(250);
     const MAX_DELAY: Duration = Duration::from_secs(2);
@@ -299,7 +389,7 @@ fn await_recovery(
         if sink.keepalive().is_err() {
             break "client_gone";
         }
-        outcome = execute_once(state, config, request, groups, permissions, key, sink, false);
+        outcome = execute_once(state, config, request, groups, permissions, key, sink, pass);
         if !awaits_recovery(&outcome) {
             break if outcome.is_success() { "recovered" } else { "failed" };
         }
@@ -392,7 +482,8 @@ fn await_activation(
         record_parking(state, request, "refused");
         return first;
     }
-    fleet.park_alias(&request.requested_model);
+    let class = priority_class(state, request, key);
+    fleet.park_alias(&request.requested_model, class);
 
     let clock = state.clock.as_ref();
     let until = request.limits.deadline;
@@ -414,13 +505,13 @@ fn await_activation(
         // Read before the round, so a change made while it runs wakes the
         // next wait at once rather than being slept through.
         seen = fleet.wake_signal().generation();
-        outcome = execute_once(state, config, request, groups, permissions, key, sink, true);
+        outcome = execute_once(state, config, request, groups, permissions, key, sink, Pass::PARKED);
         if !awaits_activation(&outcome) {
             break if outcome.is_success() { "served" } else { "failed" };
         }
     };
     pending.leave();
-    fleet.unpark_alias(&request.requested_model);
+    fleet.unpark_alias(&request.requested_model, class);
     fleet.unpark(capability);
     state.parked_requests.fetch_sub(1, Ordering::SeqCst);
     record_parking(state, request, result);
@@ -519,7 +610,7 @@ fn budget_tokens(
     let estimate = target.token_estimate(request.reasoning_effort, default_document_token_estimate);
     let input = request.estimated_input_tokens_for(&estimate);
     let output = match request.operation {
-        Operation::Embeddings | Operation::Rerank | Operation::Tokenize => 0,
+        Operation::Embeddings | Operation::Rerank | Operation::Tokenize | Operation::Job => 0,
         Operation::Chat | Operation::Responses => {
             let capabilities = &target.capabilities;
             let cap = request.limits.max_output_tokens.unwrap_or(
@@ -571,7 +662,7 @@ fn execute_once(
     permissions: &hypellm_core::rbac::PermissionSet,
     key: Option<&KeyId>,
     sink: &mut dyn EventSink,
-    parked: bool,
+    pass: Pass<'_>,
 ) -> Outcome {
     let clock = state.clock.as_ref();
     // Specification 19 budgets the *whole* router overhead at 2 ms p50. The
@@ -729,8 +820,12 @@ fn execute_once(
         // 12 removes requests past their deadline "without invoking the
         // provider" — so the wait is the smaller of the two, and a request that
         // has already run out of deadline waits not at all.
-        let queue_budget = std::time::Duration::from_millis(queue_timeout_ms)
-            .min(overall.remaining(clock));
+        // A job's pass waits not at all: it waits in the job queue instead.
+        let queue_budget = if pass.queue_wait {
+            std::time::Duration::from_millis(queue_timeout_ms).min(overall.remaining(clock))
+        } else {
+            std::time::Duration::ZERO
+        };
         // The key may lower the principal's class and never raise it.
         let principal_class = state
             .admission
@@ -811,8 +906,13 @@ fn execute_once(
         // quietly steered to it by an empty balance.
         //
         // `/v1/tokenize` is not a token-metered inference operation and is
-        // not charged.
-        let metered = request.operation != hypellm_core::canonical::Operation::Tokenize;
+        // not charged, and neither is an artifact job, whose cost is
+        // accelerator time (orchestration §11.5) — nothing token-denominated
+        // can say what it spent.
+        let metered = !matches!(
+            request.operation,
+            hypellm_core::canonical::Operation::Tokenize | hypellm_core::canonical::Operation::Job
+        );
         let mut budget_hold = match key.filter(|_| metered) {
             None => None,
             Some(key) => {
@@ -914,7 +1014,7 @@ fn execute_once(
                     &fleet_view,
                     candidate,
                     overall,
-                    parked,
+                    pass.parked,
                 );
             waiting.leave();
             match activated {
@@ -993,15 +1093,25 @@ fn execute_once(
             );
         }
         let adapter = adapter_for(provider.family);
-        let mut result = dispatch::attempt(
-            state,
-            request,
-            target,
-            provider,
-            adapter,
-            overall,
-            sink,
-        );
+        // An artifact job runs against a shim, and only against one: a job
+        // routed to any other family, or a single exchange routed to a shim,
+        // is refused before anything is sent.
+        let mut result = match pass.artifact {
+            Some(run) if provider.family == hypellm_core::target::ProviderFamily::Job => {
+                crate::job_exchange::run(state, request, target, provider, run, overall)
+            }
+            Some(_) => Err(dispatch::AttemptFailure {
+                phase: dispatch::AttemptPhase::BeforeAcceptance,
+                class: hypellm_core::event::UpstreamErrorClass::UnsupportedFeature,
+                error: RouterError::new(
+                    ErrorCode::NoEligibleTarget,
+                    "an artifact job is served by a job service only",
+                ),
+                provider_code: None,
+                client_cancelled: false,
+            }),
+            None => dispatch::attempt(state, request, target, provider, adapter, overall, sink),
+        };
 
         // Specification 22.2 step 16's bounded overlap. A rotation performed
         // before the provider activated the new secret would otherwise take the
@@ -1023,6 +1133,7 @@ fn execute_once(
             if failure.class == hypellm_core::event::UpstreamErrorClass::Authentication
                 && failure.phase == dispatch::AttemptPhase::BeforeAcceptance
                 && provider.credential_ref.is_some()
+                && pass.artifact.is_none()
             {
                 let retried = dispatch::attempt_with(
                     state,
@@ -1902,10 +2013,16 @@ fn activate_for(
     // wait, so it re-asks without being counted again; anyone else is counted
     // for the length of this call.
     if let Some(capability) = capability {
+        // Ranked by the asker's class (orchestration §11.9), resolved as
+        // admission resolves it.
+        let principal_class = state
+            .admission
+            .class_for(&request.tenant, &request.principal);
+        let class = restriction.map_or(principal_class, |r| r.cap_priority(principal_class));
         let admission = if parked {
-            fleet.poll_queue(capability, plan)
+            fleet.poll_queue(capability, plan, class)
         } else {
-            fleet.admit_to_queue(capability, plan)
+            fleet.admit_to_queue(capability, plan, class)
         };
         match admission {
             hypellm_fleet::governance::QueueAdmission::Activate => {}

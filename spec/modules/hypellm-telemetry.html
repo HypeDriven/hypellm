@@ -42,6 +42,7 @@
 <li><a href="../components/fleet-agent.html">Fleet agent</a></li>
 <li><a href="../components/identity-verifier.html">Identity verifier</a></li>
 <li><a href="../components/tls-helper.html">Outbound TLS helper</a></li>
+<li><a href="../components/job-shim.html">Job shim</a></li>
 <li><a href="../components/container-init.html">Container init</a></li>
 <li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
 </ul></details>
@@ -138,7 +139,7 @@ assert the negative directly: <code>the_vocabulary_excludes_high_cardinality_dim
 </thead>
 <tbody>
 <tr>
-<td>Closed metric label vocabulary, 13 names (one reserved)</td>
+<td>Closed metric label vocabulary, 20 names (one reserved)</td>
 <td><code>metrics::LabelName</code></td>
 <td>17 (high-cardinality prohibition)</td>
 </tr>
@@ -206,10 +207,12 @@ the property this design refuses.</li>
 syslog. Where output goes is a deployment concern (specification 20).</li>
 </ul>
 <h3 id="fleet-labels">Fleet labels</h3>
-<p><code>host</code>, <code>deployment</code>, <code>accelerator</code>, <code>agent</code>, <code>capability</code> and <code>effort</code> join the
-closed label vocabulary. Each is admissible for the same reason the existing
-ones are: the first four are administrator-configured identifiers, bounded by
-the configuration; the last two are closed enums in the router. A user id, a
+<p><code>host</code>, <code>deployment</code>, <code>accelerator</code>, <code>agent</code>, <code>capability</code>, <code>effort</code> and
+<code>class</code> join the closed label vocabulary. Each is admissible for the same reason
+the existing ones are: the first four are administrator-configured identifiers,
+bounded by the configuration; the last three are closed enums in the router —
+<code>class</code> is the three priority classes, on
+<code>hypellm_jobs_expired_waiting_total</code> (orchestration §11.9). A user id, a
 request id, a prompt or a URL remain forbidden and always will.</p>
 <p>The fleet metrics are in <code>names</code>. Every one of them is emitted by
 <code>hypellm-router</code>; a declared series that nothing writes reads on a dashboard as

@@ -111,7 +111,7 @@ impl AttemptFailure {
         !self.client_cancelled && self.class.affects_health()
     }
 
-    fn from_classification(
+    pub(crate) fn from_classification(
         phase: AttemptPhase,
         classification: &ErrorClassification,
     ) -> Self {
@@ -132,7 +132,7 @@ impl AttemptFailure {
         }
     }
 
-    fn from_upstream(phase: AttemptPhase, error: &UpstreamError) -> Self {
+    pub(crate) fn from_upstream(phase: AttemptPhase, error: &UpstreamError) -> Self {
         let class = error.class();
         Self {
             phase,

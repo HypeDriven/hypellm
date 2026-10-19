@@ -92,6 +92,12 @@ impl Adapter for OpenAiAdapter {
             Operation::Responses => "/responses",
             Operation::Embeddings => "/embeddings",
             Operation::Tokenize => "/tokenize",
+            Operation::Job => {
+                return Err(ValidationFailure::new(
+                    "operation_unsupported",
+                    "artifact jobs are served by job shims only",
+                ));
+            }
             Operation::Rerank => {
                 return Err(ValidationFailure::new(
                     "operation_unsupported",

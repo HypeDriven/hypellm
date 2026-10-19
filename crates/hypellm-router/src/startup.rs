@@ -918,14 +918,36 @@ impl Router {
 
         // Off unless asked for. A `/v1/jobs` that accepted work with no worker
         // to run it would report `queued` forever, which is worse than a 404.
-        let jobs = (config.settings.job_workers > 0).then(|| {
+        //
+        // Artifact jobs spool their parts under the state directory; a spool
+        // that cannot be created is a state directory the router cannot use,
+        // which is a startup failure like any other.
+        let spool = if config.settings.job_workers > 0 {
+            Some(
+                crate::spool::Spool::open(
+                    std::path::Path::new(&config.settings.state_dir),
+                    config.settings.max_job_part_bytes,
+                    config.settings.max_job_spool_bytes,
+                )
+                .map_err(|e| StartupError::Store(format!("the job spool: {e}")))?,
+            )
+        } else {
+            None
+        };
+        let job_poll_ms = config.settings.job_poll_ms;
+        let jobs = spool.map(|spool| {
             Arc::new(crate::jobs::JobStore::new(crate::jobs::JobLimits {
                 max_per_tenant: config.settings.max_jobs_per_tenant.max(1),
                 max_queued: config.settings.max_queued_jobs.max(1),
+                max_queued_batch: config
+                    .settings
+                    .max_queued_batch_jobs
+                    .unwrap_or_else(|| config.settings.max_queued_jobs.div_euclid(2).max(1)),
                 max_result_bytes: usize::try_from(config.settings.max_job_result_bytes)
                     .unwrap_or(usize::MAX),
                 retention_ms: config.settings.job_retention_ms,
-            }))
+            })
+            .with_spool(spool, job_poll_ms))
         });
 
         let state = Arc::new(RouterState {

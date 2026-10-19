@@ -42,6 +42,7 @@
 <li><a href="components/fleet-agent.html">Fleet agent</a></li>
 <li><a href="components/identity-verifier.html">Identity verifier</a></li>
 <li><a href="components/tls-helper.html">Outbound TLS helper</a></li>
+<li><a href="components/job-shim.html">Job shim</a></li>
 <li><a href="components/container-init.html">Container init</a></li>
 <li><a href="components/tray-monitor.html">Windows tray monitor</a></li>
 </ul></details>
@@ -315,7 +316,7 @@
 <p>This bound is the reason the hint is admissible at all. A hint that could beat policy would be a client-controlled destination by a longer route, which Appendix B forbids.</p>
 <h2 id="jobs-are-in-memory-and-a-restart-loses-them">Jobs are in memory, and a restart loses them</h2>
 <p><strong>Specification:</strong> <a href="orchestration.html">orchestration.html</a> §11. <strong>Implementation:</strong> <code>crates/hypellm-router/src/jobs.rs</code> and the <code>/v1/jobs</code> routes.</p>
-<p><code>POST /v1/jobs</code> accepts a chat-shaped body, returns <code>202</code> with a job identifier, and releases the connection. <code>GET /v1/jobs/{id}</code> reports state, <code>GET /v1/jobs/{id}/events</code> streams state changes as SSE, <code>GET /v1/jobs/{id}/result</code> returns the completed response, and <code>DELETE /v1/jobs/{id}</code> cancels. <code>GET /v1/jobs</code> lists the caller's tenant's jobs.</p>
+<p><code>POST /v1/jobs</code> accepts a chat-shaped body — or, naming a <code>verb</code>, an artifact job for a job shim (see <a href="#artifact-jobs-what-the-shims-do-not-do">below</a>) — returns <code>202</code> with a job identifier, and releases the connection. <code>GET /v1/jobs/{id}</code> reports state, <code>GET /v1/jobs/{id}/events</code> streams state changes as SSE, <code>GET /v1/jobs/{id}/result</code> returns the completed response, and <code>DELETE /v1/jobs/{id}</code> cancels. <code>GET /v1/jobs</code> lists the caller's tenant's jobs.</p>
 <p>It is <strong>off unless <code>settings job_workers</code> is greater than zero</strong>, and answers <code>404</code> otherwise: a job endpoint that accepted work with no worker to run it would report <code>queued</code> forever.</p>
 <p>Everything a caller can grow is bounded, because a job endpoint is four §3.2 hazards at once:</p>
 <div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
@@ -334,13 +335,23 @@
 </tr>
 <tr>
 <td>Live plus retained jobs per tenant</td>
-<td><code>max_jobs_per_tenant</code></td>
+<td><code>max_jobs_per_tenant</code>, or a <code>tenant:</code> quota's <code>jobs</code></td>
 <td>32</td>
 </tr>
 <tr>
-<td>Jobs waiting for a worker</td>
-<td><code>max_queued_jobs</code>, plus one re-queued job per worker</td>
+<td>Live plus retained jobs per principal</td>
+<td>a <code>principal:</code> quota's <code>jobs</code></td>
+<td>none</td>
+</tr>
+<tr>
+<td>Jobs waiting, a job being tried included</td>
+<td><code>max_queued_jobs</code></td>
 <td>64</td>
+</tr>
+<tr>
+<td>Batch-class jobs waiting</td>
+<td><code>max_queued_batch_jobs</code></td>
+<td>half of <code>max_queued_jobs</code></td>
 </tr>
 <tr>
 <td>Result bytes held per job</td>
@@ -352,6 +363,16 @@
 <td><code>job_retention_ms</code></td>
 <td>15 minutes</td>
 </tr>
+<tr>
+<td>One artifact part on disk</td>
+<td><code>max_job_part_bytes</code></td>
+<td>1 GiB, provisional</td>
+</tr>
+<tr>
+<td>Artifact parts on disk, every job</td>
+<td><code>max_job_spool_bytes</code></td>
+<td>4 GiB, provisional</td>
+</tr>
 </tbody>
 </table></div>
 <p><strong>The limitation that matters: jobs are process state.</strong> There is no durable job record and no disk spool. A router that restarts has an empty job table, and an identifier from before the restart is <code>job_not_found</code>. That is deliberate — a durable record saying <code>running</code> with no worker running it is worse, because a client waits on it — but it means a job identifier is valid only for one router lifetime. A client that must survive a restart resubmits.</p>
@@ -360,7 +381,29 @@
 <li><strong>A result is not stored beyond its retention window</strong>, and never on disk. §2.2's non-goals say the router is not a blob store, and <code>max_job_result_bytes</code> plus <code>job_retention_ms</code> are what keep <code>/v1/jobs</code> from making it one. A result larger than the spool fails the job naming the bound rather than arriving truncated.</li>
 <li><strong><code>/events</code> resumes by state, not by replay.</strong> A reconnecting client gets the job's current state immediately and then further changes. There is no event log to replay from, deliberately: storing intermediate states so a client could replay them is retention nobody asked for.</li>
 </ul>
+<p><strong>Ordering</strong> (<a href="orchestration.html#119-who-goes-next">orchestration §11.9</a>). Jobs are taken by priority class, then model locality within the class, then share between principals; a job waiting for a slot keeps its place. What that does not do:</p>
+<ul>
+<li><strong>Classes are strict.</strong> Under sustained interactive demand a batch job can wait out its deadline and fail <code>deadline_exceeded</code>; <code>hypellm_jobs_expired_waiting_total{class}</code> counts it. There is no ageing and no guaranteed batch share.</li>
+<li><strong>A job never jumps the admission queue.</strong> A synchronous request already waiting for a slot gets it before any job, whatever the two classes.</li>
+<li><strong>Nothing running is stopped.</strong> An interactive job behind a twenty-minute generation on the same slot waits for it.</li>
+<li><strong>A slot freed by an interactive request, or a model finishing its load, is noticed at the next quarter-second tick</strong>, not at once. A job leaving the queue wakes waiting jobs immediately.</li>
+<li><strong><code>GET /admin/v1/jobs</code> lists queued jobs in class and share order</strong>; locality may still reorder them within a class when a worker takes one.</li>
+</ul>
 <p>Jobs are not visible across tenants. An identifier belonging to another tenant answers <code>job_not_found</code>, identically to one that never existed and one that expired — Appendix B bounds visibility to the caller's tenant, and telling those apart would confirm that a guessed identifier names a real job.</p>
+<h2 id="artifact-jobs-what-the-shims-do-not-do">Artifact jobs: what the shims do not do</h2>
+<p><strong>Specification:</strong> §5.1, §7, §26.10, and <a href="orchestration.html#111-job-providers--partly-built">orchestration.html</a> §11.1–§11.5. <strong>Implementation:</strong> <code>hypellm_adapters::job</code>, <code>crates/hypellm-router/src/job_exchange.rs</code>, <code>spool.rs</code>, <code>protocol/job.rs</code>.</p>
+<p>A <code>/v1/jobs</code> body naming a <code>verb</code> is routed to a <code>family=job</code> provider, submitted, polled, and its parts spooled to disk and served from <code>/v1/jobs/{id}/result</code> and <code>/result/{name}</code>. The router's side is built and tested against a scripted shim. What is not:</p>
+<ul>
+<li><strong>Shims are tested against fakes, not against the services.</strong> The reference shim in <a href="components/job-shim.html"><code>job-shim/</code></a> runs a backend per service — FLUX.2, TRELLIS, YuE2 in ComfyUI, MiniMax-H3 in Gradio, Kimodo — and both have suites, but those run against scripted services. Each backend was run once against its real service, by hand; the Rust suite tests the router against a scripted shim, and the router and the reference shim were checked together once, by hand, not in a suite. A service that changes its API breaks its backend silently until a job fails.</li>
+<li><strong>A cancel does not stop a render a service has started</strong>, except in ComfyUI, where the backend removes or interrupts its own prompt. A cancelled FLUX, TRELLIS or H3 job keeps the service's GPU until it finishes, and its result is discarded.</li>
+<li><strong>The services stay reachable around the shim.</strong> The shim's bearer protects the shim; FLUX, TRELLIS, ComfyUI and the H3 app still answer anyone on their network, unauthenticated. Keeping callers to the router means putting each service where only its shim can reach it, which a backend cannot do for it.</li>
+<li><strong>Service-side outputs accumulate.</strong> Nothing removes what a job leaves in a service's own output directory.</li>
+<li><strong>Not metered.</strong> An artifact job estimates zero tokens and is not charged to a key's token budget. Accelerator-time cost (orchestration §11.5, phase 11) is not built, so what bounds a caller's artifact work is concurrency, the job caps (<code>quota … jobs</code>), the queue's batch share, and each job's patience.</li>
+<li><strong>A worker per running job.</strong> A job holds no socket between polls, but its worker thread sleeps through the whole generation, so <code>job_workers</code> is how many artifact jobs run at once.</li>
+<li><strong>The spool's bounds are coarse.</strong> Per part and in total, with defaults chosen before any output was measured. There is no per-tenant share of the spool, and free disk is not checked before a fetch.</li>
+<li><strong>A restart loses everything</strong>, parts included: jobs are not durable, and the spool directory is emptied at startup.</li>
+<li><strong><code>/v1/images/generations</code> does not reach a shim.</strong> Image generation through a shim is an artifact job on <code>/v1/jobs</code>.</li>
+</ul>
 <h2 id="predictive-pre-warm-is-on-the-dullest-signal-that-works">Predictive pre-warm is on the dullest signal that works</h2>
 <p><strong>Specification:</strong> <a href="orchestration.html">orchestration.html</a> §9.8. <strong>Implementation:</strong> <code>FleetRuntime::prewarm</code>, run from the housekeeping loop.</p>
 <p>The router will start a cold deployment before anything asks for it, when the host's <code>fleet_policy</code> declares <code>prewarm_min_rate_per_minute=N</code> and the smoothed request rate for that deployment's capability is at least <code>N</code>. It is <strong>zero — off — by default</strong>, and turning it on is a per-host decision.</p>
@@ -509,6 +552,7 @@
 <li class="toc-level-2"><a href="#streaming-backpressure">Streaming backpressure</a></li>
 <li class="toc-level-2"><a href="#the-prefer_target-routing-hint-is-a-tie-break-not-a-destination">The prefer_target routing hint is a tie-break, not a destination</a></li>
 <li class="toc-level-2"><a href="#jobs-are-in-memory-and-a-restart-loses-them">Jobs are in memory, and a restart loses them</a></li>
+<li class="toc-level-2"><a href="#artifact-jobs-what-the-shims-do-not-do">Artifact jobs: what the shims do not do</a></li>
 <li class="toc-level-2"><a href="#predictive-pre-warm-is-on-the-dullest-signal-that-works">Predictive pre-warm is on the dullest signal that works</a></li>
 <li class="toc-level-2"><a href="#management-access-with-an-api-key">Management access with an API key</a></li>
 <li class="toc-level-2"><a href="#changing-a-keys-expiry">Changing a key's expiry</a></li>

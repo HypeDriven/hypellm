@@ -305,6 +305,11 @@ pub struct Settings {
     pub max_jobs_per_tenant: u32,
     /// Jobs waiting for a worker, fleet-wide. A full queue is a `429`.
     pub max_queued_jobs: u32,
+    /// Batch-class jobs waiting, fleet-wide (orchestration §11.9). Past it a
+    /// batch submission is a `429`, so batch work never fills the queue
+    /// against the other classes. `None` is half of `max_queued_jobs`; zero
+    /// refuses batch jobs outright.
+    pub max_queued_batch_jobs: Option<u32>,
     /// Bytes of job result held in memory, per job.
     ///
     /// The spool is memory, bounded and expiring. Specification 2.2's non-goals
@@ -313,6 +318,17 @@ pub struct Settings {
     pub max_job_result_bytes: u64,
     /// How long a finished job stays readable, in milliseconds.
     pub job_retention_ms: u64,
+    /// How often an artifact job's shim is polled, in milliseconds; never
+    /// more often than every 250 (orchestration §11.5).
+    pub job_poll_ms: u64,
+    /// The largest part an artifact job may produce. A shim declaring more
+    /// fails the job before anything is fetched.
+    ///
+    /// Provisional: §11.5 sets defaults from measured outputs, and these were
+    /// chosen before any were measured.
+    pub max_job_part_bytes: u64,
+    /// Bytes of artifact parts held on disk across every job.
+    pub max_job_spool_bytes: u64,
     /// How often the liveness probe checks each probed provider endpoint, in
     /// milliseconds. Zero switches the probe off.
     ///
@@ -392,8 +408,12 @@ impl Default for Settings {
             job_workers: 0,
             max_jobs_per_tenant: 32,
             max_queued_jobs: 64,
+            max_queued_batch_jobs: None,
             max_job_result_bytes: 8 * 1024 * 1024,
             job_retention_ms: 900_000,
+            job_poll_ms: 2_000,
+            max_job_part_bytes: 1024 * 1024 * 1024,
+            max_job_spool_bytes: 4 * 1024 * 1024 * 1024,
             target_probe_interval_ms: 10_000,
             target_probe_timeout_ms: 2_000,
         }
@@ -520,6 +540,10 @@ pub struct Quota {
     /// concurrency and its service class edits one record, and the two cannot
     /// end up describing different scopes.
     pub class: hypellm_core::admission::PriorityClass,
+    /// The jobs this scope may hold, live and retained (orchestration
+    /// §11.9). Only on a `tenant:` or `principal:` scope; on a tenant it
+    /// overrides `settings max_jobs_per_tenant`. `None` when not written.
+    pub jobs: Option<u32>,
 }
 
 /// One target's price, from a stated date.
@@ -765,6 +789,27 @@ impl ValidatedConfig {
     #[must_use]
     pub fn digest_short(&self) -> String {
         self.digest.short()
+    }
+
+    /// The job caps for a caller (orchestration §11.9): its tenant's —
+    /// a `tenant:` quota's `jobs`, else `settings max_jobs_per_tenant` — and
+    /// its principal's, if a `principal:` quota sets one.
+    #[must_use]
+    pub fn job_caps(
+        &self,
+        tenant: &TenantId,
+        principal: &PrincipalId,
+    ) -> (u32, Option<u32>) {
+        let mut tenant_cap = self.settings.max_jobs_per_tenant.max(1);
+        let mut principal_cap = None;
+        for quota in &self.quotas {
+            match (&quota.scope, quota.jobs) {
+                (QuotaScope::Tenant(t), Some(cap)) if t == tenant => tenant_cap = cap,
+                (QuotaScope::Principal(p), Some(cap)) if p == principal => principal_cap = Some(cap),
+                _ => {}
+            }
+        }
+        (tenant_cap, principal_cap)
     }
 
     /// The admission limits and classes this configuration declares.
@@ -1687,8 +1732,16 @@ fn build_settings(document: &Document) -> Result<Settings, ConfigError> {
         job_workers: f.u32_field("job_workers", d.job_workers)?,
         max_jobs_per_tenant: f.u32_field("max_jobs_per_tenant", d.max_jobs_per_tenant)?,
         max_queued_jobs: f.u32_field("max_queued_jobs", d.max_queued_jobs)?,
+        max_queued_batch_jobs: if f.present("max_queued_batch_jobs") {
+            Some(f.u32_field("max_queued_batch_jobs", 0)?)
+        } else {
+            d.max_queued_batch_jobs
+        },
         max_job_result_bytes: f.u64_field("max_job_result_bytes", d.max_job_result_bytes)?,
         job_retention_ms: f.u64_field("job_retention_ms", d.job_retention_ms)?,
+        job_poll_ms: f.u64_field("job_poll_ms", d.job_poll_ms)?.max(250),
+        max_job_part_bytes: f.u64_field("max_job_part_bytes", d.max_job_part_bytes)?,
+        max_job_spool_bytes: f.u64_field("max_job_spool_bytes", d.max_job_spool_bytes)?,
         target_probe_interval_ms: f
             .u64_field("target_probe_interval_ms", d.target_probe_interval_ms)?,
         target_probe_timeout_ms: f
@@ -1920,6 +1973,16 @@ fn build_provider(
             )
         })?),
     };
+    // A job shim authenticates the router on every request (orchestration
+    // §11.3): the service behind it runs anything it is asked to, so a shim
+    // reachable without a credential is a generator anyone on its network can
+    // drive. Refused here rather than discovered at the first job.
+    if family == ProviderFamily::Job && credential_ref.is_none() {
+        return Err(f.error(
+            "job_shim_needs_credential",
+            format!("provider '{id}' is a job shim, which requires a `credential`"),
+        ));
+    }
 
     Ok((
         Provider {
@@ -2670,9 +2733,24 @@ fn build_quota(f: &Fields<'_>) -> Result<Quota, ConfigError> {
         ));
     }
 
+    // A job cap counts the jobs a caller holds. Only a tenant and a principal
+    // hold jobs, so a cap anywhere else would be silently meaningless.
+    let jobs = if f.present("jobs") {
+        if !matches!(scope, QuotaScope::Tenant(_) | QuotaScope::Principal(_)) {
+            return Err(f.error(
+                "jobs_not_on_holder",
+                "`jobs` applies only to a `tenant:` or `principal:` quota scope".to_owned(),
+            ));
+        }
+        Some(f.u32_field("jobs", 0)?)
+    } else {
+        None
+    };
+
     Ok(Quota {
         scope,
         class,
+        jobs,
         byte_rates,
         limits: hypellm_core::admission::ScopeLimits {
             max_concurrency: f.u32_field("concurrency", 0)?,

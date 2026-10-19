@@ -1200,6 +1200,8 @@ pub struct HarnessBuilder {
     with_admission: bool,
     /// The fleet control this harness serves, when a test supplies one.
     fleet: Option<Arc<dyn hypellm_admin_api::FleetControl>>,
+    /// The job queue this harness serves, when a test supplies one.
+    jobs: Option<Arc<dyn hypellm_admin_api::JobQueue>>,
     oidc_config: Option<oidc::OidcConfig>,
     verifier: Option<Arc<dyn oidc::TokenVerifier>>,
 }
@@ -1234,9 +1236,18 @@ impl HarnessBuilder {
             with_credential_sink: true,
             with_admission: true,
             fleet: None,
+            jobs: None,
             oidc_config: None,
             verifier: None,
         }
+    }
+
+    /// Serve `/admin/v1/jobs` from this queue. Absent, the endpoint says the
+    /// router runs no jobs.
+    #[must_use]
+    pub fn jobs(mut self, queue: Arc<dyn hypellm_admin_api::JobQueue>) -> Self {
+        self.jobs = Some(queue);
+        self
     }
 
     /// Serve `/admin/v1/fleet` from this control.
@@ -1427,6 +1438,7 @@ impl HarnessBuilder {
             enrollments: Arc::new(hypellm_fleet::enroll::EnrollmentRegistry::new(Arc::new(
                 hypellm_admin_api::enroll::StoreJournal::new(Arc::clone(&enrollment_store)),
             ))),
+            jobs: self.jobs.clone(),
         });
 
         Harness {

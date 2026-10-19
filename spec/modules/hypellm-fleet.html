@@ -42,6 +42,7 @@
 <li><a href="../components/fleet-agent.html">Fleet agent</a></li>
 <li><a href="../components/identity-verifier.html">Identity verifier</a></li>
 <li><a href="../components/tls-helper.html">Outbound TLS helper</a></li>
+<li><a href="../components/job-shim.html">Job shim</a></li>
 <li><a href="../components/container-init.html">Container init</a></li>
 <li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
 </ul></details>
@@ -536,7 +537,7 @@ the snapshot (<code>FleetSnapshot</code>, <code>Inventory</code>, <code>Lease</c
 <code>poll</code> keep a parked request counted for its whole wait), the idle-stop
 predicate (<code>idle</code>: <code>idle_hold</code>, <code>idle_stops</code>, <code>IdleInputs</code>, pure like the
 planner, specification 26.10), the scheduler (<code>schedule</code>: <code>gate</code>, <code>rank</code>,
-<code>pick_job</code>, <code>Contender</code>, <code>JobEntry</code>, pure and clock-free, specification 26.11;
+<code>pick_job</code>, <code>pick_reason</code>, <code>Contender</code>, <code>JobEntry</code>, pure and clock-free, specification 26.11, ranking the highest priority class first and, for jobs, ordering by share between principals within each locality step (orchestration §11.9);
 <code>ActivationQueue::untrigger</code> withdraws a trigger the gate refused), the activation machine
 (<code>ActivationLedger</code>, <code>ActivationState</code>, <code>ActivationRecord</code>), the protocol
 codec (<code>AgentRequest</code>, <code>AgentReply</code>, <code>encode_request</code>, <code>parse_reply</code>), and

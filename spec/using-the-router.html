@@ -42,6 +42,7 @@
 <li><a href="components/fleet-agent.html">Fleet agent</a></li>
 <li><a href="components/identity-verifier.html">Identity verifier</a></li>
 <li><a href="components/tls-helper.html">Outbound TLS helper</a></li>
+<li><a href="components/job-shim.html">Job shim</a></li>
 <li><a href="components/container-init.html">Container init</a></li>
 <li><a href="components/tray-monitor.html">Windows tray monitor</a></li>
 </ul></details>
@@ -694,7 +695,7 @@ router that does not run jobs answers <code>404</code>.</p>
   -H 'Content-Type: application/json' \
   -d '{&quot;model&quot;:&quot;long-generation&quot;,&quot;messages&quot;:[{&quot;role&quot;:&quot;user&quot;,&quot;content&quot;:&quot;...&quot;}]}'
 </code></pre>
-<pre><code class="language-json">{&quot;job_id&quot;:&quot;job_5f3a…&quot;,&quot;state&quot;:&quot;queued&quot;,&quot;progress_permille&quot;:0,&quot;eta_ms&quot;:0}
+<pre><code class="language-json">{&quot;job_id&quot;:&quot;job_5f3a…&quot;,&quot;state&quot;:&quot;queued&quot;,&quot;progress_permille&quot;:0,&quot;eta_ms&quot;:0,&quot;class&quot;:&quot;standard&quot;,&quot;waiting_for&quot;:&quot;turn&quot;}
 </code></pre>
 <p>Then:</p>
 <div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
@@ -707,7 +708,7 @@ router that does not run jobs answers <code>404</code>.</p>
 <tbody>
 <tr>
 <td><code>GET /v1/jobs/{id}</code></td>
-<td>state, progress, and the error once failed</td>
+<td>state, progress, class, and the error once failed; while queued, <code>waiting_for</code></td>
 </tr>
 <tr>
 <td><code>GET /v1/jobs/{id}/events</code></td>
@@ -719,7 +720,7 @@ router that does not run jobs answers <code>404</code>.</p>
 </tr>
 <tr>
 <td><code>DELETE /v1/jobs/{id}</code></td>
-<td>cancel; a queued job stops at once, a running one at its next cancellation point</td>
+<td>cancel; a queued job stops at once, a running one at the next event from its provider</td>
 </tr>
 <tr>
 <td><code>GET /v1/jobs</code></td>
@@ -739,6 +740,58 @@ storage.</li>
 nothing to stream it to. Use <code>/events</code> for progress and <code>/result</code> for the
 answer.</li>
 </ul>
+<p><strong>Who goes first.</strong> Jobs wait in one queue, taken by your priority class
+(<code>interactive</code>, <code>standard</code> or <code>batch</code>, as your administrator set it; a key can
+be minted lower), then fairly between callers: another caller's backlog holds your
+job behind at most one of its own. A job waiting for capacity keeps its place until
+its deadline rather than failing. While it is queued, <code>waiting_for</code> says why:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th><code>waiting_for</code></th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>turn</code></td>
+<td>not tried yet: other jobs are ahead of it, or every worker is busy</td>
+</tr>
+<tr>
+<td><code>slot</code></td>
+<td>every slot that could serve it is taken</td>
+</tr>
+<tr>
+<td><code>activation</code></td>
+<td>its model is not running and is waiting to be started</td>
+</tr>
+<tr>
+<td><code>backoff</code></td>
+<td>the fleet refused to start its model for now, and it will try again after <code>eta_ms</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>A queue full for your class, or a cap on how many jobs you may hold, is a <code>429</code>.</p>
+<p><strong>Artifacts.</strong> A body naming a <code>verb</code> asks a generative service for an
+artifact instead — a mesh, an image, a song — when the deployment has one behind a job
+shim. Inputs travel inline as base64; there is no field for a URL or a path:</p>
+<pre><code class="language-bash">curl -sS $BASE/v1/jobs -H &quot;Authorization: Bearer $KEY&quot; \
+  -H 'Content-Type: application/json' \
+  -d '{&quot;model&quot;:&quot;mesh&quot;,&quot;verb&quot;:&quot;image-to-3d&quot;,
+       &quot;params&quot;:{&quot;seed&quot;:7},
+       &quot;inputs&quot;:[{&quot;name&quot;:&quot;image&quot;,&quot;media_type&quot;:&quot;image/png&quot;,&quot;data&quot;:&quot;iVBORw0KGgo…&quot;}]}'
+</code></pre>
+<p>The verb must be the one the model serves. <code>params</code> are <code>duration_ms</code>, <code>seed</code>,
+<code>steps</code>, <code>width</code>, <code>height</code> and <code>count</code>; anything else the service takes goes in
+<code>options</code>, which the router passes on without reading. Any other field is refused.
+<code>patience_ms</code> may shorten how long the job may wait, not lengthen it. A succeeded
+job lists its <code>parts</code> — name, media type, length and SHA-256 — and
+<code>/result</code> serves the first as a download, <code>/result/{name}</code> any other.</p>
+<p>Which params, options and inputs a verb takes is the service's, and a shim refuses a
+param or option its service cannot honour rather than dropping it: TRELLIS takes no
+prompt, Kimodo no <code>width</code>. The services with a backend in this repository are listed,
+with what each takes and writes, under
+<a href="components/job-shim.html#backends">Job shim → Backends</a>.</p>
 <hr />
 <h2 id="limits">Limits</h2>
 <div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>

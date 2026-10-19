@@ -28,6 +28,7 @@
 //! specification 6.5 failover applies unchanged and the prohibition on splicing
 //! after semantic output is untouched.
 
+use hypellm_core::admission::PriorityClass;
 use hypellm_core::decision::{ExclusionReason, ResidencyClass};
 use hypellm_core::ids::{
     ActivationId, AgentId, AliasId, ArtifactId, DeploymentId, HostId, LeaseId, PoolId, TargetId,
@@ -229,11 +230,13 @@ pub struct FleetRuntime {
     /// budget, capacity or dwell — would otherwise sit at the top of the
     /// ranking and hold every other capability waiting for the same host.
     refused_until: Mutex<BTreeMap<DeploymentId, u64>>,
-    /// Requests parked per alias: how many, and since when the oldest
-    /// (specification 26.11). The demand the scheduler ranks, counted per
-    /// alias because an alias names the models a request could use; two chat
-    /// models share a capability and are exactly what it must tell apart.
-    parked_aliases: Mutex<BTreeMap<AliasId, (u32, u64)>>,
+    /// Requests and jobs parked per alias and priority class: how many, and
+    /// since when the oldest (specification 26.11, orchestration §11.9). The
+    /// demand the scheduler ranks, counted per alias because an alias names
+    /// the models a request could use — two chat models share a capability
+    /// and are exactly what it must tell apart — and per class because the
+    /// highest class waiting is what ranks first.
+    parked_aliases: Mutex<BTreeMap<(AliasId, PriorityClass), (u32, u64)>>,
     /// The deployments each alias's permitted targets resolve to, projected
     /// from the routing snapshot like `capabilities`.
     alias_deployments: RwLock<BTreeMap<AliasId, Vec<DeploymentId>>>,
@@ -1129,6 +1132,21 @@ impl FleetRuntime {
             self.publish_commitments();
         }
 
+        // Claim every idle victim against new dispatches, as idle stop claims
+        // what it stops (specification 26.10). The gate let this plan through
+        // because nothing was running on them; without the claim, a request
+        // routed a moment earlier — a lower-class job taken by another worker
+        // as the last one finished, say — could still be dispatched into a
+        // model this plan is about to stop, and the swap the gate chose would
+        // wait out a whole generation (orchestration §11.9). A victim already
+        // carrying work is not claimed: it is drained, as before.
+        let claimed: Vec<DeploymentId> = plan
+            .eviction_set()
+            .into_iter()
+            .filter(|victim| self.claim_for_stop(victim))
+            .cloned()
+            .collect();
+
         // Durable before the mutating verb. This is the whole basis of crash
         // recovery: a router that died between the write and the verb replays
         // the lease and asks the agent what happened; one that died between the
@@ -1153,6 +1171,9 @@ impl FleetRuntime {
             );
             self.publish_commitments();
             self.budgets.refund(&plan.host, &policy, now);
+            for victim in &claimed {
+                self.release_stop_claim(victim);
+            }
             return ActivationResult::Failed {
                 code: "fleet_unavailable",
             };
@@ -1185,6 +1206,11 @@ impl FleetRuntime {
         };
 
         self.finish(&lease_id, activation_outcome, plan);
+        // After the plan, rolled back or not: a stopped victim needs no claim,
+        // and one a rollback restarted serves again from here.
+        for victim in &claimed {
+            self.release_stop_claim(victim);
+        }
         if let Some(capability) = self.capability_of(&plan.deployment) {
             self.queue.settle(capability);
         }
@@ -1876,14 +1902,17 @@ impl FleetRuntime {
     /// how long it would be before the queue triggers on its own. A trigger is
     /// then put to the churn-aware gate (specification 26.11): it goes only if
     /// it ranks first among everything waiting for the plan's host.
+    ///
+    /// `class` is the asker's priority class, which the gate ranks it by when
+    /// nothing has counted it as parked yet.
     #[must_use]
-    pub fn admit_to_queue(&self, capability: Capability, plan: &Plan) -> QueueAdmission {
+    pub fn admit_to_queue(&self, capability: Capability, plan: &Plan, class: PriorityClass) -> QueueAdmission {
         let config = self.config();
         let policy = config.policy_for(&plan.host);
         let admission = self
             .queue
             .admit(capability, &policy, self.clock.now_millis());
-        self.gated(capability, plan, &policy, admission)
+        self.gated(capability, plan, &policy, admission, class)
     }
 
     /// Note that a waiting request has stopped waiting, for any reason.
@@ -1907,32 +1936,48 @@ impl FleetRuntime {
         self.queue.park(capability, self.clock.now_millis())
     }
 
-    /// Count a parked request as demand for `alias`, for the scheduler
-    /// (specification 26.11). Exactly once per successful [`Self::park`],
-    /// and undone with [`Self::unpark_alias`].
-    pub fn park_alias(&self, alias: &AliasId) {
+    /// Count a queued job as parked demand for `capability`, within the share
+    /// of its queue jobs may hold
+    /// ([`hypellm_fleet::governance::MAX_JOBS_QUEUED_PER_CAPABILITY`]).
+    /// `false` when that share is full, in which case [`Self::unpark`] must
+    /// not be called.
+    #[must_use]
+    pub fn park_job(&self, capability: Capability) -> bool {
+        self.queue.park_up_to(
+            capability,
+            self.clock.now_millis(),
+            hypellm_fleet::governance::MAX_JOBS_QUEUED_PER_CAPABILITY,
+        )
+    }
+
+    /// Count a parked request or queued job as demand for `alias` at
+    /// `class`, for the scheduler (specification 26.11). Exactly once per
+    /// successful [`Self::park`], and undone with [`Self::unpark_alias`]
+    /// at the same class.
+    pub fn park_alias(&self, alias: &AliasId, class: PriorityClass) {
         let now = self.clock.now_millis();
         let mut book = match self.parked_aliases.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let entry = book.entry(alias.clone()).or_insert((0, now));
+        let entry = book.entry((alias.clone(), class)).or_insert((0, now));
         if entry.0 == 0 {
             entry.1 = now;
         }
         entry.0 = entry.0.saturating_add(1);
     }
 
-    /// Stop counting a parked request against `alias`.
-    pub fn unpark_alias(&self, alias: &AliasId) {
+    /// Stop counting a parked request against `alias` at `class`.
+    pub fn unpark_alias(&self, alias: &AliasId, class: PriorityClass) {
         let mut book = match self.parked_aliases.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some(entry) = book.get_mut(alias) {
+        let key = (alias.clone(), class);
+        if let Some(entry) = book.get_mut(&key) {
             entry.0 = entry.0.saturating_sub(1);
             if entry.0 == 0 {
-                book.remove(alias);
+                book.remove(&key);
             }
         }
     }
@@ -1950,11 +1995,11 @@ impl FleetRuntime {
     ///
     /// [`Self::admit_to_queue`] without counting the caller again.
     #[must_use]
-    pub fn poll_queue(&self, capability: Capability, plan: &Plan) -> QueueAdmission {
+    pub fn poll_queue(&self, capability: Capability, plan: &Plan, class: PriorityClass) -> QueueAdmission {
         let config = self.config();
         let policy = config.policy_for(&plan.host);
         let admission = self.queue.poll(capability, &policy, self.clock.now_millis());
-        self.gated(capability, plan, &policy, admission)
+        self.gated(capability, plan, &policy, admission, class)
     }
 
     // -- Churn-aware scheduling (specification 26.11) ----------------------
@@ -1971,6 +2016,7 @@ impl FleetRuntime {
         plan: &Plan,
         policy: &FleetPolicy,
         admission: QueueAdmission,
+        class: PriorityClass,
     ) -> QueueAdmission {
         if admission != QueueAdmission::Activate {
             return admission;
@@ -1987,6 +2033,7 @@ impl FleetRuntime {
                 waiting: 1,
                 oldest_ms: now,
                 restore_cost_ms: self.restore_cost(&snapshot, &plan.deployment),
+                class,
             });
         }
         let victims_busy = {
@@ -2048,8 +2095,8 @@ impl FleetRuntime {
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         };
-        let mut demand: BTreeMap<DeploymentId, (u32, u64)> = BTreeMap::new();
-        for (alias, (waiting, oldest_ms)) in &parked {
+        let mut demand: BTreeMap<DeploymentId, (u32, u64, PriorityClass)> = BTreeMap::new();
+        for ((alias, class), (waiting, oldest_ms)) in &parked {
             for deployment in aliases.get(alias).into_iter().flatten() {
                 let Some(declared) = config.deployments.get(deployment) else {
                     continue;
@@ -2062,18 +2109,22 @@ impl FleetRuntime {
                 {
                     continue;
                 }
-                let entry = demand.entry(deployment.clone()).or_insert((0, *oldest_ms));
+                let entry = demand
+                    .entry(deployment.clone())
+                    .or_insert((0, *oldest_ms, *class));
                 entry.0 = entry.0.saturating_add(*waiting);
                 entry.1 = entry.1.min(*oldest_ms);
+                entry.2 = entry.2.min(*class);
             }
         }
         demand
             .into_iter()
-            .map(|(deployment, (waiting, oldest_ms))| hypellm_fleet::schedule::Contender {
+            .map(|(deployment, (waiting, oldest_ms, class))| hypellm_fleet::schedule::Contender {
                 restore_cost_ms: self.restore_cost(snapshot, &deployment),
                 deployment,
                 waiting,
                 oldest_ms,
+                class,
             })
             .collect()
     }

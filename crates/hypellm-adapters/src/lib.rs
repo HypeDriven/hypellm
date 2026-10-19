@@ -22,6 +22,7 @@
 //! | Moonshot / Kimi | [`openai::OpenAiAdapter`] | as above; "no assumptions from model name" |
 //! | Generic OpenAI | [`openai::OpenAiAdapter`] | opt-in only, see `hypellm-config` |
 //! | SemIf | [`semif::SemIfAdapter`] | `POST /score`; rerank only, never streams |
+//! | Job shim | [`job::JobAdapter`] | submit, poll, fetch parts; serves `/v1/jobs` only |
 
 #![forbid(unsafe_code)]
 // Specification 18.2: no panics on data-plane input, all integer conversions
@@ -49,6 +50,7 @@
 
 pub mod anthropic;
 pub mod contract;
+pub mod job;
 pub mod openai;
 pub mod semif;
 #[cfg(any(test, feature = "test-harness"))]
@@ -59,6 +61,7 @@ pub use contract::{
     Adapter, CredentialHandle, ErrorClassification, RequestMeta, SensitiveHeaders,
     ValidationFailure, ValidationResult, is_usable_credential,
 };
+pub use job::{JobAdapter, JobFamilyAdapter};
 pub use openai::OpenAiAdapter;
 pub use semif::SemIfAdapter;
 
@@ -71,6 +74,7 @@ static MOONSHOT: OpenAiAdapter = OpenAiAdapter::new(ProviderFamily::Moonshot);
 static GENERIC: OpenAiAdapter = OpenAiAdapter::new(ProviderFamily::GenericOpenAi);
 static ANTHROPIC: AnthropicAdapter = AnthropicAdapter;
 static SEMIF: SemIfAdapter = SemIfAdapter;
+static JOB: JobFamilyAdapter = JobFamilyAdapter;
 
 /// The adapter for a provider family.
 ///
@@ -86,6 +90,7 @@ pub fn adapter_for(family: ProviderFamily) -> &'static dyn Adapter {
         ProviderFamily::Moonshot => &MOONSHOT,
         ProviderFamily::GenericOpenAi => &GENERIC,
         ProviderFamily::SemIf => &SEMIF,
+        ProviderFamily::Job => &JOB,
     }
 }
 
@@ -229,6 +234,16 @@ mod tests {
         // does not do that at all". A new family has to be given a case here
         // before it can pass, which is the point of iterating `all()`.
         for family in ProviderFamily::all() {
+            if *family == ProviderFamily::Job {
+                // A job shim serves no single-exchange operation at all, so
+                // there is no work to ask it that would reach the streaming
+                // check; what it must do is refuse, which it does first.
+                let failure = adapter_for(*family)
+                    .validate(&request_fixture(), &target_fixture().capabilities)
+                    .expect_err("a job shim serves nothing here");
+                assert_eq!(failure.code, "operation_unsupported");
+                continue;
+            }
             let (mut request, mut capabilities) = match family {
                 ProviderFamily::SemIf => (
                     crate::testing::rerank_request_fixture(),

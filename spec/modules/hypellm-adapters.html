@@ -42,6 +42,7 @@
 <li><a href="../components/fleet-agent.html">Fleet agent</a></li>
 <li><a href="../components/identity-verifier.html">Identity verifier</a></li>
 <li><a href="../components/tls-helper.html">Outbound TLS helper</a></li>
+<li><a href="../components/job-shim.html">Job shim</a></li>
 <li><a href="../components/container-init.html">Container init</a></li>
 <li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
 </ul></details>
@@ -102,7 +103,7 @@ input/resource limits.</p>
 </tr>
 <tr>
 <td>Fuzz targets</td>
-<td><code>tests/fuzz.rs</code> — 10 targets over recorded provider events, driven by <code>hypellm-test-corpus::fuzz</code>. See <a href="#fuzz-targets">Fuzz targets</a>.</td>
+<td><code>tests/fuzz.rs</code> — 11 targets over recorded provider events and job-shim replies, driven by <code>hypellm-test-corpus::fuzz</code>. See <a href="#fuzz-targets">Fuzz targets</a>.</td>
 </tr>
 </tbody>
 </table></div>
@@ -340,6 +341,21 @@ a check on the result, not a cap on the work.</p>
 <td>16, and each index distinct and in range</td>
 <td><code>semif::decode_response</code>; anything else is a <code>ProtocolViolation</code></td>
 </tr>
+<tr>
+<td>A job shim's control reply (status, accepted, health, cancelled)</td>
+<td>16 KiB input, depth 4, 1 KiB per string, 64 items</td>
+<td><code>job::REPLY_LIMITS</code>; a status, error or media type outside its set is a <code>ProtocolViolation</code></td>
+</tr>
+<tr>
+<td>A shim's job identifier and part names</td>
+<td>1–64 bytes of <code>[A-Za-z0-9_-]</code>, validated before any path is built</td>
+<td><code>job::ProviderJobId::parse</code>, <code>job::PartName::parse</code>; the path builders take only these types</td>
+</tr>
+<tr>
+<td>Parts per job, inline inputs per job</td>
+<td>4 and 4, part names distinct</td>
+<td><code>job::MAX_PARTS</code> in <code>decode_status</code>, <code>job::MAX_INPUTS</code> in <code>encode_submit</code></td>
+</tr>
 </tbody>
 </table></div>
 <p>Bounds this module does <strong>not</strong> enforce, stated plainly so no one reads the table
@@ -419,6 +435,10 @@ sent.</p>
 <td>Every score a mutated SemIf reply produces carries an index this adapter could have sent: unique, in range, finite. The defect it guards is one <code>unwrap_or(0)</code></td>
 </tr>
 <tr>
+<td><code>a_provider_job_id_with_a_path_separator_never_reaches_a_request_path</code></td>
+<td>Every path built from a mutated shim reply is a plain <code>/job/v1/jobs/&lt;id&gt;[/parts/&lt;name&gt;]</code> of identifier characters, no part a router would fetch is scriptable, and no classification carries the shim's body (orchestration §11.8). Shown to fail with identifier validation removed</td>
+</tr>
+<tr>
 <td><code>every_recorded_fixture_is_reachable_as_a_seed</code></td>
 <td>A seed set that silently shrank would leave the rest fuzzing a fraction of the corpus while still passing</td>
 </tr>
@@ -475,6 +495,16 @@ be requiring the field not to work. What is required of it is the narrowing.</p>
 There is no registration function, no lookup table an operator can extend, and no
 path by which a request selects an adapter; adding a family is a compile error
 until <code>adapter_for</code> is updated.</p>
+<p><code>job</code> is the shim protocol of orchestration §11.3, and the one family that is
+not a single exchange: <code>JobAdapter</code> builds the health, submit, status, part and
+cancel requests and parses their replies, pure like the rest, and
+<code>JobFamilyAdapter</code> is what <code>adapter_for(ProviderFamily::Job)</code> returns — it refuses
+every inference operation before anything is sent, so an alias misconfigured onto
+a shim fails closed. <code>JobAdapter::encode_headers</code> takes a credential by value,
+not by <code>Option</code>: a shim authenticates the router on every request, and there is
+no path that sends without one. It is credential handling, under the same
+two-person review as every <code>encode_headers</code>. Nothing in the router calls
+<code>JobAdapter</code> yet; the job worker that will is phase 10's next step.</p>
 <p><code>testing</code> is deliberately <code>pub</code> rather than <code>#[cfg(test)]</code> so that
 <code>hypellm-test-corpus</code> and the compatibility suite build the same canonical requests
 the unit tests use — two suites with subtly different fixtures is how a golden

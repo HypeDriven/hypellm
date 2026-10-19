@@ -1,0 +1,806 @@
+#!/usr/bin/env python3
+"""The HypeLLM reference job shim.
+
+A job shim stands beside one generative service and speaks the router's job
+protocol on its behalf (orchestration §11.3). This one is the reference: it
+serves the protocol for any service that can be run as a command, and it is
+what a service-specific shim is measured against. It is **not** part of the
+HypeLLM workspace and is not built by `cargo build --workspace`, for the same
+reason `agent/` and `tls-helper/` are not: the router never executes a process
+(specification 26.2), and running a generator is exactly that.
+
+    GET    /job/v1/health                 → 200 { verbs[] }
+    POST   /job/v1/jobs                   → 202 { id }
+    GET    /job/v1/jobs/{id}              → { state, progress_permille, eta_ms, elapsed_ms, error, parts[] }
+    GET    /job/v1/jobs/{id}/parts/{name} → bytes, with Content-Type and Content-Length
+    DELETE /job/v1/jobs/{id}              → 202 { stopped }
+
+The rules it exists to keep
+---------------------------
+
+1. **The router authenticates, every request.** A bearer token from a key file,
+   compared in constant time. Nothing — not health — answers without it. Run
+   the service itself where only this shim can reach it.
+2. **Inputs are bytes, never references.** An input is a name, a media type
+   from a closed set, and base64 data. There is no field for a URL or a path,
+   so a caller cannot make the service read a file or fetch a host; inputs are
+   written into the job's own directory under names this shim chooses.
+3. **No shell.** A verb runs a configured argv — an absolute program and fixed
+   arguments — with placeholders replaced by whole values. The prompt is one
+   argument, passed literally; `; rm -rf /` in a prompt is a prompt.
+4. **Outputs are declared.** A verb lists the files it produces and their media
+   types. After the command exits, each must be a regular file — not a link —
+   inside the job's output directory, within the size cap. Anything else fails
+   the job; nothing undeclared is ever served.
+5. **Closed vocabularies.** States, error codes and media types are the
+   protocol's own sets. A command signals `invalid_input` by exiting 65
+   (EX_DATAERR) and `out_of_memory` by exiting 75 (EX_TEMPFAIL); any other
+   failure is `internal`.
+6. **Everything is bounded.** Request bodies, inputs, concurrent connections,
+   one job running at a time, a job's wall time, retained jobs, and part
+   sizes. A job's directory is removed when it is cancelled or expires.
+7. **No prompt is logged.** A log line names the method, the route and the
+   status, never a body.
+
+Configuration is a JSON file; see `job-shim.example.json` beside this file and
+spec/components/job-shim.html.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import hmac
+import http.server
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import socketserver
+import stat
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+# Hard ceilings. A configuration may lower these, never raise them past.
+MAX_BODY_CEILING = 256 * 1024 * 1024
+MAX_PART_CEILING = 16 * 1024 * 1024 * 1024
+MAX_CONNECTIONS_CEILING = 256
+MAX_RETAINED_JOBS = 64
+MAX_CONFIG_BYTES = 256 * 1024
+MAX_INPUTS = 4
+MAX_PARTS = 4
+MAX_PROMPT_BYTES = 64 * 1024
+READ_CHUNK = 64 * 1024
+
+IDENTIFIER = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+FILE_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
+PLACEHOLDER = re.compile(r"\{([a-z_]+)(?::([A-Za-z0-9_-]{1,64}))?\}")
+
+STATES = ("queued", "running", "succeeded", "failed", "cancelled")
+ERRORS = ("invalid_input", "out_of_memory", "not_ready", "internal")
+MEDIA_TYPES = {
+    "audio/flac": "flac",
+    "audio/wav": "wav",
+    "video/mp4": "mp4",
+    "image/png": "png",
+    "image/webp": "webp",
+    "model/gltf-binary": "glb",
+    "application/octet-stream": "bin",
+}
+PARAMS = ("duration_ms", "seed", "steps", "width", "height", "count")
+SUBMIT_FIELDS = ("verb", "prompt", "params", "inputs", "options", "request_id")
+
+# The exit codes a command signals with (sysexits.h).
+EX_DATAERR = 65
+EX_TEMPFAIL = 75
+
+
+class Refusal(Exception):
+    """A request this shim declines: the HTTP status and the protocol error."""
+
+    def __init__(self, status: int, error: str) -> None:
+        if error not in ERRORS:
+            error = "internal"
+        super().__init__(error)
+        self.status = status
+        self.error = error
+
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Part:
+    name: str
+    file: str
+    media_type: str
+    optional: bool = False
+
+
+@dataclass(frozen=True)
+class Verb:
+    name: str
+    argv: tuple[str, ...]
+    inputs: dict[str, tuple[str, ...]]
+    parts: tuple[Part, ...]
+    timeout_s: int
+    progress_file: str | None = None
+    optional_inputs: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class Config:
+    host: str
+    port: int
+    key: bytes
+    work_dir: str
+    verbs: dict[str, Verb]
+    max_body_bytes: int = 64 * 1024 * 1024
+    max_part_bytes: int = 1024 * 1024 * 1024
+    max_connections: int = 16
+    retention_s: int = 900
+
+
+class ConfigError(Exception):
+    pass
+
+
+def bounded_int(document: dict[str, Any], key: str, default: int, low: int, high: int) -> int:
+    value = document.get(key, default)
+    if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
+        raise ConfigError(f"{key} must be an integer from {low} to {high}")
+    return value
+
+
+def load_verb(name: str, document: Any) -> Verb:
+    if not isinstance(document, dict):
+        raise ConfigError(f"verb {name}: must be an object")
+    unknown = set(document) - {"argv", "inputs", "parts", "timeout_s", "progress_file"}
+    if unknown:
+        raise ConfigError(f"verb {name}: unknown fields {sorted(unknown)}")
+    argv = document.get("argv")
+    if (
+        not isinstance(argv, list)
+        or not argv
+        or not all(isinstance(a, str) for a in argv)
+        or not os.path.isabs(argv[0])
+    ):
+        raise ConfigError(f"verb {name}: argv must be a list of strings starting with an absolute program")
+    inputs_document = document.get("inputs", {})
+    if not isinstance(inputs_document, dict) or len(inputs_document) > MAX_INPUTS:
+        raise ConfigError(f"verb {name}: inputs must be an object of at most {MAX_INPUTS}")
+    inputs: dict[str, tuple[str, ...]] = {}
+    optional_inputs: set[str] = set()
+    for input_name, declared in inputs_document.items():
+        if not IDENTIFIER.match(input_name):
+            raise ConfigError(f"verb {name}: input name {input_name!r} is not an identifier")
+        # A list of media types is a required input; an object can make one
+        # optional. An optional input has no placeholder: there is no whole
+        # value to put in its place when it is absent, so the command finds it
+        # at in/<name>.<ext> in its working directory, or does not.
+        types = declared
+        if isinstance(declared, dict):
+            if set(declared) - {"media_types", "optional"} or not isinstance(declared.get("optional", False), bool):
+                raise ConfigError(f"verb {name}: input {input_name} has unknown fields")
+            types = declared.get("media_types")
+            if declared.get("optional", False):
+                optional_inputs.add(input_name)
+        if not isinstance(types, list) or not types or not all(t in MEDIA_TYPES for t in types):
+            raise ConfigError(f"verb {name}: input {input_name} must list media types from the protocol's set")
+        inputs[input_name] = tuple(types)
+    parts_document = document.get("parts")
+    if not isinstance(parts_document, dict) or not 1 <= len(parts_document) <= MAX_PARTS:
+        raise ConfigError(f"verb {name}: parts must be an object of 1 to {MAX_PARTS}")
+    parts = []
+    files: set[str] = set()
+    for part_name, part in parts_document.items():
+        if not IDENTIFIER.match(part_name) or not isinstance(part, dict):
+            raise ConfigError(f"verb {name}: part {part_name!r} is not an identifier with an object")
+        file = part.get("file")
+        media_type = part.get("media_type")
+        optional = part.get("optional", False)
+        if not isinstance(file, str) or not FILE_NAME.match(file) or file in (".", ".."):
+            raise ConfigError(f"verb {name}: part {part_name}'s file must be a plain file name")
+        if file in files:
+            raise ConfigError(f"verb {name}: two parts share the file {file}")
+        files.add(file)
+        if media_type not in MEDIA_TYPES:
+            raise ConfigError(f"verb {name}: part {part_name}'s media type is not in the protocol's set")
+        if not isinstance(optional, bool) or set(part) - {"file", "media_type", "optional"}:
+            raise ConfigError(f"verb {name}: part {part_name} has unknown fields")
+        parts.append(Part(part_name, file, media_type, optional))
+    if all(p.optional for p in parts):
+        raise ConfigError(f"verb {name}: at least one part must be required")
+    for element in argv:
+        for match in PLACEHOLDER.finditer(element):
+            kind, arg = match.group(1), match.group(2)
+            if kind == "input":
+                if arg not in inputs:
+                    raise ConfigError(f"verb {name}: argv names undeclared input {arg!r}")
+                if arg in optional_inputs:
+                    raise ConfigError(f"verb {name}: optional input {arg!r} cannot be a placeholder")
+            elif kind in ("prompt", "params_file", "options_file", "out_dir") and arg is None:
+                pass
+            else:
+                raise ConfigError(f"verb {name}: argv has unknown placeholder {match.group(0)}")
+    progress_file = document.get("progress_file")
+    if progress_file is not None and (not isinstance(progress_file, str) or not FILE_NAME.match(progress_file)):
+        raise ConfigError(f"verb {name}: progress_file must be a plain file name")
+    timeout_s = bounded_int(document, "timeout_s", 900, 1, 86_400)
+    return Verb(name, tuple(argv), inputs, tuple(parts), timeout_s, progress_file, frozenset(optional_inputs))
+
+
+def load_config(path: str) -> Config:
+    with open(path, "rb") as handle:
+        raw = handle.read(MAX_CONFIG_BYTES + 1)
+    if len(raw) > MAX_CONFIG_BYTES:
+        raise ConfigError("configuration is too large")
+    document = json.loads(raw)
+    if not isinstance(document, dict):
+        raise ConfigError("configuration must be an object")
+    unknown = set(document) - {
+        "listen", "key_file", "work_dir", "verbs", "max_body_bytes",
+        "max_part_bytes", "max_connections", "retention_s",
+    }
+    if unknown:
+        raise ConfigError(f"unknown fields {sorted(unknown)}")
+    listen = document.get("listen")
+    if not isinstance(listen, str) or ":" not in listen:
+        raise ConfigError("listen must be host:port")
+    host, _, port_text = listen.rpartition(":")
+    if not port_text.isdigit() or not 0 <= int(port_text) <= 65535:
+        raise ConfigError("listen port is out of range")
+    key_file = document.get("key_file")
+    if not isinstance(key_file, str):
+        raise ConfigError("key_file is required")
+    key = read_key(key_file)
+    work_dir = document.get("work_dir")
+    if not isinstance(work_dir, str) or not os.path.isabs(work_dir):
+        raise ConfigError("work_dir must be an absolute path")
+    verbs_document = document.get("verbs")
+    if not isinstance(verbs_document, dict) or not verbs_document:
+        raise ConfigError("verbs must declare at least one verb")
+    verbs = {name: load_verb(name, verb) for name, verb in verbs_document.items()}
+    return Config(
+        host=host.strip("[]"),
+        port=int(port_text),
+        key=key,
+        work_dir=work_dir,
+        verbs=verbs,
+        max_body_bytes=bounded_int(document, "max_body_bytes", 64 * 1024 * 1024, 1024, MAX_BODY_CEILING),
+        max_part_bytes=bounded_int(document, "max_part_bytes", 1024 * 1024 * 1024, 1, MAX_PART_CEILING),
+        max_connections=bounded_int(document, "max_connections", 16, 1, MAX_CONNECTIONS_CEILING),
+        retention_s=bounded_int(document, "retention_s", 900, 1, 86_400),
+    )
+
+
+def read_key(path: str) -> bytes:
+    """The bearer the router presents: visible ASCII, at least 16 bytes."""
+    info = os.stat(path)
+    if info.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise ConfigError(f"{path} must not be readable by group or others")
+    with open(path, "rb") as handle:
+        key = handle.read(4097).strip()
+    if not 16 <= len(key) <= 4096 or not all(0x21 <= b <= 0x7E for b in key):
+        raise ConfigError("the key must be 16 to 4096 visible ASCII characters")
+    return key
+
+
+# --------------------------------------------------------------------------
+# Jobs
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Job:
+    id: str
+    verb: Verb
+    directory: str
+    started: float
+    state: str = "running"
+    error: str | None = None
+    parts: list[tuple[Part, int]] = field(default_factory=list)
+    process: subprocess.Popen[bytes] | None = None
+    finished: float | None = None
+    cancelled: bool = False
+
+
+class Jobs:
+    """The job table: one job running at a time, a bounded number retained."""
+
+    def __init__(self, config: Config, log: Log) -> None:
+        self.config = config
+        self.log = log
+        self.lock = threading.Lock()
+        self.jobs: dict[str, Job] = {}
+
+    def sweep_locked(self) -> None:
+        now = time.monotonic()
+        for job_id in [
+            j.id for j in self.jobs.values()
+            if j.finished is not None and now - j.finished > self.config.retention_s
+        ]:
+            job = self.jobs.pop(job_id)
+            shutil.rmtree(job.directory, ignore_errors=True)
+
+    def submit(self, document: Any) -> str:
+        verb, prompt, params, inputs, options = validate_submit(document, self.config)
+        with self.lock:
+            self.sweep_locked()
+            if any(j.state == "running" for j in self.jobs.values()):
+                raise Refusal(503, "not_ready")
+            if len(self.jobs) >= MAX_RETAINED_JOBS:
+                raise Refusal(503, "not_ready")
+            job_id = "j" + secrets.token_hex(12)
+            directory = os.path.join(self.config.work_dir, job_id)
+            os.makedirs(os.path.join(directory, "in"), mode=0o700)
+            os.makedirs(os.path.join(directory, "out"), mode=0o700)
+            job = Job(job_id, verb, directory, time.monotonic())
+            self.jobs[job_id] = job
+        try:
+            argv = render_argv(verb, directory, prompt, params, inputs, options)
+            # The command's output goes to the job's own log, which is removed
+            # with the job; the shim's log never carries it.
+            with open(os.path.join(directory, "log"), "wb") as output:
+                job.process = subprocess.Popen(
+                    argv,
+                    cwd=directory,
+                    stdin=subprocess.DEVNULL,
+                    stdout=output,
+                    stderr=subprocess.STDOUT,
+                    env={"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": directory, "LANG": "C.UTF-8"},
+                    start_new_session=True,
+                    close_fds=True,
+                )
+        except OSError:
+            with self.lock:
+                self.finish_locked(job, "failed", "internal")
+            return job_id
+        threading.Thread(target=self.watch, args=(job,), daemon=True).start()
+        return job_id
+
+    def watch(self, job: Job) -> None:
+        process = job.process
+        if process is None:
+            return
+        try:
+            code = process.wait(timeout=job.verb.timeout_s)
+        except subprocess.TimeoutExpired:
+            kill(process)
+            code = None
+        with self.lock:
+            if job.cancelled:
+                self.finish_locked(job, "cancelled", None)
+            elif code == 0:
+                parts = collect_parts(job, self.config)
+                if parts is None:
+                    self.finish_locked(job, "failed", "internal")
+                else:
+                    job.parts = parts
+                    self.finish_locked(job, "succeeded", None)
+            elif code == EX_DATAERR:
+                self.finish_locked(job, "failed", "invalid_input")
+            elif code == EX_TEMPFAIL:
+                self.finish_locked(job, "failed", "out_of_memory")
+            else:
+                self.finish_locked(job, "failed", "internal")
+
+    def finish_locked(self, job: Job, state: str, error: str | None) -> None:
+        job.state = state
+        job.error = error
+        job.finished = time.monotonic()
+        if state != "succeeded":
+            # Nothing of a failed or cancelled job will be served, so nothing
+            # of it is kept.
+            shutil.rmtree(job.directory, ignore_errors=True)
+
+    def status(self, job_id: str) -> dict[str, Any]:
+        with self.lock:
+            self.sweep_locked()
+            job = self.jobs.get(job_id)
+            if job is None:
+                raise Refusal(404, "invalid_input")
+            elapsed = int(((job.finished or time.monotonic()) - job.started) * 1000)
+            body: dict[str, Any] = {"state": job.state, "elapsed_ms": elapsed}
+            if job.state == "running":
+                body["progress_permille"] = read_progress(job)
+            elif job.state == "succeeded":
+                body["progress_permille"] = 1000
+                body["parts"] = [
+                    {"name": p.name, "media_type": p.media_type, "bytes": size}
+                    for p, size in job.parts
+                ]
+            if job.state == "failed":
+                body["error"] = job.error or "internal"
+            return body
+
+    def part(self, job_id: str, name: str) -> tuple[str, str, int]:
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job is None or job.state != "succeeded":
+                raise Refusal(404, "invalid_input")
+            for part, size in job.parts:
+                if part.name == name:
+                    return os.path.join(job.directory, "out", part.file), part.media_type, size
+        raise Refusal(404, "invalid_input")
+
+    def cancel(self, job_id: str) -> bool:
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                raise Refusal(404, "invalid_input")
+            if job.state != "running":
+                return False
+            job.cancelled = True
+            process = job.process
+        if process is not None:
+            kill(process)
+        return True
+
+
+def kill(process: subprocess.Popen[bytes]) -> None:
+    """Stop a command and everything it started: its whole session."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(process.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        try:
+            process.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def read_progress(job: Job) -> int:
+    """The command's own progress, if it writes one: clamped below 1000, since
+    a job is not done until it has exited."""
+    if job.verb.progress_file is None:
+        return 0
+    try:
+        with open(os.path.join(job.directory, "out", job.verb.progress_file), "rb") as handle:
+            text = handle.read(16).strip()
+        return max(0, min(999, int(text)))
+    except (OSError, ValueError):
+        return 0
+
+
+def collect_parts(job: Job, config: Config) -> list[tuple[Part, int]] | None:
+    """Each declared output: a regular file, not a link, within the cap."""
+    out = os.path.join(job.directory, "out")
+    parts: list[tuple[Part, int]] = []
+    for part in job.verb.parts:
+        path = os.path.join(out, part.file)
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            if part.optional:
+                continue
+            return None
+        if not stat.S_ISREG(info.st_mode) or info.st_size > config.max_part_bytes:
+            return None
+        parts.append((part, info.st_size))
+    return parts or None
+
+
+def validate_submit(document: Any, config: Config) -> tuple[Verb, str, dict[str, int], dict[str, tuple[str, bytes]], Any]:
+    if not isinstance(document, dict) or set(document) - set(SUBMIT_FIELDS):
+        raise Refusal(400, "invalid_input")
+    verb = config.verbs.get(document.get("verb"))  # type: ignore[arg-type]
+    if verb is None:
+        raise Refusal(400, "invalid_input")
+    prompt = document.get("prompt", "")
+    if not isinstance(prompt, str) or len(prompt.encode()) > MAX_PROMPT_BYTES or "\0" in prompt:
+        raise Refusal(400, "invalid_input")
+    params_document = document.get("params", {})
+    if not isinstance(params_document, dict) or set(params_document) - set(PARAMS):
+        raise Refusal(400, "invalid_input")
+    params: dict[str, int] = {}
+    for key, value in params_document.items():
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise Refusal(400, "invalid_input")
+        params[key] = value
+    inputs_document = document.get("inputs", [])
+    if not isinstance(inputs_document, list) or len(inputs_document) > MAX_INPUTS:
+        raise Refusal(400, "invalid_input")
+    inputs: dict[str, tuple[str, bytes]] = {}
+    for item in inputs_document:
+        if not isinstance(item, dict) or set(item) != {"name", "media_type", "data"}:
+            raise Refusal(400, "invalid_input")
+        name, media_type, data = item["name"], item["media_type"], item["data"]
+        if not isinstance(name, str) or not IDENTIFIER.match(name) or name in inputs:
+            raise Refusal(400, "invalid_input")
+        if name not in verb.inputs or media_type not in verb.inputs[name]:
+            raise Refusal(400, "invalid_input")
+        if not isinstance(data, str):
+            raise Refusal(400, "invalid_input")
+        try:
+            raw = base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise Refusal(400, "invalid_input") from error
+        inputs[name] = (media_type, raw)
+    if set(verb.inputs) - verb.optional_inputs - set(inputs):
+        raise Refusal(400, "invalid_input")
+    options = document.get("options")
+    if options is not None and not isinstance(options, dict):
+        raise Refusal(400, "invalid_input")
+    request_id = document.get("request_id", "")
+    if not isinstance(request_id, str) or len(request_id) > 64:
+        raise Refusal(400, "invalid_input")
+    return verb, prompt, params, inputs, options
+
+
+def render_argv(
+    verb: Verb,
+    directory: str,
+    prompt: str,
+    params: dict[str, int],
+    inputs: dict[str, tuple[str, bytes]],
+    options: Any,
+) -> list[str]:
+    """Write the job's files and build its argv: no shell, whole values."""
+    files: dict[str, str] = {}
+    for name, (media_type, raw) in inputs.items():
+        path = os.path.join(directory, "in", f"{name}.{MEDIA_TYPES[media_type]}")
+        write_private(path, raw)
+        files[f"input:{name}"] = path
+    params_file = os.path.join(directory, "params.json")
+    write_private(params_file, json.dumps(params).encode())
+    options_file = os.path.join(directory, "options.json")
+    write_private(options_file, json.dumps(options or {}).encode())
+    values = {
+        "prompt": prompt,
+        "params_file": params_file,
+        "options_file": options_file,
+        "out_dir": os.path.join(directory, "out"),
+        **files,
+    }
+
+    def substitute(match: re.Match[str]) -> str:
+        key = match.group(1) if match.group(2) is None else f"{match.group(1)}:{match.group(2)}"
+        return values[key]
+
+    return [PLACEHOLDER.sub(substitute, element) for element in verb.argv]
+
+
+def write_private(path: str, data: bytes) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(data)
+
+
+# --------------------------------------------------------------------------
+# HTTP
+# --------------------------------------------------------------------------
+
+
+class Log:
+    def __init__(self, stream: Any = sys.stderr) -> None:
+        self.stream = stream
+        self.lock = threading.Lock()
+
+    def line(self, **fields: Any) -> None:
+        text = " ".join(f"{k}={v}" for k, v in fields.items())
+        with self.lock:
+            print(text, file=self.stream, flush=True)
+
+
+def no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    keys = [k for k, _ in pairs]
+    if len(set(keys)) != len(keys):
+        raise ValueError("duplicate key")
+    return dict(pairs)
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "hypellm-job-shim"
+    sys_version = ""
+    protocol_version = "HTTP/1.1"
+
+    # Set by the server.
+    shim: Shim
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        # The standard log would print the request line, which carries a job
+        # id but never a body; the shim logs its own shorter line instead.
+        pass
+
+    def reply(self, status: int, body: dict[str, Any]) -> None:
+        payload = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(payload)
+        self.close_connection = True
+
+    def route(self) -> str:
+        parts = self.path.split("/")
+        if len(parts) >= 5 and parts[:4] == ["", "job", "v1", "jobs"]:
+            return "/job/v1/jobs/{id}" + ("/parts/{name}" if len(parts) == 7 else "")
+        return self.path if self.path in ("/job/v1/health", "/job/v1/jobs") else "other"
+
+    def authenticated(self) -> bool:
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Bearer "):
+            return False
+        return hmac.compare_digest(header[len("Bearer "):].encode(), self.shim.config.key)
+
+    def body(self) -> Any:
+        if self.headers.get("Transfer-Encoding") is not None:
+            raise Refusal(411, "invalid_input")
+        length_text = self.headers.get("Content-Length", "0")
+        if not length_text.isdigit():
+            raise Refusal(400, "invalid_input")
+        length = int(length_text)
+        if length > self.shim.config.max_body_bytes:
+            raise Refusal(413, "invalid_input")
+        raw = self.rfile.read(length)
+        try:
+            return json.loads(raw, object_pairs_hook=no_duplicates)
+        except (ValueError, RecursionError) as error:
+            raise Refusal(400, "invalid_input") from error
+
+    def handle_any(self, method: str) -> None:
+        status = 500
+        try:
+            if not self.authenticated():
+                status = 401
+                self.reply(401, {"error": "invalid_input"})
+                return
+            status = self.dispatch(method)
+        except Refusal as refusal:
+            status = refusal.status
+            self.reply(refusal.status, {"error": refusal.error})
+        except Exception:  # noqa: BLE001
+            status = 500
+            self.reply(500, {"error": "internal"})
+        finally:
+            self.shim.log.line(method=method, route=self.route(), status=status)
+
+    def path_parts(self) -> list[str]:
+        parts = self.path.split("/")
+        for segment in parts[4:]:
+            if not IDENTIFIER.match(segment) and segment != "parts":
+                raise Refusal(404, "invalid_input")
+        return parts
+
+    def dispatch(self, method: str) -> int:
+        jobs = self.shim.jobs
+        if method == "GET" and self.path == "/job/v1/health":
+            self.reply(200, {"verbs": sorted(self.shim.config.verbs)})
+            return 200
+        if method == "POST" and self.path == "/job/v1/jobs":
+            job_id = jobs.submit(self.body())
+            self.reply(202, {"id": job_id})
+            return 202
+        parts = self.path_parts()
+        if len(parts) == 5 and parts[:4] == ["", "job", "v1", "jobs"]:
+            if method == "GET":
+                self.reply(200, jobs.status(parts[4]))
+                return 200
+            if method == "DELETE":
+                self.reply(202, {"stopped": jobs.cancel(parts[4])})
+                return 202
+        if method == "GET" and len(parts) == 7 and parts[:4] == ["", "job", "v1", "jobs"] and parts[5] == "parts":
+            path, media_type, size = jobs.part(parts[4], parts[6])
+            self.send_response(200)
+            self.send_header("Content-Type", media_type)
+            self.send_header("Content-Length", str(size))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            with open(path, "rb") as handle:
+                remaining = size
+                while remaining > 0:
+                    chunk = handle.read(min(READ_CHUNK, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+            self.close_connection = True
+            return 200
+        raise Refusal(404, "invalid_input")
+
+    def do_GET(self) -> None:  # noqa: N802
+        self.handle_any("GET")
+
+    def do_POST(self) -> None:  # noqa: N802
+        self.handle_any("POST")
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        self.handle_any("DELETE")
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, shim: Shim) -> None:
+        self.shim = shim
+        self.slots = threading.BoundedSemaphore(shim.config.max_connections)
+        handler = type("BoundHandler", (Handler,), {"shim": shim})
+        super().__init__((shim.config.host, shim.config.port), handler)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        # Bounded: past max_connections a connection is closed, not queued.
+        if not self.slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
+class Shim:
+    def __init__(self, config: Config, log: Log | None = None) -> None:
+        self.config = config
+        self.log = log or Log()
+        os.makedirs(config.work_dir, mode=0o700, exist_ok=True)
+        # Jobs are not durable: what a previous process left can be served by
+        # nobody, so it goes.
+        for entry in os.listdir(config.work_dir):
+            if re.match(r"^j[0-9a-f]{24}$", entry):
+                shutil.rmtree(os.path.join(config.work_dir, entry), ignore_errors=True)
+        self.jobs = Jobs(config, self.log)
+        self.server = Server(self)
+        self.serving = threading.Event()
+
+    @property
+    def address(self) -> tuple[str, int]:
+        return self.server.server_address[:2]  # type: ignore[return-value]
+
+    def serve(self) -> None:
+        self.serving.set()
+        self.server.serve_forever(poll_interval=0.2)
+
+    def close(self) -> None:
+        # `shutdown` waits for `serve_forever` to notice, so it is only asked
+        # of a server that is serving; one that never started would wait for
+        # ever.
+        if self.serving.is_set():
+            self.server.shutdown()
+        self.server.server_close()
+        for job in list(self.jobs.jobs.values()):
+            if job.process is not None and job.state == "running":
+                kill(job.process)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--config", required=True)
+    args = parser.parse_args(argv)
+    for name in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+        if name in os.environ:
+            print(f"{name} is set and ignored: this shim makes no outbound requests", file=sys.stderr)
+    try:
+        config = load_config(args.config)
+    except (OSError, ValueError, ConfigError) as error:
+        print(f"configuration refused: {error}", file=sys.stderr)
+        return 2
+    shim = Shim(config)
+    print(f"listening on {config.host}:{config.port}", file=sys.stderr, flush=True)
+    try:
+        shim.serve()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        shim.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

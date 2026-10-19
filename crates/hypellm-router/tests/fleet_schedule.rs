@@ -15,6 +15,7 @@
     reason = "specification 18.2 permits these in tests"
 )]
 
+use hypellm_core::admission::PriorityClass;
 use hypellm_core::time::Clock;
 use hypellm_net::fleet_sim::{AgentScript, Behaviour, SimulatedAgent};
 use hypellm_router::routes::InferenceHandler;
@@ -83,16 +84,26 @@ struct Harness {
 
 impl Harness {
     fn start(reorder_ms: u64, name: &str) -> Self {
+        Self::start_with(reorder_ms, name, "")
+    }
+
+    /// [`Harness::start`], with `extra` records appended to the configuration.
+    fn start_with(reorder_ms: u64, name: &str, extra: &str) -> Self {
+        Self::start_scripted(reorder_ms, name, extra, Behaviour::ReadyAfter(1))
+    }
+
+    /// [`Harness::start_with`], with `d-b` behaving as `beta`.
+    fn start_scripted(reorder_ms: u64, name: &str, extra: &str, beta: Behaviour) -> Self {
         let socket = socket(name);
         let upstream = FakeUpstream::start(CannedResponse::json(200, COMPLETION));
-        let text = config(upstream.address.port(), &socket, reorder_ms);
+        let text = format!("{}{extra}", config(upstream.address.port(), &socket, reorder_ms));
         let router = router_with_config(&upstream, &text);
         let digest = router.state.config().fleet.digest();
         let agent = SimulatedAgent::start(
             &socket,
             AgentScript::empty(digest, KEY)
                 .with_deployment("d-a", Behaviour::ReadyAfter(1))
-                .with_deployment("d-b", Behaviour::ReadyAfter(1))
+                .with_deployment("d-b", beta)
                 .with_state("d-a", "stopped")
                 .with_state("d-b", "stopped"),
         );
@@ -126,8 +137,12 @@ impl Harness {
     }
 
     fn submit(&self, alias: &str) -> String {
+        self.submit_with(&self.router.api_key, alias)
+    }
+
+    fn submit_with(&self, key: &str, alias: &str) -> String {
         let body = format!(r#"{{"model":"{alias}","messages":[{{"role":"user","content":"hi"}}]}}"#);
-        let (status, text) = request(self.address, &self.router.api_key, "POST", "/v1/jobs", &body);
+        let (status, text) = request(self.address, key, "POST", "/v1/jobs", &body);
         assert_eq!(status, 202, "{text}");
         text.split("\"job_id\":\"")
             .nth(1)
@@ -301,19 +316,19 @@ fn a_parked_swap_waits_while_the_loaded_model_is_working_and_goes_when_it_is_qui
     let hold = fleet.enter_dispatch(&alpha).unwrap().expect("alpha is a fleet target");
     let beta = hypellm_core::ids::AliasId::new("beta").unwrap();
     assert!(fleet.park(Capability::Chat));
-    fleet.park_alias(&beta);
+    fleet.park_alias(&beta, PriorityClass::Standard);
 
     let swap = plan_for(&harness, "pb:m");
     assert!(swap.evicts(), "the fixture must force a swap");
     assert!(
-        matches!(fleet.poll_queue(Capability::Chat, &swap), QueueAdmission::Wait { .. }),
+        matches!(fleet.poll_queue(Capability::Chat, &swap, PriorityClass::Standard), QueueAdmission::Wait { .. }),
         "the swap went ahead while alpha was serving"
     );
 
     fleet.leave_dispatch(hold);
-    assert_eq!(fleet.poll_queue(Capability::Chat, &swap), QueueAdmission::Activate);
+    assert_eq!(fleet.poll_queue(Capability::Chat, &swap, PriorityClass::Standard), QueueAdmission::Activate);
 
-    fleet.unpark_alias(&beta);
+    fleet.unpark_alias(&beta, PriorityClass::Standard);
     fleet.unpark(Capability::Chat);
 }
 
@@ -330,11 +345,11 @@ fn the_model_more_requests_wait_for_is_loaded_first_and_the_fleet_view_says_so()
     let alpha = hypellm_core::ids::AliasId::new("alpha").unwrap();
     let beta = hypellm_core::ids::AliasId::new("beta").unwrap();
     assert!(fleet.park(Capability::Chat));
-    fleet.park_alias(&alpha);
+    fleet.park_alias(&alpha, PriorityClass::Standard);
     std::thread::sleep(Duration::from_millis(20));
     for _ in 0..3 {
         assert!(fleet.park(Capability::Chat));
-        fleet.park_alias(&beta);
+        fleet.park_alias(&beta, PriorityClass::Standard);
     }
 
     let next = fleet.next_activations();
@@ -346,15 +361,169 @@ fn the_model_more_requests_wait_for_is_loaded_first_and_the_fleet_view_says_so()
     let load_alpha = plan_for(&harness, "pa:m");
     let load_beta = plan_for(&harness, "pb:m");
     assert!(
-        matches!(fleet.poll_queue(Capability::Chat, &load_alpha), QueueAdmission::Wait { .. }),
+        matches!(fleet.poll_queue(Capability::Chat, &load_alpha, PriorityClass::Standard), QueueAdmission::Wait { .. }),
         "alpha was loaded ahead of three times the demand"
     );
-    assert_eq!(fleet.poll_queue(Capability::Chat, &load_beta), QueueAdmission::Activate);
+    assert_eq!(fleet.poll_queue(Capability::Chat, &load_beta, PriorityClass::Standard), QueueAdmission::Activate);
 
-    fleet.unpark_alias(&alpha);
+    fleet.unpark_alias(&alpha, PriorityClass::Standard);
     for _ in 0..3 {
-        fleet.unpark_alias(&beta);
+        fleet.unpark_alias(&beta, PriorityClass::Standard);
         fleet.unpark(Capability::Chat);
     }
     fleet.unpark(Capability::Chat);
+}
+
+/// A second API key, for principal `svc:human` of the test tenant.
+fn second_key(harness: &Harness) -> String {
+    harness
+        .router
+        .state
+        .keys
+        .create(
+            hypellm_core::ids::TenantId::new("acme").unwrap(),
+            hypellm_core::ids::PrincipalId::new("svc:human").unwrap(),
+            vec![hypellm_auth::Scope::Inference],
+            None,
+            hypellm_auth::SourceRestriction::Any,
+            None,
+            harness.router.state.clock.wall_millis(),
+        )
+        .unwrap()
+        .into_secret()
+}
+
+#[test]
+fn an_interactive_job_for_a_cold_model_goes_before_batch_work_on_the_warm_one() {
+    // Orchestration §11.9. `alpha` is loaded; four batch jobs wait for it and
+    // one interactive job waits for `beta`, which can only be loaded by
+    // stopping `alpha`. Locality alone would serve the warm batch work first
+    // and load `beta` last. Class goes first: `beta` is loaded at once, and
+    // `alpha` is loaded again for the batch work after it.
+    let harness = Harness::start_with(
+        120_000,
+        "classes",
+        "quota scope=principal:svc:test class=batch\n\
+         quota scope=principal:svc:human class=interactive\n",
+    );
+    let human = second_key(&harness);
+    let body = r#"{"model":"alpha","messages":[{"role":"user","content":"hi"}]}"#;
+    let (status, text) =
+        request(harness.address, &harness.router.api_key, "POST", "/v1/chat/completions", body);
+    assert_eq!(status, 200, "{text}");
+
+    let mut jobs: Vec<String> = (0..4).map(|_| harness.submit("alpha")).collect();
+    jobs.push(harness.submit_with(&human, "beta"));
+    let states = harness.run(&jobs);
+    assert!(states.iter().all(|s| s == "succeeded"), "{states:?}");
+    let loads = harness.loads();
+    assert_eq!(
+        loads,
+        vec!["d-a", "d-b", "d-a"],
+        "the interactive job's model was not loaded first: {loads:?}"
+    );
+}
+
+#[test]
+fn a_queued_job_is_demand_from_submission_until_it_leaves_the_queue() {
+    // A job no worker has taken is still demand for its model: the batching
+    // queue counts it and the scheduler ranks its deployment. Cancelled, it
+    // stops counting once a worker has removed it — exactly once.
+    let harness = Harness::start(120_000, "demand");
+    let fleet = harness.router.state.fleet().expect("fleet attached");
+    let queued = || {
+        fleet
+            .demand_snapshot()
+            .queued
+            .get(&hypellm_core::target::Capability::Chat)
+            .copied()
+            .unwrap_or(0)
+    };
+    assert_eq!(queued(), 0);
+
+    let job = harness.submit("beta");
+    assert_eq!(queued(), 1, "a queued job was not counted as demand");
+    let next = fleet.next_activations();
+    assert_eq!(next.len(), 1, "{next:?}");
+    assert_eq!(next[0].deployment.as_str(), "d-b");
+
+    let (status, text) =
+        request(harness.address, &harness.router.api_key, "DELETE", &format!("/v1/jobs/{job}"), "");
+    assert!((200..300).contains(&status), "{text}");
+    // Released by the worker that removes it, which the store's shutdown at
+    // the end of `run` waits for rather than racing.
+    let states = harness.run(&[job]);
+    assert_eq!(states, vec!["cancelled"]);
+    assert_eq!(queued(), 0, "a cancelled job's demand was not released");
+    assert!(fleet.next_activations().is_empty());
+}
+
+#[test]
+fn a_job_still_queued_at_shutdown_releases_its_demand() {
+    let harness = Harness::start(120_000, "drain");
+    let fleet = harness.router.state.fleet().expect("fleet attached");
+    let queued = || {
+        fleet
+            .demand_snapshot()
+            .queued
+            .get(&hypellm_core::target::Capability::Chat)
+            .copied()
+            .unwrap_or(0)
+    };
+    let job = harness.submit("beta");
+    assert_eq!(queued(), 1);
+    let state = Arc::clone(&harness.router.state);
+    state.jobs().expect("jobs").shutdown();
+    let worker = std::thread::spawn(move || hypellm_router::jobs::worker_loop(&state));
+    worker.join().unwrap();
+    assert_eq!(queued(), 0, "job {job}, queued at shutdown, kept its demand");
+}
+
+#[test]
+fn a_plan_holds_its_idle_victim_against_new_dispatches_until_it_finishes() {
+    // The gate lets a swap through because nothing runs on the model it would
+    // stop. Without a claim, a request routed a moment earlier — a lower-class
+    // job another worker took as the last one finished — could still be
+    // dispatched into that model, and the swap the gate chose would wait out a
+    // whole generation. `beta` never finishes loading here, so the plan stays
+    // open for as long as the test needs to look.
+    let harness = Harness::start_scripted(120_000, "claim", "", Behaviour::Hangs);
+    let body = r#"{"model":"alpha","messages":[{"role":"user","content":"hi"}]}"#;
+    let (status, text) =
+        request(harness.address, &harness.router.api_key, "POST", "/v1/chat/completions", body);
+    assert_eq!(status, 200, "{text}");
+    let fleet = Arc::clone(harness.router.state.fleet().expect("fleet attached"));
+    let alpha = hypellm_core::ids::TargetId::new("pa:m").unwrap();
+
+    let swap = plan_for(&harness, "pb:m");
+    assert!(swap.evicts(), "the fixture must force a swap");
+    let host = swap.host.clone();
+    let activating = {
+        let fleet = Arc::clone(&fleet);
+        std::thread::spawn(move || {
+            let beta = hypellm_core::ids::TargetId::new("pb:m").unwrap();
+            fleet.ensure_ready(&beta, &swap, "claim-test", 1_500)
+        })
+    };
+    let until = Instant::now() + Duration::from_secs(10);
+    while fleet.ledger().slots_held(&host) == 0 {
+        assert!(Instant::now() < until, "the plan never committed");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        fleet.enter_dispatch(&alpha).is_err(),
+        "a dispatch entered a model the committed plan is stopping"
+    );
+
+    let result = activating.join().unwrap();
+    assert!(
+        matches!(result, hypellm_router::fleet::ActivationResult::Failed { .. }),
+        "{result:?}"
+    );
+    // Finished, rolled back: the claim is gone and `alpha` serves again.
+    let hold = fleet
+        .enter_dispatch(&alpha)
+        .expect("the claim outlived its plan")
+        .expect("alpha is a fleet target");
+    fleet.leave_dispatch(hold);
 }

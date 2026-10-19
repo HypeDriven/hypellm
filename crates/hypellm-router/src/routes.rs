@@ -397,6 +397,62 @@ impl InferenceHandler {
             usize::try_from(config.settings.max_body_bytes).unwrap_or(usize::MAX),
         );
 
+        // A body naming a `verb` is an artifact job for a shim (orchestration
+        // §11.5); any other is a chat job, as it always was.
+        let parsed = wire_json::parse(body, &limits).ok();
+        let artifact = match parsed.as_ref().filter(|v| crate::protocol::job::is_artifact_body(v)) {
+            None => None,
+            Some(value) => match crate::protocol::job::parse_artifact_request(value, &context) {
+                Ok(parsed) => Some(parsed),
+                Err(error) => return respond_error(writer, &error, Some(request_id), protocol),
+            },
+        };
+        if let Some((request, spec, asked)) = artifact {
+            if !jobs.runs_artifacts() {
+                let error = RouterError::new(
+                    ErrorCode::InvalidRequest,
+                    "this router does not run artifact jobs",
+                );
+                return respond_error(writer, &error, Some(request_id), protocol);
+            }
+            // Refused here only when the caller can already see the alias:
+            // for one they cannot, "it serves another verb" would confirm it
+            // exists, so routing answers `model_not_found` as for any other.
+            let restriction = crate::pipeline::key_restriction(state, principal.key_id.as_ref());
+            let attempted = Vec::new();
+            let routing = hypellm_core::policy::RoutingContext {
+                principal: &principal.id,
+                groups: &principal.groups,
+                tenant: &principal.tenant,
+                attempted: &attempted,
+                now_millis: 0,
+                key: restriction.as_ref(),
+            };
+            if let Some(alias) = config
+                .snapshot
+                .servable_aliases(&routing, Operation::Job)
+                .into_iter()
+                .find(|alias| alias.id == request.requested_model)
+            {
+                if alias.capability != Some(spec.verb) {
+                    let error = RouterError::invalid_request(&format!(
+                        "this model does not serve {}",
+                        spec.verb.as_str()
+                    ))
+                    .with_param("verb");
+                    return respond_error(writer, &error, Some(request_id), protocol);
+                }
+            }
+            let mut request = request;
+            if let Some(asked) = asked {
+                // The caller may wait less than the configured ceiling, never
+                // more.
+                let patience = Duration::from_millis(asked).min(patience);
+                request.limits.deadline = Deadline::after(state.clock.as_ref(), patience);
+            }
+            return self.accept_job(writer, principal, request_id, protocol, &config, jobs, request, Some(spec));
+        }
+
         let mut request = match openai::parse_chat_request(body, &context, &limits) {
             Ok(request) => request,
             Err(error) => return respond_error(writer, &error, Some(request_id), protocol),
@@ -415,11 +471,45 @@ impl InferenceHandler {
         }
         let _ = head;
 
+        self.accept_job(writer, principal, request_id, protocol, &config, jobs, request, None)
+    }
+
+    /// Queue a parsed job and answer `202`, or say why not.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the one submission both job dialects share; a struct would only rename the arguments"
+    )]
+    fn accept_job(
+        &self,
+        writer: &mut ClientWriter,
+        principal: &Principal,
+        request_id: RequestId,
+        protocol: ClientProtocol,
+        config: &hypellm_config::ValidatedConfig,
+        jobs: &crate::jobs::JobStore,
+        request: CanonicalRequest,
+        artifact: Option<crate::protocol::job::ArtifactSpec>,
+    ) -> io::Result<Disposition> {
+        let state = &self.state;
+        // Stamped now, as admission would resolve it for this caller: a policy
+        // published while the job waits applies to later submissions.
+        let priority = crate::pipeline::priority_class(state, &request, principal.key_id.as_ref());
+        let alias = request.requested_model.clone();
+        let parked = crate::jobs::park(state, &alias, priority);
+        let (tenant_cap, principal_cap) = config.job_caps(&request.tenant, &request.principal);
+        let terms = crate::jobs::SubmitTerms {
+            class: priority,
+            parked,
+            tenant_cap: Some(tenant_cap),
+            principal_cap,
+            artifact,
+        };
         match jobs.submit(
             request,
             principal.groups.clone(),
             principal.permissions(),
             principal.key_id.clone(),
+            terms,
             state.clock.wall_millis(),
             state.clock.now_millis(),
         ) {
@@ -429,6 +519,7 @@ impl InferenceHandler {
                 Ok(Disposition::KeepAlive)
             }
             Err(refusal) => {
+                crate::jobs::release_parked(state, &alias, priority, parked);
                 let error = match refusal {
                     crate::jobs::SubmitRefusal::NoEntropy => RouterError::new(
                         ErrorCode::InternalFault,
@@ -444,6 +535,10 @@ impl InferenceHandler {
                     crate::jobs::SubmitRefusal::TenantAtCapacity => RouterError::new(
                         ErrorCode::RateLimited,
                         "this tenant already holds as many jobs as this router will keep",
+                    ),
+                    crate::jobs::SubmitRefusal::PrincipalAtCapacity => RouterError::new(
+                        ErrorCode::RateLimited,
+                        "this caller already holds as many jobs as its quota allows",
                     ),
                     crate::jobs::SubmitRefusal::QueueFull => RouterError::new(
                         ErrorCode::RateLimited,
@@ -534,10 +629,23 @@ impl InferenceHandler {
                 }
                 None => respond_error(writer, &not_found(), Some(request_id), protocol),
             },
+            (Method::Get, part) if part.starts_with("result/") => {
+                // A named part of an artifact job. The name was validated as
+                // an identifier when the shim's status was parsed; this one
+                // only selects among those, so an unknown name is not found.
+                let name = part.strip_prefix("result/").unwrap_or_default();
+                match jobs.part(&id, &principal.tenant, Some(name), now) {
+                    Some((part, file)) => write_part(writer, &part, file, request_id),
+                    None => respond_error(writer, &not_found(), Some(request_id), protocol),
+                }
+            }
             (Method::Get, "result") => {
                 let Some(view) = jobs.get(&id, &principal.tenant, now) else {
                     return respond_error(writer, &not_found(), Some(request_id), protocol);
                 };
+                if let Some((part, file)) = jobs.part(&id, &principal.tenant, None, now) {
+                    return write_part(writer, &part, file, request_id);
+                }
                 match jobs.result(&id, &principal.tenant, now) {
                     Some(bytes) => {
                         let payload = String::from_utf8(bytes).unwrap_or_default();
@@ -1438,6 +1546,48 @@ fn write_json(
     writer.write(&head)?;
     writer.write(payload.as_bytes())?;
     writer.flush()
+}
+
+/// Serve one spooled part of an artifact job.
+///
+/// Its media type is from the protocol's closed set, none of it scriptable,
+/// and it is sent with `nosniff` and as an attachment besides: a result is
+/// bytes a service produced from a caller's prompt, and nothing here should
+/// let a browser treat it as a page (orchestration §11.7).
+fn write_part(
+    writer: &mut ClientWriter,
+    part: &crate::spool::SpooledPart,
+    mut file: std::fs::File,
+    request_id: RequestId,
+) -> io::Result<Disposition> {
+    use std::io::Read;
+    let length = usize::try_from(part.bytes).map_err(|_| io::Error::other("part length"))?;
+    let disposition = format!("attachment; filename=\"{}\"", part.name.as_str());
+    let head = ResponseBuilder::new(200)
+        .header("Content-Type", part.media_type.as_str())
+        .and_then(|b| b.header("Content-Disposition", &disposition))
+        .and_then(|b| b.header("X-Content-Type-Options", "nosniff"))
+        .and_then(|b| b.header("X-Request-Id", &request_id.to_string()))
+        .and_then(|b| b.finish_with_length(length))
+        .map_err(|_| io::Error::other("response head"))?;
+    writer.write(&head)?;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut remaining = part.bytes;
+    while remaining > 0 {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            // Shorter on disk than when it was spooled: the head has promised
+            // a length the body cannot keep, so the connection is closed
+            // rather than reused with its framing broken.
+            return Ok(Disposition::Close);
+        }
+        let read_bytes = u64::try_from(read).unwrap_or(u64::MAX).min(remaining);
+        let take = usize::try_from(read_bytes).unwrap_or(read);
+        writer.write(buffer.get(..take).unwrap_or_default())?;
+        remaining = remaining.saturating_sub(read_bytes);
+    }
+    writer.flush()?;
+    Ok(Disposition::KeepAlive)
 }
 
 fn write_json_plain(writer: &mut ClientWriter, status: u16, payload: &str) -> io::Result<()> {

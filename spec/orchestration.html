@@ -42,6 +42,7 @@
 <li><a href="components/fleet-agent.html">Fleet agent</a></li>
 <li><a href="components/identity-verifier.html">Identity verifier</a></li>
 <li><a href="components/tls-helper.html">Outbound TLS helper</a></li>
+<li><a href="components/job-shim.html">Job shim</a></li>
 <li><a href="components/container-init.html">Container init</a></li>
 <li><a href="components/tray-monitor.html">Windows tray monitor</a></li>
 </ul></details>
@@ -79,6 +80,7 @@
 <h1 id="capability-orchestration-across-a-managed-fleet">Capability orchestration across a managed fleet</h1>
 <p><strong>Status: built, with four stated exceptions.</strong> Phases 5 through 8 are implemented: the capability contract, the fleet domain model and agent protocol, observation, planning, activation with leases and rollback, anti-thrash governance, the management surface, and the SPA screens. <code>crates/hypellm-fleet</code> is the planner, <code>crates/hypellm-net/src/fleet.rs</code> the socket, <code>crates/hypellm-router/src/fleet.rs</code> the runtime, and <code>agent/</code> the reference agent that reaches the slaves.</p>
 <p>One thing described here is <strong>not</strong> implemented, and is recorded in <a href="deferred-issues.html">current limitations</a> rather than approximated: Windows-host actuation. <code>POST /v1/jobs</code> is built, with its job records in memory rather than durable — see <a href="deferred-issues.html#jobs-are-in-memory-and-a-restart-loses-them">current limitations</a>. Two implemented details deviate from the design below and are marked <strong>[as built]</strong> where they occur — the <code>HELLO</code> line carries the fleet digest, and the activation budget is a sliding window rather than a token bucket. Both changes were forced by building it, and both are explained at the point they appear.</p>
+<p><strong>A proposal, not built:</strong> §11.1–§11.8 and phases 10–12 extend jobs to the fleet's non-text generative services through out-of-process shims. Phase 10 is in progress: the router's side — §11.9's job ordering, the shim protocol client, typed artifact jobs, polling and the spool — the reference shim, and a backend for each of TRELLIS, FLUX, YuE, H3 and Kimodo are built.</p>
 <p>This document remains written in the specification's normative voice. <code>spec/router-specification.html</code> §26 now carries the normative summary; this is the reasoning behind it.</p>
 <p><strong>Reference convention.</strong> <code>spec §N</code> refers to <code>spec/router-specification.html</code>. A bare <code>§N</code> refers to a section of this document.</p>
 <p><strong>Specification relationship.</strong> This extends spec §5, §5.1, §6, §11.1, §12, §13, §16, §17, §21 and §24. It does not amend spec §4, §4.1, §10, §15 or §18.2, and every design decision below is constrained by them. Where the specification must change, the change is stated explicitly rather than implied.</p>
@@ -864,8 +866,8 @@ a digest it has actually received.</p>
 <ul>
 <li><strong>Next activation.</strong> A trigger the batching queue grants goes only when its deployment ranks first among everything parked for the same host: starving demand first, then waiting requests aged and divided by load cost. Demand is counted per deployment, from the parked requests of every alias that could use it, because two chat models share a capability and are exactly what must be told apart.</li>
 <li><strong>Warm hysteresis.</strong> A swap that would stop a model with a request in flight waits until that model is quiet.</li>
-<li><strong>Jobs.</strong> A free worker takes jobs whose model is loaded, then jobs for a model coming up, then cold jobs from the largest group, so one load serves the group.</li>
-<li><strong>The bound.</strong> <code>fleet_policy … max_reorder_wait_ms</code> (default 120,000; 0 restores arrival order; otherwise 5,000–3,600,000). Work that has waited that long goes first in age order, whatever it displaces.</li>
+<li><strong>Jobs.</strong> A free worker takes jobs whose model is loaded, then jobs for a model coming up, then cold jobs from the largest group, so one load serves the group — all within the highest priority class waiting, and fairly between principals (§11.9).</li>
+<li><strong>The bound.</strong> <code>fleet_policy … max_reorder_wait_ms</code> (default 120,000; 0 restores arrival order; otherwise 5,000–3,600,000). Work that has waited that long goes first in its priority class, whatever it displaces there; it never goes ahead of a higher class (§11.9).</li>
 </ul>
 <p>Measured on the property suite's adversarial case — two models strictly alternating, faster than a load, on one slot, 400 generated cases — arrival order made 6,194 loads and the scheduler 813. End to end, six alternating jobs load each model once instead of six times. <code>GET /admin/v1/fleet</code> shows each host's next activation and why, and <code>hypellm_fleet_schedule_decisions_total</code> counts the reorderings.</p>
 <hr />
@@ -902,6 +904,302 @@ DELETE /v1/jobs/{id}        → cancel; releases reservations and any activation
 </code></pre>
 <p>Where a standard shape exists it is used unchanged: <code>/v1/audio/speech</code> and <code>/v1/images/generations</code> keep their OpenAI-compatible forms and simply gain orchestrated targets behind them.</p>
 <p>Jobs carry <code>patience_ms</code> far exceeding an interactive deadline, which is what makes an eviction- or fetch-requiring target legitimately eligible (§7.3). Job records are bounded per tenant and in retention. Results stream through with bounded buffers and are <strong>not</strong> stored beyond a bounded time-limited spool — the router is not becoming a blob store, and spec §2.2's non-goals are not being quietly widened.</p>
+<h3 id="111-job-providers--partly-built">11.1 Job providers — partly built</h3>
+<p><strong>Status: partly built.</strong> §11.9 is built. Of §11.3–§11.5, the router's half is built: the shim protocol client, the typed job request, polling, the disk spool and the two verbs, each marked <strong>[as built]</strong> where it differs from the design. The reference shim in <code>job-shim/</code> is built, with its conformance suite, and so is a backend for each service §11.4 names (§11.4 <strong>[as built]</strong>). Not built: durable job records, the accelerator-time cost unit, <code>/v1/images/generations</code> over a shim, and §11.6's fleet changes. Router specification §5.1, §7, §26.1 and §26.10 carry the normative rules for what is built.</p>
+<p>The fleet runs generative services the router does not route. Placement is what answered on 2026-10-19 (each service's health endpoint, ComfyUI's model list, the Gradio app's title); timings are from the operators' notes for this fleet.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Service</th>
+<th>Verb</th>
+<th>Where</th>
+<th>Interface today</th>
+<th>One job</th>
+<th>Output</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TRELLIS (<code>TRELLIS-image-large</code>)</td>
+<td>image → 3D</td>
+<td><code>rtx4090</code> :7871; <code>spark-ff25</code> (stopped)</td>
+<td>HTTP, synchronous, behind a global lock</td>
+<td>22–55 s; minutes for the first call after a restart</td>
+<td>GLB and PLY files, fetched by URL afterwards</td>
+</tr>
+<tr>
+<td>FLUX.2 klein (<code>flux2-klein</code>)</td>
+<td><code>text-to-image</code></td>
+<td><code>rtx4090</code> :7870; <code>spark-ff25</code> (stopped)</td>
+<td>HTTP, synchronous, behind a lock</td>
+<td>83–155 s</td>
+<td>PNG files, or base64</td>
+</tr>
+<tr>
+<td>YuE2 (<code>yue2_3b_bf16</code>)</td>
+<td><code>text-to-music</code></td>
+<td><code>spark-ff25</code> :8188, <code>node0</code> :8188; <code>rtx4090</code> (created, not running)</td>
+<td>ComfyUI: submit a node graph, poll its history</td>
+<td>about 2 min for a 45 s song, cold</td>
+<td>FLAC on the host's volume</td>
+</tr>
+<tr>
+<td>MiniMax-H3</td>
+<td><code>audio-to-video</code></td>
+<td><code>spark-ef2f</code> :7860, its conditioner on <code>rtx4090</code> :8896; <code>rtx4090</code> (created, not running)</td>
+<td>Gradio, synchronous, behind a lock; refuses a prompt whose conditioning file is not already on the host</td>
+<td>about 9 min per 12 s scene; up to 21 min at 1080p</td>
+<td>MP4</td>
+</tr>
+<tr>
+<td>Kimodo</td>
+<td>text → motion</td>
+<td><code>rtx4090</code> (created, not running)</td>
+<td>None: a command-line tool, plus a CPU text encoder holding about 16 GB of host RAM</td>
+<td>about 11 s for 6 s of motion</td>
+<td>NPZ, BVH</td>
+</tr>
+</tbody>
+</table></div>
+<p>Every one of them runs one job at a time and leaves its result as a file on its own host. Which runs where is decided by hand, from rules in operator notes: stop TRELLIS and FLUX during an H3 batch; one YuE at a time; never H3 on both Sparks.</p>
+<p>§11 as first built could not carry them, for five reasons. The first two are resolved, the third in part; the last two are not.</p>
+<ol>
+<li><strong>A job is a chat request.</strong> <code>POST /v1/jobs</code> parsed every body with the chat parser and set <code>Operation::Chat</code>; the result was the rendered chat response, held in memory up to <code>max_job_result_bytes</code> (8 MiB). <strong>Resolved:</strong> a body naming a <code>verb</code> is an artifact job (§11.5), and its parts are spooled and served as files.</li>
+<li><strong>An adapter makes one exchange.</strong> <code>Adapter::path_for</code> returns a <code>&amp;'static str</code>, the response is decoded whole into <code>CanonicalEvent</code>s, and no event carries bytes. <strong>Resolved:</strong> <code>JobAdapter</code> expresses submit, poll, fetch and cancel beside it (§11.5).</li>
+<li><strong>A job worker holds its upstream connection for the whole generation.</strong> For H3 that is up to twenty minutes of one worker and one socket. <strong>In part:</strong> an artifact job holds no socket between polls, but still holds its worker (§11.5).</li>
+<li><strong>Cost is counted in tokens.</strong> Eligibility excludes a target whose <code>max_context_tokens</code> is below the request's estimate, prices are per million tokens, and spec §12.1 budgets are tokens. <code>Capability::is_long_running</code> is documented as choosing a job's default patience; nothing calls it. <strong>Not resolved:</strong> an artifact job now estimates zero tokens, so no context window need be invented, but nothing yet meters it in accelerator time either.</li>
+<li><strong>The fleet has no relationships between deployments.</strong> Kimodo is useless without its text encoder, and &quot;never H3 on both Sparks&quot; is not a memory rule. Neither can be declared.</li>
+</ol>
+<h3 id="112-why-not-plugins">11.2 Why not plugins</h3>
+<p>Letting an operator plug in an arbitrary job provider is closed three ways.</p>
+<ul>
+<li><strong>In-process plugins are a stated non-goal.</strong> Spec §2.2 excludes &quot;dynamic third-party plugins, Lua, WASM, shared objects, downloaded adapters, or runtime code evaluation&quot;. Spec §4.1 forbids <code>dlopen</code>, and <code>depscan</code> fails the build on it. A plugin would run inside the trusted computing base, beside the credentials and the data plane.</li>
+<li><strong>A configured HTTP mapping is a reverse proxy.</strong> &quot;Post this body template to this URL and take the result from this JSON path&quot; is spec §2.2's general-purpose reverse proxy under another name. It also moves request construction into configuration strings, which spec §11.1's ban on templates exists to prevent.</li>
+<li><strong>Per-service adapters put the wrong code in the router.</strong> A <code>gradio</code> or <code>comfyui</code> family would teach the router a queue protocol and a node-graph format, both large and unstable across versions. Two of the five services cannot be reached over HTTP at all: Kimodo is a command, and H3 needs a file placed on its host first. Reaching them from the router means executing a process, which spec §26.2 forbids.</li>
+</ul>
+<p>What remains is the answer the router already gives three times, in the identity verifier, the TLS helper and the fleet agent: put the variable part out of process, behind a narrow protocol the router owns.</p>
+<h3 id="113-one-family-many-shims">11.3 One family, many shims</h3>
+<p>One new compile-time family, <code>job</code>, speaks one first-party protocol. On the other side of it, beside each service, a <strong>shim</strong> — a small HTTP server — translates that protocol into the service's own interface. To the router a shim is a provider like any other: an administrator-configured destination, untrusted, read with bounded parsers.</p>
+<p>Adding a service is a new shim and configuration records, with no router change. Adding a <em>kind</em> of output is a new capability verb, which stays a reviewed code change (§21). The shim is the plugin; it is just not inside the router.</p>
+<pre><code class="language-text">GET    /job/v1/health                 → 200 { verbs[] } once loaded; 503 before
+POST   /job/v1/jobs                   → 202 { id }
+GET    /job/v1/jobs/{id}              → { state, progress_permille, eta_ms, elapsed_ms, error, parts[] }
+GET    /job/v1/jobs/{id}/parts/{name} → bytes, with Content-Type and Content-Length
+DELETE /job/v1/jobs/{id}              → 202 { stopped }
+</code></pre>
+<p>The rules that keep it narrow:</p>
+<ul>
+<li><strong>Identifiers are validated before they become paths.</strong> A job <code>id</code> and a part <code>name</code> are 1–64 characters of <code>[A-Za-z0-9_-]</code>, checked when the reply is parsed, so a hostile shim cannot put <code>/</code>, <code>..</code>, <code>%</code> or <code>?</code> into the next request's path. A job has at most four parts.</li>
+<li><strong>Vocabularies are closed.</strong> <code>state</code> is one of <code>queued</code>, <code>running</code>, <code>succeeded</code>, <code>failed</code>, <code>cancelled</code>; <code>error</code> one of <code>invalid_input</code>, <code>out_of_memory</code>, <code>not_ready</code>, <code>internal</code>. A part's media type is one of <code>audio/flac</code>, <code>audio/wav</code>, <code>video/mp4</code>, <code>image/png</code>, <code>image/webp</code>, <code>model/gltf-binary</code>, and <code>application/octet-stream</code> for formats with no registered type (PLY, NPZ, BVH). Anything else fails the job.</li>
+<li><strong>Inputs travel inline.</strong> Images and audio are base64 in the submit body, within <code>max_body_bytes</code>. The router never sends a URL or a path, so no client value can name a file or a host on the service's side.</li>
+<li><strong>Failure before success is retryable; failure after it cannot happen.</strong> No client-visible byte exists until a job succeeds, so the no-splice rule (spec §6.5) holds trivially. <code>out_of_memory</code> and <code>not_ready</code> re-queue the job like any other capacity shortage (spec §26.10); <code>invalid_input</code> fails it.</li>
+<li><strong>Shims authenticate the router.</strong> Unlike SemIf, a shim requires a bearer credential (<code>credential_ref</code>), and the service behind it listens only on its own container network. H3's Gradio stops being reachable from the LAN.</li>
+</ul>
+<p><strong>[as built]</strong> The router's side of the protocol is <code>hypellm_adapters::job</code>: <code>ProviderJobId</code> and <code>PartName</code> can be built only by validating parsers, every path builder takes them, the closed sets are enums, and <code>JobAdapter::encode_headers</code> takes a credential by value. Configuration refuses a <code>family=job</code> provider without a <code>credential</code>. A shim's control reply is read to at most 64 KiB and parsed to depth 4. <code>GET /job/v1/health</code> is decoded but nothing in the router calls it: readiness is the fleet agent's probe (§11.6). The fuzz target <code>a_provider_job_id_with_a_path_separator_never_reaches_a_request_path</code> runs over mutated shim replies. One failure mode is narrower than written: <code>internal</code> fails the job rather than retrying it, because the router cannot tell an internal error that will recur from one that will not.</p>
+<h3 id="114-what-a-shim-owns">11.4 What a shim owns</h3>
+<p><strong>[as built]</strong> The reference shim is <a href="components/job-shim.html"><code>job-shim/hypellm-job-shim</code></a>: standard-library Python, serving the protocol for any service that can be run as a command — a configured argv per verb, inputs written as files, declared outputs served — with its conformance suite in <code>job-shim/test_job_shim.py</code>. It is the Kimodo row's shape below, generalised. Each service in the table below is served by that shim running a <em>backend</em> — a command in <code>job-shim/backends/</code> that turns one job into one call to the service — rather than by a server of its own: the protocol, the key, the bounds and the declared outputs are then written once, not five times. The backends keep the rules of the table — inputs as bytes, a fixed ComfyUI graph, H3's conditioning written to the app's cache — and have their own suite against fake services. Two departures: a shim's health does not probe its service, so a service that is down fails a job as <code>internal</code> rather than holding it back as not ready; and only ComfyUI's backend can stop work its service has already started. The router's own tests use a scripted shim (<code>hypellm_router::testing::SimulatedShim</code>); the router and the reference shim were checked together once, by hand.</p>
+<p>Everything service-specific that now lives in client scripts moves into that service's shim, and none of it into the router.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Service</th>
+<th>The shim's work</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TRELLIS</td>
+<td>Wrap the synchronous call in a job, fetch the GLB and PLY files as parts, and map the service's 507 to <code>out_of_memory</code>. Accept the image as bytes only: the service also reads any path that exists inside its container, and the shim must not forward that form.</td>
+</tr>
+<tr>
+<td>FLUX.2 klein</td>
+<td>The same shape as TRELLIS. <code>/v1/images/generations</code> (§11) is a client-facing shape over the same exchange, not a second shim.</td>
+</tr>
+<tr>
+<td>YuE2</td>
+<td>Own the ComfyUI node graph and fill it from the prompt, lyrics, style and duration; submit, poll the history, fetch the FLAC. Carry over the memory hygiene the current batch worker does — free memory and restart ComfyUI between songs.</td>
+</tr>
+<tr>
+<td>MiniMax-H3</td>
+<td>Call the conditioner and write the conditioning file on its own host, replacing the SSH push clients do now. Report Gradio's progress as <code>progress_permille</code>. Enforce the 1080p limits (960×544 canvas, at most 6 s). Answer 503 from <code>health</code> after a failed load, which stays failed until the container restarts.</td>
+</tr>
+<tr>
+<td>Kimodo</td>
+<td>Run the generation command inside its own container — a shim may execute a process; the router may not — and enforce the 10-second limit.</td>
+</tr>
+</tbody>
+</table></div>
+<p>Anything that chains jobs stays with the client. A music video's storyboard, and the continuity keyframe taken from one scene's output for the next, are workflow. The router is not an agent framework (spec §1), and a job never consumes another job's output.</p>
+<p>Shims use only Python's standard library, like the fleet agent and the TLS helper, and each carries its own tests. This repository would hold the protocol, a reference shim with a conformance suite, and a simulated shim for the router's integration tests on the pattern of <code>hypellm_net::fleet_sim</code>. Service-specific shims belong with their services' deployment files, because they change when the service does.</p>
+<h3 id="115-router-changes">11.5 Router changes</h3>
+<ol>
+<li><strong>A typed job request.</strong> <code>Operation::Job</code>, parsed by its own dialect rather than the chat parser. A body without <code>verb</code> is a chat job, as today. A body with one is an artifact job and must name the verb its alias serves, so a request for music sent to a video alias is refused rather than surprising.
+<pre><code class="language-text">POST /v1/jobs
+{ "model": "song",
+  "verb": "text-to-music",
+  "prompt": "…",
+  "params": { "duration_ms": 45000, "seed": 7, "steps": 32 },
+  "inputs": [ { "name": "keyframe", "media_type": "image/png", "data": "…base64…" } ],
+  "options": { "style": "industrial" },
+  "patience_ms": 1800000 }
+</code></pre>
+<code>params</code> are the bounded integers the router needs for cost and validation. <code>options</code> is a JSON object with capped depth and size, passed through uninterpreted, for whatever a service takes that the router has no reason to understand. The prompt and options are inert data (Appendix B). <strong>[as built]</strong> Built in <code>protocol::job</code>, and stricter than written: a field the parser does not know is refused rather than ignored, an input carries only <code>name</code>, <code>media_type</code> and <code>data</code>, and <code>options</code> nest at most four levels with at most 64 entries at each. A verb mismatch is refused at submission only for an alias the caller can already see; for any other, routing answers <code>model_not_found</code>, so the refusal does not confirm the alias exists. <code>patience_ms</code> may shorten the configured patience, never lengthen it.</li>
+<li><strong>A job exchange in the adapter contract.</strong> A <code>JobAdapter</code> beside <code>Adapter</code>, and pure like it: encode the submit, decode the accepted id into a validated <code>ProviderJobId</code>, build the status, part and cancel requests from it, and decode status. The single-exchange <code>Adapter</code> is unchanged. <strong>[as built]</strong> Built as described; <code>hypellm_router::job_exchange::run</code> drives it, called by the pipeline in place of a single exchange once every reservation is held. A job routed to a provider of any other family is refused before anything is sent.</li>
+<li><strong>Polling instead of holding.</strong> A worker submits, releases the connection, and polls at the target's <code>poll_ms</code>, each poll a bounded request with its own deadline. Holding no socket between polls, one worker can advance many jobs: <code>job_workers</code> bounds threads, and a new <code>max_running_jobs</code> bounds work in flight. <code>/events</code> carries the shim's progress instead of only 0 and 1000. <strong>[as built]</strong> No socket is held between polls, but the worker is: it sleeps between polls, so <code>job_workers</code> bounds artifact jobs in flight and <code>max_running_jobs</code> does not exist. The interval is <code>settings job_poll_ms</code> (default 2000, never under 250), not a per-target <code>poll_ms</code>. Five polls in a row that cannot reach the shim fail the job. <code>/events</code> carries the shim's progress.</li>
+<li><strong>A disk spool, filled at completion.</strong> When a shim reports success, the router pulls every part before the attempt ends, while the deployment is still held, so an eviction cannot destroy a result the router has promised. Each part streams to a file under the state directory, hashed as it goes; a part longer than its declared length fails the job. Bounds: <code>max_job_part_bytes</code> per part, a per-tenant and a total spool size, and free-disk headroom checked before the pull. Files are deleted at <code>job_retention_ms</code>, on cancel, and by a sweep at startup. <code>GET /v1/jobs/{id}/result</code> serves the first part and <code>/result/{name}</code> the others.
+<p>This revises the as-built &quot;memory, never disk&quot; choice. Song-length audio, high-bitrate video and textured meshes outgrow 8 MiB, and memory multiplies by every retained job. Bound and expiry are what keep the router from being a blob store, not the medium. Defaults are set from measured outputs in phase 10.</p> <strong>[as built]</strong> Built with the per-part bound (<code>settings max_job_part_bytes</code>, default 1 GiB) and the total (<code>max_job_spool_bytes</code>, default 4 GiB), both provisional until outputs are measured; there is no per-tenant spool cap, and free disk is not checked — the standard library has no portable free-space query, and §18.2 forbids the unsafe call that would ask. Parts live under <code>&lt;state_dir&gt;/jobs/&lt;job id&gt;/</code>, the directory is emptied at startup, and a job's parts go when its record expires or a fetch fails.</li>
+<li><strong>Durable job records.</strong> Jobs are in memory today because a durable &quot;running&quot; with nothing running it would be a lie (<a href="deferred-issues.html#jobs-are-in-memory-and-a-restart-loses-them">current limitations</a>). With the work held by a shim under a provider id, it no longer is. A record is appended before submit. On restart the router reconciles each live record by polling its shim, as lease recovery does (§10.4), and re-takes its concurrency reservation before the listener opens. A shim that no longer knows the id fails the job as <code>lost_on_restart</code>. <strong>Not built.</strong></li>
+<li><strong>A cost unit that is not tokens.</strong> A target declares an accelerator-time estimate: a fixed part plus a part per unit of output (seconds of audio, video or motion; images; meshes). It drives admission, a spec §12.1 budget in accelerator-milliseconds held to the same durable high-water mark as tokens, a price per accelerator-second, and the default patience. It settles on the shim's <code>elapsed_ms</code>, as tokens settle on provider-reported usage. As with <code>bytes_per_token</code>, the router reports estimate error per target and an operator calibrates; the router never learns the estimate itself. A job request estimates zero tokens, so the context check passes without a fictitious context window. <strong>Not built.</strong> Until it is, an artifact job estimates zero tokens, is not token-metered, and is bounded only by concurrency, the job caps and its patience.</li>
+<li><strong>Two verbs.</strong> <code>image-to-3d</code> (TRELLIS) and <code>text-to-motion</code> (Kimodo) join the closed enum. <code>is_long_running</code> either starts choosing the default patience or is deleted. <strong>[as built]</strong> Both added. <code>is_long_running</code> is unchanged and still uncalled.</li>
+</ol>
+<h3 id="116-fleet-changes">11.6 Fleet changes</h3>
+<p>Most of the hand-kept placement rules are already expressible. &quot;Stop TRELLIS and FLUX during an H3 batch&quot; and &quot;FLUX and TRELLIS, or MOSS-SFX, not both&quot; are memory: <code>memory_bytes</code> on the right pool, plus eviction (§8). &quot;One YuE at a time&quot; is <code>concurrency=1</code> on each instance.</p>
+<ul>
+<li><strong>A polled job is in flight.</strong> From submit until its last part is pulled, a job counts as in flight on its deployment, though no socket is open. Otherwise the planner would see an idle deployment and evict it mid-generation, or idle stop (§9.10) would. Counted, a running job makes its deployment non-evictable under the default <code>max_drainable_inflight=0</code>, which is the right answer for a twenty-minute generation.</li>
+<li><strong>Containers are command rows, not templates.</strong> These services mount model directories, which the host kit's <code>docker create</code> vocabulary refuses: it admits no mount but the container's own state directory. Declare them as <code>start</code>/<code>stop</code>/<code>probe</code> rows running <code>docker compose</code> in the agent's table, which the agent supports today. Widening the vocabulary to read-only model mounts is a separate host-kit decision.</li>
+<li><strong>Readiness is the shim's health.</strong> It answers 503 until the model is loaded, so the existing loopback probe becomes the readiness check for every service, in place of five service-specific signals.</li>
+<li><strong>Dependencies: bundle first.</strong> Kimodo and its encoder go in one compose project and one deployment. The cost is that a deployment has one memory pool, so the encoder's host RAM goes undeclared. If bundling proves too coarse, add <code>requires=&lt;deployment&gt;</code> to the deployment record: the planner activates the dependency in the same plan and never evicts it while a dependent is resident.</li>
+<li><strong>Exclusion is an open question.</strong> The operators' notes give no memory reason for &quot;never H3 on both Sparks&quot;. If it must be enforced, <code>exclusive_group=&lt;id&gt;</code> would let the planner refuse an activation that makes two members resident. Until the reason is known, it stays an operator rule.</li>
+</ul>
+<h3 id="117-security">11.7 Security</h3>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Threat</th>
+<th>Control</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A hostile or broken shim</td>
+<td>It is a provider. Replies are parsed by <code>wire-json</code> under its bounds; ids and part names are validated before they reach a path; part bytes are capped by declared length and spool quota. Nothing it returns selects a destination, path or credential.</td>
+</tr>
+<tr>
+<td>Result bytes executing in a browser</td>
+<td>The media-type set has nothing scriptable: no <code>text/html</code>, no <code>image/svg+xml</code>. Results are served with <code>X-Content-Type-Options: nosniff</code> and <code>Content-Disposition: attachment</code>.</td>
+</tr>
+<tr>
+<td>A client naming a file or host on the service's side</td>
+<td>Inputs are inline only. The router sends no path or URL, and the shim refuses the service's own path forms (TRELLIS). The H3 conditioner's address is shim configuration, never request data.</td>
+</tr>
+<tr>
+<td>Spool exhaustion</td>
+<td>Per-part, per-tenant and total caps, free-disk headroom, expiry, and a startup sweep. A part over its bound fails the job and leaves no file.</td>
+</tr>
+<tr>
+<td>Cancelled work still holding the accelerator</td>
+<td>The client's job ends at once. The target's concurrency reservation is released when the shim reports a terminal state, not when the client cancels, so a service that cannot stop mid-generation is not handed a second job.</td>
+</tr>
+<tr>
+<td>A caller reaching a shim directly</td>
+<td>Every shim request carries a bearer credential, and the service itself listens only on its container network.</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>Specification relationship.</strong> If this is built, spec §5.1 gains the <code>job</code> operation, spec §7 the job exchange, spec §12 and §12.1 an accelerator-time unit, and spec §26.1 two verbs. Spec §2.2, §4, §4.1, §10, §18.2 and §26.2 are unchanged; that is the point of putting the variable part in shims.</p>
+<h3 id="118-testing">11.8 Testing</h3>
+<p>Properties to write first, each shown to fail without its control:</p>
+<ul>
+<li><code>a_provider_job_id_with_a_path_separator_never_reaches_a_request_path</code> — also a fuzz target over shim replies</li>
+<li><code>a_polled_job_keeps_its_deployment_out_of_every_eviction_set</code></li>
+<li><code>a_cancelled_job_holds_its_concurrency_slot_until_the_shim_reports_terminal</code></li>
+<li><code>a_part_longer_than_its_declared_length_fails_the_job_and_leaves_no_spool_file</code></li>
+<li><code>a_job_result_is_never_served_as_html_or_svg</code></li>
+<li><code>spool_bytes_never_exceed_the_tenant_cap_under_concurrent_completions</code> — a property over seeded interleavings</li>
+<li><code>a_restarted_router_reattaches_to_a_running_shim_job_without_resubmitting</code></li>
+</ul>
+<p>Integration runs against a simulated shim over a real socket, with <code>TestClock</code> advancing a twenty-minute job in microseconds, as the fleet suite does. No accelerator, no Docker, no network.</p>
+<h3 id="119-who-goes-next">11.9 Who goes next</h3>
+<p><strong>Status: built.</strong> Unlike §11.1–§11.8, this section describes code: the job queue in <code>crates/hypellm-router/src/jobs.rs</code>, <code>hypellm_fleet::schedule</code>, and class in the fleet's gate. It orders the chat-shaped jobs <code>/v1/jobs</code> carries today and needs no shim. Where the build departs from the design it was written as, the difference is marked <strong>[as built]</strong>. Router specification §12, §26.10 and §26.11 carry the normative rules.</p>
+<p>§11.1–§11.8 decide what a job is and where it can run. This section decides whose job starts when a slot frees. The configuration in <code>docker/hypellm.conf</code> declares one tenant, so a rule that is fair only between tenants does nothing there: the unit of fairness is the principal.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Question</th>
+<th>Control</th>
+<th>State</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>May this principal use this generator?</td>
+<td>A <code>grant</code> on the alias, and a key's <code>models</code> narrowing. An artifact alias would serve one verb (§11.5), so a grant on the video alias would be a grant to generate video.</td>
+<td>Built</td>
+</tr>
+<tr>
+<td>How many at once, how many held?</td>
+<td><code>quota</code> <code>concurrency</code> and <code>queued</code> on <code>principal:</code>, <code>tenant:</code>, <code>alias:</code> and <code>target:</code> scopes; <code>quota … jobs</code> on <code>principal:</code> and <code>tenant:</code>; <code>settings max_jobs_per_tenant</code> and <code>max_queued_batch_jobs</code></td>
+<td>Built</td>
+</tr>
+<tr>
+<td>How much in total?</td>
+<td>Accelerator-millisecond budgets (§11.5)</td>
+<td>Proposed</td>
+</tr>
+<tr>
+<td>Whose job starts next?</td>
+<td>Class and share, below</td>
+<td>Built</td>
+</tr>
+<tr>
+<td>Which service runs on which host?</td>
+<td>Memory pools, eviction and the planner (§11.6)</td>
+<td>Built</td>
+</tr>
+</tbody>
+</table></div>
+<p>Before this, the job queue ordered by model locality and submission order alone, so one principal's 32 queued songs held another's one song behind all of them; a job that found its slot taken went to the back of the queue on a backoff, so whichever job was due when the slot freed took it; and a job counted as demand only once a worker had taken it.</p>
+<ul>
+<li><strong>Waiting happens in one place.</strong> A job stays in the job queue, in its place, until a pass holds its reservations. A worker's pass does not wait in the admission queue and does not park. A pass that fails only because a slot is taken, or its model is still to be started, puts the job back where it was: no attempt counted, no backoff. The job's deadline is the only bound on that wait, and a job still waiting at it fails <code>deadline_exceeded</code>. Holding no worker while it waits, a job for a busy slave no longer keeps a job for an idle one behind it.
+<ul>
+<li><strong>[as built]</strong> A blocked job is tried again when a job leaves the queue, or at the quarter-second tick. The design also listed a reservation released, a deployment ready or stopped, and a submission; a slot freed by an interactive request and a model finishing its load are noticed at the tick, as a parked request notices them.</li>
+<li><strong>[as built]</strong> Backoff remains for refusals by the fleet's own governance — <code>activation_budget_exhausted</code> and <code>host_capacity_insufficient</code> — at most sixteen passes, doubling from one second to a minute; trying those every tick would ask the agent for an activation four times a second. The design named the shim's <code>not_ready</code> and <code>out_of_memory</code>, which do not exist until §11.3 is built.</li>
+<li><strong>[as built]</strong> At most one pass per alias that has not yet acquired its reservations runs at a time. Not in the design: two idle workers woken by one freed slot took the interactive job and the next batch job together, and whichever reserved first got the slot. The end-to-end class test failed two runs in four before this rule.</li>
+<li><strong>[as built]</strong> A job never jumps the admission queue: a freed slot goes to a request already waiting there, whatever its class. The design gave the slot to the job when it outranked the admission queue's head; admission already admits no newcomer past anyone waiting, and a second rule would have been two orders for one slot.</li>
+<li><code>max_queued_jobs</code> bounds the queue, a job being tried included.</li>
+</ul></li>
+<li><strong>Order.</strong> Among the jobs that can start, a worker takes by:
+<ol>
+<li><em>Class</em>: interactive, then standard, then batch. This is the existing <code>PriorityClass</code>, resolved as admission resolves it — the principal's quota class, else the tenant's, lowered and never raised by the key. It is stamped at submission and kept, as an in-flight request keeps its policy snapshot; a published change applies to later submissions.</li>
+<li><em>Locality, within the class</em>: §9.11's rule, unchanged inside a class — jobs past <code>max_reorder_wait_ms</code> first, then warm, then activating, then the largest cold group. The bound still sets how much share is traded for fewer swaps, and it never crosses a class. With the bound at zero, or without a fleet, there is no locality step.</li>
+<li><em>Share, within each of those</em>: in place of submission order, the job's round — how many of the principal's own jobs of that class were waiting, not yet running, when it was submitted, stamped as the admission queue stamps it (<code>QueueState</code> in <code>crates/hypellm-core/src/admission.rs</code>). Every principal's first waiting job goes before anyone's second. Ties go to the lower tenant round, the same count over the tenant; then submission order.</li>
+</ol>
+The key ends in the submission sequence, which is unique, so equal queue and fleet state give an equal pick (Appendix B). <code>pick_job</code> stays pure: <code>JobEntry</code> carries the class and the two rounds, and no identity crosses into <code>hypellm-fleet</code>. Jobs are not durable (<a href="deferred-issues.html#jobs-are-in-memory-and-a-restart-loses-them">current limitations</a>), so neither are rounds.</li>
+<li><strong>No preemption.</strong> Class decides which job starts when a slot frees. It never stops one that is running. H3 and YuE cannot stop mid-generation, and a stopped twenty-minute scene is twenty minutes lost. An interactive job's worst wait is therefore what remains of the job on its slot, plus a load. An operator who cannot accept that puts long batch work on its own deployment or host, and narrows the batch keys with <code>hosts</code>.</li>
+<li><strong>Class reaches the fleet.</strong> Without this, a batch keeps its model busy back to back and an interactive job for another model on the same host waits for the whole batch.
+<ul>
+<li>Queued jobs are demand. <strong>[as built]</strong> From submission: a job is counted as parked demand for its alias's capability, at its class, until it leaves the queue, so the batching trigger, eviction value and idle stop see work no worker has taken. Jobs hold at most half of a capability's batching queue (128 of 256), so a request holding its connection can always park; a job past that share is uncounted until a pass finds its model cold and room has opened.</li>
+<li>Next activation (§9.11) ranks by the highest class waiting for each deployment, then by the existing rule. Like the rest of §9.11, only while reordering is on.</li>
+<li>Between jobs, the model a higher class waits for is loaded before the next lower-class job can take the slot. <strong>[as built]</strong> The mechanism is a claim at commitment: every plan the gate lets through claims each victim with nothing in flight, under the lock idle stop's claim takes, until the plan finishes, so a dispatch routed a moment earlier is refused and parks. The design claimed only for a higher class; the race is the same whoever is asking, so every plan claims. A victim with work in flight is drained as before.</li>
+<li>Class exempts nothing from §9. Dwell, cooldown, flap backoff and the activation budget still apply, so interactive requests arriving through a batch cannot swap the host on every request.</li>
+</ul></li>
+<li><strong>Queue room.</strong> One principal could fill <code>max_jobs_per_tenant</code> (32) and, in a one-tenant deployment, half the fleet-wide queue. Two bounds:
+<ul>
+<li><code>quota … jobs=&lt;n&gt;</code> on <code>principal:</code> and <code>tenant:</code> scopes: the jobs that scope may hold, live and retained, counted as <code>max_jobs_per_tenant</code> counts them. On a tenant it overrides the setting; on any other scope it is a configuration error. Past it, <code>429</code>.</li>
+<li><code>settings … max_queued_batch_jobs</code>, by default half of <code>max_queued_jobs</code>: batch submissions past it are refused with <code>429</code>, so a batch never fills the queue against the other classes. Queued work is never displaced to admit new work.</li>
+</ul></li>
+<li><strong>Visible to the caller and the operator.</strong> <code>GET /v1/jobs/{id}</code> carries <code>class</code> and, while queued, <code>waiting_for</code>. <strong>[as built]</strong> The vocabulary is <code>turn</code> (not yet tried), <code>slot</code>, <code>activation</code> and <code>backoff</code>; the design's <code>higher_class</code> and <code>share</code> were dropped, because a job not yet tried cannot tell which of them holds it. It names no other principal and gives no count. <code>GET /admin/v1/jobs</code> (<code>read_tenant_usage</code>, the caller's tenant only) lists unfinished jobs, running first, then queued in class and share order, with principal, alias, class, round, state, <code>waiting_for</code> and age. <strong>[as built]</strong> No deployment column, and the order does not predict locality's reordering within a class. <code>hypellm_fleet_schedule_decisions_total</code> gains <code>job_by_class</code> and <code>job_by_share</code>, and <code>hypellm_jobs_expired_waiting_total{class}</code> counts jobs whose deadline passed before they finished.</li>
+</ul>
+<p>In configuration, with a key minted <code>priority: batch</code> for a principal's own bulk runs so they queue behind that principal's interactive work:</p>
+<pre><code class="language-text">grant scope=group:artists model=video allow=true
+quota scope=principal:user:alice class=interactive jobs=8
+quota scope=principal:svc:renders class=batch jobs=32
+quota scope=alias:video concurrency=1
+settings … max_queued_batch_jobs=32
+</code></pre>
+<p>Open questions:</p>
+<ul>
+<li><strong>Batch under sustained interactive demand.</strong> Strict classes let interactive demand hold batch work until its deadline. Ageing is rejected, because it makes a long-waiting batch job indistinguishable from an interactive one. The alternative is a guaranteed share — one slot in N to batch — and it is not built until <code>hypellm_jobs_expired_waiting_total{class=&quot;batch&quot;}</code> shows it is needed.</li>
+<li><strong>Class by group.</strong> Classes attach to principals and tenants; <code>quota</code> has no <code>group:</code> scope, so &quot;artists interactive, render service batch&quot; is written per principal. A group class needs a rule for a principal in two groups, and the lower class is the safe one.</li>
+</ul>
+<p>Tests, each shown to fail with its control removed:</p>
+<ul>
+<li><code>crates/hypellm-fleet/tests/properties.rs</code>: <code>the_job_taken_is_always_of_the_highest_class_waiting_and_first_in_its_share</code> and <code>a_model_a_higher_class_waits_for_always_ranks_first</code>, 400 seeded cases each; the determinism property now draws classes and rounds too.</li>
+<li><code>crates/hypellm-router/tests/job_priority.rs</code>, one slot and real workers: <code>an_interactive_job_starts_before_every_batch_job_waiting_for_its_slot</code>, <code>a_principals_one_job_waits_for_at_most_one_job_of_another_principals_backlog</code>, <code>a_job_waiting_for_a_slot_takes_it_when_it_frees_and_never_spends_an_attempt</code>, and the caller's and operator's views.</li>
+<li><code>crates/hypellm-router/tests/fleet_schedule.rs</code>, against the simulated agent: <code>an_interactive_job_for_a_cold_model_goes_before_batch_work_on_the_warm_one</code>, <code>a_queued_job_is_demand_from_submission_until_it_leaves_the_queue</code>, <code>a_job_still_queued_at_shutdown_releases_its_demand</code>, <code>a_plan_holds_its_idle_victim_against_new_dispatches_until_it_finishes</code>.</li>
+<li><code>a_jobs_class_is_its_principals_lowered_by_its_key_and_never_raised</code> (over HTTP), <code>batch_submissions_never_hold_more_than_their_share_of_the_queue</code>, <code>a_principal_cannot_hold_more_jobs_than_its_quota_and_its_tenant_still_can</code>, the configuration's refusal of <code>jobs</code> on other scopes, and <code>crates/hypellm-admin-api/tests/job_queue.rs</code>.</li>
+</ul>
+<p>The per-alias rule against concurrent tries has no deterministic test: the race it closes needs two workers woken by one event. The end-to-end class test is its evidence — it failed two runs in four without the rule, and has passed every run since.</p>
 <hr />
 <h2 id="12-artifact-acquisition">12. Artifact acquisition</h2>
 <p>&quot;If a model is on no machine, it should be retrieved.&quot; This is the highest-risk path in the feature: the one place a request causes the fleet to consume tens or hundreds of gigabytes of disk and hours of bandwidth.</p>
@@ -1379,9 +1677,24 @@ fleet_grant id=ci-music scope=principal:svc:ci host=spark \
 <td>Artifact fetch with digest verification and budgets; predictive pre-warm, shipped disabled.</td>
 <td>Fetch drills including disk-full and interruption; pre-warm demonstrated not to raise the thrash ratio.</td>
 </tr>
+<tr>
+<td><strong>10 — Job contract</strong> (in progress)</td>
+<td><strong>Built:</strong> the class-ordered, principal-fair job queue, with queued jobs counted as demand (§11.9); the <code>job</code> family and the router's side of the shim protocol, the typed job request, polling, the disk spool, and <code>image-to-3d</code> (§11.3, §11.5); the reference shim (<code>job-shim/</code>) and its conformance suite; a backend each for TRELLIS, FLUX, YuE, H3 and Kimodo (§11.4), with their own suite. <strong>Not built:</strong> FLUX behind <code>/v1/images/generations</code>.</td>
+<td>Met: one principal's job, submitted behind another's backlog, starts after at most one of it, and no job fails for want of a slot inside its patience. Met against a simulated shim: a GLB and a PLY arrive through <code>/v1/jobs</code> and are served as attachments; an input naming a path or a URL is refused; a part longer than declared, or of another type, fails the job and leaves no file. Open: the same from the real TRELLIS service and its shim's refusal of its own path form; spool caps under concurrent completions, which are tested only as a unit; and a property that a cancelled job's reservations release exactly once, which is tested only as an end-to-end case.</td>
+</tr>
+<tr>
+<td><strong>11 — Long jobs</strong> (proposed)</td>
+<td>Accelerator-time cost unit and budgets, durable job records, YuE2 and H3 shims.</td>
+<td>An H3 job survives a router restart without being resubmitted and without its deployment being evicted; budgets settle on reported elapsed time; the H3, TRELLIS and FLUX placement rules are kept by the planner, not by hand.</td>
+</tr>
+<tr>
+<td><strong>12 — Fleet relationships</strong> (proposed)</td>
+<td>Kimodo's shim and <code>text-to-motion</code>; <code>requires=</code> and <code>exclusive_group</code> only if bundling and operator rules prove insufficient.</td>
+<td>Kimodo is served through <code>/v1/jobs</code> with its encoder resident; no dependency is evicted under a resident dependent.</td>
+</tr>
 </tbody>
 </table></div>
-<p>Phases 5 through 8 are built, and so is phase 9: <code>FETCH</code> is permissioned, budgeted, disk-gated and digest-verified, and the reference agent retries it within the router's deadline, one fetch per host, resuming at layer granularity; predictive pre-warm is implemented and ships disabled. <code>POST /v1/jobs</code>, listed under phase 8, is built and ships disabled; its job records are process state rather than durable, which is recorded in <a href="deferred-issues.html#jobs-are-in-memory-and-a-restart-loses-them">current limitations</a>.</p>
+<p>Phases 5 through 8 are built, and so is phase 9: <code>FETCH</code> is permissioned, budgeted, disk-gated and digest-verified, and the reference agent retries it within the router's deadline, one fetch per host, resuming at layer granularity; predictive pre-warm is implemented and ships disabled. <code>POST /v1/jobs</code>, listed under phase 8, is built and ships disabled; its job records are process state rather than durable, which is recorded in <a href="deferred-issues.html#jobs-are-in-memory-and-a-restart-loses-them">current limitations</a>. Phases 10–12 are the job-provider proposal of §11.1–§11.9. Phase 10 is in progress — its router side and the reference shim are built, no service's shim is — and phases 11 and 12 are not built.</p>
 <p>Phases 5 and 6 are each worth doing alone. Phase 5 fixes a request model that is currently unable to express what callers ask for, with no new trust boundary. Phase 6 gives an accurate read-only picture of what is loaded where, improving routing immediately, with none of the risk of actuation.</p>
 <hr />
 <h2 id="21-open-decisions">21. Open decisions</h2>
@@ -1429,6 +1742,18 @@ fleet_grant id=ci-music scope=principal:svc:ci host=spark \
 <tr>
 <td>Capability vocabulary</td>
 <td>Closed enum in the router. Adding one is a code change and a review, not a configuration string.</td>
+</tr>
+<tr>
+<td>Job provider extensibility (proposed)</td>
+<td>One compile-time <code>job</code> family; service-specific code in out-of-process shims (§11.3). No in-process plugins, and no configured request templates.</td>
+</tr>
+<tr>
+<td>Job result medium (proposed)</td>
+<td>A bounded, expiring spool on disk, filled when a job succeeds (§11.5). Revises the in-memory spool as built.</td>
+</tr>
+<tr>
+<td>Job cost unit (proposed)</td>
+<td>Estimated accelerator time per target, settled on shim-reported elapsed time (§11.5). Not derived from tokens.</td>
 </tr>
 <tr>
 <td>Un-containerised models (MOSS-SoundEffect)</td>
@@ -1551,6 +1876,15 @@ fleet_grant id=ci-music scope=principal:svc:ci host=spark \
 <li class="toc-level-3"><a href="#104-leases-and-crash-recovery">10.4 Leases and crash recovery</a></li>
 <li class="toc-level-3"><a href="#105-every-lease-is-released-exactly-once">10.5 Every lease is released exactly once</a></li>
 <li class="toc-level-2"><a href="#11-long-running-generative-work">11. Long-running generative work</a></li>
+<li class="toc-level-3"><a href="#111-job-providers--partly-built">11.1 Job providers — partly built</a></li>
+<li class="toc-level-3"><a href="#112-why-not-plugins">11.2 Why not plugins</a></li>
+<li class="toc-level-3"><a href="#113-one-family-many-shims">11.3 One family, many shims</a></li>
+<li class="toc-level-3"><a href="#114-what-a-shim-owns">11.4 What a shim owns</a></li>
+<li class="toc-level-3"><a href="#115-router-changes">11.5 Router changes</a></li>
+<li class="toc-level-3"><a href="#116-fleet-changes">11.6 Fleet changes</a></li>
+<li class="toc-level-3"><a href="#117-security">11.7 Security</a></li>
+<li class="toc-level-3"><a href="#118-testing">11.8 Testing</a></li>
+<li class="toc-level-3"><a href="#119-who-goes-next">11.9 Who goes next</a></li>
 <li class="toc-level-2"><a href="#12-artifact-acquisition">12. Artifact acquisition</a></li>
 <li class="toc-level-2"><a href="#13-configuration-grammar-additions">13. Configuration grammar additions</a></li>
 <li class="toc-level-2"><a href="#14-durable-state">14. Durable state</a></li>

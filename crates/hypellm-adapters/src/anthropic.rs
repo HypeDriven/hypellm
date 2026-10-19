@@ -53,7 +53,7 @@ impl Adapter for AnthropicAdapter {
         match request.operation {
             Operation::Chat | Operation::Responses => Ok("/messages"),
             Operation::Tokenize => Ok("/messages/count_tokens"),
-            Operation::Embeddings | Operation::Rerank => Err(ValidationFailure::new(
+            Operation::Embeddings | Operation::Rerank | Operation::Job => Err(ValidationFailure::new(
                 "operation_unsupported",
                 "this provider does not serve this operation",
             )),

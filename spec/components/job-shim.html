@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="HypeLLM Router documentation: Job shim.">
+  <title>Job shim · HypeLLM Wiki</title>
+  <link rel="stylesheet" href="../assets/wiki.css">
+  <script defer src="../assets/search-index.js"></script>
+  <script defer src="../assets/wiki.js"></script>
+</head>
+<body data-wiki-root="../" data-page-title="Job shim" data-page-group="Components">
+  <a class="skip-link" href="#content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">H</span><span>HypeLLM <span class="brand-subtitle">Specification wiki</span></span></a>
+    <span class="header-note">Router · Fleet · Security</span>
+  </header>
+  <div class="wiki-layout">
+    <aside class="sidebar" aria-label="Wiki navigation">
+      <div class="search-control" hidden>
+        <label for="wiki-query">Search the wiki</label>
+        <input id="wiki-query" type="search" placeholder="Search all documents…" autocomplete="off" aria-controls="search-results">
+        <p class="search-hint">Press / to search · Esc to clear</p>
+      </div>
+      <nav aria-label="Documentation">
+<details open class="nav-group"><summary>Start here</summary><ul>
+<li><a href="../index.html">Wiki home</a></li>
+<li><a href="../overview.html">Project overview</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Design &amp; security</summary><ul>
+<li><a href="../router-specification.html">Router specification</a></li>
+<li><a href="../threat-model.html">Threat model</a></li>
+<li><a href="../orchestration.html">Fleet orchestration</a></li>
+<li><a href="../deferred-issues.html">Current limitations</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Operator guides</summary><ul>
+<li><a href="../using-the-router.html">Using the router</a></li>
+<li><a href="../deployment.html">Deployment &amp; configuration</a></li>
+<li><a href="../runbooks.html">Operational runbooks</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Components</summary><ul>
+<li><a href="fleet-agent.html">Fleet agent</a></li>
+<li><a href="identity-verifier.html">Identity verifier</a></li>
+<li><a href="tls-helper.html">Outbound TLS helper</a></li>
+<li><a href="job-shim.html" aria-current="page">Job shim</a></li>
+<li><a href="container-init.html">Container init</a></li>
+<li><a href="tray-monitor.html">Windows tray monitor</a></li>
+</ul></details>
+<details open class="nav-group"><summary>Module contracts</summary><ul>
+<li><a href="../modules/hypellm-adapters.html">hypellm-adapters</a></li>
+<li><a href="../modules/hypellm-admin-api.html">hypellm-admin-api</a></li>
+<li><a href="../modules/hypellm-auth.html">hypellm-auth</a></li>
+<li><a href="../modules/hypellm-bench.html">hypellm-bench</a></li>
+<li><a href="../modules/hypellm-config.html">hypellm-config</a></li>
+<li><a href="../modules/hypellm-core.html">hypellm-core</a></li>
+<li><a href="../modules/hypellm-crypto.html">hypellm-crypto</a></li>
+<li><a href="../modules/hypellm-devtools.html">hypellm-devtools</a></li>
+<li><a href="../modules/hypellm-fleet.html">hypellm-fleet</a></li>
+<li><a href="../modules/hypellm-net.html">hypellm-net</a></li>
+<li><a href="../modules/hypellm-router.html">hypellm-router</a></li>
+<li><a href="../modules/hypellm-store.html">hypellm-store</a></li>
+<li><a href="../modules/hypellm-telemetry.html">hypellm-telemetry</a></li>
+<li><a href="../modules/hypellm-test-corpus.html">hypellm-test-corpus</a></li>
+<li><a href="../modules/wire-http1.html">wire-http1</a></li>
+<li><a href="../modules/wire-json.html">wire-json</a></li>
+<li><a href="../modules/wire-sse.html">wire-sse</a></li>
+</ul></details>
+      </nav>
+      <p class="sidebar-note">Self-contained documentation<br>Read locally or serve statically.</p>
+    </aside>
+    <main id="content" tabindex="-1">
+      <p class="breadcrumb"><a href="../index.html">Wiki</a><span aria-hidden="true">/</span>Components</p>
+      <section id="search-results" hidden aria-label="Search results">
+        <h1>Search the wiki</h1>
+        <p id="search-status" role="status" aria-live="polite"></p>
+        <ol id="search-list"></ol>
+      </section>
+      <article class="document">
+
+<h1 id="the-hypellm-reference-job-shim">The HypeLLM reference job shim</h1>
+<p><code>job-shim/</code> holds the reference <strong>job shim</strong>: a small HTTP server that stands
+beside one generative service and speaks the router's job protocol on its behalf
+(<a href="../orchestration.html#113-one-family-many-shims">orchestration §11.3</a>). It
+serves the protocol for any service that can be run as a command — one verb, one
+argv, a declared set of output files — and it is the behaviour a service-specific shim
+is measured against. It is <strong>not</strong> part of the Cargo workspace.</p>
+<p><strong>Status.</strong> Built and tested by its own suite, and checked once against the
+router binary end to end. No shim for a particular service — TRELLIS, FLUX, YuE, H3,
+Kimodo — is built; each needs its own argv and, where the service is not a command,
+its own backend (<a href="../orchestration.html#114-what-a-shim-owns">§11.4</a>).</p>
+<h2 id="why-it-is-a-separate-process">Why it is a separate process</h2>
+<p>Running a generator is executing a process, which the router never does
+(router specification §26.2). Putting the variable part out of process, behind a
+narrow protocol the router owns, is the answer the router already gives three times —
+the identity verifier, the TLS helper and the fleet agent. To the router a shim is a
+provider like any other: an administrator-configured destination, untrusted, read
+with bounded parsers.</p>
+<h2 id="what-it-keeps">What it keeps</h2>
+<ul>
+<li><strong>The router authenticates, every request.</strong> A bearer token from a key file
+the shim refuses to read if group or others can, compared in constant time. Nothing,
+not even health, answers without it. Put the service where only the shim can reach it.</li>
+<li><strong>Inputs are bytes, never references.</strong> An input is a name, a media type from
+the protocol's closed set, and base64 data. A body with a URL, a path, or any field it
+does not know is refused, and nothing runs. Inputs are written into the job's own
+directory, as <code>in/&lt;name&gt;.&lt;ext&gt;</code>, and the command runs in that directory.</li>
+<li><strong>No shell.</strong> A verb's argv is an absolute program and fixed arguments;
+<code>{prompt}</code>, <code>{input:&lt;name&gt;}</code>, <code>{params_file}</code>, <code>{options_file}</code> and
+<code>{out_dir}</code> are replaced by whole values. A prompt is one argument, literally.</li>
+<li><strong>Outputs are declared.</strong> After the command exits 0, each declared output must
+be a regular file — not a link — inside the job's output directory and within
+<code>max_part_bytes</code>. Anything else fails the job, and nothing undeclared is served.</li>
+<li><strong>Closed vocabularies.</strong> A command signals <code>invalid_input</code> by exiting 65 and
+<code>out_of_memory</code> by exiting 75; any other failure is <code>internal</code>. The router waits and
+retries on <code>out_of_memory</code> and fails the job on the rest.</li>
+<li><strong>Bounded.</strong> Request bodies, inputs (four), connections, one job running at a
+time — a second submit is <code>503 not_ready</code> — a job's wall time, 64 retained jobs, and
+part sizes. A failed or cancelled job's files are removed at once, a succeeded one's
+after <code>retention_s</code>, and everything a previous process left is removed at start.</li>
+<li><strong>No prompt is logged.</strong> A log line is the method, the route and the status.</li>
+</ul>
+<h2 id="the-protocol">The protocol</h2>
+<pre><code class="language-text">GET    /job/v1/health                 → 200 { verbs[] }
+POST   /job/v1/jobs                   → 202 { id }
+GET    /job/v1/jobs/{id}              → { state, progress_permille, elapsed_ms, error, parts[] }
+GET    /job/v1/jobs/{id}/parts/{name} → bytes, with Content-Type and Content-Length
+DELETE /job/v1/jobs/{id}              → 202 { stopped }
+</code></pre>
+<p>The router's side is <code>hypellm_adapters::job</code>. A cancel stops the command's whole
+process session and reports <code>stopped: true</code>; the router holds the job's slot until the
+next status says <code>cancelled</code>. Progress is whatever the command writes, as an integer
+in permille, to the verb's <code>progress_file</code> in its output directory; without one it is 0
+until the job finishes.</p>
+<h2 id="configuration">Configuration</h2>
+<p>A JSON file; <code>job-shim/job-shim.example.json</code> is a TRELLIS-shaped example. Unknown
+fields are refused, so is a relative program, a placeholder the shim does not know, an
+<code>{input:…}</code> the verb does not declare, an output file name with a separator, and a
+media type outside the protocol's set. An optional input has no placeholder — there is no
+whole value to put in its place when it is absent — so naming one in <code>argv</code> is refused
+too; the command finds it at <code>in/&lt;name&gt;.&lt;ext&gt;</code>, or does not.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Meaning</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr><td><code>listen</code></td><td><code>host:port</code></td><td>required</td></tr>
+<tr><td><code>key_file</code></td><td>The bearer the router presents: 16–4096 visible ASCII characters, mode 0600</td><td>required</td></tr>
+<tr><td><code>work_dir</code></td><td>Absolute; one directory per job beneath it</td><td>required</td></tr>
+<tr><td><code>verbs</code></td><td>Verb name to <code>argv</code>, <code>inputs</code> (name to media types, or to <code>{"media_types": […], "optional": true}</code>), <code>parts</code> (name to <code>file</code>, <code>media_type</code>, <code>optional</code>), <code>timeout_s</code>, <code>progress_file</code></td><td>required</td></tr>
+<tr><td><code>max_body_bytes</code></td><td>Largest submit body</td><td>64 MiB</td></tr>
+<tr><td><code>max_part_bytes</code></td><td>Largest output served</td><td>1 GiB</td></tr>
+<tr><td><code>max_connections</code></td><td>Concurrent connections; past it a connection is closed</td><td>16</td></tr>
+<tr><td><code>retention_s</code></td><td>How long a finished job is kept</td><td>900</td></tr>
+</tbody>
+</table></div>
+<h2 id="setting-it-up">Setting it up</h2>
+<ol>
+<li>Write a key: <code>head -c 32 /dev/urandom | base64 &gt; /run/secrets/hypellm-job-shim.key</code>, mode 0600.
+Put the same text in the router's <code>&lt;secrets&gt;/credentials/&lt;credential-id&gt;</code>.</li>
+<li>Write the configuration and start it: <code>job-shim/hypellm-job-shim --config job-shim.json</code>.</li>
+<li>Declare it to the router as a <code>family=job</code> provider with that credential, a target
+with <code>operations=job</code> and the verb in <code>capabilities</code>, and an alias declaring the same
+<code>capability</code> — see <a href="../deployment.html">Deployment &amp; configuration</a>.</li>
+</ol>
+<h2 id="backends">Backends</h2>
+<p>A service that is not a command is reached through a <em>backend</em>: a command, in
+<code>job-shim/backends/</code>, that turns one job into one call to the service and its answer
+into the declared files. Each is Python's standard library only; each takes the service's
+address from a fixed <code>--service</code> argument in the configuration, never from the job; each
+refuses a param or option it cannot honour (exit 65) rather than ignoring it; each
+checks that what the service returned is the media type the part declares.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Backend</th>
+<th>Verb</th>
+<th>Service</th>
+<th>Takes</th>
+<th>Writes</th>
+</tr>
+</thead>
+<tbody>
+<tr><td><code>flux.py</code></td><td><code>text-to-image</code></td><td>FLUX.2 [klein] HTTP API, <code>POST /generate</code></td><td>prompt; <code>width</code>, <code>height</code> (multiples of 16, ≤ 1536), <code>steps</code> (≤ 60), <code>seed</code>, <code>count</code> (≤ 4); option <code>guidance_scale</code>; optional input <code>reference</code> (an edit)</td><td><code>image.png</code> … <code>image-4.png</code></td></tr>
+<tr><td><code>trellis.py</code></td><td><code>image-to-3d</code></td><td>TRELLIS HTTP API, <code>POST /generate</code></td><td>input <code>image</code>, no prompt; <code>seed</code>, <code>steps</code>; options <code>formats</code>, <code>remove_background</code>, guidance strengths, <code>simplify</code>, <code>texture_size</code></td><td><code>mesh.glb</code>, and <code>geometry.ply</code> / <code>gaussians.ply</code></td></tr>
+<tr><td><code>comfy_yue.py</code></td><td><code>text-to-music</code></td><td>ComfyUI with YuE2: a fixed graph, <code>POST /prompt</code>, <code>/history</code>, <code>/view</code></td><td>prompt (the style); <code>duration_ms</code> (≤ 6 min), <code>seed</code>, <code>steps</code>; option <code>lyrics</code></td><td><code>audio.flac</code></td></tr>
+<tr><td><code>gradio_h3.py</code></td><td><code>audio-to-video</code></td><td>MiniMax-H3 Gradio app, and its prompt conditioner</td><td>prompt; input <code>audio</code>, optional <code>keyframe</code>; <code>duration_ms</code> (2–6 s at 1080p), <code>steps</code>, <code>seed</code>; option <code>resolution</code></td><td><code>video.mp4</code></td></tr>
+<tr><td><code>kimodo.py</code></td><td><code>text-to-motion</code></td><td>Kimodo's text encoder; the motion model runs in the shim's container</td><td>prompt; <code>duration_ms</code> (≤ 10 s per sentence), <code>seed</code>, <code>steps</code>; options <code>bvh</code>, <code>postprocess</code></td><td><code>motion.npz</code>, <code>motion.bvh</code></td></tr>
+</tbody>
+</table></div>
+<p>Nothing a caller sends becomes a URL, a path, a node, a file name or a model name on
+the service's side. FLUX's and TRELLIS's own APIs accept a path inside their container
+where an image goes; the backends only ever send bytes. The YuE2 graph is fixed in
+<code>comfy_yue.py</code>, with the caller's style and lyrics as values in it. A reply naming a
+file outside the service's <code>/outputs/</code>, or audio saved anywhere but the job's own
+prefix, fails the job instead of being fetched, and no backend follows a redirect.</p>
+<p>A cancel stops the backend's session. <code>comfy_yue.py</code> also takes its prompt out of
+ComfyUI's queue, or interrupts it by its own id when it is the one running — never a bare
+<code>/interrupt</code>, which would stop another client's work. The others cannot stop work a
+service has already started: see below.</p>
+<h2 id="checking-it-works">Checking it works</h2>
+<p><code>python3 job-shim/test_job_shim.py</code> runs its suite against a generator script it writes
+per run: no network beyond loopback, no service, no GPU. It covers the key on every
+route, inputs as bytes only, no shell, declared outputs only (a link, a missing file and
+an oversized one each fail the job), the exit-code mapping, one job at a time, a cancel
+stopping the command and removing its files, paths that are not identifiers, bounded
+and unambiguous bodies, optional inputs, and configuration refusals. Run it when touching
+<code>job-shim/</code>.</p>
+<p><code>python3 job-shim/backends/test_backends.py</code> runs each backend the way the shim
+does, against fake services on loopback that record what they are sent: that a param or
+option the service cannot honour sends nothing, that each service status lands on the
+right exit code, that a reply naming a file elsewhere is not fetched and a redirect is not
+followed, that a ComfyUI cancel removes only its own prompt, that H3's conditioning is
+written under the app's cache key and reused, and that Kimodo's prompt stays one argument
+in an environment the backend builds rather than inherits.</p>
+<h2 id="what-it-does-not-do">What it does not do</h2>
+<ul>
+<li>It runs one job at a time and queues nothing; the router's job queue does the waiting.</li>
+<li>A backend cannot stop what a service has already started, except ComfyUI's. A
+cancelled FLUX, TRELLIS or H3 job still finishes rendering on the service — the
+service holds its GPU until then — and its result is discarded.</li>
+<li>The services' own outputs are not cleaned up: FLUX's and TRELLIS's
+<code>/outputs</code>, ComfyUI's <code>hypellm/</code> folder and H3's render directory keep every
+file a job made.</li>
+<li>It does not make the service private. The bearer protects the shim; a service still
+listening on the network can be called around it.</li>
+<li>It does not isolate the command beyond a private working directory, a minimal
+environment and its own process session. Run it as an unprivileged user, in the
+service's container.</li>
+<li>Its jobs are not durable: a restart forgets them and removes their files.</li>
+</ul>
+
+      </article>
+      <footer class="page-footer"><a href="../index.html">Wiki home</a><a href="#content">Back to top ↑</a></footer>
+    </main>
+    <aside class="page-toc" aria-label="On this page">
+      <details open><summary>On this page</summary><ol>
+<li class="toc-level-2"><a href="#why-it-is-a-separate-process">Why it is a separate process</a></li>
+<li class="toc-level-2"><a href="#what-it-keeps">What it keeps</a></li>
+<li class="toc-level-2"><a href="#the-protocol">The protocol</a></li>
+<li class="toc-level-2"><a href="#configuration">Configuration</a></li>
+<li class="toc-level-2"><a href="#setting-it-up">Setting it up</a></li>
+<li class="toc-level-2"><a href="#backends">Backends</a></li>
+<li class="toc-level-2"><a href="#checking-it-works">Checking it works</a></li>
+<li class="toc-level-2"><a href="#what-it-does-not-do">What it does not do</a></li>
+</ol></details>
+    </aside>
+  </div>
+</body>
+</html>

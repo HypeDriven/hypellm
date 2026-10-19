@@ -550,6 +550,12 @@ pub struct AdminState {
     /// switched on for. The router shares the same registry, and offers what
     /// is approved and published to the fleet agent.
     pub enrollments: Arc<hypellm_fleet::enroll::EnrollmentRegistry>,
+    /// The job queue, when this router runs jobs (orchestration §11.9).
+    ///
+    /// `None` when `settings job_workers` is zero: `GET /admin/v1/jobs` then
+    /// says the router runs no jobs, rather than listing an empty queue that
+    /// reads as an idle one.
+    pub jobs: Option<Arc<dyn crate::jobs::JobQueue>>,
 }
 
 /// Somewhere a provider credential can be put.
@@ -1481,6 +1487,7 @@ impl AdminApi {
             }
 
             (Method::Get, "/admin/v1/usage") => self.list_usage(session),
+            (Method::Get, "/admin/v1/jobs") => self.list_job_queue(session),
             (Method::Get, "/admin/v1/usage/principals") => {
                 self.usage_by_principal(request, session)
             }
@@ -3004,6 +3011,31 @@ impl AdminApi {
             ),
         );
 
+        Ok(ApiResponse::ok(&Value::Object(root)))
+    }
+
+    /// `GET /admin/v1/jobs` — the caller's tenant's unfinished jobs, running
+    /// first, then queued in class and share order (orchestration §11.9).
+    ///
+    /// `read_tenant_usage`, because it shows who in the tenant is waiting for
+    /// what. Never another tenant's jobs, and never a prompt.
+    fn list_job_queue(&self, session: &Session) -> Result<ApiResponse, ApiError> {
+        self.require(session, Permission::ReadTenantUsage)?;
+        let Some(jobs) = self.state.jobs.as_ref() else {
+            return Err(ApiError::new(
+                ApiErrorCode::NotFound,
+                "this router does not run jobs; set `settings job_workers`",
+            ));
+        };
+        let now = self.state.clock.wall_millis();
+        let items: Vec<Value> = jobs
+            .queue(&session.tenant)
+            .iter()
+            .map(|job| job.to_json(now))
+            .collect();
+        let mut root = Object::new();
+        root.push("tenant", Value::from(session.tenant.as_str()));
+        root.push("items", Value::Array(items));
         Ok(ApiResponse::ok(&Value::Object(root)))
     }
 

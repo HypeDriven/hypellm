@@ -923,6 +923,7 @@ fn an_idle_stop_picks_the_longest_idle_model_on_each_host() {
 
 // -- Churn-aware scheduling (specification 26.11) ---------------------------
 
+use hypellm_core::admission::PriorityClass;
 use hypellm_fleet::schedule::{
     Asking, Contender, JobClass, JobEntry, Proceed, Verdict, gate, pick_job, rank,
 };
@@ -946,6 +947,7 @@ fn contenders(rng: &mut Rng, now: u64) -> Vec<Contender> {
             waiting: 1 + u32::try_from(rng.below(4)).unwrap(),
             oldest_ms: now.saturating_sub(rng.below(4) * 60_000),
             restore_cost_ms: 10_000 * (1 + rng.below(3)),
+            class: PriorityClass::Standard,
         })
         .collect()
 }
@@ -969,7 +971,10 @@ fn scheduling_decisions_do_not_depend_on_the_order_their_inputs_arrive_in() {
         let mut rng = Rng::new(u64::from(seed) + 7_001);
         let policy = schedule_policy(&mut rng);
         let now = 1_000_000;
-        let all = contenders(&mut rng, now);
+        let mut all = contenders(&mut rng, now);
+        for contender in &mut all {
+            contender.class = priority_of(rng.below(3));
+        }
         let permuted = shuffled(&mut rng, &all);
 
         let order = |list: &[Contender]| -> Vec<DeploymentId> {
@@ -1004,6 +1009,9 @@ fn scheduling_decisions_do_not_depend_on_the_order_their_inputs_arrive_in() {
                     2 => JobClass::Cold("a".to_owned()),
                     _ => JobClass::Cold("b".to_owned()),
                 },
+                priority: priority_of(rng.below(3)),
+                principal_round: u32::try_from(rng.below(3)).unwrap(),
+                tenant_round: u32::try_from(rng.below(3)).unwrap(),
             })
             .collect();
         let shuffled_jobs = shuffled(&mut rng, &jobs);
@@ -1011,6 +1019,84 @@ fn scheduling_decisions_do_not_depend_on_the_order_their_inputs_arrive_in() {
             pick_job(list, now, policy.max_reorder_wait_ms).map(|i| list[i].seq)
         };
         assert_eq!(seq_of(&jobs), seq_of(&shuffled_jobs), "seed {seed}: job pick moved");
+    }
+}
+
+fn priority_of(n: u64) -> PriorityClass {
+    match n {
+        0 => PriorityClass::Interactive,
+        1 => PriorityClass::Standard,
+        _ => PriorityClass::Batch,
+    }
+}
+
+#[test]
+fn the_job_taken_is_always_of_the_highest_class_waiting_and_first_in_its_share() {
+    // Orchestration §11.9. Whatever locality, age and the bound say, no job is
+    // taken while a due job of a higher class waits; and among due jobs of
+    // the taken class and the same locality, none with a lower principal
+    // round is passed over.
+    for seed in 0..CASES {
+        let mut rng = Rng::new(u64::from(seed) + 21_001);
+        let now = 10_000_000;
+        let bound = if rng.below(4) == 0 { 0 } else { 5_000 + rng.below(200_000) };
+        let jobs: Vec<JobEntry> = (0..10_u64)
+            .map(|seq| JobEntry {
+                seq,
+                submitted_ms: now - rng.below(400_000),
+                due: rng.below(4) != 0,
+                class: match rng.below(3) {
+                    0 => JobClass::Warm,
+                    1 => JobClass::Activating,
+                    _ => JobClass::Cold(format!("g{}", rng.below(2))),
+                },
+                priority: priority_of(rng.below(3)),
+                principal_round: u32::try_from(rng.below(4)).unwrap(),
+                tenant_round: u32::try_from(rng.below(4)).unwrap(),
+            })
+            .collect();
+        let Some(picked) = pick_job(&jobs, now, bound) else {
+            assert!(jobs.iter().all(|j| !j.due), "seed {seed}: due work, nothing taken");
+            continue;
+        };
+        let chosen = &jobs[picked];
+        assert!(chosen.due, "seed {seed}: a job not due was taken");
+        let top = jobs.iter().filter(|j| j.due).map(|j| j.priority).min().unwrap();
+        assert_eq!(chosen.priority, top, "seed {seed}: a lower class went ahead");
+        let starving = |j: &JobEntry| bound != 0 && now - j.submitted_ms >= bound;
+        for other in jobs.iter().filter(|j| {
+            j.due
+                && j.priority == top
+                && (bound == 0 || (j.class == chosen.class && starving(j) == starving(chosen)))
+        }) {
+            assert!(
+                other.principal_round >= chosen.principal_round,
+                "seed {seed}: a job of round {} was passed over for round {}",
+                other.principal_round,
+                chosen.principal_round
+            );
+        }
+    }
+}
+
+#[test]
+fn a_model_a_higher_class_waits_for_always_ranks_first() {
+    // Orchestration §11.9: the next activation goes to the highest class
+    // waiting, whatever the demand, age or load cost of the others — and the
+    // starvation bound never lifts a contender over a class above it.
+    for seed in 0..CASES {
+        let mut rng = Rng::new(u64::from(seed) + 23_001);
+        let policy = schedule_policy(&mut rng);
+        let now = 10_000_000;
+        let mut all = contenders(&mut rng, now);
+        for contender in &mut all {
+            contender.class = priority_of(rng.below(3));
+            contender.waiting = 1 + u32::try_from(rng.below(200)).unwrap();
+            contender.oldest_ms = now.saturating_sub(rng.below(2 * policy.max_reorder_wait_ms));
+        }
+        let top = all.iter().map(|c| c.class).min().unwrap();
+        let ranked = rank(&all, now, &policy);
+        assert_eq!(ranked[0].class, top, "seed {seed}: a lower class ranked first");
     }
 }
 
@@ -1074,6 +1160,9 @@ fn nothing_waits_behind_reordering_past_the_bound() {
                 } else {
                     JobClass::Warm
                 },
+                priority: PriorityClass::Standard,
+                principal_round: 0,
+                tenant_round: 0,
             })
             .collect();
         let picked = pick_job(&jobs, now, policy.max_reorder_wait_ms).unwrap();
@@ -1113,6 +1202,7 @@ fn simulate(arrivals: &[(u64, usize)], load_ms: u64, serve_ms: u64, policy: &Fle
                         waiting: u32::try_from(waiting.iter().filter(|w| w.1 == m).count()).unwrap(),
                         oldest_ms,
                         restore_cost_ms: load_ms,
+                        class: PriorityClass::Standard,
                     })
                 })
                 .collect();
@@ -1210,6 +1300,7 @@ fn scheduling_priority_never_overflows() {
             waiting: u32::try_from(rng.next_u64() >> 32).unwrap(),
             oldest_ms: rng.next_u64(),
             restore_cost_ms: rng.next_u64(),
+            class: PriorityClass::Standard,
         };
         // Must not panic in debug builds, where overflow would.
         let now = rng.next_u64();

@@ -590,9 +590,13 @@ pub fn router_with_config(_upstream: &FakeUpstream, config_text: &str) -> TestRo
         // `/v1/jobs` does not have to remember to turn it on in its fixture.
         // The workers are started by `serve`; a test driving the store
         // directly needs none.
-        jobs: Some(Arc::new(crate::jobs::JobStore::new(
-            crate::jobs::JobLimits::DEFAULT,
-        ))),
+        jobs: Some(Arc::new(
+            crate::jobs::JobStore::new(crate::jobs::JobLimits::DEFAULT).with_spool(
+                crate::spool::Spool::open(dir.path(), 64 * 1024 * 1024, 256 * 1024 * 1024)
+                    .expect("the test spool"),
+                250,
+            ),
+        )),
         anonymous_access: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         config: Arc::new(Activatable::new(config)),
         keys: Arc::new(keys),
@@ -650,4 +654,280 @@ pub fn config_from(text: &str) -> ValidatedConfig {
                 .join("\n")
         )
     })
+}
+
+// -- A simulated job shim (orchestration §11.3) ------------------------------
+
+/// What a [`SimulatedShim`] does, part by part.
+#[derive(Debug, Clone)]
+pub struct ShimPart {
+    /// The part's name, as the status reports it.
+    pub name: String,
+    /// The media type the status declares.
+    pub declared_type: String,
+    /// The length the status declares.
+    pub declared_bytes: u64,
+    /// The media type the part's head actually carries.
+    pub served_type: String,
+    /// The bytes actually served.
+    pub body: Vec<u8>,
+}
+
+impl ShimPart {
+    /// An honest part: declared exactly as served.
+    #[must_use]
+    pub fn honest(name: &str, media_type: &str, body: &[u8]) -> Self {
+        Self {
+            name: name.to_owned(),
+            declared_type: media_type.to_owned(),
+            declared_bytes: u64::try_from(body.len()).unwrap_or(u64::MAX),
+            served_type: media_type.to_owned(),
+            body: body.to_vec(),
+        }
+    }
+}
+
+/// How a [`SimulatedShim`] behaves.
+#[derive(Debug, Clone)]
+pub struct ShimScript {
+    /// The bearer it requires.
+    pub bearer: String,
+    /// Refusals answered to the first submits, as `(status, error token)`.
+    pub submit_refusals: Vec<(u16, &'static str)>,
+    /// The job id it hands out.
+    pub job_id: String,
+    /// Status polls answered `running` before the job finishes.
+    pub polls_before_done: u32,
+    /// `Some(error)` fails the job with it instead of succeeding.
+    pub fail_with: Option<&'static str>,
+    /// What a succeeded job produced.
+    pub parts: Vec<ShimPart>,
+}
+
+impl ShimScript {
+    /// One job, done after two polls, producing `parts`.
+    #[must_use]
+    pub fn succeeding(parts: Vec<ShimPart>) -> Self {
+        Self {
+            bearer: "test-provider-secret".to_owned(),
+            submit_refusals: Vec::new(),
+            job_id: "sim_0001".to_owned(),
+            polls_before_done: 2,
+            fail_with: None,
+            parts,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ShimState {
+    submits: Vec<Vec<u8>>,
+    log: Vec<String>,
+    polls: u32,
+    cancelled: bool,
+    refusals_left: Vec<(u16, &'static str)>,
+}
+
+/// A job shim speaking the protocol over a real socket, scripted.
+///
+/// One request per connection, answered with `Connection: close`, so the
+/// router's pooled-socket handling is exercised as a peer that closes.
+#[derive(Debug)]
+pub struct SimulatedShim {
+    /// Where it listens.
+    pub address: std::net::SocketAddr,
+    state: Arc<std::sync::Mutex<ShimState>>,
+    stopping: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SimulatedShim {
+    /// Start a shim following `script`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if it cannot bind.
+    #[must_use]
+    #[allow(
+        clippy::expect_used,
+        reason = "test scaffolding: a harness that cannot bind must fail loudly"
+    )]
+    pub fn start(script: ShimScript) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind simulated shim");
+        let address = listener.local_addr().expect("shim address");
+        let state = Arc::new(std::sync::Mutex::new(ShimState {
+            refusals_left: script.submit_refusals.clone(),
+            ..ShimState::default()
+        }));
+        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_state = Arc::clone(&state);
+        let thread_stopping = Arc::clone(&stopping);
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if thread_stopping.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(mut socket) = stream else { break };
+                let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
+                let Some((method, path, auth, body)) = read_request(&mut socket) else {
+                    continue;
+                };
+                let reply = shim_reply(&script, &thread_state, &method, &path, &auth, body);
+                let _ = socket.write_all(&reply);
+                let _ = socket.flush();
+            }
+        });
+        Self {
+            address,
+            state,
+            stopping,
+            handle: Some(handle),
+        }
+    }
+
+    /// Every submit body received, in order.
+    #[must_use]
+    pub fn submits(&self) -> Vec<Vec<u8>> {
+        self.state.lock().map(|s| s.submits.clone()).unwrap_or_default()
+    }
+
+    /// Every request, as `METHOD path auth-ok`.
+    #[must_use]
+    pub fn log(&self) -> Vec<String> {
+        self.state.lock().map(|s| s.log.clone()).unwrap_or_default()
+    }
+}
+
+impl Drop for SimulatedShim {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(self.address);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Read one request: method, path, the `Authorization` value and the body.
+fn read_request(socket: &mut std::net::TcpStream) -> Option<(String, String, String, Vec<u8>)> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    let head_end = loop {
+        let read = socket.read(&mut chunk).ok()?;
+        if read == 0 {
+            return None;
+        }
+        buffer.extend_from_slice(chunk.get(..read)?);
+        if let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+            break end;
+        }
+        if buffer.len() > 64 * 1024 {
+            return None;
+        }
+    };
+    let head = String::from_utf8_lossy(buffer.get(..head_end)?).into_owned();
+    let mut lines = head.split("\r\n");
+    let mut first = lines.next()?.split(' ');
+    let method = first.next()?.to_owned();
+    let path = first.next()?.to_owned();
+    let mut length = 0_usize;
+    let mut auth = String::new();
+    for line in lines {
+        let (name, value) = line.split_once(':')?;
+        match name.trim().to_ascii_lowercase().as_str() {
+            "content-length" => length = value.trim().parse().ok()?,
+            "authorization" => value.trim().clone_into(&mut auth),
+            _ => {}
+        }
+    }
+    let mut body = buffer.get(head_end + 4..)?.to_vec();
+    while body.len() < length {
+        let read = socket.read(&mut chunk).ok()?;
+        if read == 0 {
+            break;
+        }
+        body.extend_from_slice(chunk.get(..read)?);
+    }
+    Some((method, path, auth, body))
+}
+
+fn shim_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
+    let mut out = format!(
+        "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    out.extend_from_slice(body);
+    out
+}
+
+fn shim_reply(
+    script: &ShimScript,
+    state: &std::sync::Mutex<ShimState>,
+    method: &str,
+    path: &str,
+    auth: &str,
+    body: Vec<u8>,
+) -> Vec<u8> {
+    let json = |status: u16, text: &str| shim_response(status, "application/json", text.as_bytes());
+    let Ok(mut state) = state.lock() else {
+        return json(500, r#"{"error":"internal"}"#);
+    };
+    let authorised = auth == format!("Bearer {}", script.bearer);
+    state.log.push(format!("{method} {path} {}", if authorised { "auth" } else { "noauth" }));
+    if !authorised {
+        return json(401, r#"{"error":"invalid_input"}"#);
+    }
+    let job = format!("/job/v1/jobs/{}", script.job_id);
+    match (method, path) {
+        ("POST", "/job/v1/jobs") => {
+            state.submits.push(body);
+            if !state.refusals_left.is_empty() {
+                let (status, error) = state.refusals_left.remove(0);
+                return json(status, &format!(r#"{{"error":"{error}"}}"#));
+            }
+            json(202, &format!(r#"{{"id":"{}"}}"#, script.job_id))
+        }
+        ("GET", p) if p == job => {
+            state.polls = state.polls.saturating_add(1);
+            if state.cancelled {
+                return json(200, r#"{"state":"cancelled"}"#);
+            }
+            if state.polls <= script.polls_before_done {
+                return json(200, r#"{"state":"running","progress_permille":500,"eta_ms":1000}"#);
+            }
+            if let Some(error) = script.fail_with {
+                return json(200, &format!(r#"{{"state":"failed","error":"{error}"}}"#));
+            }
+            let parts: Vec<String> = script
+                .parts
+                .iter()
+                .map(|p| {
+                    format!(
+                        r#"{{"name":"{}","media_type":"{}","bytes":{}}}"#,
+                        p.name, p.declared_type, p.declared_bytes
+                    )
+                })
+                .collect();
+            json(
+                200,
+                &format!(
+                    r#"{{"state":"succeeded","progress_permille":1000,"elapsed_ms":4200,"parts":[{}]}}"#,
+                    parts.join(",")
+                ),
+            )
+        }
+        ("DELETE", p) if p == job => {
+            state.cancelled = true;
+            json(202, r#"{"stopped":true}"#)
+        }
+        ("GET", p) => match p
+            .strip_prefix(&format!("{job}/parts/"))
+            .and_then(|name| script.parts.iter().find(|part| part.name == name))
+        {
+            Some(part) => shim_response(200, &part.served_type, &part.body),
+            None => json(404, r#"{"error":"invalid_input"}"#),
+        },
+        _ => json(404, r#"{"error":"invalid_input"}"#),
+    }
 }

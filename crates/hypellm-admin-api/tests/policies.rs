@@ -1715,6 +1715,7 @@ fn self_approving_api(admin: &Harness) -> AdminApi {
         credentials: admin.state.credentials.clone(),
         fleet: hypellm_admin_api::FleetSlot::default(),
         enrollments: Arc::clone(&admin.state.enrollments),
+        jobs: None,
     });
     AdminApi::new(state)
 }

@@ -407,3 +407,65 @@ fn a_restriction_record_never_decodes_looser_than_it_was_written() {
     assert_eq!(accepted + rejected, ITERATIONS);
     assert!(accepted > 0, "no mutated restriction record ever decoded");
 }
+
+/// Artifact-job bodies (orchestration §11.5), each a seed a mutation can make
+/// hostile.
+const ARTIFACT_SEEDS: &[&[u8]] = &[
+    br#"{"model":"mesh","verb":"image-to-3d","prompt":"a chair","params":{"seed":7,"steps":32},"inputs":[{"name":"image","media_type":"image/png","data":"iVBORw0KGgo="}],"options":{"texture_size":1024},"patience_ms":600000}"#,
+    br#"{"model":"song","verb":"text-to-music","prompt":"industrial","params":{"duration_ms":45000}}"#,
+    br#"{"model":"video","verb":"audio-to-video","inputs":[{"name":"audio","media_type":"audio/wav","data":"UklGRg=="},{"name":"keyframe","media_type":"image/png","data":"iVBORw0KGgo="}],"options":{"a":{"b":[1,2,{"c":3}]}}}"#,
+];
+
+#[test]
+fn an_artifact_job_never_carries_a_name_a_path_or_a_field_the_router_did_not_validate() {
+    // Whatever a mutated body parses to, every input name is an identifier
+    // that cannot change a path, every input is base64 rather than a
+    // reference, every param is within its bound, options are shallow, and
+    // the request it routes by is a job the caller cannot dress up as
+    // anything else — its identity the router's, its cost zero tokens.
+    use hypellm_router::protocol::job::{MAX_OPTIONS_DEPTH, parse_artifact_request};
+    fn depth(value: &wire_json::Value) -> usize {
+        match value {
+            wire_json::Value::Object(o) => 1 + o.iter().map(|(_, v)| depth(v)).max().unwrap_or(0),
+            wire_json::Value::Array(a) => 1 + a.iter().map(depth).max().unwrap_or(0),
+            _ => 0,
+        }
+    }
+    let context = context();
+    let mut rng = Rng::new(0x0b_a7_1f_ac);
+    let mut accepted = 0_u32;
+    for _ in 0..ITERATIONS {
+        let case = fuzz::mutate(rng.pick(ARTIFACT_SEEDS).copied().unwrap_or(b""), &mut rng);
+        let Ok(value) = wire_json::parse(&case, &Limits::DEFAULT) else {
+            continue;
+        };
+        let Ok((request, spec, _)) = parse_artifact_request(&value, &context) else {
+            continue;
+        };
+        accepted += 1;
+        assert_eq!(request.operation, hypellm_core::canonical::Operation::Job);
+        assert_eq!(request.tenant.as_str(), TENANT);
+        assert_eq!(request.principal.as_str(), PRINCIPAL);
+        assert_eq!(request.estimated_total_tokens(), 0);
+        assert!(request.inputs.is_empty());
+        assert!(spec.inputs.len() <= hypellm_adapters::job::MAX_INPUTS);
+        for input in &spec.inputs {
+            assert!(
+                input.name.as_str().bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                "{:?}",
+                input.name
+            );
+            assert!(
+                input.data_base64.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='),
+                "an input carried something other than base64"
+            );
+        }
+        if let Some(width) = spec.params.width {
+            assert!(width <= 16_384);
+        }
+        if let Some(options) = &spec.options {
+            assert!(depth(options) <= MAX_OPTIONS_DEPTH, "options nested past the bound");
+        }
+    }
+    assert!(accepted > 0, "no mutation parsed; the property is vacuous");
+}

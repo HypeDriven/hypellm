@@ -417,7 +417,7 @@ price target=p:typo input_per_million=250
 
     use super::*;
     use hypellm_core::canonical::Operation;
-    use hypellm_core::ids::{AliasId, ProviderId, TargetId, TenantId};
+    use hypellm_core::ids::{AliasId, PrincipalId, ProviderId, TargetId, TenantId};
     use hypellm_core::target::{AdminState, EndpointScheme, ProviderFamily};
 
     /// A configuration exercising every record type.
@@ -509,6 +509,44 @@ role_binding subject=group:platform role=operator
         assert_eq!(c.settings.cors_origins, vec!["https://admin.example"]);
         assert!(!c.settings.allow_generic_adapter, "default is off");
         assert!(!c.settings.capture_bodies, "bodies are not captured by default");
+    }
+
+    #[test]
+    fn a_job_shim_without_a_credential_is_refused() {
+        let shim = "provider id=trellis family=job scheme=http host=127.0.0.1 port=7871 egress=local";
+        let errors = load_err(&format!("{FULL}{shim}\n"));
+        assert!(codes(&errors).contains(&"job_shim_needs_credential"), "{:?}", codes(&errors));
+        let c = load_ok(&format!(
+            "{FULL}credential id=cred_shim\n{shim} credential=cred_shim\n"
+        ));
+        assert!(c.snapshot.providers.contains_key(&ProviderId::new("trellis").unwrap()));
+    }
+
+    #[test]
+    fn a_job_cap_is_read_from_tenant_and_principal_quotas_and_refused_anywhere_else() {
+        // Orchestration §11.9. A tenant's `jobs` overrides the setting; a
+        // principal's adds its own cap; anywhere else a cap would count
+        // nothing, so it is an error rather than a silent no-op.
+        let text = format!(
+            "{FULL}quota scope=tenant:other jobs=3\nquota scope=principal:user:42 jobs=2 class=batch\n"
+        );
+        let c = load_ok(&text);
+        let acme = TenantId::new("acme").unwrap();
+        let other = TenantId::new("other").unwrap();
+        let user42 = PrincipalId::new("user:42").unwrap();
+        let user99 = PrincipalId::new("user:99").unwrap();
+        assert_eq!(c.job_caps(&acme, &user42), (c.settings.max_jobs_per_tenant, Some(2)));
+        assert_eq!(c.job_caps(&acme, &user99), (c.settings.max_jobs_per_tenant, None));
+        assert_eq!(c.job_caps(&other, &user99), (3, None));
+
+        for scope in ["global", "target:local:qwen", "alias:code-fast"] {
+            let errors = load_err(&format!("{FULL}quota scope={scope} jobs=1\n"));
+            assert!(
+                codes(&errors).contains(&"jobs_not_on_holder"),
+                "{scope}: {:?}",
+                codes(&errors)
+            );
+        }
     }
 
     #[test]

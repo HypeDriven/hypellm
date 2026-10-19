@@ -23,23 +23,31 @@
 //!    A swap that would stop a model still carrying work is deferred while that
 //!    model has work — the hysteresis that keeps two busy models from
 //!    ping-ponging one slot.
-//! 2. **[`pick_job`] — which queued job does a free worker take?** Jobs whose
-//!    model is already loaded first, then jobs for a model being loaded, then
-//!    cold jobs grouped by model, so one activation serves the whole group.
+//! 2. **[`pick_job`] — which queued job does a free worker take?** The highest
+//!    priority class first (orchestration §11.9). Within it, jobs whose model is
+//!    already loaded, then jobs for a model being loaded, then cold jobs grouped
+//!    by model, so one activation serves the whole group; and within each of
+//!    those, every principal's first waiting job before anyone's second.
 //!
 //! # The starvation bound
 //!
 //! Every reordering is bounded by `max_reorder_wait_ms`. Work that has waited
-//! that long is served in age order ahead of any score, whatever it would
-//! displace, so reordering can delay work by at most the bound and never
-//! indefinitely. Zero disables reordering: activations go first-come and jobs
-//! are taken in queue order, exactly as before this module existed.
+//! that long is served ahead of any score, whatever it would displace, so
+//! reordering can delay work by at most the bound and never indefinitely. Zero
+//! disables reordering: activations go first-come and jobs are taken by class
+//! and share alone.
+//!
+//! The bound never crosses a priority class. A batch job is not promoted over
+//! interactive work by waiting: strict classes are what an operator who set
+//! them asked for, and a batch job held past its patience fails at its
+//! deadline, where it is counted.
 //!
 //! The bound does not override the safety controls. A starving deployment
 //! still needs a plan the planner accepts — dwell floor, cooldown, budget and
 //! eviction margin all still apply — so "served ahead of score" means "first in
 //! line", not "permitted to break the fleet's rules".
 
+use hypellm_core::admission::PriorityClass;
 use hypellm_core::ids::DeploymentId;
 
 use crate::model::FleetPolicy;
@@ -72,6 +80,9 @@ pub struct Contender {
     pub oldest_ms: u64,
     /// Expected milliseconds from deciding to serving, eviction excluded.
     pub restore_cost_ms: u64,
+    /// The highest priority class among the waiting requests (orchestration
+    /// §11.9).
+    pub class: PriorityClass,
 }
 
 impl Contender {
@@ -120,18 +131,22 @@ impl Contender {
 ///
 /// Expects at most one contender per deployment; the caller aggregates.
 ///
-/// Starving contenders first, oldest first. Then everything else by
-/// [`Contender::priority`], highest first, ties broken by cheaper load, then
-/// older demand, then deployment identifier — a total order over the inputs'
-/// *content*, so permuting the input never changes the answer.
+/// The highest class waiting first (orchestration §11.9): a model an
+/// interactive request waits for is loaded before one only batch work waits
+/// for, however much batch work there is. Within a class, starving contenders
+/// first, oldest first. Then everything else by [`Contender::priority`],
+/// highest first, ties broken by cheaper load, then older demand, then
+/// deployment identifier — a total order over the inputs' *content*, so
+/// permuting the input never changes the answer.
 #[must_use]
 pub fn rank<'a>(contenders: &'a [Contender], now_ms: u64, policy: &FleetPolicy) -> Vec<&'a Contender> {
     let mut ranked: Vec<&Contender> = contenders.iter().collect();
     ranked.sort_by(|a, b| {
         let starving_a = a.is_starving(now_ms, policy);
         let starving_b = b.is_starving(now_ms, policy);
-        starving_b
-            .cmp(&starving_a)
+        a.class
+            .cmp(&b.class)
+            .then_with(|| starving_b.cmp(&starving_a))
             .then_with(|| {
                 if starving_a && starving_b {
                     a.oldest_ms.cmp(&b.oldest_ms)
@@ -231,6 +246,8 @@ pub fn gate(asking: &Asking<'_>, contenders: &[Contender], now_ms: u64, policy: 
     // Hysteresis. A model still carrying work is not displaced for a model that
     // has not waited past the bound: the swap would stop work to start work,
     // and the next arrival for the stopped model would swap straight back.
+    // Class does not lift this: a higher class decides what is loaded when
+    // the model goes quiet, and never stops work in flight.
     if asking.evicts && asking.victims_busy && !starving {
         return Verdict::Defer(Defer::WarmDemand);
     }
@@ -291,48 +308,68 @@ pub struct JobEntry {
     pub seq: u64,
     /// When it was submitted, on the router's clock.
     pub submitted_ms: u64,
-    /// Whether its backoff has elapsed.
+    /// Whether it may be tried now: not backing off, not just found blocked.
     pub due: bool,
     /// How its model stands.
     pub class: JobClass,
+    /// Its priority class, stamped at submission.
+    pub priority: PriorityClass,
+    /// How many of its principal's jobs of the same priority were already
+    /// waiting when it was submitted.
+    pub principal_round: u32,
+    /// The same count over its tenant.
+    pub tenant_round: u32,
+}
+
+impl JobEntry {
+    /// The order within one locality step: every principal's first waiting
+    /// job before anyone's second, the less-loaded tenant first among equals,
+    /// then submission order. Unique, because `seq` is.
+    const fn share_key(&self) -> (u32, u32, u64) {
+        (self.principal_round, self.tenant_round, self.seq)
+    }
 }
 
 /// Which job a free worker should take, as an index into `entries`.
 ///
-/// `entries` is in queue order. With reordering disabled, the first due entry
-/// — the queue's own order, as before. Otherwise, among due entries:
+/// Only due entries, and only those of the highest priority class among them.
+/// With reordering disabled, the first of those by share. Otherwise:
 ///
-/// 1. any that has waited past `max_reorder_wait_ms`, lowest `seq` first;
-/// 2. `Warm`, lowest `seq` first;
-/// 3. `Activating`, lowest `seq` first;
+/// 1. any that has waited past `max_reorder_wait_ms`;
+/// 2. `Warm`;
+/// 3. `Activating`;
 /// 4. `Cold`, from the group with the most due jobs (ties to the group whose
-///    oldest job is oldest), lowest `seq` within it.
+///    oldest job is oldest).
 ///
-/// Tenant fairness is the starvation bound: no class or group may hold any
-/// tenant's job past it. Within a class the order is submission order, which
-/// is what every tenant had before.
+/// Within each step the order is share: lowest principal round, then lowest
+/// tenant round, then lowest `seq`. With every round zero that is submission
+/// order, which is what this function did before share existed.
 #[must_use]
 pub fn pick_job(entries: &[JobEntry], now_ms: u64, max_reorder_wait_ms: u64) -> Option<usize> {
-    let due = entries.iter().enumerate().filter(|(_, e)| e.due);
-    if max_reorder_wait_ms == 0 {
-        return due.map(|(i, _)| i).next();
-    }
-    let due: Vec<(usize, &JobEntry)> = due.collect();
-    let oldest = |pick: &mut dyn Iterator<Item = &(usize, &JobEntry)>| {
-        pick.min_by_key(|(_, e)| e.seq).map(|(i, _)| *i)
+    let top = entries.iter().filter(|e| e.due).map(|e| e.priority).min()?;
+    let due: Vec<(usize, &JobEntry)> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.due && e.priority == top)
+        .collect();
+    let first = |pick: &mut dyn Iterator<Item = &(usize, &JobEntry)>| {
+        pick.min_by_key(|(_, e)| e.share_key()).map(|(i, _)| *i)
     };
+    if max_reorder_wait_ms == 0 {
+        return first(&mut due.iter());
+    }
 
-    if let Some(i) = oldest(
+    if let Some(i) = first(
         &mut due
             .iter()
             .filter(|(_, e)| now_ms.saturating_sub(e.submitted_ms) >= max_reorder_wait_ms),
     ) {
         return Some(i);
     }
-    if let Some(i) = oldest(&mut due.iter().filter(|(_, e)| e.class == JobClass::Warm)) {
+    if let Some(i) = first(&mut due.iter().filter(|(_, e)| e.class == JobClass::Warm)) {
         return Some(i);
     }
-    if let Some(i) = oldest(&mut due.iter().filter(|(_, e)| e.class == JobClass::Activating)) {
+    if let Some(i) = first(&mut due.iter().filter(|(_, e)| e.class == JobClass::Activating)) {
         return Some(i);
     }
 
@@ -351,11 +388,85 @@ pub fn pick_job(entries: &[JobEntry], now_ms: u64, max_reorder_wait_ms: u64) -> 
     }
     groups.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)).then_with(|| a.0.cmp(b.0)));
     let (key, _, _) = groups.first()?;
-    oldest(
+    first(
         &mut due
             .iter()
             .filter(|(_, e)| matches!(&e.class, JobClass::Cold(k) if k == key)),
     )
+}
+
+/// Why [`pick_job`] chose what it chose, measured against what submission
+/// order would have taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickReason {
+    /// The job submission order would have taken.
+    InOrder,
+    /// The job submission order would have taken, and it had waited past the
+    /// bound.
+    Starving,
+    /// A higher priority class went ahead of an older job.
+    ByClass,
+    /// Within one class, another principal's turn went ahead of an older job.
+    ByShare,
+    /// Within one class, model locality went ahead of an older job.
+    Reordered,
+}
+
+impl PickReason {
+    /// The `hypellm_fleet_schedule_decisions_total` outcome, or `None` when
+    /// the job was taken in order.
+    #[must_use]
+    pub const fn outcome(self) -> Option<&'static str> {
+        match self {
+            Self::InOrder => None,
+            Self::Starving => Some("job_starving"),
+            Self::ByClass => Some("job_by_class"),
+            Self::ByShare => Some("job_by_share"),
+            Self::Reordered => Some("job_reordered"),
+        }
+    }
+}
+
+/// Explain the pick at `picked`.
+///
+/// Pure, and separate from [`pick_job`] so the decision itself carries no
+/// bookkeeping: the explanation is for metrics, never an input.
+#[must_use]
+pub fn pick_reason(entries: &[JobEntry], picked: usize, now_ms: u64, max_reorder_wait_ms: u64) -> PickReason {
+    let Some(chosen) = entries.get(picked) else {
+        return PickReason::InOrder;
+    };
+    let Some(earliest) = entries.iter().filter(|e| e.due).min_by_key(|e| e.seq) else {
+        return PickReason::InOrder;
+    };
+    let starving = max_reorder_wait_ms != 0
+        && now_ms.saturating_sub(chosen.submitted_ms) >= max_reorder_wait_ms;
+    if earliest.seq == chosen.seq {
+        return if starving {
+            PickReason::Starving
+        } else {
+            PickReason::InOrder
+        };
+    }
+    if earliest.priority != chosen.priority {
+        return PickReason::ByClass;
+    }
+    // Same class as the job arrival order would take. Had share not existed,
+    // would locality alone have chosen this one?
+    let without_share: Vec<JobEntry> = entries
+        .iter()
+        .map(|e| JobEntry {
+            principal_round: 0,
+            tenant_round: 0,
+            ..e.clone()
+        })
+        .collect();
+    match pick_job(&without_share, now_ms, max_reorder_wait_ms)
+        .and_then(|i| without_share.get(i))
+    {
+        Some(e) if e.seq == chosen.seq => PickReason::Reordered,
+        _ => PickReason::ByShare,
+    }
 }
 
 #[cfg(test)]
@@ -383,6 +494,7 @@ mod tests {
             waiting,
             oldest_ms,
             restore_cost_ms: 60_000,
+            class: PriorityClass::Standard,
         }
     }
 
@@ -476,6 +588,34 @@ mod tests {
     }
 
     #[test]
+    fn a_model_a_higher_class_waits_for_is_loaded_first_whatever_the_demand() {
+        let policy = policy(120_000);
+        let mut human = contender("human", 1, 50_000);
+        human.class = PriorityClass::Interactive;
+        let mut bulk = contender("bulk", 40, 0);
+        bulk.class = PriorityClass::Batch;
+        let all = [human.clone(), bulk.clone()];
+        let asking = |deployment| Asking {
+            deployment,
+            evicts: false,
+            victims_busy: false,
+        };
+        assert_eq!(
+            gate(&asking(&bulk.deployment), &all, 60_000, &policy),
+            Verdict::Defer(Defer::Outranked)
+        );
+        assert_eq!(
+            gate(&asking(&human.deployment), &all, 60_000, &policy),
+            Verdict::Proceed(Proceed::Ranked)
+        );
+        // Starving does not lift batch over a class above it.
+        assert_eq!(
+            gate(&asking(&bulk.deployment), &all, 500_000, &policy),
+            Verdict::Defer(Defer::Outranked)
+        );
+    }
+
+    #[test]
     fn priority_saturates_rather_than_wrapping() {
         let extreme = Contender {
             waiting: u32::MAX,
@@ -497,6 +637,9 @@ mod tests {
             submitted_ms: seq,
             due: true,
             class,
+            priority: PriorityClass::Standard,
+            principal_round: 0,
+            tenant_round: 0,
         }
     }
 
@@ -523,12 +666,66 @@ mod tests {
     }
 
     #[test]
-    fn a_job_past_the_bound_is_taken_first_and_a_zero_bound_is_queue_order() {
+    fn a_job_past_the_bound_is_taken_first_and_a_zero_bound_is_submission_order() {
         let mut entries = vec![job(5, JobClass::Warm), job(1, cold("a"))];
         entries[1].submitted_ms = 0;
         assert_eq!(pick_job(&entries, 119_999, 120_000), Some(0));
         assert_eq!(pick_job(&entries, 120_000, 120_000), Some(1));
-        assert_eq!(pick_job(&entries, 10, 0), Some(0));
+        assert_eq!(pick_job(&entries, 10, 0), Some(1));
+    }
+
+    fn of(mut entry: JobEntry, priority: PriorityClass, principal_round: u32) -> JobEntry {
+        entry.priority = priority;
+        entry.principal_round = principal_round;
+        entry
+    }
+
+    #[test]
+    fn a_higher_class_goes_before_older_warm_work_of_a_lower_one() {
+        // The interactive job is cold and the youngest. Locality and age both
+        // favour the batch job; only the class can explain the pick.
+        let entries = [
+            of(job(1, JobClass::Warm), PriorityClass::Batch, 0),
+            of(job(2, cold("a")), PriorityClass::Interactive, 0),
+        ];
+        assert_eq!(pick_job(&entries, 10, 120_000), Some(1));
+        assert_eq!(pick_job(&entries, 10, 0), Some(1));
+        assert_eq!(pick_reason(&entries, 1, 10, 120_000), PickReason::ByClass);
+    }
+
+    #[test]
+    fn the_bound_never_lifts_a_job_over_a_higher_class() {
+        let mut starving = of(job(1, JobClass::Warm), PriorityClass::Batch, 0);
+        starving.submitted_ms = 0;
+        let fresh = of(job(2, cold("a")), PriorityClass::Standard, 0);
+        assert_eq!(pick_job(&[starving, fresh], 500_000, 120_000), Some(1));
+    }
+
+    #[test]
+    fn a_principals_backlog_yields_to_another_principals_first_job() {
+        // One principal submitted three jobs first (rounds 0, 1, 2); another
+        // submitted one (round 0). After the backlog's first, the other
+        // principal goes next, though its job is the youngest.
+        let entries = [
+            of(job(1, JobClass::Warm), PriorityClass::Standard, 0),
+            of(job(2, JobClass::Warm), PriorityClass::Standard, 1),
+            of(job(3, JobClass::Warm), PriorityClass::Standard, 2),
+            of(job(4, JobClass::Warm), PriorityClass::Standard, 0),
+        ];
+        assert_eq!(pick_job(&entries, 10, 120_000), Some(0));
+        let rest = &entries[1..];
+        assert_eq!(pick_job(rest, 10, 120_000), Some(2));
+        assert_eq!(pick_reason(rest, 2, 10, 120_000), PickReason::ByShare);
+    }
+
+    #[test]
+    fn locality_still_orders_work_within_a_class() {
+        let entries = [
+            of(job(1, cold("a")), PriorityClass::Standard, 0),
+            of(job(2, JobClass::Warm), PriorityClass::Standard, 0),
+        ];
+        assert_eq!(pick_job(&entries, 10, 120_000), Some(1));
+        assert_eq!(pick_reason(&entries, 1, 10, 120_000), PickReason::Reordered);
     }
 
     #[test]

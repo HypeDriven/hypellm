@@ -1,0 +1,22 @@
+{
+  "listen": "10.0.0.21:7871",
+  "key_file": "/run/secrets/hypellm-job-shim.key",
+  "work_dir": "/var/lib/hypellm-job-shim",
+  "max_body_bytes": 67108864,
+  "max_part_bytes": 1073741824,
+  "max_connections": 16,
+  "retention_s": 900,
+  "verbs": {
+    "image-to-3d": {
+      "argv": ["/opt/trellis/generate", "--image", "{input:image}", "--prompt", "{prompt}",
+               "--params", "{params_file}", "--options", "{options_file}", "--out", "{out_dir}"],
+      "inputs": {"image": ["image/png", "image/webp"]},
+      "parts": {
+        "mesh": {"file": "mesh.glb", "media_type": "model/gltf-binary"},
+        "points": {"file": "points.ply", "media_type": "application/octet-stream", "optional": true}
+      },
+      "timeout_s": 900,
+      "progress_file": "progress"
+    }
+  }
+}

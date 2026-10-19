@@ -33,6 +33,9 @@ pub enum Operation {
     Tokenize,
     /// Reranking.
     Rerank,
+    /// An artifact job through a job shim (orchestration §11.5): submitted,
+    /// polled and its parts fetched, never a single exchange.
+    Job,
 }
 
 impl Operation {
@@ -45,6 +48,7 @@ impl Operation {
             Self::Embeddings => "embeddings",
             Self::Tokenize => "tokenize",
             Self::Rerank => "rerank",
+            Self::Job => "job",
         }
     }
 
@@ -57,6 +61,7 @@ impl Operation {
             "embeddings" => Self::Embeddings,
             "tokenize" => Self::Tokenize,
             "rerank" => Self::Rerank,
+            "job" => Self::Job,
             _ => return None,
         })
     }
@@ -76,6 +81,7 @@ impl Operation {
             Self::Embeddings,
             Self::Tokenize,
             Self::Rerank,
+            Self::Job,
         ]
     }
 }
@@ -1184,6 +1190,14 @@ impl CanonicalRequest {
     /// Conservative upper bound on input tokens, given a target's declaration.
     #[must_use]
     pub fn estimated_input_tokens_for(&self, estimate: &TokenEstimate) -> u64 {
+        // An artifact job's cost is accelerator time, not tokens (orchestration
+        // §11.5): its prompt is a few words driving minutes of generation, and
+        // counting it in tokens would only make a media target declare a
+        // context window it does not have. Zero passes the context check and
+        // reserves nothing token-denominated.
+        if self.operation == Operation::Job {
+            return 0;
+        }
         // Saturating rather than truncating: this is an upper bound feeding a
         // quota check, so a value too large holds the request, while a
         // wrapped-around small value would let it slip past.
@@ -1216,6 +1230,9 @@ impl CanonicalRequest {
     /// completion through the existing `Reservation::commit` path.
     #[must_use]
     pub fn estimated_output_tokens_with(&self, output_multiplier: u32) -> u64 {
+        if self.operation == Operation::Job {
+            return 0;
+        }
         u64::from(self.limits.max_output_tokens.unwrap_or(0))
             .saturating_mul(u64::from(output_multiplier.max(1)))
     }

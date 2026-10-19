@@ -43,6 +43,7 @@ pub mod enroll;
 pub mod fleet;
 pub mod fleet_access;
 pub mod handlers;
+pub mod jobs;
 pub mod response;
 pub mod traffic;
 pub mod usage;
@@ -52,6 +53,7 @@ pub use cors::{CorsPolicy, PreflightOutcome, security_headers};
 pub use decisions::DecisionCache;
 pub use drafts::{Draft, DraftStore, PublishRefusal};
 pub use fleet::{DeploymentPatch, FleetControl, FleetSlot};
+pub use jobs::{JobQueue, QueuedJob};
 pub use handlers::{
     AdminApi, AdminRequest, AdminState, BreakGlassPolicy, CredentialSink, ProbeOutcome,
 };

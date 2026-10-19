@@ -42,6 +42,7 @@
 <li><a href="../components/fleet-agent.html">Fleet agent</a></li>
 <li><a href="../components/identity-verifier.html">Identity verifier</a></li>
 <li><a href="../components/tls-helper.html">Outbound TLS helper</a></li>
+<li><a href="../components/job-shim.html">Job shim</a></li>
 <li><a href="../components/container-init.html">Container init</a></li>
 <li><a href="../components/tray-monitor.html">Windows tray monitor</a></li>
 </ul></details>
@@ -464,7 +465,13 @@ text. Their scope is fixed at creation and must be <code>principal:</code> or
 for its subject (<code>edit::scope_rule</code>). Of a principal's quota the scope, class
 and every limit are reachable (<code>edit::QUOTA_EDITABLE</code>: <code>concurrency</code>,
 <code>queued</code>, <code>rps</code>, <code>burst</code>, <code>tpm</code>, <code>token_burst</code>, <code>budget</code>,
-<code>budget_period</code>), and it may be removed. Raising a limit widens what a principal
+<code>budget_period</code>, <code>jobs</code>), and it may be removed. A quota's <code>jobs</code> — the jobs
+a scope may hold (orchestration §11.9) — is refused on any scope but
+<code>tenant:</code> and <code>principal:</code>, where it would count nothing; <code>job_caps</code> resolves
+a caller's two caps for the job store. A <code>family=job</code> provider without a
+<code>credential</code> is refused (<code>job_shim_needs_credential</code>): a shim authenticates the
+router on every request, and one reachable without a credential is a generator anyone
+on its network can drive. <code>settings job_poll_ms</code> is raised to 250 if written lower. Raising a limit widens what a principal
 may consume; the control on that is the draft's review and the second person
 who publishes it, not this list. The byte rates stay out (specification 12 puts
 them at the Global layer only) and so does <code>operation</code> (it qualifies an

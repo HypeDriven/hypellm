@@ -53,6 +53,10 @@ pub enum Capability {
     AudioToVideo,
     /// Lip synchronisation.
     Lipsync,
+    /// A 3D model from an image (orchestration §11.5).
+    ImageTo3d,
+    /// Motion capture from text (orchestration §11.5).
+    TextToMotion,
 }
 
 impl Capability {
@@ -73,6 +77,8 @@ impl Capability {
             Self::ImageToVideo => "image-to-video",
             Self::AudioToVideo => "audio-to-video",
             Self::Lipsync => "lipsync",
+            Self::ImageTo3d => "image-to-3d",
+            Self::TextToMotion => "text-to-motion",
         }
     }
 
@@ -93,6 +99,8 @@ impl Capability {
             "image-to-video" => Self::ImageToVideo,
             "audio-to-video" => Self::AudioToVideo,
             "lipsync" => Self::Lipsync,
+            "image-to-3d" => Self::ImageTo3d,
+            "text-to-motion" => Self::TextToMotion,
             _ => return None,
         })
     }
@@ -114,6 +122,8 @@ impl Capability {
             Self::ImageToVideo,
             Self::AudioToVideo,
             Self::Lipsync,
+            Self::ImageTo3d,
+            Self::TextToMotion,
         ]
     }
 
@@ -158,6 +168,14 @@ pub enum ProviderFamily {
     /// Specification 25: "Disabled by default; fixed endpoint and explicit
     /// capabilities required."
     GenericOpenAi,
+    /// A job shim: the first-party protocol for long-running generative
+    /// services (orchestration §11.3).
+    ///
+    /// Not OpenAI-shaped and not a single exchange: a job is submitted, polled
+    /// and its parts fetched, through `hypellm_adapters::job::JobAdapter`. It
+    /// serves no inference operation, so a chat request routed to one is
+    /// refused before anything is sent.
+    Job,
     /// A SemIf semantic-decision scorer.
     ///
     /// The one family here that does not speak an OpenAI-shaped dialect at
@@ -180,6 +198,7 @@ impl ProviderFamily {
             Self::Moonshot => "moonshot",
             Self::GenericOpenAi => "generic_openai",
             Self::SemIf => "semif",
+            Self::Job => "job",
         }
     }
 
@@ -194,6 +213,7 @@ impl ProviderFamily {
             "moonshot" | "kimi" => Self::Moonshot,
             "generic_openai" => Self::GenericOpenAi,
             "semif" => Self::SemIf,
+            "job" => Self::Job,
             _ => return None,
         })
     }
@@ -215,6 +235,7 @@ impl ProviderFamily {
             Self::Moonshot,
             Self::GenericOpenAi,
             Self::SemIf,
+            Self::Job,
         ]
     }
 }

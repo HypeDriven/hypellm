@@ -73,6 +73,7 @@ pub const QUOTA_EDITABLE: &[&str] = &[
     "token_burst",
     "budget",
     "budget_period",
+    "jobs",
 ];
 
 /// The `settings` fields an edit may touch. The rest of `settings` governs

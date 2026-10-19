@@ -329,6 +329,11 @@ struct QueueState {
 /// requests that will all miss their deadlines together.
 pub const MAX_QUEUED_PER_CAPABILITY: u32 = 256;
 
+/// Of those, the most that may be queued jobs rather than requests holding a
+/// connection: half, so a job queue configured large cannot leave an
+/// interactive request for a cold model nowhere to park.
+pub const MAX_JOBS_QUEUED_PER_CAPABILITY: u32 = MAX_QUEUED_PER_CAPABILITY.div_euclid(2);
+
 impl ActivationQueue {
     /// Create an empty queue.
     #[must_use]
@@ -388,6 +393,17 @@ impl ActivationQueue {
     /// `false` when the capability's queue is full; a request refused here
     /// must not call [`Self::leave`].
     pub fn park(&self, capability: Capability, now_ms: u64) -> bool {
+        self.park_up_to(capability, now_ms, MAX_QUEUED_PER_CAPABILITY)
+    }
+
+    /// [`Self::park`], refused once `limit` are waiting rather than at the
+    /// full bound.
+    ///
+    /// For queued jobs (orchestration §11.9), which are counted from
+    /// submission: held to [`MAX_JOBS_QUEUED_PER_CAPABILITY`], they can never
+    /// fill a capability's queue against the requests that hold a connection
+    /// and have nowhere else to wait.
+    pub fn park_up_to(&self, capability: Capability, now_ms: u64, limit: u32) -> bool {
         let Ok(mut map) = self.inner.write() else {
             return false;
         };
@@ -396,7 +412,7 @@ impl ActivationQueue {
             oldest_ms: now_ms,
             triggered: false,
         });
-        if state.waiting >= MAX_QUEUED_PER_CAPABILITY {
+        if state.waiting >= limit.min(MAX_QUEUED_PER_CAPABILITY) {
             return false;
         }
         if state.waiting == 0 {
@@ -710,6 +726,20 @@ mod tests {
     fn parking_is_bounded_by_the_same_ceiling_as_admission() {
         let queue = ActivationQueue::new();
         for _ in 0..MAX_QUEUED_PER_CAPABILITY {
+            assert!(queue.park(Capability::TextToMusic, 0));
+        }
+        assert!(!queue.park(Capability::TextToMusic, 0));
+    }
+
+    #[test]
+    fn queued_jobs_leave_room_for_requests_to_park() {
+        let queue = ActivationQueue::new();
+        for _ in 0..MAX_JOBS_QUEUED_PER_CAPABILITY {
+            assert!(queue.park_up_to(Capability::TextToMusic, 0, MAX_JOBS_QUEUED_PER_CAPABILITY));
+        }
+        assert!(!queue.park_up_to(Capability::TextToMusic, 0, MAX_JOBS_QUEUED_PER_CAPABILITY));
+        // The other half is the requests'.
+        for _ in MAX_JOBS_QUEUED_PER_CAPABILITY..MAX_QUEUED_PER_CAPABILITY {
             assert!(queue.park(Capability::TextToMusic, 0));
         }
         assert!(!queue.park(Capability::TextToMusic, 0));

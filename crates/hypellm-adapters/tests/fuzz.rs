@@ -330,3 +330,81 @@ fn every_recorded_fixture_is_reachable_as_a_seed() {
         let _ = adapter_for(family_for(stream.family));
     }
 }
+
+/// Job-shim replies (orchestration §11.3): well-formed seeds, each of which a
+/// mutation can turn into a hostile one.
+const SHIM_SEEDS: &[&[u8]] = &[
+    br#"{"id":"job_0001"}"#,
+    br#"{"id":"a-b_C9"}"#,
+    br#"{"state":"running","progress_permille":250,"eta_ms":9000,"elapsed_ms":1000}"#,
+    br#"{"state":"succeeded","progress_permille":1000,"elapsed_ms":42000,"parts":[{"name":"mesh","media_type":"model/gltf-binary","bytes":1024},{"name":"points","media_type":"application/octet-stream","bytes":2048}]}"#,
+    br#"{"state":"failed","error":"out_of_memory"}"#,
+    br#"{"state":"cancelled"}"#,
+    br#"{"verbs":["image-to-3d","text-to-image"]}"#,
+    br#"{"stopped":true}"#,
+    br#"{"error":"invalid_input"}"#,
+];
+
+/// Whether `path` stays inside the shim protocol's own namespace, built only
+/// from identifier characters.
+fn is_confined(path: &str) -> bool {
+    path.strip_prefix("/job/v1/jobs/").is_some_and(|rest| {
+        !rest.is_empty()
+            && rest
+                .split('/')
+                .all(|segment| {
+                    !segment.is_empty()
+                        && segment
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                })
+    })
+}
+
+#[test]
+fn a_provider_job_id_with_a_path_separator_never_reaches_a_request_path() {
+    // Orchestration §11.8. A hostile or broken shim names the job and its
+    // parts, and the router puts both into its next requests' paths. Whatever
+    // a mutated reply decodes to, every path built from it stays a plain
+    // `/job/v1/jobs/<id>[/parts/<name>]` of identifier characters — no `/`,
+    // `..`, `%`, `?` or `#` smuggled in — and a part the router would fetch
+    // has a media type from the closed, non-scriptable set.
+    use hypellm_adapters::job::{JobAdapter, MAX_PARTS, PartMediaType};
+    let statuses = [200u16, 202, 400, 404, 500, 503, 507];
+    let mut rng = Rng::new(0xada9_00a1);
+    let mut accepted = 0_u32;
+    let mut statuses_decoded = 0_u32;
+    for _ in 0..ITERATIONS {
+        let case = fuzz::mutate(rng.pick(SHIM_SEEDS).copied().unwrap_or(b""), &mut rng);
+        let status = rng.pick(&statuses).copied().unwrap_or(200);
+
+        if let Ok(id) = JobAdapter::decode_accepted(status, &case) {
+            accepted += 1;
+            let path = JobAdapter::status_path(&id);
+            assert!(is_confined(&path), "a submit reply built {path:?}");
+        }
+        if let Ok(reply) = JobAdapter::decode_status(status, &case) {
+            statuses_decoded += 1;
+            assert!(reply.parts.len() <= MAX_PARTS);
+            assert!(reply.progress_permille <= 1_000);
+            let id = hypellm_adapters::job::ProviderJobId::parse("job_0001").unwrap();
+            for part in &reply.parts {
+                let path = JobAdapter::part_path(&id, &part.name);
+                assert!(is_confined(&path), "a status reply built {path:?}");
+                assert!(
+                    !matches!(part.media_type.as_str(), "text/html" | "image/svg+xml"),
+                    "a scriptable part was accepted"
+                );
+                assert_eq!(PartMediaType::parse(part.media_type.as_str()), Some(part.media_type));
+            }
+        }
+        let _ = JobAdapter::decode_health(status, &case);
+        let _ = JobAdapter::decode_cancelled(status, &case);
+        // A classification never carries the shim's body to the client.
+        let classified = JobAdapter::classify(status, &case);
+        let detail = classified.safe_detail.as_str();
+        assert!(!detail.contains('{') && !detail.contains('/'), "{detail:?}");
+    }
+    // The property is vacuous if nothing ever decoded.
+    assert!(accepted > 0 && statuses_decoded > 0, "{accepted} {statuses_decoded}");
+}

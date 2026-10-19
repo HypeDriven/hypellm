@@ -454,3 +454,58 @@ fn a_key_minted_narrowed_is_narrowed_from_its_first_request() {
     let kept = send(harness.address, &secret, "POST", "/v1/chat/completions", &chat("agent", "x"));
     assert_eq!(kept.status, 200, "{}", kept.body);
 }
+
+#[test]
+fn a_jobs_class_is_its_principals_lowered_by_its_key_and_never_raised() {
+    // Orchestration §11.9: the job queue resolves a caller's class exactly as
+    // admission does. The test key's principal is configured `batch`; a key
+    // that asks for `interactive` must not lift it, and a key narrowed to
+    // `batch` must lower a principal that is `standard`.
+    let upstream = FakeUpstream::start(ok_response("ok"));
+    let config = format!(
+        "{}quota scope=principal:svc:test class=batch\n",
+        three_aliases(upstream.address.port())
+    );
+    let harness = Harness::start(router_with_config(&upstream, &config));
+    let class_of = |key: &str| {
+        let response = send(harness.address, key, "POST", "/v1/jobs", &chat("agent", "x"));
+        assert_eq!(response.status, 202, "{}", response.body);
+        response
+            .json()
+            .get("class")
+            .and_then(wire_json::Value::as_str)
+            .expect("a job reports its class")
+            .to_owned()
+    };
+
+    harness.restrict(KeyRestriction {
+        priority: Some(PriorityClass::Interactive),
+        ..KeyRestriction::default()
+    });
+    assert_eq!(class_of(&harness.router.api_key), "batch", "a key raised its principal's class");
+
+    let other = harness
+        .router
+        .state
+        .keys
+        .create(
+            hypellm_core::ids::TenantId::new("acme").unwrap(),
+            hypellm_core::ids::PrincipalId::new("svc:other").unwrap(),
+            vec![hypellm_auth::Scope::Inference],
+            None,
+            hypellm_auth::SourceRestriction::Any,
+            None,
+            harness.router.state.clock.wall_millis(),
+        )
+        .unwrap()
+        .into_secret();
+    assert_eq!(class_of(&other), "standard");
+    assert!(harness.router.state.keys.set_restrictions(
+        &key_id_of(&other),
+        KeyRestriction {
+            priority: Some(PriorityClass::Batch),
+            ..KeyRestriction::default()
+        },
+    ));
+    assert_eq!(class_of(&other), "batch", "a batch key did not lower its job");
+}

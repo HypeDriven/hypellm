@@ -51,6 +51,7 @@
 pub mod admin;
 pub mod dispatch;
 pub mod fleet;
+pub mod job_exchange;
 pub mod jobs;
 pub mod hardening;
 pub mod pipeline;
@@ -58,6 +59,7 @@ pub mod probe;
 pub mod protocol;
 pub mod routes;
 pub mod server;
+pub mod spool;
 pub mod startup;
 pub mod state;
 #[cfg(any(test, feature = "test-harness"))]

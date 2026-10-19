@@ -12,6 +12,7 @@
 //! | [`rerank`] | `/v1/rerank` |
 
 pub mod anthropic;
+pub mod job;
 pub mod openai;
 pub mod rerank;
 
