@@ -937,13 +937,37 @@ provider discounts cache reads and you want that reflected.</li>
 <p>The figure appears as <code>estimated_cost</code> on usage rows from <code>GET /admin/v1/usage</code>, alongside its currency, and is labelled an estimate there.
 The tokenizer half of specification 25's cost question — pre-flight token
 <em>counting</em> — is not implemented; see <a href="deferred-issues.html#conservative-token-estimation">current limitations</a>.</p>
-<h3 id="alias-sampler-settings-llamacpp">Alias sampler settings (llama.cpp)</h3>
+<h3 id="alias-sampler-settings-llamacpp">Repetition samplers (llama.cpp)</h3>
 <p>A llama.cpp server's sampler flags apply to every client, and a default that suits one workload
 breaks another. DRY (<code>--dry-multiplier</code>) keeps a chat model from looping, but it also stops an agent
 from copying an identifier out of a tool result, because a verbatim copy is the repetition DRY
 penalises. With <code>--dry-multiplier 0.8 --dry-allowed-length 2</code>, a model asked to repeat
 <code>ds_5a8c1f0e2b7d4e93a61c</code> returns <code>ds_5a8c1e2b7d4a61c</code>.</p>
-<p>An alias can fix two of these for every request it routes, without changing the server:</p>
+<p>A client can set llama.cpp's repetition samplers on its own request: the server's flags are only
+defaults. An OpenAI-protocol request body (<code>/v1/chat/completions</code>) may carry any of these, under
+llama.cpp's own names:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable table"><table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Range</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr><td><code>repeat_penalty</code></td><td>0–2</td><td><code>1</code> turns it off</td></tr>
+<tr><td><code>repeat_last_n</code></td><td>-1–1,048,576</td><td>tokens it looks back over; <code>0</code> off, <code>-1</code> the whole context</td></tr>
+<tr><td><code>dry_multiplier</code></td><td>0–5</td><td><code>0</code> turns DRY off</td></tr>
+<tr><td><code>dry_base</code></td><td>1–10</td><td>how fast DRY's penalty grows with the repeated length</td></tr>
+<tr><td><code>dry_allowed_length</code></td><td>0–1,024</td><td>the longest repetition DRY leaves alone</td></tr>
+<tr><td><code>dry_penalty_last_n</code></td><td>-1–1,048,576</td><td>tokens DRY looks back over; <code>0</code> off, <code>-1</code> the whole context</td></tr>
+<tr><td><code>dry_sequence_breakers</code></td><td>up to 16 strings of 1–64 bytes</td><td>strings that end a repeated sequence; <code>[]</code> means none</td></tr>
+</tbody>
+</table></div>
+<p>A value out of range is refused with <code>400</code> naming the field. Only llama.cpp-family providers
+receive them; a request routed to any other family goes without. The Anthropic protocol has no
+spelling for them.</p>
+<p>An alias can also set two of them as defaults for every request it routes, without changing the server:</p>
 <pre><code class="language-text">alias id=agent targets=spark-q8kp:qwen38 dry_multiplier=0 repeat_penalty=1 capability=chat \
       description=&quot;tool-using agents: DRY off so identifiers survive&quot;
 </code></pre>
@@ -968,8 +992,8 @@ penalises. With <code>--dry-multiplier 0.8 --dry-allowed-length 2</code>, a mode
 </tr>
 </tbody>
 </table></div>
-<p>These are operator settings: no client protocol can set or clear them, and a request that spells
-them gets nothing for it. Only llama.cpp-family providers receive them, and configuration refuses
+<p>They are defaults, not overrides: a client that sends the field keeps its own value, and one that
+leaves it out gets the alias's. Only llama.cpp-family providers receive them, and configuration refuses
 (<code>sampling_family_mismatch</code>) an alias that sets them and lists a target on any other family. Remember
 to add the alias to the target's own <code>aliases=</code> list.</p>
 <h3 id="alias-quotas">Alias quotas</h3>
@@ -1348,7 +1372,7 @@ records appear in.</p>
 </tr>
 <tr>
 <td><code>alias</code></td>
-<td><code>capability</code>, <code>dry_multiplier</code>, <code>repeat_penalty</code> (llama.cpp only; see <a href="#alias-sampler-settings-llamacpp">Alias sampler settings</a>)</td>
+<td><code>capability</code>, <code>dry_multiplier</code>, <code>repeat_penalty</code> (llama.cpp only; see <a href="#alias-sampler-settings-llamacpp">Repetition samplers</a>)</td>
 </tr>
 <tr>
 <td><code>target</code></td>
@@ -1610,7 +1634,7 @@ cargo run -q -p hypellm-devtools --bin depscan --offline -- --root . --manifest
 <li class="toc-level-3"><a href="#the-static-admin-application">The static admin application</a></li>
 <li class="toc-level-2"><a href="#configuration">Configuration</a></li>
 <li class="toc-level-3"><a href="#price-schedules">Price schedules</a></li>
-<li class="toc-level-3"><a href="#alias-sampler-settings-llamacpp">Alias sampler settings (llama.cpp)</a></li>
+<li class="toc-level-3"><a href="#alias-sampler-settings-llamacpp">Repetition samplers (llama.cpp)</a></li>
 <li class="toc-level-3"><a href="#alias-quotas">Alias quotas</a></li>
 <li class="toc-level-3"><a href="#byte-rates-and-spend-budgets">Byte rates and spend budgets</a></li>
 <li class="toc-level-3"><a href="#per-key-token-budgets">Per-key token budgets</a></li>

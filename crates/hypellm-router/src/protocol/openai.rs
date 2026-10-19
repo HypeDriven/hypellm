@@ -16,7 +16,7 @@
 use hypellm_core::canonical::{
     CanonicalRequest, ClientProtocol, ContentPart, CostClass, DocumentSource, DocumentType,
     ImageSource, Message, Operation, QualityClass, ReasoningEffort, RequestLimits, Residency,
-    ResponseFormat, Role, RoutingHints, Sampling, StreamOptions, ToolCall, ToolChoice, ToolDef,
+    ResponseFormat, Role, RoutingHints, LlamaCppSamplers, Sampling, StreamOptions, ToolCall, ToolChoice, ToolDef,
 };
 use hypellm_core::error::{ErrorCode, RouterError};
 use hypellm_core::event::{CanonicalEvent, FinishReason, ResponseAccumulator};
@@ -427,10 +427,7 @@ fn parse_sampling(value: &Value) -> Result<Sampling, RouterError> {
         presence_penalty: value.opt_field_f64("presence_penalty").map_err(type_error)?,
         stop: parse_stop(value)?,
         enable_thinking: parse_enable_thinking(value)?,
-        // Alias configuration, never the client's: a request that spells them
-        // gets nothing for it (`LlamaCppSampling`).
-        dry_multiplier: None,
-        repeat_penalty: None,
+        llamacpp: parse_llamacpp_samplers(value)?,
     };
     if let Err(param) = sampling.validate() {
         return Err(
@@ -438,6 +435,43 @@ fn parse_sampling(value: &Value) -> Result<Sampling, RouterError> {
         );
     }
     Ok(sampling)
+}
+
+/// llama.cpp's repetition and DRY samplers, under llama.cpp's own names.
+///
+/// Not OpenAI fields: only a llama.cpp-family target receives them, and a
+/// request routed elsewhere goes without. A negative `dry_allowed_length` is
+/// out of range rather than a type error, so it reads as one.
+fn parse_llamacpp_samplers(value: &Value) -> Result<LlamaCppSamplers, RouterError> {
+    let out_of_range = |param: &str| {
+        RouterError::invalid_request("a sampling parameter is out of range").with_param(param)
+    };
+    let dry_allowed_length = match value.opt_field_i64("dry_allowed_length").map_err(type_error)? {
+        None => None,
+        Some(n) => Some(u32::try_from(n).map_err(|_| out_of_range("dry_allowed_length"))?),
+    };
+    let dry_sequence_breakers = match value.opt_field_array("dry_sequence_breakers").map_err(type_error)? {
+        None => None,
+        Some(items) => Some(
+            items
+                .iter()
+                .map(|v| v.as_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    RouterError::invalid_request("'dry_sequence_breakers' must be an array of strings")
+                        .with_param("dry_sequence_breakers")
+                })?,
+        ),
+    };
+    Ok(LlamaCppSamplers {
+        repeat_penalty: value.opt_field_f64("repeat_penalty").map_err(type_error)?,
+        repeat_last_n: value.opt_field_i64("repeat_last_n").map_err(type_error)?,
+        dry_multiplier: value.opt_field_f64("dry_multiplier").map_err(type_error)?,
+        dry_base: value.opt_field_f64("dry_base").map_err(type_error)?,
+        dry_allowed_length,
+        dry_penalty_last_n: value.opt_field_i64("dry_penalty_last_n").map_err(type_error)?,
+        dry_sequence_breakers,
+    })
 }
 
 fn parse_enable_thinking(value: &Value) -> Result<Option<bool>, RouterError> {

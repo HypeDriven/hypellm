@@ -988,19 +988,60 @@ fn an_alias_turns_llamacpp_sampling_off_for_its_requests_and_only_its_requests()
         .replace("family=openai", "family=llamacpp")
         .replace("alias id=test-alias", "alias id=agent targets=local:model dry_multiplier=0 repeat_penalty=1\nalias id=test-alias");
     let harness = Harness::start(upstream, router_with_config_text(&config));
+    let sent = |body: &str| {
+        let response = harness.request("POST", "/v1/chat/completions", body, true);
+        assert_eq!(response.status, 200, "{}", response.body);
+        parse_str(&harness.upstream.last_body().expect("a body"), &Limits::DEFAULT).expect("JSON")
+    };
 
-    let agent = r#"{"model":"agent","messages":[{"role":"user","content":"Copy ds_5a8c1f0e2b7d4e93a61c."}]}"#;
-    assert_eq!(harness.request("POST", "/v1/chat/completions", agent, true).status, 200);
-    let sent = parse_str(&harness.upstream.last_body().expect("a body"), &Limits::DEFAULT).expect("JSON");
-    assert_eq!(sent.opt_field_f64("dry_multiplier").unwrap(), Some(0.0));
-    assert_eq!(sent.opt_field_f64("repeat_penalty").unwrap(), Some(1.0));
+    let agent = sent(r#"{"model":"agent","messages":[{"role":"user","content":"Copy ds_5a8c1f0e2b7d4e93a61c."}]}"#);
+    assert_eq!(agent.opt_field_f64("dry_multiplier").unwrap(), Some(0.0));
+    assert_eq!(agent.opt_field_f64("repeat_penalty").unwrap(), Some(1.0));
 
-    // The other alias sends neither, and a client cannot set them itself.
-    let plain = r#"{"model":"test-alias","dry_multiplier":5,"repeat_penalty":2,"messages":[{"role":"user","content":"x"}]}"#;
-    let response = harness.request("POST", "/v1/chat/completions", plain, true);
+    // The other alias sends neither, so the server's defaults stand.
+    let plain = sent(r#"{"model":"test-alias","messages":[{"role":"user","content":"x"}]}"#);
+    assert!(plain.get("dry_multiplier").is_none() && plain.get("repeat_penalty").is_none());
+
+    // The alias's values are defaults: a client that sends its own keeps them,
+    // and a field it leaves out still takes the alias's.
+    let mixed = sent(r#"{"model":"agent","dry_multiplier":0.8,"messages":[{"role":"user","content":"x"}]}"#);
+    assert_eq!(mixed.opt_field_f64("dry_multiplier").unwrap(), Some(0.8));
+    assert_eq!(mixed.opt_field_f64("repeat_penalty").unwrap(), Some(1.0));
+}
+
+#[test]
+fn a_client_sets_llamacpp_repetition_samplers_per_request() {
+    let upstream = FakeUpstream::start(chat_completion_response());
+    let config = default_config_text(upstream.address.port()).replace("family=openai", "family=llamacpp");
+    let harness = Harness::start(upstream, router_with_config_text(&config));
+
+    let body = r#"{"model":"test-alias","messages":[{"role":"user","content":"x"}],
+        "repeat_penalty":1.05,"repeat_last_n":256,"dry_multiplier":0.4,"dry_base":2,
+        "dry_allowed_length":3,"dry_penalty_last_n":-1,"dry_sequence_breakers":["\n","```"]}"#;
+    let response = harness.request("POST", "/v1/chat/completions", body, true);
     assert_eq!(response.status, 200, "{}", response.body);
     let sent = parse_str(&harness.upstream.last_body().expect("a body"), &Limits::DEFAULT).expect("JSON");
-    assert!(sent.get("dry_multiplier").is_none() && sent.get("repeat_penalty").is_none());
+    assert_eq!(sent.opt_field_f64("repeat_penalty").unwrap(), Some(1.05));
+    assert_eq!(sent.opt_field_i64("repeat_last_n").unwrap(), Some(256));
+    assert_eq!(sent.opt_field_f64("dry_multiplier").unwrap(), Some(0.4));
+    assert_eq!(sent.opt_field_f64("dry_base").unwrap(), Some(2.0));
+    assert_eq!(sent.opt_field_i64("dry_allowed_length").unwrap(), Some(3));
+    assert_eq!(sent.opt_field_i64("dry_penalty_last_n").unwrap(), Some(-1));
+    let breakers = sent.opt_field_array("dry_sequence_breakers").unwrap().expect("sent");
+    assert_eq!(breakers.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>(), ["\n", "```"]);
+
+    // Out of range is the client's mistake, said before anything is sent.
+    for (bad, param) in [
+        (r#""repeat_penalty":3"#, "repeat_penalty"),
+        (r#""dry_base":0.5"#, "dry_base"),
+        (r#""dry_allowed_length":-1"#, "dry_allowed_length"),
+        (r#""dry_sequence_breakers":[1]"#, "dry_sequence_breakers"),
+    ] {
+        let body = format!(r#"{{"model":"test-alias",{bad},"messages":[{{"role":"user","content":"x"}}]}}"#);
+        let response = harness.request("POST", "/v1/chat/completions", &body, true);
+        assert_eq!(response.status, 400, "{bad}: {}", response.body);
+        assert!(response.body.contains(param), "{bad}: {}", response.body);
+    }
 }
 
 #[test]

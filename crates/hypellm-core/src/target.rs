@@ -676,10 +676,10 @@ pub struct Alias {
     pub llamacpp_sampling: LlamaCppSampling,
 }
 
-/// llama.cpp sampler settings an alias applies to every request it routes.
+/// llama.cpp sampler defaults an alias applies to the requests it routes.
 ///
-/// Operator configuration, never client input: the client protocols have no
-/// spelling for these, so a caller can neither set nor clear them. They exist
+/// Defaults, not overrides: a client that names the field in its request body
+/// (`crate::canonical::LlamaCppSamplers`) keeps its own value. They exist
 /// because a llama.cpp server's command-line defaults apply to every client,
 /// and a default that suits one workload breaks another — DRY (`--dry-multiplier`)
 /// stops a chat model looping, and also stops an agent copying an identifier
@@ -696,10 +696,12 @@ pub struct LlamaCppSampling {
 }
 
 impl LlamaCppSampling {
-    /// Accepted `dry_multiplier` values.
-    pub const DRY_MULTIPLIER_RANGE: core::ops::RangeInclusive<f64> = 0.0..=5.0;
-    /// Accepted `repeat_penalty` values.
-    pub const REPEAT_PENALTY_RANGE: core::ops::RangeInclusive<f64> = 0.0..=2.0;
+    /// Accepted `dry_multiplier` values, the same a client may send.
+    pub const DRY_MULTIPLIER_RANGE: core::ops::RangeInclusive<f64> =
+        crate::canonical::LlamaCppSamplers::DRY_MULTIPLIER_RANGE;
+    /// Accepted `repeat_penalty` values, the same a client may send.
+    pub const REPEAT_PENALTY_RANGE: core::ops::RangeInclusive<f64> =
+        crate::canonical::LlamaCppSamplers::REPEAT_PENALTY_RANGE;
 
     /// True when the alias overrides nothing.
     #[must_use]

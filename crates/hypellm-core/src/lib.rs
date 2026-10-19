@@ -92,7 +92,8 @@ pub mod target;
 pub mod time;
 
 pub use canonical::{
-    CanonicalRequest, ClientProtocol, ContentPart, CostClass, DocumentSource, DocumentType, Message,
+    CanonicalRequest, ClientProtocol, ContentPart, CostClass, DocumentSource, DocumentType, LlamaCppSamplers,
+    Message,
     Modality, Operation, QualityClass, ReasoningEffort, RequestLimits, Residency, ResponseFormat,
     Role, RoutingHints, Sampling, StreamOptions, TokenEstimate, ToolCall, ToolChoice, ToolDef,
 };

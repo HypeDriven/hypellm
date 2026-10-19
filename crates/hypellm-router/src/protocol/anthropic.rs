@@ -21,7 +21,7 @@
 
 use hypellm_core::canonical::{
     CanonicalRequest, ClientProtocol, ContentPart, DocumentSource, DocumentType, ImageSource,
-    Message, Operation, ReasoningEffort, RequestLimits, Role, Sampling,
+    Message, Operation, ReasoningEffort, RequestLimits, Role, LlamaCppSamplers, Sampling,
     StreamOptions, ToolCall, ToolChoice, ToolDef,
 };
 use hypellm_core::error::{ErrorCode, RouterError};
@@ -127,9 +127,9 @@ pub fn parse_messages_request(
             })
             .unwrap_or_default(),
         enable_thinking: None,
-        // Alias configuration, never the client's (`LlamaCppSampling`).
-        dry_multiplier: None,
-        repeat_penalty: None,
+        // The Anthropic protocol has no spelling for llama.cpp's samplers; an
+        // alias's defaults still apply (`LlamaCppSampling`).
+        llamacpp: LlamaCppSamplers::default(),
     };
     if let Err(param) = sampling.validate() {
         return Err(

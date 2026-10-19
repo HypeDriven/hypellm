@@ -52,7 +52,7 @@ use crate::contract::{
     ValidationFailure, ValidationResult, class_for_status, sanitize_provider_code,
 };
 use hypellm_core::canonical::{
-    CanonicalRequest, ContentPart, DocumentSource, ImageSource, Operation, ReasoningEffort,
+    CanonicalRequest, ContentPart, DocumentSource, ImageSource, LlamaCppSamplers, Operation, ReasoningEffort,
     ResponseFormat, Role, ToolChoice,
 };
 use hypellm_core::event::{
@@ -271,11 +271,9 @@ impl Adapter for OpenAiAdapter {
                     kwargs.push("enable_thinking", Value::from(thinking));
                     body.push("chat_template_kwargs", Value::Object(kwargs));
                 }
-                // Set by the alias, not the client (`LlamaCppSampling`); configuration
-                // already refuses them on an alias that can reach another family.
+                // llama.cpp's own fields; another family would reject or ignore them.
                 if self.family == ProviderFamily::LlamaCpp {
-                    body.push_opt("dry_multiplier", request.sampling.dry_multiplier.map(Value::from));
-                    body.push_opt("repeat_penalty", request.sampling.repeat_penalty.map(Value::from));
+                    push_llamacpp_samplers(&mut body, &request.sampling.llamacpp);
                 }
             }
         }
@@ -615,6 +613,24 @@ fn decode_tool_call(call: &Value, index: u32) -> ToolCallDelta {
 fn declared_output_limit(meta: &RequestMeta<'_>) -> Option<u32> {
     let declared = meta.target.capabilities.max_output_tokens;
     (declared != 0).then_some(declared)
+}
+
+/// llama.cpp's repetition and DRY samplers, each only when set: an absent
+/// field leaves the server's command-line default in force.
+fn push_llamacpp_samplers(body: &mut Object, samplers: &LlamaCppSamplers) {
+    body.push_opt("repeat_penalty", samplers.repeat_penalty.map(Value::from));
+    body.push_opt("repeat_last_n", samplers.repeat_last_n.map(Value::from));
+    body.push_opt("dry_multiplier", samplers.dry_multiplier.map(Value::from));
+    body.push_opt("dry_base", samplers.dry_base.map(Value::from));
+    body.push_opt("dry_allowed_length", samplers.dry_allowed_length.map(Value::from));
+    body.push_opt("dry_penalty_last_n", samplers.dry_penalty_last_n.map(Value::from));
+    body.push_opt(
+        "dry_sequence_breakers",
+        samplers
+            .dry_sequence_breakers
+            .as_ref()
+            .map(|b| Value::Array(b.iter().map(|s| Value::from(s.as_str())).collect())),
+    );
 }
 
 /// The sampling tail Chat Completions and embeddings share.
@@ -1554,10 +1570,17 @@ mod tests {
     }
 
     #[test]
-    fn alias_sampler_settings_reach_llamacpp_family_servers_only() {
+    fn llamacpp_samplers_reach_llamacpp_family_servers_only() {
         let mut request = request_fixture();
-        request.sampling.dry_multiplier = Some(0.0);
-        request.sampling.repeat_penalty = Some(1.0);
+        request.sampling.llamacpp = LlamaCppSamplers {
+            repeat_penalty: Some(1.0),
+            repeat_last_n: Some(-1),
+            dry_multiplier: Some(0.0),
+            dry_base: Some(1.75),
+            dry_allowed_length: Some(4),
+            dry_penalty_last_n: Some(0),
+            dry_sequence_breakers: Some(vec!["\n".to_owned(), "```".to_owned()]),
+        };
         let target = target_fixture();
         let endpoint = target_fixture_endpoint();
         let meta = meta_fixture(&target, &endpoint, false);
@@ -1565,18 +1588,38 @@ mod tests {
             let bytes = OpenAiAdapter::new(family).encode_request(request, &meta).expect("encodes");
             parse(&bytes, &Limits::DEFAULT).expect("valid JSON")
         };
+        const FIELDS: [&str; 7] = [
+            "repeat_penalty",
+            "repeat_last_n",
+            "dry_multiplier",
+            "dry_base",
+            "dry_allowed_length",
+            "dry_penalty_last_n",
+            "dry_sequence_breakers",
+        ];
 
         let llamacpp = encode(ProviderFamily::LlamaCpp, &request);
         // Zero is a value here: it is what turns DRY off.
         assert_eq!(llamacpp.opt_field_f64("dry_multiplier").unwrap(), Some(0.0));
         assert_eq!(llamacpp.opt_field_f64("repeat_penalty").unwrap(), Some(1.0));
+        assert_eq!(llamacpp.opt_field_i64("repeat_last_n").unwrap(), Some(-1));
+        assert_eq!(llamacpp.opt_field_f64("dry_base").unwrap(), Some(1.75));
+        assert_eq!(llamacpp.opt_field_i64("dry_allowed_length").unwrap(), Some(4));
+        assert_eq!(llamacpp.opt_field_i64("dry_penalty_last_n").unwrap(), Some(0));
+        let breakers = llamacpp.opt_field_array("dry_sequence_breakers").unwrap().expect("sent");
+        assert_eq!(breakers.iter().filter_map(Value::as_str).collect::<Vec<_>>(), ["\n", "```"]);
         let openai = encode(ProviderFamily::OpenAi, &request);
-        assert!(openai.get("dry_multiplier").is_none() && openai.get("repeat_penalty").is_none());
+        assert!(FIELDS.iter().all(|f| openai.get(f).is_none()));
 
-        request.sampling.dry_multiplier = None;
-        request.sampling.repeat_penalty = None;
+        // An empty breaker list is sent: it means "none", not "the server's".
+        request.sampling.llamacpp =
+            LlamaCppSamplers { dry_sequence_breakers: Some(Vec::new()), ..LlamaCppSamplers::default() };
+        let empty = encode(ProviderFamily::LlamaCpp, &request);
+        assert_eq!(empty.opt_field_array("dry_sequence_breakers").unwrap().map(<[Value]>::len), Some(0));
+
+        request.sampling.llamacpp = LlamaCppSamplers::default();
         let unset = encode(ProviderFamily::LlamaCpp, &request);
-        assert!(unset.get("dry_multiplier").is_none() && unset.get("repeat_penalty").is_none());
+        assert!(FIELDS.iter().all(|f| unset.get(f).is_none()));
     }
 
     #[test]
@@ -2393,8 +2436,11 @@ mod tests {
             stop: vec!["END".to_owned()],
             top_k: None,
             enable_thinking: Some(false),
-            dry_multiplier: Some(0.0),
-            repeat_penalty: Some(1.0),
+            llamacpp: LlamaCppSamplers {
+                dry_multiplier: Some(0.0),
+                repeat_penalty: Some(1.0),
+                ..LlamaCppSamplers::default()
+            },
         };
         let body = encoded(&request);
 

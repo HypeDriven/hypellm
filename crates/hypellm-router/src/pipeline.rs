@@ -155,11 +155,10 @@ pub fn execute_under(
     execute_once(state, config, request, groups, permissions, None, sink, false)
 }
 
-/// The request with its alias's llama.cpp sampler settings applied, or `None`
-/// when the alias sets none (the common case, which costs no copy).
+/// The request with its alias's llama.cpp sampler defaults filled in, or
+/// `None` when there is nothing to fill (the common case, which costs no copy).
 ///
-/// The fields are operator configuration: no client protocol can set them, so
-/// whatever the request carries is replaced, never merged.
+/// Defaults, not overrides: a field the client sent is the client's.
 fn alias_sampling(
     config: &hypellm_config::ValidatedConfig,
     request: &CanonicalRequest,
@@ -169,12 +168,16 @@ fn alias_sampling(
         .aliases
         .get(&request.requested_model)?
         .llamacpp_sampling;
-    if fixed.is_unset() {
+    let sent = &request.sampling.llamacpp;
+    let fills = (sent.dry_multiplier.is_none() && fixed.dry_multiplier.is_some())
+        || (sent.repeat_penalty.is_none() && fixed.repeat_penalty.is_some());
+    if !fills {
         return None;
     }
     let mut request = request.clone();
-    request.sampling.dry_multiplier = fixed.dry_multiplier;
-    request.sampling.repeat_penalty = fixed.repeat_penalty;
+    let llamacpp = &mut request.sampling.llamacpp;
+    llamacpp.dry_multiplier = llamacpp.dry_multiplier.or(fixed.dry_multiplier);
+    llamacpp.repeat_penalty = llamacpp.repeat_penalty.or(fixed.repeat_penalty);
     Some(request)
 }
 
