@@ -957,15 +957,15 @@ llama.cpp's own names:</p>
 </thead>
 <tbody>
 <tr><td><code>repeat_penalty</code></td><td>0–2</td><td><code>1</code> turns it off</td></tr>
-<tr><td><code>repeat_last_n</code></td><td>-1–1,048,576</td><td>tokens it looks back over; <code>0</code> off, <code>-1</code> the whole context</td></tr>
+<tr><td><code>repeat_last_n</code></td><td>0–1,048,576</td><td>tokens it looks back over; <code>0</code> off</td></tr>
 <tr><td><code>dry_multiplier</code></td><td>0–5</td><td><code>0</code> turns DRY off</td></tr>
 <tr><td><code>dry_base</code></td><td>1–10</td><td>how fast DRY's penalty grows with the repeated length</td></tr>
 <tr><td><code>dry_allowed_length</code></td><td>0–1,024</td><td>the longest repetition DRY leaves alone</td></tr>
-<tr><td><code>dry_penalty_last_n</code></td><td>-1–1,048,576</td><td>tokens DRY looks back over; <code>0</code> off, <code>-1</code> the whole context</td></tr>
+<tr><td><code>dry_penalty_last_n</code></td><td>0–1,048,576</td><td>tokens DRY looks back over; <code>0</code> off</td></tr>
 <tr><td><code>dry_sequence_breakers</code></td><td>up to 16 strings of 1–64 bytes</td><td>strings that end a repeated sequence; <code>[]</code> means none</td></tr>
 </tbody>
 </table></div>
-<p>A value out of range is refused with <code>400</code> naming the field. Only llama.cpp-family providers
+<p>A value out of range is refused with <code>400</code> naming the field. llama.cpp's own <code>-1</code> (&ldquo;the whole context&rdquo;) is out of range: the served build (b10454) refuses the whole request for it, so give the window in tokens. Only llama.cpp-family providers
 receive them; a request routed to any other family goes without. The Anthropic protocol has no
 spelling for them.</p>
 <p>An alias can also set two of them as defaults for every request it routes, without changing the server:</p>

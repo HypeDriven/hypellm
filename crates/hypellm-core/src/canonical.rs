@@ -627,7 +627,7 @@ pub struct LlamaCppSamplers {
     /// `repeat_penalty`: 1 disables it.
     pub repeat_penalty: Option<f64>,
     /// `repeat_last_n`: tokens the repeat penalty looks back over; 0 disables
-    /// it, -1 means the whole context.
+    /// it.
     pub repeat_last_n: Option<i64>,
     /// `dry_multiplier`: 0 disables DRY.
     pub dry_multiplier: Option<f64>,
@@ -635,8 +635,7 @@ pub struct LlamaCppSamplers {
     pub dry_base: Option<f64>,
     /// `dry_allowed_length`: the longest repetition DRY leaves alone.
     pub dry_allowed_length: Option<u32>,
-    /// `dry_penalty_last_n`: tokens DRY looks back over; 0 disables it, -1
-    /// means the whole context.
+    /// `dry_penalty_last_n`: tokens DRY looks back over; 0 disables it.
     pub dry_penalty_last_n: Option<i64>,
     /// `dry_sequence_breakers`: strings that end a repeated sequence. `None`
     /// keeps the server's; an empty list is a value, and means none.
@@ -650,9 +649,12 @@ impl LlamaCppSamplers {
     pub const DRY_MULTIPLIER_RANGE: core::ops::RangeInclusive<f64> = 0.0..=5.0;
     /// Accepted `dry_base` values. llama.cpp ignores DRY below 1.
     pub const DRY_BASE_RANGE: core::ops::RangeInclusive<f64> = 1.0..=10.0;
-    /// Accepted `repeat_last_n` and `dry_penalty_last_n` values: -1 for the
-    /// whole context, else a window no larger than any served context.
-    pub const LAST_N_RANGE: core::ops::RangeInclusive<i64> = -1..=1_048_576;
+    /// Accepted `repeat_last_n` and `dry_penalty_last_n` values: a window no
+    /// larger than any served context. llama.cpp documents -1 as "the whole
+    /// context", but the served build (b10454) refuses it with a 400 on the
+    /// whole request, so it is refused here, naming the field, before anything
+    /// is sent.
+    pub const LAST_N_RANGE: core::ops::RangeInclusive<i64> = 0..=1_048_576;
     /// The longest `dry_allowed_length`.
     pub const MAX_DRY_ALLOWED_LENGTH: u32 = 1024;
     /// The most `dry_sequence_breakers`, and the longest one in bytes.
@@ -1518,7 +1520,8 @@ mod tests {
         );
         let llamacpp = |llamacpp: LlamaCppSamplers| Sampling { llamacpp, ..Sampling::default() }.validate();
         assert_eq!(llamacpp(LlamaCppSamplers { repeat_penalty: Some(2.5), ..Default::default() }), Err("repeat_penalty"));
-        assert_eq!(llamacpp(LlamaCppSamplers { repeat_last_n: Some(-2), ..Default::default() }), Err("repeat_last_n"));
+        assert_eq!(llamacpp(LlamaCppSamplers { repeat_last_n: Some(-1), ..Default::default() }), Err("repeat_last_n"));
+        assert_eq!(llamacpp(LlamaCppSamplers { dry_penalty_last_n: Some(-1), ..Default::default() }), Err("dry_penalty_last_n"));
         assert_eq!(llamacpp(LlamaCppSamplers { dry_multiplier: Some(f64::NAN), ..Default::default() }), Err("dry_multiplier"));
         assert_eq!(llamacpp(LlamaCppSamplers { dry_base: Some(0.5), ..Default::default() }), Err("dry_base"));
         assert_eq!(llamacpp(LlamaCppSamplers { dry_allowed_length: Some(1025), ..Default::default() }), Err("dry_allowed_length"));
@@ -1527,16 +1530,16 @@ mod tests {
             llamacpp(LlamaCppSamplers { dry_sequence_breakers: Some(vec![String::new()]), ..Default::default() }),
             Err("dry_sequence_breakers")
         );
-        // The ends of every range, -1 for "the whole context", and an empty
-        // breaker list (DRY with no breakers) are all values.
+        // The ends of every range and an empty breaker list (DRY with no
+        // breakers) are all values.
         assert_eq!(
             llamacpp(LlamaCppSamplers {
                 repeat_penalty: Some(0.0),
-                repeat_last_n: Some(-1),
+                repeat_last_n: Some(0),
                 dry_multiplier: Some(5.0),
                 dry_base: Some(1.0),
                 dry_allowed_length: Some(0),
-                dry_penalty_last_n: Some(-1),
+                dry_penalty_last_n: Some(1_048_576),
                 dry_sequence_breakers: Some(Vec::new()),
             }),
             Ok(())

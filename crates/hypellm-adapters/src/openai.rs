@@ -1580,7 +1580,7 @@ mod tests {
         let mut request = request_fixture();
         request.sampling.llamacpp = LlamaCppSamplers {
             repeat_penalty: Some(1.0),
-            repeat_last_n: Some(-1),
+            repeat_last_n: Some(4096),
             dry_multiplier: Some(0.0),
             dry_base: Some(1.75),
             dry_allowed_length: Some(4),
@@ -1608,7 +1608,7 @@ mod tests {
         // Zero is a value here: it is what turns DRY off.
         assert_eq!(llamacpp.opt_field_f64("dry_multiplier").unwrap(), Some(0.0));
         assert_eq!(llamacpp.opt_field_f64("repeat_penalty").unwrap(), Some(1.0));
-        assert_eq!(llamacpp.opt_field_i64("repeat_last_n").unwrap(), Some(-1));
+        assert_eq!(llamacpp.opt_field_i64("repeat_last_n").unwrap(), Some(4096));
         assert_eq!(llamacpp.opt_field_f64("dry_base").unwrap(), Some(1.75));
         assert_eq!(llamacpp.opt_field_i64("dry_allowed_length").unwrap(), Some(4));
         assert_eq!(llamacpp.opt_field_i64("dry_penalty_last_n").unwrap(), Some(0));

@@ -1017,7 +1017,7 @@ fn a_client_sets_llamacpp_repetition_samplers_per_request() {
 
     let body = r#"{"model":"test-alias","messages":[{"role":"user","content":"x"}],
         "repeat_penalty":1.05,"repeat_last_n":256,"dry_multiplier":0.4,"dry_base":2,
-        "dry_allowed_length":3,"dry_penalty_last_n":-1,"dry_sequence_breakers":["\n","```"]}"#;
+        "dry_allowed_length":3,"dry_penalty_last_n":131072,"dry_sequence_breakers":["\n","```"]}"#;
     let response = harness.request("POST", "/v1/chat/completions", body, true);
     assert_eq!(response.status, 200, "{}", response.body);
     let sent = parse_str(&harness.upstream.last_body().expect("a body"), &Limits::DEFAULT).expect("JSON");
@@ -1026,7 +1026,7 @@ fn a_client_sets_llamacpp_repetition_samplers_per_request() {
     assert_eq!(sent.opt_field_f64("dry_multiplier").unwrap(), Some(0.4));
     assert_eq!(sent.opt_field_f64("dry_base").unwrap(), Some(2.0));
     assert_eq!(sent.opt_field_i64("dry_allowed_length").unwrap(), Some(3));
-    assert_eq!(sent.opt_field_i64("dry_penalty_last_n").unwrap(), Some(-1));
+    assert_eq!(sent.opt_field_i64("dry_penalty_last_n").unwrap(), Some(131072));
     let breakers = sent.opt_field_array("dry_sequence_breakers").unwrap().expect("sent");
     assert_eq!(breakers.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>(), ["\n", "```"]);
 
