@@ -991,6 +991,77 @@ impl PasswordThrottle {
     }
 }
 
+/// Whether a local account's password is still its own username.
+///
+/// The shipped configuration declares `admin` with the password `admin`, and
+/// the admin application shows a banner on every screen until it is changed.
+/// Answering that costs one verification, which is far too much for
+/// `GET /auth/session` — the application reads it on every navigation — so
+/// the verdict is kept per verifier.
+///
+/// Keyed by the encoded verifier, not the username, so a changed password is a
+/// new key and is checked afresh rather than served a stale verdict. A sign-in
+/// fills the entry for nothing: having just matched the presented password
+/// against the verifier, whether that password equals the username *is* the
+/// verdict.
+///
+/// Bounded at twice [`hypellm_config::MAX_LOCAL_USERS`] and emptied when it
+/// would exceed that, which only successive publications changing verifiers
+/// can cause. Only configured verifiers are inserted; a caller cannot add one.
+#[derive(Debug)]
+struct DefaultPasswords {
+    verdicts: Mutex<BTreeMap<String, bool>>,
+}
+
+impl DefaultPasswords {
+    const fn new() -> Self {
+        Self {
+            verdicts: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Recovered rather than propagated, for the reason
+    /// `PasswordThrottle::accounts` gives: the map holds plain booleans.
+    fn verdicts(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, bool>> {
+        match self.verdicts.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn record(&self, verifier: String, is_default: bool) {
+        let mut map = self.verdicts();
+        if map.len() >= hypellm_config::MAX_LOCAL_USERS.saturating_mul(2)
+            && !map.contains_key(&verifier)
+        {
+            map.clear();
+        }
+        map.insert(verifier, is_default);
+    }
+
+    /// The verdict for `user`, computing it if it is not known yet.
+    ///
+    /// `None` when it is unknown and no verification permit was free: the
+    /// question is asked again on the next read, and reporting `false` instead
+    /// would hide the banner on exactly the router that is busiest.
+    fn check(
+        &self,
+        user: &hypellm_config::LocalUser,
+        throttle: &PasswordThrottle,
+    ) -> Option<bool> {
+        let key = user.verifier.encode();
+        if let Some(verdict) = self.verdicts().get(&key) {
+            return Some(*verdict);
+        }
+        // Outside the lock: a verification takes tens of milliseconds, and
+        // the permit bounds how many run at once.
+        let _slot = throttle.enter()?;
+        let verdict = user.verifier.verify(&user.id);
+        self.record(key, verdict);
+        Some(verdict)
+    }
+}
+
 /// The management API.
 #[derive(Debug)]
 pub struct AdminApi {
@@ -1009,6 +1080,8 @@ pub struct AdminApi {
     password_audits: AnonymousAuditBudget,
     /// Failure counters and the verification concurrency bound.
     passwords: PasswordThrottle,
+    /// Which local accounts still have their username as their password.
+    default_passwords: DefaultPasswords,
     /// Which management keys have already been recorded as having signed in.
     key_first_use: KeyFirstUse,
 }
@@ -1023,6 +1096,7 @@ impl AdminApi {
             break_glass_audits: AnonymousAuditBudget::new(),
             password_audits: AnonymousAuditBudget::new(),
             passwords: PasswordThrottle::new(),
+            default_passwords: DefaultPasswords::new(),
             key_first_use: KeyFirstUse::new(),
         }
     }
@@ -1681,6 +1755,22 @@ impl AdminApi {
             "authenticated_at",
             Value::from(session.authenticated_at_millis),
         );
+        // Whether this session's own local account still has its username as
+        // its password — the shipped `admin/admin`. The admin application
+        // shows a banner on every screen while it does. Read from the active
+        // configuration each time, so a published or restarted change of
+        // password clears it without signing out.
+        if session.method == hypellm_auth::AuthMethod::Password {
+            let account = config
+                .local_users
+                .iter()
+                .find(|u| u.principal == session.principal && u.tenant == session.tenant);
+            if let Some(is_default) =
+                account.and_then(|u| self.default_passwords.check(u, &self.passwords))
+            {
+                root.push("default_password", Value::from(is_default));
+            }
+        }
         Ok(ApiResponse::ok(&Value::Object(root)))
     }
 
@@ -2172,6 +2262,8 @@ impl AdminApi {
         // Only now, and only on the path that actually authenticated. Clearing
         // earlier would let a wrong password reset the counter.
         self.passwords.clear(&user.id);
+        self.default_passwords
+            .record(user.verifier.encode(), password == user.id);
 
         let issued = self
             .state

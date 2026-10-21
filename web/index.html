@@ -61,6 +61,24 @@
     </nav>
 
     <main class="main" id="main" tabindex="-1">
+      <!--
+        Not dismissable, and separate from the error banner below so no
+        screen's errors can clear it. Shown while the signed-in local account's
+        password is still its username (the shipped admin/admin).
+      -->
+      <div class="banner banner--alarm" id="default-password-banner" hidden role="alert">
+        <div class="banner__body">
+          <strong class="banner__title">Change the admin password now.</strong>
+          <span>
+            This account still has its default password, so anyone who can reach this
+            page can sign in as a full administrator. Derive a new verifier with
+            <code>just password</code> (or <code>hypellm-router --hash-password</code>),
+            replace this account's <code>verifier=</code> in the configuration's
+            <code>local_user</code> record, and restart the router.
+          </span>
+        </div>
+      </div>
+
       <div class="banner banner--error" id="error-banner" hidden role="alert">
         <span class="banner__text" id="error-text"></span>
         <button type="button" class="button button--quiet" id="error-dismiss">Dismiss</button>

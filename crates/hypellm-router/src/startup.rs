@@ -547,11 +547,10 @@ impl Router {
         // A shipped default credential is the one configuration mistake that
         // is invisible from inside the process and fatal from outside it, so
         // the router says it out loud on every start. `docker/hypellm.conf`
-        // once shipped `admin/admin` so a fresh checkout was usable before an
-        // identity provider existed; it now carries generated passwords, but
-        // any configuration may still declare a username-as-password account,
-        // and that convenience must not survive contact with a network anybody
-        // else can reach.
+        // ships `admin/admin` so a new deployment is usable before an identity
+        // provider exists, and that convenience must not survive contact with
+        // a network anybody else can reach. The admin application says it too,
+        // as a banner fed by `default_password` in `GET /admin/v1/session`.
         //
         // "The password is the username" is the cheapest test that catches it.
         // It costs one verification per local account, so it runs

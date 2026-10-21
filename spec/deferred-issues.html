@@ -146,7 +146,7 @@
 </tr>
 <tr>
 <td>Local password sign-in</td>
-<td><code>local_user</code> accounts are a deviation from the specification's four authentication methods. An unknown username is refused faster than a known one with a wrong password, which is a username oracle.</td>
+<td><code>local_user</code> accounts are a deviation from the specification's four authentication methods. An unknown username is refused faster than a known one with a wrong password, which is a username oracle. The shipped configuration's <code>admin</code> account has the password <code>admin</code> until changed.</td>
 <td>Use it to operate a deployment before an identity provider is configured, not as the steady state. Keep the management listener off untrusted networks and move to <code>identity</code> records once OIDC works.</td>
 </tr>
 <tr>
@@ -496,7 +496,7 @@
 <ul>
 <li><strong>A password is still a password.</strong> scrypt raises the cost of an offline attack by orders of magnitude over the PBKDF2 verifier it replaced, and it does not make a guessable password safe. Treat an offline copy of the configuration as an offline copy of the password hashes, and choose accordingly.</li>
 <li><strong>An unknown username is refused without hashing anything</strong>, so it is refused measurably faster than a known username with a wrong password. That is a username oracle. The alternative — hashing a dummy verifier so the two take the same time — hands an unauthenticated caller a CPU amplifier on an endpoint that runs before any session, and a management plane that stops answering is worse than one that confirms <code>admin</code> exists.</li>
-<li><strong><code>docker/hypellm.conf</code> ships <code>admin</code>/<code>admin</code>.</strong> That is a default credential, deliberately, so a fresh checkout is usable. The router logs <code>critical</code> <code>startup.default_password_in_use</code> on every start for any account whose password is its own username; that log line is the warning, not a formality.</li>
+<li><strong><code>docker/hypellm.conf</code> ships <code>admin</code>/<code>admin</code>, and that account holds every role.</strong> That is a default credential, deliberately, so a new deployment is usable with no setup — and until it is changed, anyone who can reach the management listener is a full administrator. Two things say so: the router logs <code>critical</code> <code>startup.default_password_in_use</code> on every start for any account whose password is its own username, and <code>GET /admin/v1/session</code> reports <code>default_password: true</code> for a password session on such an account, which the admin application shows as a red banner on every screen that cannot be dismissed. The banner clears once the account's verifier no longer matches its username. There is no in-application way to change the password: it is a <code>local_user</code> verifier in the configuration, replaced by hand and activated by a restart.</li>
 </ul>
 <h2 id="anonymous-inference-access-is-a-deviation">Anonymous inference access is a deviation</h2>
 <p><strong>Specification:</strong> §9.2. <strong>Implementation:</strong> <code>RecordKind::AnonymousAccess</code> in <code>hypellm-store</code>, <code>RouterState::anonymous_access</code>, <code>Principal::anonymous</code>, <code>routes::authenticate</code>, <code>AdminApi::set_anonymous_access</code>, <code>web/views/credentials.js</code>.</p>

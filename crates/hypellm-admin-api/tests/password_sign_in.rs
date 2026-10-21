@@ -438,3 +438,68 @@ fn error_message(response: &harness::Response) -> String {
         .map(str::to_owned)
         .expect("an error message")
 }
+
+fn default_password_flag(h: &Harness, cookie: &str) -> Option<bool> {
+    let session = h
+        .request(Method::Get, "/admin/v1/session")
+        .cookie(cookie)
+        .send();
+    assert_eq!(session.status, 200, "{}", session.body);
+    session.json().opt_field_bool("default_password").unwrap()
+}
+
+#[test]
+fn an_account_whose_password_is_its_username_is_flagged_on_its_session() {
+    // The shipped `admin/admin`. The admin application's red banner reads
+    // exactly this field; if it were absent or false, nothing on screen would
+    // say that anyone can sign in as a full administrator.
+    let h = Harness::builder()
+        .config(&config_with_user(USERNAME, USERNAME, &["operator"]))
+        .build();
+    let cookie = session_cookie(&sign_in(&h, USERNAME, USERNAME));
+
+    assert_eq!(default_password_flag(&h, &cookie), Some(true));
+    // Read twice: the second answer comes from the cached verdict, and must
+    // agree with the first.
+    assert_eq!(default_password_flag(&h, &cookie), Some(true));
+}
+
+#[test]
+fn a_changed_password_is_not_flagged() {
+    // A banner that stayed up after the password was changed would teach the
+    // operator to ignore it.
+    let h = harness();
+    let cookie = session_cookie(&sign_in(&h, USERNAME, PASSWORD));
+
+    assert_eq!(default_password_flag(&h, &cookie), Some(false));
+}
+
+#[test]
+fn the_flag_is_derived_from_the_verifier_when_no_sign_in_supplied_it() {
+    // A session the router did not see sign in here — one restored after a
+    // restart — has no cached verdict, so the answer must come from checking
+    // the configured verifier itself rather than defaulting to "changed".
+    let h = Harness::builder()
+        .config(&config_with_user(USERNAME, USERNAME, &["operator"]))
+        .build();
+    let session = h.session_with_method(
+        "user:admin",
+        "acme",
+        &[hypellm_core::rbac::Role::Operator],
+        hypellm_auth::AuthMethod::Password,
+    );
+
+    assert_eq!(default_password_flag(&h, &session.cookie()), Some(true));
+}
+
+#[test]
+fn a_session_that_is_not_a_password_session_carries_no_flag() {
+    // The banner tells *this* account to change *its* password; a session
+    // that has none must not be told to.
+    let h = Harness::builder()
+        .config(&config_with_user(USERNAME, USERNAME, &["operator"]))
+        .build();
+    let session = h.session("user:admin", "acme", &[hypellm_core::rbac::Role::Operator]);
+
+    assert_eq!(default_password_flag(&h, &session.cookie()), None);
+}

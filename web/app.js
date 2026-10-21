@@ -103,6 +103,7 @@ const shell = {
   signOut: byId('sign-out'),
   factConfig: byId('fact-config'),
   factPrincipal: byId('fact-principal'),
+  defaultPassword: byId('default-password-banner'),
 };
 
 const state = {
@@ -433,6 +434,9 @@ async function route() {
 /** Put the principal and configuration digest in the masthead. */
 function renderFacts() {
   const session = state.session;
+  // `true` only: an absent field means the router could not say, which is not
+  // the same as "changed".
+  shell.defaultPassword.hidden = !(session && session.default_password === true);
   if (!session) {
     shell.factConfig.textContent = '—';
     replace(shell.factPrincipal, text('—'));

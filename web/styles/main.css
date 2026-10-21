@@ -577,6 +577,33 @@ textarea {
   font-weight: 600;
 }
 
+/* The default-password warning: solid red, not the quiet error tint, so it
+   cannot be mistaken for a dismissable message. A fixed dark red in both
+   themes: the dark theme's --danger is too light to carry white text. */
+.banner--alarm {
+  background: #b42318;
+  border-color: #b42318;
+  color: #fff;
+  padding: var(--space-loose);
+  font-size: var(--step-1);
+}
+
+.banner__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space);
+}
+
+.banner__title {
+  font-size: var(--step-2);
+}
+
+.banner--alarm code {
+  background: rgb(0 0 0 / 0.25);
+  padding: 0 0.25em;
+  border-radius: 3px;
+}
+
 .secret {
   font-family: var(--font-mono);
   font-size: var(--step--1);
