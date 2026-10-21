@@ -516,6 +516,17 @@ fn classify_error_object(error: &Value, status: u16) -> ErrorClassification {
         class_for_status(status)
     };
 
+    // The message is read to choose one of the router's own sentences, never
+    // copied. llama.cpp refuses a response schema its grammar compiler cannot
+    // take with an ordinary 400, which read as "rejected the request as invalid"
+    // and left a structured-output client with nothing to change.
+    let message = error.get("message").and_then(|v| v.as_str()).unwrap_or("");
+    let safe_detail = if matches!(status, 400 | 422) && message.contains("failed to parse grammar") {
+        GRAMMAR_REJECTED
+    } else {
+        safe_detail_for(status)
+    };
+
     ErrorClassification {
         class,
         // The provider's *type* is recorded, narrowed. Its *message* is not:
@@ -526,10 +537,14 @@ fn classify_error_object(error: &Value, status: u16) -> ErrorClassification {
         } else {
             code
         })),
-        safe_detail: Capped::new(safe_detail_for(status), 200),
+        safe_detail: Capped::new(safe_detail, 200),
         retry_after_secs: None,
     }
 }
+
+/// The detail for a response schema the provider could not compile.
+const GRAMMAR_REJECTED: &str = "the provider could not compile the response schema into a grammar; \
+     llama.cpp refuses some length and item bounds (2000 among them)";
 
 const fn safe_detail_for(status: u16) -> &'static str {
     match status {
@@ -2093,6 +2108,16 @@ mod tests {
             classification.provider_code.expect("code").as_str(),
             "invalid_request_error"
         );
+    }
+
+    #[test]
+    fn a_schema_the_provider_cannot_compile_says_so() {
+        let classification = adapter().classify_error(
+            400,
+            br#"{"error":{"code":400,"message":"Failed to initialize samplers: failed to parse grammar","type":"invalid_request_error"}}"#,
+        );
+        assert_eq!(classification.class, UpstreamErrorClass::InvalidRequest);
+        assert_eq!(classification.safe_detail.as_str(), GRAMMAR_REJECTED);
     }
 
     #[test]
