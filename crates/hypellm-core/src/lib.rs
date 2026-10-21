@@ -84,6 +84,7 @@ pub mod fleet_access;
 pub mod health;
 pub mod ids;
 pub mod key_restriction;
+pub mod machine;
 pub mod netaddr;
 pub mod policy;
 pub mod rbac;

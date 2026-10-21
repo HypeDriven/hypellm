@@ -838,7 +838,12 @@ fn execute_once(
         // thing they control. A limit attached only to targets would be spread
         // across however many the alias resolves to.
         let waiting = PendingGauge::enter(state, request, "capacity");
-        let reserved = state.admission.reserve_queued_for(
+        // The request id is stable across a job's passes, so it is the job's
+        // place in line for its target's machine memory (`hypellm_core::machine`).
+        // Only a job leaves a claim behind: a request that may wait waits on the
+        // machine itself, and one that may not has no next pass to present it.
+        let claim = (!pass.queue_wait).then(|| request.request_id.to_string());
+        let reserved = state.admission.reserve_queued_as(
             &request.tenant,
             &request.principal,
             Some((&request.requested_model, request.operation)),
@@ -846,6 +851,7 @@ fn execute_once(
             estimate,
             class,
             queue_budget,
+            claim.as_deref(),
         );
         waiting.leave();
         let reservation = match reserved {

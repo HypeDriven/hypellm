@@ -166,6 +166,7 @@ on the spot.</p>
 <pre><code>GET /admin/v1/overview        # ReadSummary
 GET /admin/v1/targets         # ReadSummary, paginated
 GET /admin/v1/traffic         # ReadSummary
+GET /admin/v1/machines        # ReadSummary: machine memory held and waiting (spec 12.4)
 </code></pre>
 <p><code>overview</code> returns <code>targets_total</code>, <code>targets_healthy</code>, <code>targets_degraded</code>,
 <code>config_version</code>, <code>config_digest</code>, <code>audit_head</code>, <code>audit_records</code>.</p>

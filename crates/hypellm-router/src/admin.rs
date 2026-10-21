@@ -488,6 +488,7 @@ const STATIC_MODULES: &[&str] = &[
     "/views/fleet-enroll.js",
     "/views/fleet-access.js",
     "/views/routing-priority.js",
+    "/views/machines.js",
     "/views/activations.js",
     "/views/policies.js",
     "/views/principal-access.js",

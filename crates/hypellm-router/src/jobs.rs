@@ -1289,6 +1289,9 @@ pub fn worker_loop(state: &Arc<RouterState>) {
                 expired,
             } => {
                 release_parked(state, &work.request.requested_model, work.priority, parked);
+                state
+                    .admission
+                    .drop_machine_claims(&work.request.request_id.to_string());
                 if expired {
                     count_expired(state, work.priority);
                     jobs.finish(
@@ -1427,6 +1430,12 @@ fn run_pass(state: &RouterState, jobs: &JobStore, work: &Arc<Work>, generation: 
                 jobs.leave(&work.id),
             );
     }
+
+    // The job is no longer waiting: a place it held in line for a machine's
+    // memory would only hold up lower-class work until its lease ran out.
+    state
+        .admission
+        .drop_machine_claims(&work.request.request_id.to_string());
 
     // Recorded once per job, for the pass that ended it, the same way an
     // interactive request is, so usage, quota and the decision trace do not

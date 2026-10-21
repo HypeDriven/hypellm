@@ -128,6 +128,7 @@ pub const SCHEMAS: &[Schema] = &[
             "egress",
             "ports",
             "recovery_wait_ms",
+            "machine",
         ],
         singleton: false,
     },
@@ -162,7 +163,15 @@ pub const SCHEMAS: &[Schema] = &[
             "concurrency",
             "rps",
             "endpoint",
+            "run_memory_bytes",
+            "class",
         ],
+        singleton: false,
+    },
+    Schema {
+        kind: "machine",
+        required: &["id", "memory_bytes"],
+        optional: &["description"],
         singleton: false,
     },
     Schema {

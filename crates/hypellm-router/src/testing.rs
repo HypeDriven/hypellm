@@ -544,6 +544,7 @@ pub fn router_with_config(_upstream: &FakeUpstream, config_text: &str) -> TestRo
             hypellm_config::QuotaScope::Global => {}
         }
     }
+    admission.configure_machines(&config.admission_plan());
 
     let resolver = Resolver::new(Box::new(StaticResolver::new().with(
         "127.0.0.1",

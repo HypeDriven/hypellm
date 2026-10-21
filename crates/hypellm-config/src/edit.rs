@@ -43,6 +43,7 @@ pub const EDITABLE_KINDS: &[&str] = &[
     "grant",
     "quota",
     "settings",
+    "machine",
 ];
 
 /// The `quota` fields an edit may touch on a principal's quota: its scope,
@@ -423,6 +424,26 @@ mod tests {
         assert_eq!(spark.get("arch"), Some("aarch64"), "a merge must keep fields it did not name");
         assert_eq!(spark.get("reserved_memory_bytes"), Some("1024"));
         assert!(doc.of_kind("host").any(|r| r.get("id") == Some("spark3")));
+    }
+
+    #[test]
+    fn a_machine_and_a_targets_memory_and_class_are_editable() {
+        let text = "provider id=p family=llamacpp scheme=http host=127.0.0.1\n\
+                    target id=p:m provider=p model=m\n";
+        let applied = apply(
+            text,
+            &[
+                set("machine", "spark", &[("memory_bytes", Some("85899345920"))]),
+                set("provider", "p", &[("machine", Some("spark"))]),
+                set("target", "p:m", &[("run_memory_bytes", Some("1024")), ("class", Some("batch"))]),
+            ],
+        )
+        .unwrap();
+        assert!(applied.text.contains("machine id=spark memory_bytes=85899345920"), "{}", applied.text);
+        assert!(applied.text.contains("machine=spark"), "{}", applied.text);
+        let target = applied.text.lines().find(|l| l.starts_with("target ")).unwrap_or_default();
+        assert!(target.contains("class=batch") && target.contains("run_memory_bytes=1024"), "{target}");
+        assert_eq!(applied.changed, 3);
     }
 
     #[test]

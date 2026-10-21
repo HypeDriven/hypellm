@@ -1392,6 +1392,7 @@ impl HarnessBuilder {
                     },
                 );
             }
+            controller.configure_machines(&config.admission_plan());
             Some(Arc::new(controller))
         } else {
             None

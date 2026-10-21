@@ -1535,6 +1535,7 @@ impl AdminApi {
 
             (Method::Get, "/admin/v1/targets") => self.list_targets(request, session),
             (Method::Get, "/admin/v1/providers") => self.list_providers(session),
+            (Method::Get, "/admin/v1/machines") => self.list_machines(session),
             (Method::Get, "/admin/v1/aliases") => self.list_aliases(session),
             (Method::Get, "/admin/v1/overview") => self.overview(session),
             (Method::Get, "/admin/v1/traffic") => self.traffic(session),
@@ -2623,6 +2624,96 @@ impl AdminApi {
 
         object.push("capabilities", capabilities_value(&target.capabilities));
         Value::Object(object)
+    }
+
+    /// `GET /admin/v1/machines` — each machine's memory: its capacity, what
+    /// running work holds, which targets draw on it in which class, and the
+    /// waiting line in admission order (`hypellm_core::machine`).
+    ///
+    /// Scoped like `/targets`: a machine is listed when it backs a target the
+    /// caller can see, and only those targets appear in it. A waiter is shown
+    /// by class, size and age, never by its key — that is a caller's request
+    /// or job identifier.
+    fn list_machines(&self, session: &Session) -> Result<ApiResponse, ApiError> {
+        self.require(session, Permission::ReadSummary)?;
+        let config = self.state.config();
+        let visible = visible_targets(&config, session);
+        let live: BTreeMap<String, hypellm_core::machine::MachineView> = self
+            .state
+            .admission
+            .as_ref()
+            .map(|admission| admission.machine_views().into_iter().collect())
+            .unwrap_or_default();
+        let items: Vec<Value> = config
+            .machines
+            .iter()
+            .filter_map(|machine| {
+                let targets: Vec<Value> = config
+                    .target_memory
+                    .iter()
+                    .filter(|(id, memory)| memory.machine == machine.id && visible.contains(*id))
+                    .map(|(id, memory)| {
+                        let mut row = Object::new();
+                        row.push("id", Value::from(id.as_str()));
+                        row.push_opt(
+                            "provider",
+                            config
+                                .snapshot
+                                .targets
+                                .get(id)
+                                .map(|t| Value::from(t.provider_id.as_str())),
+                        );
+                        row.push("run_memory_bytes", Value::from(memory.bytes));
+                        row.push_opt("class", memory.class.map(|c| Value::from(c.as_str())));
+                        Value::Object(row)
+                    })
+                    .collect();
+                if targets.is_empty() {
+                    return None;
+                }
+                let mut object = Object::new();
+                object.push("id", Value::from(machine.id.as_str()));
+                object.push_opt("description", machine.description.as_deref().map(Value::from));
+                object.push("memory_bytes", Value::from(machine.memory_bytes));
+                object.push("targets", Value::Array(targets));
+                match live.get(&machine.id) {
+                    Some(view) => {
+                        object.push("live", Value::from(true));
+                        object.push("held_bytes", Value::from(view.held_bytes));
+                        let holders: Vec<Value> = view
+                            .holders
+                            .iter()
+                            .filter(|(target, _, _)| visible.contains(target))
+                            .map(|(target, holds, bytes)| {
+                                let mut row = Object::new();
+                                row.push("target", Value::from(target.as_str()));
+                                row.push("holds", Value::from(u64::from(*holds)));
+                                row.push("bytes", Value::from(*bytes));
+                                Value::Object(row)
+                            })
+                            .collect();
+                        object.push("holders", Value::Array(holders));
+                        let waiting: Vec<Value> = view
+                            .waiting
+                            .iter()
+                            .map(|w| {
+                                let mut row = Object::new();
+                                row.push("class", Value::from(w.class.as_str()));
+                                row.push("bytes", Value::from(w.bytes));
+                                row.push("waited_ms", Value::from(w.waited_ms));
+                                Value::Object(row)
+                            })
+                            .collect();
+                        object.push("waiting", Value::Array(waiting));
+                    }
+                    // No data path attached, or a publication not yet applied:
+                    // say so rather than report an idle machine.
+                    None => object.push("live", Value::from(false)),
+                }
+                Some(Value::Object(object))
+            })
+            .collect();
+        Ok(ApiResponse::ok(&list_envelope(items, None)))
     }
 
     fn list_providers(&self, session: &Session) -> Result<ApiResponse, ApiError> {

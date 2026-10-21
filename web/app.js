@@ -38,6 +38,7 @@ import { banner, buttonRow, card, field, pageHeader, render } from './components
 import * as overview from './views/overview.js';
 import * as targets from './views/targets.js';
 import * as fleet from './views/fleet.js';
+import * as machines from './views/machines.js';
 import * as activations from './views/activations.js';
 import * as policies from './views/policies.js';
 import * as principalAccess from './views/principal-access.js';
@@ -58,6 +59,9 @@ const VIEWS = [
   // other is how an operator concludes a model is "down" when it is merely
   // cold.
   fleet,
+  // Memory shared by the targets on one machine, and the class each waits in:
+  // why a job is queued when its own target looks idle.
+  machines,
   activations,
   policies,
   // A principal's ceiling sits between routing policy and the people and keys

@@ -383,6 +383,11 @@ gate.</p>
 <td><code>fleet_access::MAX_FLEET_GRANTS</code>, checked by <code>hypellm-config</code> at load</td>
 </tr>
 <tr>
+<td>Machine-memory claims</td>
+<td>256 per machine; a claim lapses 60 s after its last renewal</td>
+<td><code>machine::MAX_CLAIMS</code>, <code>machine::CLAIM_TTL_MS</code></td>
+</tr>
+<tr>
 <td><code>RequestId</code> text form</td>
 <td>exactly 32 lowercase hex characters</td>
 <td><code>RequestId::parse</code></td>
@@ -775,6 +780,12 @@ target, two successes (<code>PROBE_SUCCESSES_TO_RESTORE</code>) restore it, and 
 restoration ramp then applies. A probe record never reads or writes a breaker,
 so a probe success cannot close a breaker that routed requests opened. The map
 holds only targets the router is currently probing.</li>
+<li><code>machine::MachineLedger</code> is one machine's memory (specification 12.4). <code>AdmissionController</code>
+takes it last in the chain, after every scope, and a <code>Reservation</code> returns it with everything else.
+<code>reserve_queued_as</code> is <code>reserve_queued_for</code> as the holder of a claim key: with no queue
+budget a refusal for memory leaves a claim under it, which a job's next pass presents to keep its place;
+<code>drop_machine_claims</code> gives one up. A claim is a lease, renewed on every refused pass, so a
+claim nobody releases holds lower-class work back for one lease at most.</li>
 <li><code>rbac::Role</code> is re-exported as <code>ManagementRole</code> because <code>canonical::Role</code> is a
 message role. The two would read identically at a call site and mean entirely
 different things.</li>

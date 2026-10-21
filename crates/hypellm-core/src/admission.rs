@@ -25,6 +25,7 @@
 use crate::decision::ExclusionReason;
 use crate::canonical::Operation;
 use crate::ids::{AliasId, PrincipalId, TargetId, TenantId};
+use crate::machine::{MachineHold, MachineLedger, MachineView};
 use crate::time::Clock;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -248,6 +249,12 @@ pub enum Rejection {
     BudgetExhausted,
     /// The token bucket is empty.
     TokenRateExceeded,
+    /// The target's machine has not the memory free, or work of a higher class
+    /// is waiting for it ([`crate::machine`]).
+    ///
+    /// Capacity to the caller, like a full slot; separate for the operator,
+    /// because the fix is the machine's memory, not the target's concurrency.
+    MemoryExhausted,
 }
 
 impl Rejection {
@@ -255,9 +262,10 @@ impl Rejection {
     #[must_use]
     pub const fn exclusion_reason(self) -> ExclusionReason {
         match self {
-            Self::ConcurrencyExhausted | Self::QueueFull | Self::QueueTimeout => {
-                ExclusionReason::CapacityExhausted
-            }
+            Self::ConcurrencyExhausted
+            | Self::QueueFull
+            | Self::QueueTimeout
+            | Self::MemoryExhausted => ExclusionReason::CapacityExhausted,
             Self::RequestRateExceeded
             | Self::TokenRateExceeded
             | Self::ByteRateExceeded
@@ -269,9 +277,10 @@ impl Rejection {
     #[must_use]
     pub const fn error_code(self) -> crate::error::ErrorCode {
         match self {
-            Self::ConcurrencyExhausted | Self::QueueFull | Self::QueueTimeout => {
-                crate::error::ErrorCode::CapacityExhausted
-            }
+            Self::ConcurrencyExhausted
+            | Self::QueueFull
+            | Self::QueueTimeout
+            | Self::MemoryExhausted => crate::error::ErrorCode::CapacityExhausted,
             Self::RequestRateExceeded
             | Self::TokenRateExceeded
             | Self::ByteRateExceeded
@@ -290,6 +299,7 @@ impl Rejection {
             Self::TokenRateExceeded => "token_rate_exceeded",
             Self::ByteRateExceeded => "byte_rate_exceeded",
             Self::BudgetExhausted => "budget_exhausted",
+            Self::MemoryExhausted => "memory_exhausted",
         }
     }
 }
@@ -1125,6 +1135,8 @@ pub struct Reservation {
     clock: Arc<dyn Clock>,
     /// The target this reservation admits a request to.
     pub target: TargetId,
+    /// Memory held on the target's machine, returned with everything else.
+    machine: Option<MachineHold>,
 }
 
 impl Reservation {
@@ -1169,6 +1181,9 @@ impl Reservation {
         let now = self.clock.now_millis();
         // Release in reverse acquisition order so that the narrowest scope is
         // freed first, mirroring lock discipline.
+        if let Some(hold) = &self.machine {
+            hold.release();
+        }
         for scope in self.scopes.iter().rev() {
             scope.release(self.reserved_tokens, actual_tokens, now);
         }
@@ -1223,6 +1238,22 @@ pub struct AdmissionPlan {
     pub targets: BTreeMap<TargetId, ScopeLimits>,
     /// Admission-queue classes by scope name.
     pub classes: BTreeMap<String, PriorityClass>,
+    /// Machines, by id, with the memory their targets share.
+    pub machines: BTreeMap<String, u64>,
+    /// What a request or job to each target holds on its machine.
+    pub target_memory: BTreeMap<TargetId, TargetMemory>,
+}
+
+/// What one request or job to a target holds while it runs, and where.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetMemory {
+    /// The machine, by id.
+    pub machine: String,
+    /// Bytes held while it runs. Zero for a model that is resident anyway.
+    pub bytes: u64,
+    /// The class its work waits in for the machine's memory; the caller's
+    /// class when absent.
+    pub class: Option<PriorityClass>,
 }
 
 impl AdmissionPlan {
@@ -1242,6 +1273,8 @@ impl AdmissionPlan {
             aliases: BTreeMap::new(),
             targets: BTreeMap::new(),
             classes: BTreeMap::new(),
+            machines: BTreeMap::new(),
+            target_memory: BTreeMap::new(),
         }
     }
 }
@@ -1274,6 +1307,23 @@ pub struct AdmissionController {
     /// limits and differ in class, and a scope that is reconfigured must not
     /// silently lose its class along with its old limits.
     classes: RwLock<BTreeMap<String, PriorityClass>>,
+    /// Machine memory ledgers by machine id ([`crate::machine`]).
+    machines: RwLock<BTreeMap<String, Arc<MachineLedger>>>,
+    /// Which machine each target draws on, and how much.
+    target_memory: RwLock<BTreeMap<TargetId, TargetMemory>>,
+    /// Names the machine waits of requests without a key of their own.
+    next_wait: AtomicU64,
+}
+
+/// How a reservation takes its target's machine memory.
+enum MemoryAsk<'a> {
+    /// Try now, in `class`, as the holder of claim `key` if any.
+    Take {
+        class: PriorityClass,
+        key: Option<&'a str>,
+    },
+    /// Already held, by a request that waited on the machine for it.
+    Held(MachineHold),
 }
 
 impl AdmissionController {
@@ -1293,6 +1343,9 @@ impl AdmissionController {
             default_tenant_limits: ScopeLimits::UNLIMITED,
             default_principal_limits: ScopeLimits::UNLIMITED,
             classes: RwLock::new(BTreeMap::new()),
+            machines: RwLock::new(BTreeMap::new()),
+            target_memory: RwLock::new(BTreeMap::new()),
+            next_wait: AtomicU64::new(0),
         }
     }
 
@@ -1371,6 +1424,71 @@ impl AdmissionController {
             now,
         );
         self.replace_classes(plan.classes.clone());
+        self.configure_machines(plan);
+    }
+
+    /// Bring the machine ledgers in line with `plan`, and nothing else.
+    ///
+    /// [`Self::apply`] calls it; it is separate for a caller that builds its
+    /// scopes another way. A ledger is reconfigured, never replaced, so what it
+    /// holds and who waits survive a publication. A machine the plan no longer
+    /// names is dropped from the lookup; holds already taken on it are still
+    /// returned to it.
+    pub fn configure_machines(&self, plan: &AdmissionPlan) {
+        if let Ok(mut machines) = self.machines.write() {
+            machines.retain(|id, _| plan.machines.contains_key(id));
+            for (id, capacity) in &plan.machines {
+                match machines.get(id) {
+                    Some(ledger) => ledger.reconfigure(*capacity),
+                    None => {
+                        machines.insert(id.clone(), Arc::new(MachineLedger::new(id, *capacity)));
+                    }
+                }
+            }
+        }
+        if let Ok(mut memory) = self.target_memory.write() {
+            memory.clone_from(&plan.target_memory);
+        }
+    }
+
+    /// The ledger a target draws on, what one of its requests holds, and the
+    /// class it waits in.
+    fn machine_for(
+        &self,
+        target: &TargetId,
+        caller: PriorityClass,
+    ) -> Option<(Arc<MachineLedger>, u64, PriorityClass)> {
+        let memory = self.target_memory.read().ok()?.get(target).cloned()?;
+        let ledger = self.machines.read().ok()?.get(&memory.machine).cloned()?;
+        Some((ledger, memory.bytes, memory.class.unwrap_or(caller)))
+    }
+
+    /// Every machine and what it holds, for the management API.
+    #[must_use]
+    pub fn machine_views(&self) -> Vec<(String, MachineView)> {
+        let now = self.clock.now_millis();
+        self.machines.read().map_or_else(
+            |_| Vec::new(),
+            |machines| {
+                machines
+                    .iter()
+                    .map(|(id, ledger)| (id.clone(), ledger.view(now)))
+                    .collect()
+            },
+        )
+    }
+
+    /// Give up `key`'s place in line on every machine.
+    ///
+    /// For a job whose pass ended other than waiting for memory: it is running,
+    /// finished or gone, and a claim left behind would hold up lower-class
+    /// work until its lease ran out.
+    pub fn drop_machine_claims(&self, key: &str) {
+        if let Ok(machines) = self.machines.read() {
+            for ledger in machines.values() {
+                ledger.drop_claim(key);
+            }
+        }
     }
 
     /// Record the admission-queue class of a named scope.
@@ -1705,7 +1823,18 @@ impl AdmissionController {
         target: &TargetId,
         estimated_tokens: u64,
     ) -> Result<Reservation, (Rejection, String)> {
-        self.acquire_chain(tenant, principal, alias, target, estimated_tokens, None)
+        self.acquire_chain(
+            tenant,
+            principal,
+            alias,
+            target,
+            estimated_tokens,
+            None,
+            MemoryAsk::Take {
+                class: PriorityClass::Standard,
+                key: None,
+            },
+        )
     }
 
     /// Every scope a request passes through, widest to narrowest.
@@ -1745,7 +1874,12 @@ impl AdmissionController {
     /// Acquire across the whole chain, all or nothing.
     ///
     /// `holder` is a queue ticket and the scope it is honoured at, for a
-    /// request that has waited its turn.
+    /// request that has waited its turn; `memory` is how the target's machine
+    /// memory is taken.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the chain's layers plus how it is held; a struct would hide which one a caller forgot"
+    )]
     fn acquire_chain(
         &self,
         tenant: &TenantId,
@@ -1754,6 +1888,7 @@ impl AdmissionController {
         target: &TargetId,
         estimated_tokens: u64,
         holder: Option<(&Arc<Scope>, u64)>,
+        memory: MemoryAsk<'_>,
     ) -> Result<Reservation, (Rejection, String)> {
         let now = self.clock.now_millis();
         let chain = self.chain(tenant, principal, alias, target);
@@ -1778,12 +1913,34 @@ impl AdmissionController {
             }
         }
 
+        // Memory last: it is the scarcest thing, and the narrowest. A request
+        // refused by its tenant's quota must not have held a machine's memory
+        // even for the moment it took to find out.
+        let machine = match memory {
+            MemoryAsk::Held(hold) => Some(hold),
+            MemoryAsk::Take { class, key } => match self.machine_for(target, class) {
+                None => None,
+                Some((ledger, bytes, class)) => {
+                    match ledger.try_hold(target, bytes, class, key, now) {
+                        Ok(hold) => Some(hold),
+                        Err(crate::machine::Refused) => {
+                            for acquired in held.iter().rev() {
+                                acquired.rollback(estimated_tokens);
+                            }
+                            return Err((Rejection::MemoryExhausted, ledger.name.clone()));
+                        }
+                    }
+                }
+            },
+        };
+
         Ok(Reservation {
             scopes: held,
             reserved_tokens: estimated_tokens,
             released: AtomicBool::new(false),
             clock: Arc::clone(&self.clock),
             target: target.clone(),
+            machine,
         })
     }
 
@@ -1840,9 +1997,79 @@ impl AdmissionController {
         class: PriorityClass,
         budget: std::time::Duration,
     ) -> Result<(Reservation, u64), (Rejection, String)> {
-        let first = self.reserve_for(tenant, principal, alias, target, estimated_tokens);
+        self.reserve_queued_as(
+            tenant,
+            principal,
+            alias,
+            target,
+            estimated_tokens,
+            class,
+            budget,
+            None,
+        )
+    }
+
+    /// `reserve_queued_for`, as the holder of machine claim `key`.
+    ///
+    /// A job passes its own stable identifier: with no budget to wait, a pass
+    /// refused for memory leaves a claim under that key, and the job's next
+    /// pass holds its place in line by presenting it again
+    /// ([`crate::machine`]). A request that can wait waits on the machine
+    /// itself, as `key` or under a name of its own.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each argument is one admission layer or one queue parameter; \
+                  bundling them into a struct would hide which layer a caller forgot"
+    )]
+    pub fn reserve_queued_as(
+        &self,
+        tenant: &TenantId,
+        principal: &PrincipalId,
+        alias: Option<(&AliasId, Operation)>,
+        target: &TargetId,
+        estimated_tokens: u64,
+        class: PriorityClass,
+        budget: std::time::Duration,
+        key: Option<&str>,
+    ) -> Result<(Reservation, u64), (Rejection, String)> {
+        let take = MemoryAsk::Take { class, key };
+        let first = self.acquire_chain(tenant, principal, alias, target, estimated_tokens, None, take);
         match first {
             Ok(reservation) => Ok((reservation, 0)),
+            Err((Rejection::MemoryExhausted, name)) => {
+                let Some((ledger, bytes, machine_class)) = self.machine_for(target, class) else {
+                    return Err((Rejection::MemoryExhausted, name));
+                };
+                if budget.is_zero() {
+                    if let Some(key) = key {
+                        ledger.claim(key, machine_class, bytes, self.clock.now_millis());
+                    }
+                    return Err((Rejection::MemoryExhausted, name));
+                }
+                let own;
+                let key = if let Some(key) = key {
+                    key
+                } else {
+                    own = format!("wait-{}", self.next_wait.fetch_add(1, Ordering::SeqCst));
+                    own.as_str()
+                };
+                let started = std::time::Instant::now();
+                let clock = Arc::clone(&self.clock);
+                let hold = ledger
+                    .hold_waiting(target, bytes, machine_class, key, budget, &|| clock.now_millis())
+                    .map_err(|crate::machine::Refused| (Rejection::QueueTimeout, name))?;
+                let waited = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                self.acquire_chain(
+                    tenant,
+                    principal,
+                    alias,
+                    target,
+                    estimated_tokens,
+                    None,
+                    MemoryAsk::Held(hold),
+                )
+                .map(|reservation| (reservation, waited))
+            }
             Err((Rejection::ConcurrencyExhausted, name)) => {
                 let Some(scope) = self.scope_named(&name, tenant, principal, alias, target) else {
                     return Err((Rejection::ConcurrencyExhausted, name));
@@ -1877,6 +2104,7 @@ impl AdmissionController {
                         target,
                         estimated_tokens,
                         Some((&scope, ticket.ticket)),
+                        MemoryAsk::Take { class, key },
                     ) {
                         Ok(reservation) => return Ok((reservation, waited)),
                         Err((Rejection::ConcurrencyExhausted, again)) if again == name => {
@@ -3188,5 +3416,161 @@ mod tests {
         assert_eq!(c.global().in_flight(), 0);
         let (acquired, released) = c.global().conservation();
         assert_eq!(acquired, released, "reservations leaked under contention");
+    }
+
+    // -- Machine memory ----------------------------------------------------
+
+    const GIB: u64 = 1 << 30;
+
+    fn spark_plan() -> (AdmissionPlan, TargetId, TargetId, TargetId) {
+        let qwen = TargetId::new("spark:qwen").unwrap();
+        let yue = TargetId::new("spark:yue2").unwrap();
+        let h3 = TargetId::new("spark:h3").unwrap();
+        let mut plan = AdmissionPlan::new(ScopeLimits::UNLIMITED);
+        plan.machines.insert("spark".to_owned(), 80 * GIB);
+        let on_spark = |bytes, class| TargetMemory {
+            machine: "spark".to_owned(),
+            bytes,
+            class: Some(class),
+        };
+        plan.target_memory.insert(qwen.clone(), on_spark(0, PriorityClass::Interactive));
+        plan.target_memory.insert(yue.clone(), on_spark(24 * GIB, PriorityClass::Standard));
+        plan.target_memory.insert(h3.clone(), on_spark(70 * GIB, PriorityClass::Batch));
+        plan.targets.insert(
+            h3.clone(),
+            ScopeLimits {
+                max_concurrency: 4,
+                ..ScopeLimits::UNLIMITED
+            },
+        );
+        (plan, qwen, yue, h3)
+    }
+
+    #[test]
+    fn a_memory_refusal_rolls_back_every_scope_it_passed() {
+        let clock = Arc::new(TestClock::new());
+        let (plan, _, _, h3) = spark_plan();
+        let c = AdmissionController::from_plan(clock, &plan);
+        let first = c.reserve(&tenant(), &principal(), &h3, 0);
+        assert!(first.is_ok());
+        let second = c.reserve(&tenant(), &principal(), &h3, 0);
+        assert!(matches!(second, Err((Rejection::MemoryExhausted, ref name)) if name == "machine:spark"));
+        // Only the running job holds the target's slot and the global one.
+        assert_eq!(c.target_scope(&h3).map(|s| s.in_flight()), Some(1));
+        assert_eq!(c.global().in_flight(), 1);
+        drop(first);
+        assert_eq!(c.global().in_flight(), 0);
+        assert_eq!(c.machine_views()[0].1.held_bytes, 0);
+    }
+
+    #[test]
+    fn a_waiting_job_keeps_its_place_across_passes_ahead_of_a_lower_class() {
+        let clock = Arc::new(TestClock::new());
+        let (plan, qwen, yue, h3) = spark_plan();
+        let c = AdmissionController::from_plan(clock.clone(), &plan);
+        let pass = |target: &TargetId, key: &str| {
+            c.reserve_queued_as(
+                &tenant(),
+                &principal(),
+                None,
+                target,
+                0,
+                PriorityClass::Standard,
+                std::time::Duration::ZERO,
+                Some(key),
+            )
+        };
+        let rendering = pass(&h3, "h3-1");
+        assert!(rendering.is_ok());
+        // YuE's pass is refused for memory and leaves a claim.
+        assert!(matches!(pass(&yue, "yue-1"), Err((Rejection::MemoryExhausted, _))));
+        assert_eq!(c.machine_views()[0].1.waiting.len(), 1);
+        // Chat to the resident model is not held up by any of it.
+        assert!(pass(&qwen, "chat-1").is_ok());
+        drop(rendering);
+        // The next H3 job fits on the empty machine, and is still refused:
+        // YuE outranks it.
+        assert!(matches!(pass(&h3, "h3-2"), Err((Rejection::MemoryExhausted, _))));
+        assert_eq!(c.target_scope(&h3).map(|s| s.in_flight()), Some(0));
+        let song = pass(&yue, "yue-1");
+        assert!(song.is_ok());
+        // YuE's claim went with its admission; H3 waits only for memory now.
+        assert!(matches!(pass(&h3, "h3-2"), Err((Rejection::MemoryExhausted, _))));
+        drop(song);
+        assert!(pass(&h3, "h3-2").is_ok());
+    }
+
+    #[test]
+    fn a_job_that_ends_another_way_gives_up_its_place() {
+        let clock = Arc::new(TestClock::new());
+        let (plan, _, yue, h3) = spark_plan();
+        let c = AdmissionController::from_plan(clock, &plan);
+        let held = c.reserve(&tenant(), &principal(), &h3, 0);
+        assert!(held.is_ok());
+        let refused = c.reserve_queued_as(
+            &tenant(),
+            &principal(),
+            None,
+            &yue,
+            0,
+            PriorityClass::Standard,
+            std::time::Duration::ZERO,
+            Some("yue-1"),
+        );
+        assert!(refused.is_err());
+        c.drop_machine_claims("yue-1");
+        assert!(c.machine_views()[0].1.waiting.is_empty());
+    }
+
+    #[test]
+    fn a_publication_keeps_the_memory_already_held() {
+        let clock = Arc::new(TestClock::new());
+        let (mut plan, _, yue, h3) = spark_plan();
+        let c = AdmissionController::from_plan(clock, &plan);
+        let rendering = c.reserve(&tenant(), &principal(), &h3, 0);
+        assert!(rendering.is_ok());
+        plan.machines.insert("spark".to_owned(), 100 * GIB);
+        c.apply(&plan);
+        assert_eq!(c.machine_views()[0].1.held_bytes, 70 * GIB);
+        assert!(c.reserve(&tenant(), &principal(), &yue, 0).is_ok());
+        // A machine the plan drops admits nothing more, and the hold already
+        // taken on it is still returned to it.
+        plan.machines.clear();
+        plan.target_memory.clear();
+        c.apply(&plan);
+        assert!(c.machine_views().is_empty());
+        drop(rendering);
+    }
+
+    #[test]
+    fn a_request_that_can_wait_is_admitted_when_the_memory_comes_back() {
+        let clock = Arc::new(TestClock::new());
+        let (plan, _, yue, h3) = spark_plan();
+        let c = Arc::new(AdmissionController::from_plan(clock, &plan));
+        let Ok(rendering) = c.reserve(&tenant(), &principal(), &h3, 0) else {
+            unreachable!()
+        };
+        let waiter = {
+            let c = Arc::clone(&c);
+            let yue = yue.clone();
+            std::thread::spawn(move || {
+                c.reserve_queued_for(
+                    &tenant(),
+                    &principal(),
+                    None,
+                    &yue,
+                    0,
+                    PriorityClass::Standard,
+                    std::time::Duration::from_secs(10),
+                )
+                .map(|(reservation, _)| reservation.target.clone())
+            })
+        };
+        while c.machine_views()[0].1.waiting.is_empty() {
+            std::thread::yield_now();
+        }
+        rendering.release_unused();
+        assert_eq!(waiter.join().ok().and_then(Result::ok), Some(yue));
+        assert_eq!(c.machine_views()[0].1.held_bytes, 0);
     }
 }

@@ -511,6 +511,58 @@ role_binding subject=group:platform role=operator
         assert!(!c.settings.capture_bodies, "bodies are not captured by default");
     }
 
+    /// FULL with `local` on a machine and its target holding memory.
+    fn on_a_machine(machine: &str, provider: &str, target: &str) -> String {
+        FULL.replace(
+            "provider id=local family=llamacpp scheme=http host=127.0.0.1 port=8080 egress=local",
+            &format!(
+                "{machine}\nprovider id=local family=llamacpp scheme=http host=127.0.0.1 \
+                 port=8080 egress=local {provider}"
+            ),
+        )
+        .replace("target id=local:qwen ", &format!("target id=local:qwen {target} "))
+    }
+
+    #[test]
+    fn a_target_on_a_machine_draws_on_its_memory_in_its_class() {
+        let c = load_ok(&on_a_machine(
+            "machine id=spark memory_bytes=85899345920",
+            "machine=spark",
+            "run_memory_bytes=25769803776 class=batch",
+        ));
+        let plan = c.admission_plan();
+        assert_eq!(plan.machines.get("spark"), Some(&85_899_345_920));
+        let qwen = hypellm_core::ids::TargetId::new("local:qwen").unwrap();
+        let memory = plan.target_memory.get(&qwen).unwrap();
+        assert_eq!(memory.machine, "spark");
+        assert_eq!(memory.bytes, 25_769_803_776);
+        assert_eq!(memory.class, Some(hypellm_core::admission::PriorityClass::Batch));
+    }
+
+    #[test]
+    fn machine_references_must_resolve_and_fit() {
+        let unknown = load_err(&on_a_machine("", "machine=spark", ""));
+        assert!(codes(&unknown).contains(&"unresolved_reference"), "{:?}", codes(&unknown));
+        // Memory with nowhere to hold it would silently admit everything.
+        let homeless = load_err(&on_a_machine("", "", "run_memory_bytes=1"));
+        assert!(codes(&homeless).contains(&"incomplete_record"), "{:?}", codes(&homeless));
+        // A target bigger than its machine could never run.
+        let too_big = load_err(&on_a_machine(
+            "machine id=spark memory_bytes=1000",
+            "machine=spark",
+            "run_memory_bytes=1001",
+        ));
+        assert!(codes(&too_big).contains(&"invalid_value"), "{:?}", codes(&too_big));
+        let empty = load_err(&on_a_machine("machine id=spark memory_bytes=0", "machine=spark", ""));
+        assert!(codes(&empty).contains(&"invalid_value"), "{:?}", codes(&empty));
+        let class = load_err(&on_a_machine(
+            "machine id=spark memory_bytes=1000",
+            "machine=spark",
+            "class=urgent",
+        ));
+        assert!(codes(&class).contains(&"invalid_value"), "{:?}", codes(&class));
+    }
+
     #[test]
     fn a_job_shim_without_a_credential_is_refused() {
         let shim = "provider id=trellis family=job scheme=http host=127.0.0.1 port=7871 egress=local";

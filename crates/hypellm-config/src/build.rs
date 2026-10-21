@@ -738,6 +738,23 @@ pub struct CredentialMeta {
     pub rotates_after_days: u32,
 }
 
+/// One physical machine whose memory several targets share.
+///
+/// Not a fleet `host`: that is a slave the router starts containers on, and
+/// needs an agent. A machine is only a memory pool that requests and jobs
+/// draw on while they run, whoever started the services on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Machine {
+    /// The identifier providers name in `machine=`.
+    pub id: String,
+    /// The memory its targets' work may hold at once. What is resident
+    /// regardless — the operating system, a model that never unloads — is
+    /// left out of it.
+    pub memory_bytes: u64,
+    /// A description.
+    pub description: Option<String>,
+}
+
 /// A fully validated configuration, ready to activate.
 #[derive(Debug, Clone)]
 pub struct ValidatedConfig {
@@ -771,6 +788,11 @@ pub struct ValidatedConfig {
     pub prices: Vec<PriceSchedule>,
     /// Egress profile per provider.
     pub egress_profiles: BTreeMap<ProviderId, EgressProfile>,
+    /// Machines whose memory their targets share ([`hypellm_core::machine`]).
+    pub machines: Vec<Machine>,
+    /// What one request or job to a target holds on its machine, for every
+    /// target whose provider names a machine.
+    pub target_memory: BTreeMap<TargetId, hypellm_core::admission::TargetMemory>,
     /// The declared fleet: hosts, accelerators, deployments, artifacts.
     ///
     /// Always present and always validated. An empty one — which is what every
@@ -862,6 +884,12 @@ impl ValidatedConfig {
                 }
             }
         }
+        plan.machines = self
+            .machines
+            .iter()
+            .map(|m| (m.id.clone(), m.memory_bytes))
+            .collect();
+        plan.target_memory.clone_from(&self.target_memory);
         for (id, target) in &self.snapshot.targets {
             if target.max_concurrency > 0 && !plan.targets.contains_key(id) {
                 plan.targets.insert(
@@ -1289,6 +1317,19 @@ pub fn build(document: &Document, version: u64) -> Result<ValidatedConfig, Vec<C
 
     let credentials = collect(document, "credential", &mut errors, build_credential);
 
+    let machines = collect(document, "machine", &mut errors, build_machine);
+    let mut seen_machines: BTreeSet<&str> = BTreeSet::new();
+    for machine in &machines {
+        if !seen_machines.insert(machine.id.as_str()) {
+            errors.push(ConfigError::new(
+                "duplicate_record",
+                format!("machine '{}' is declared more than once", machine.id),
+                Position { line: 0, column: 0 },
+            ));
+        }
+    }
+    let target_memory = build_target_memory(document, &machines, &mut errors);
+
     // A price naming a target that does not exist is almost always a typo in
     // the target id, and silently ignoring it would report a spend of zero for
     // a target that is costing money — the one direction a cost estimate must
@@ -1548,9 +1589,122 @@ pub fn build(document: &Document, version: u64) -> Result<ValidatedConfig, Vec<C
         credentials,
         prices,
         egress_profiles,
+        machines,
+        target_memory,
         canonical,
         digest,
     })
+}
+
+fn build_machine(f: &Fields<'_>) -> Result<Machine, ConfigError> {
+    let id = f.str_field("id")?;
+    let valid = !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.' || b == b'_');
+    if !valid {
+        return Err(f.error(
+            "invalid_identifier",
+            format!("machine '{id}': lowercase letters, digits, '-', '.' and '_', at most 64"),
+        ));
+    }
+    let memory_bytes = f.u64_field("memory_bytes", 0)?;
+    if memory_bytes == 0 {
+        return Err(f.error(
+            "invalid_value",
+            format!("machine '{id}' has no memory_bytes: nothing could ever run on it"),
+        ));
+    }
+    Ok(Machine {
+        id: id.to_owned(),
+        memory_bytes,
+        description: f.opt_str("description").map(str::to_owned),
+    })
+}
+
+/// Which machine each target's work draws on, from `provider machine=` and
+/// `target run_memory_bytes= class=`.
+///
+/// Read beside the provider and target builders rather than inside them: the
+/// routing snapshot has no use for memory, and admission is the only reader.
+fn build_target_memory(
+    document: &Document,
+    machines: &[Machine],
+    errors: &mut Vec<ConfigError>,
+) -> BTreeMap<TargetId, hypellm_core::admission::TargetMemory> {
+    use hypellm_core::admission::{PriorityClass, TargetMemory};
+
+    let capacity: BTreeMap<&str, u64> =
+        machines.iter().map(|m| (m.id.as_str(), m.memory_bytes)).collect();
+    let mut provider_machine: BTreeMap<&str, &str> = BTreeMap::new();
+    for record in document.of_kind("provider") {
+        let f = Fields::new(record);
+        if let (Some(id), Some(machine)) = (f.opt_str("id"), f.opt_str("machine")) {
+            if capacity.contains_key(machine) {
+                provider_machine.insert(id, machine);
+            } else {
+                errors.push(f.error(
+                    "unresolved_reference",
+                    format!("provider '{id}' names machine '{machine}', which is not defined"),
+                ));
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    for record in document.of_kind("target") {
+        let f = Fields::new(record);
+        let (Some(id), Some(provider)) = (f.opt_str("id"), f.opt_str("provider")) else {
+            continue;
+        };
+        let bytes = match f.u64_field("run_memory_bytes", 0) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                errors.push(e);
+                continue;
+            }
+        };
+        let class = match f.opt_parsed("class", "invalid_value", PriorityClass::parse) {
+            Ok(class) => class,
+            Err(e) => {
+                errors.push(e);
+                continue;
+            }
+        };
+        let Some(machine) = provider_machine.get(provider) else {
+            if bytes > 0 || class.is_some() {
+                errors.push(f.error(
+                    "incomplete_record",
+                    format!(
+                        "target '{id}' sets run_memory_bytes or class, but its provider \
+                         '{provider}' names no machine for them to apply to"
+                    ),
+                ));
+            }
+            continue;
+        };
+        if capacity.get(machine).is_some_and(|c| bytes > *c) {
+            errors.push(f.error(
+                "invalid_value",
+                format!(
+                    "target '{id}' needs {bytes} bytes, more than machine '{machine}' has: \
+                     it could never run"
+                ),
+            ));
+            continue;
+        }
+        if let Ok(target) = TargetId::new(id) {
+            out.insert(
+                target,
+                TargetMemory {
+                    machine: (*machine).to_owned(),
+                    bytes,
+                    class,
+                },
+            );
+        }
+    }
+    out
 }
 
 fn collect<T>(
