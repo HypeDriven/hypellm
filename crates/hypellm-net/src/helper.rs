@@ -356,14 +356,34 @@ mod tests {
     use wire_json::parse_str;
 
     /// Run a helper that replies with `reply` and then echoes.
+    /// One whole request: its line, and for `VERIFY <n>` the `n` bytes after it. A single `read`
+    /// returned whatever had arrived, and on a loaded machine the client's second write (the token
+    /// after `VERIFY 24\n`) had not, so the request looked cut short.
+    fn read_request(socket: &mut std::os::unix::net::UnixStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut byte = [0u8; 1];
+        while request.last() != Some(&b'\n') {
+            match socket.read(&mut byte) {
+                Ok(1) => request.push(byte[0]),
+                _ => return request,
+            }
+        }
+        let line = String::from_utf8_lossy(&request).into_owned();
+        if let Some(length) = line.trim_end().strip_prefix("VERIFY ").and_then(|n| n.parse::<usize>().ok()) {
+            let mut body = vec![0u8; length];
+            if socket.read_exact(&mut body).is_ok() {
+                request.extend_from_slice(&body);
+            }
+        }
+        request
+    }
+
     fn helper(dir: &TempDir, name: &str, reply: Vec<u8>) -> (String, thread::JoinHandle<Vec<u8>>) {
         let path = dir.join(name).to_string_lossy().into_owned();
         let listener = UnixListener::bind(&path).expect("bind");
         let handle = thread::spawn(move || {
             let (mut socket, _) = listener.accept().expect("accept");
-            let mut request = vec![0u8; 4096];
-            let n = socket.read(&mut request).unwrap_or(0);
-            request.truncate(n);
+            let request = read_request(&mut socket);
             socket.write_all(&reply).expect("write");
             socket.flush().expect("flush");
             request
