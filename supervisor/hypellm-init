@@ -53,6 +53,9 @@
 #    outlives the deadline, this says so on stderr and exits non-zero. A silent
 #    fallback to SIGKILL would recreate exactly the behaviour it exists to
 #    remove.
+#
+# One thing more, and only when asked: with HYPELLM_LOG_DIR set, it keeps a
+# size-capped copy of the router's output on disk (see "A durable copy" below).
 
 set -u
 
@@ -144,6 +147,107 @@ if [ -z "$config" ] || [ -z "$secrets" ]; then
     exit "$EXIT_ARGUMENTS"
 fi
 
+# A durable copy of the router's output, when HYPELLM_LOG_DIR names a directory.
+#
+# The router writes its log to stderr and nothing else: where output goes is a
+# deployment concern (spec/modules/hypellm-telemetry.html), and a container
+# runtime keeps it only as long as the container. A restarted pod takes the log
+# that explains why it restarted with it. So this tees everything the router and
+# this init print -- still to stdout, so `kubectl logs` is unchanged -- into
+# `router.log` in that directory, rotated by size: HYPELLM_LOG_FILES files of
+# HYPELLM_LOG_FILE_BYTES each, 10 x 10 MiB by default, and the oldest deleted.
+#
+# Bounded like everything else. Each file can overrun its size by at most one
+# line, and a line is cut at LOG_LINE_MAX bytes. A write that fails -- a full
+# disk -- drops that line from the file and nothing else; the stdout copy and
+# the router carry on. The router never waits on this: its own log writer sits
+# behind a bounded queue that drops the oldest line rather than block.
+LOG_DIR="${HYPELLM_LOG_DIR:-}"
+LOG_FILE_BYTES="${HYPELLM_LOG_FILE_BYTES:-10485760}"
+LOG_FILES="${HYPELLM_LOG_FILES:-10}"
+LOG_LINE_MAX=65536
+writer=0
+
+if [ -n "$LOG_DIR" ]; then
+    if ! [[ "$LOG_FILE_BYTES" =~ ^[1-9][0-9]{0,11}$ && "$LOG_FILES" =~ ^[1-9][0-9]{0,2}$ ]]; then
+        echo "hypellm-init: HYPELLM_LOG_FILE_BYTES and HYPELLM_LOG_FILES must be positive integers" >&2
+        exit "$EXIT_ARGUMENTS"
+    fi
+    if [ ! -d "$LOG_DIR" ] || [ ! -w "$LOG_DIR" ]; then
+        echo "hypellm-init: HYPELLM_LOG_DIR ${LOG_DIR} is not a writable directory" >&2
+        exit "$EXIT_ARGUMENTS"
+    fi
+fi
+
+# Shift router.log.N up by one, dropping the oldest, and start an empty
+# router.log on fd 4.
+rotate_log() {
+    local file="$1" i
+    exec 4>&-
+    if [ "$LOG_FILES" -gt 1 ]; then
+        for ((i = LOG_FILES - 2; i >= 1; i--)); do
+            if [ -e "$file.$i" ]; then
+                mv -f -- "$file.$i" "$file.$((i + 1))"
+            fi
+        done
+        mv -f -- "$file" "$file.1"
+    fi
+    exec 4>"$file"
+}
+
+# Runs as a process substitution: stdin is the router's output and this init's
+# stderr, stdout is the container's.
+log_writer() {
+    local LC_ALL=C
+    local file="$LOG_DIR/router.log" line size=0 old n
+
+    # Files numbered beyond the budget, left by a larger HYPELLM_LOG_FILES.
+    for old in "$file".*; do
+        n="${old##*.}"
+        if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge "$LOG_FILES" ]; then
+            rm -f -- "$old"
+        fi
+    done
+    if [ -f "$file" ]; then
+        size=$(stat -c %s -- "$file" 2>/dev/null) || size=0
+    fi
+    if ! { exec 4>>"$file"; } 2>/dev/null; then
+        echo "hypellm-init: cannot open ${file}; the router's output is not being kept"
+        exec 4>/dev/null
+    fi
+
+    while IFS= read -r -n "$LOG_LINE_MAX" line || [ -n "$line" ]; do
+        printf '%s\n' "$line"
+        if [ "$size" -ge "$LOG_FILE_BYTES" ]; then
+            rotate_log "$file" 2>/dev/null || exec 4>/dev/null
+            size=0
+        fi
+        if printf '%s\n' "$line" >&4 2>/dev/null; then
+            size=$((size + ${#line} + 1))
+        fi
+    done
+}
+
+if [ -n "$LOG_DIR" ]; then
+    exec > >(log_writer) 2>&1
+    writer=$!
+fi
+
+# Exit, letting the log writer finish first. Its input closes when this and the
+# router have both closed their ends; the wait is bounded so that something
+# else holding the pipe cannot keep PID 1 alive past the grace period.
+finish() {
+    local code="$1" t
+    if [ "$writer" -ne 0 ]; then
+        exec >/dev/null 2>&1
+        for ((t = 0; t < 20; t++)); do
+            kill -0 "$writer" 2>/dev/null || break
+            sleep 0.1
+        done
+    fi
+    exit "$code"
+}
+
 # Turn a signal into the router's own shutdown command.
 #
 # Re-entrant on purpose: a second SIGTERM while a drain is running is an
@@ -175,8 +279,10 @@ on_signal() {
     # The deadline, as a background timer rather than a blocking sleep, so the
     # wait loop below keeps running and the child is still reaped promptly if it
     # finishes first.
+    # `sleep` gets no copy of the log pipe: killing this subshell leaves it
+    # running, and an open write end would hold the log writer past the exit.
     (
-        sleep "$DRAIN_DEADLINE"
+        sleep "$DRAIN_DEADLINE" >/dev/null 2>&1
         if [ "$child" -gt 0 ] && kill -0 "$child" 2>/dev/null; then
             echo "hypellm-init: the router did not exit within ${DRAIN_DEADLINE}s of the drain starting; killing it" >&2
             kill -KILL "$child" 2>/dev/null
@@ -233,6 +339,6 @@ fi
 
 if [ "$drain_failed" -eq 1 ]; then
     echo "hypellm-init: the shutdown was not graceful; in-flight streams may have been cut" >&2
-    exit "$EXIT_DRAIN_FAILED"
+    finish "$EXIT_DRAIN_FAILED"
 fi
-exit "$status"
+finish "$status"

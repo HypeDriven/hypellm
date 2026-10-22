@@ -58,6 +58,7 @@ class InitTest(unittest.TestCase):
         refuses_with: int = 0,
         exits: int = 0,
         shutdown_lingers: float = 0.0,
+        prints: str = "",
     ) -> None:
         """A stand-in for the router binary.
 
@@ -88,6 +89,8 @@ class InitTest(unittest.TestCase):
             'case "$1" in\n'
             "  --generate-secrets|--check|--version|-V|--help|-h|--hash-password) exit 0 ;;\n"
             "esac\n"
+            # What the running router writes, before it starts waiting.
+            f"{prints}\n"
             'trap "" TERM INT\n'
             "for _ in $(seq 1 600); do\n"
             f'  if [ -f "{self.sentinel}" ]; then exit {exits}; fi\n'
@@ -98,7 +101,10 @@ class InitTest(unittest.TestCase):
         self.router.chmod(0o755)
 
     def start(
-        self, deadline: float = 3.0, extra_env: dict[str, str] | None = None
+        self,
+        deadline: float = 3.0,
+        extra_env: dict[str, str] | None = None,
+        capture_stdout: bool = False,
     ) -> subprocess.Popen[bytes]:
         environment = dict(os.environ)
         environment["HYPELLM_ROUTER_BIN"] = str(self.router)
@@ -107,6 +113,7 @@ class InitTest(unittest.TestCase):
         process = subprocess.Popen(
             [INIT, "--config", self.config, "--secrets", self.secrets, "--log", "info"],
             env=environment,
+            stdout=subprocess.PIPE if capture_stdout else None,
             stderr=subprocess.PIPE,
             # Its own process group, so an init that signals its whole group
             # cannot take the test runner with it.
@@ -120,8 +127,9 @@ class InitTest(unittest.TestCase):
         if process.poll() is None:
             process.kill()
             process.wait(timeout=5)
-        if process.stderr is not None:
-            process.stderr.close()
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
 
     def calls(self) -> list[str]:
         if not self.log.exists():
@@ -325,6 +333,116 @@ class InitTest(unittest.TestCase):
                 [" ".join(arguments)],
                 f"{arguments} did not reach the router verbatim",
             )
+
+    # -- The durable log ---------------------------------------------------
+
+    def log_dir(self) -> Path:
+        logs = self.root / "logs"
+        logs.mkdir(exist_ok=True)
+        return logs
+
+    def run_to_shutdown(self, extra_env: dict[str, str]) -> tuple[int, str]:
+        process = self.start(extra_env=extra_env, capture_stdout=True)
+        self.wait_for_start(process)
+        process.send_signal(signal.SIGTERM)
+        out, _ = process.communicate(timeout=15)
+        return process.returncode, out.decode()
+
+    def test_the_routers_output_is_kept_on_disk_and_still_reaches_stdout(self) -> None:
+        # The log that explains a restart is the one a restart used to take
+        # with it. Both streams and the init's own drain report have to land in
+        # the file, and stdout has to keep carrying them for `kubectl logs`.
+        self.fake_router(prints='echo \'{"event":"router.started"}\' >&2; echo listening')
+        logs = self.log_dir()
+
+        status, out = self.run_to_shutdown({"HYPELLM_LOG_DIR": str(logs)})
+
+        self.assertEqual(status, 0, out)
+        kept = (logs / "router.log").read_text()
+        for expected in ('{"event":"router.started"}', "listening", "SIGTERM → hypellm-router --shutdown"):
+            self.assertIn(expected, kept)
+            self.assertIn(expected, out)
+
+    def test_a_restart_appends_to_the_log_rather_than_replacing_it(self) -> None:
+        logs = self.log_dir()
+        for run in ("first-run", "second-run"):
+            self.log.unlink(missing_ok=True)
+            self.sentinel.unlink(missing_ok=True)
+            self.fake_router(prints=f"echo {run}")
+            status, out = self.run_to_shutdown({"HYPELLM_LOG_DIR": str(logs)})
+            self.assertEqual(status, 0, out)
+
+        kept = (logs / "router.log").read_text()
+        self.assertIn("first-run", kept)
+        self.assertLess(kept.index("first-run"), kept.index("second-run"))
+
+    def test_the_log_rotates_within_its_budget_and_keeps_the_newest_lines_in_order(self) -> None:
+        # 300 lines of 101 bytes against four files of 2,000: most of it has to
+        # go, the oldest first, and what stays has to read in order across the
+        # rotated files -- four, so the shift between them is more than one
+        # rename. A file left over from a larger budget goes too.
+        self.fake_router(
+            prints='for i in $(seq 1 300); do printf "line-%04d %090d\\n" "$i" 0; done'
+        )
+        logs = self.log_dir()
+        (logs / "router.log.9").write_text("stale\n")
+
+        status, out = self.run_to_shutdown(
+            {
+                "HYPELLM_LOG_DIR": str(logs),
+                "HYPELLM_LOG_FILE_BYTES": "2000",
+                "HYPELLM_LOG_FILES": "4",
+            }
+        )
+
+        self.assertEqual(status, 0, out)
+        self.assertEqual(
+            sorted(p.name for p in logs.iterdir()),
+            ["router.log", "router.log.1", "router.log.2", "router.log.3"],
+        )
+        for path in logs.iterdir():
+            self.assertLessEqual(path.stat().st_size, 2000 + 101, path.name)
+
+        ordered = "".join(
+            (logs / name).read_text() for name in ("router.log.3", "router.log.2", "router.log.1", "router.log")
+        )
+        numbers = [int(line[5:9]) for line in ordered.splitlines() if line.startswith("line-")]
+        self.assertEqual(numbers, list(range(numbers[0], 301)), "a line was lost or reordered")
+        self.assertGreater(numbers[0], 1, "nothing was rotated away")
+        self.assertIn("line-0300", out, "stdout lost lines the file rotated away")
+
+    def test_a_line_with_no_end_is_cut_rather_than_held(self) -> None:
+        # A writer reading "up to the newline" holds as much memory as the
+        # output has bytes before one.
+        self.fake_router(prints="head -c 200000 /dev/zero | tr '\\0' x; echo")
+        logs = self.log_dir()
+
+        status, out = self.run_to_shutdown({"HYPELLM_LOG_DIR": str(logs)})
+
+        self.assertEqual(status, 0, out[:200])
+        lines = (logs / "router.log").read_bytes().splitlines()
+        self.assertLessEqual(max(len(line) for line in lines), 65536)
+        self.assertEqual(sum(line.count(b"x") for line in lines), 200000)
+
+    def test_an_unusable_log_setting_is_refused_before_the_router_starts(self) -> None:
+        # A typo that silently meant "keep nothing" would be found at exactly
+        # the moment the log was needed.
+        for setting in (
+            {"HYPELLM_LOG_DIR": str(self.root / "missing")},
+            {"HYPELLM_LOG_DIR": str(self.log_dir()), "HYPELLM_LOG_FILES": "0"},
+            {"HYPELLM_LOG_DIR": str(self.log_dir()), "HYPELLM_LOG_FILE_BYTES": "10M"},
+        ):
+            self.fake_router()
+            environment = {**os.environ, "HYPELLM_ROUTER_BIN": str(self.router), **setting}
+            completed = subprocess.run(
+                [INIT, "--config", self.config, "--secrets", self.secrets],
+                env=environment,
+                capture_output=True,
+                check=False,
+                timeout=15,
+            )
+            self.assertEqual(completed.returncode, EXIT_ARGUMENTS, f"{setting}")
+            self.assertEqual(self.calls(), [], f"{setting}: the router ran anyway")
 
     def test_the_drain_deadline_exceeds_the_routers_own(self) -> None:
         # The ordering that makes the whole thing work: the default deadline

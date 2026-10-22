@@ -71,6 +71,12 @@ spec:
             - /srv/hypellm/web
             - --log
             - info
+          # hypellm-init tees the router's output into run/logs, so the log that explains a
+          # restart outlives the pod: router.log plus nine rotated files of 10 MiB, 100 MiB in all.
+          env:
+            - {name: HYPELLM_LOG_DIR, value: /var/log/hypellm}
+            - {name: HYPELLM_LOG_FILE_BYTES, value: "10485760"}
+            - {name: HYPELLM_LOG_FILES, value: "10"}
           securityContext:
             runAsUser: 1000
             runAsGroup: 1000
@@ -90,6 +96,7 @@ spec:
             # `settings backup_dir` is /var/backups/hypellm/current; the router writes it when the
             # `backup` CronJob (k8s/backup.yaml) asks over the control socket.
             - {name: backups, mountPath: /var/backups/hypellm}
+            - {name: logs, mountPath: /var/log/hypellm}
         # Outbound HTTPS for `scheme=https` providers (spec/components/tls-helper.html). The router
         # speaks cleartext HTTP to the socket; this process does the TLS with the image's OpenSSL
         # and CA store, to the destinations tls-helper/tls-helper.json allowlists, and nowhere else.
@@ -158,3 +165,5 @@ spec:
           emptyDir: {medium: Memory, sizeLimit: 1Mi}
         - name: backups
           hostPath: {path: "${PROJECT_DIR}/run/backups", type: Directory}
+        - name: logs
+          hostPath: {path: "${PROJECT_DIR}/run/logs", type: Directory}

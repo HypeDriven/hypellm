@@ -110,6 +110,8 @@ and <code>docker</code> the router may not, and this handles the signals the rou
 <li>Waits for the router to finish its own drain, up to <code>HYPELLM_DRAIN_DEADLINE</code>
 seconds (40 by default), then kills it.</li>
 <li>Exits with the router's status, or <code>70</code> if the shutdown was not graceful.</li>
+<li>With <code>HYPELLM_LOG_DIR</code> set, keeps a size-capped copy of the router's output on disk
+(below).</li>
 </ul>
 <p><code>--config</code> and <code>--secrets</code> are read twice: the router needs them to run, and
 this needs them to address the control socket. Missing either is exit <code>71</code>,
@@ -122,6 +124,29 @@ and no drain to arrange. This is not a convenience — <code>docker run hypellm-
 checkout creates its secret bundle, and the image's contract is &quot;append
 arguments and they reach the router&quot;. Putting an init in front of it must not
 change that.</p>
+<h2 id="durable-log">A durable copy of the log</h2>
+<p>The router logs to stderr and nowhere else; where output goes is a deployment
+concern (<a href="../modules/hypellm-telemetry.html">hypellm-telemetry</a>). A container runtime keeps that output
+only as long as the container, so a replaced pod takes the log that explains the
+replacement with it. When <code>HYPELLM_LOG_DIR</code> names a writable directory, the init
+tees the router's stdout and stderr, and its own messages, into <code>router.log</code>
+there. Everything still reaches the container's stdout, so <code>kubectl logs</code> is
+unchanged; the two streams are merged into one.</p>
+<table>
+<thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>HYPELLM_LOG_DIR</code></td><td>unset: no copy</td><td>Directory for <code>router.log</code> and its rotations</td></tr>
+<tr><td><code>HYPELLM_LOG_FILE_BYTES</code></td><td>10485760</td><td>Size at which <code>router.log</code> is rotated</td></tr>
+<tr><td><code>HYPELLM_LOG_FILES</code></td><td>10</td><td>Files kept, <code>router.log</code> included; the oldest is deleted</td></tr>
+</tbody>
+</table>
+<p>The defaults cap the directory at 100 MiB. A file can exceed its size by one line, and a line
+is cut at 64 KiB. A restart appends to the existing <code>router.log</code>. An unusable setting
+(missing or unwritable directory, a value that is not a positive integer) is exit <code>71</code>
+before the router starts. A write that fails, such as on a full disk, drops that line from the
+file only. The router never waits on any of this, because its own writer sits behind a bounded
+queue that drops the oldest line rather than block. <code>k8s/hypellm.yaml</code> sets the
+directory to <code>run/logs</code> on the host; <code>just logs kept</code> follows it.</p>
 <h2 id="what-it-deliberately-is-not">What it deliberately is not</h2>
 <p><strong>Not a supervisor.</strong> One child, one shutdown, one exit status. It does not
 restart the router. Under Compose that was <code>restart: &quot;no&quot;</code>, because a router
@@ -129,8 +154,9 @@ that exited cleanly after a drain must not be started again. The Kubernetes
 Deployment in <code>k8s/</code> restarts any exit, so <code>just down</code> deletes the pod rather
 than asking the router to exit; a <code>--shutdown</code> sent by hand is followed by a
 restart.</p>
-<p><strong>Not a decision maker.</strong> It reads nothing from the network, from a file, or
-from the router. Its whole input is its own argv.</p>
+<p><strong>Not a decision maker.</strong> It reads nothing from the network or from a file, and
+from the router only the output it copies. Its whole input is its own argv and the
+three log variables above.</p>
 <p><strong>Not silent about failure.</strong> A refused shutdown, an undeliverable one, and a
 router that outlives the deadline each print to stderr and exit <code>70</code>. A quiet
 fallback to <code>SIGKILL</code> would be indistinguishable from having no init at all,
@@ -159,13 +185,16 @@ silently.</p>
 <h2 id="tests">Tests</h2>
 <pre><code class="language-bash">python3 supervisor/test_hypellm_init.py
 </code></pre>
-<p>Eight tests, no container and no real router: the router is replaced by a script
+<p>Sixteen tests, no container and no real router: the router is replaced by a script
 the test controls, connected to its own <code>--shutdown</code> invocation through a
 sentinel file the way the real one is connected through the control socket. They
 cover the signal becoming the right command with the right paths, a second
 signal not cutting the drain, a router that ignores the drain being killed <em>and
 reported</em>, a refused shutdown being reported rather than absorbed, and the exit
-status being forwarded. Four of them fail if the signal traps are removed.</p>
+status being forwarded. Four of them fail if the signal traps are removed. Five cover the
+durable log: output kept on disk and still on stdout, a restart appending, rotation
+within the budget with no line lost or reordered, an unterminated line cut at the
+limit, and unusable settings refused before the router starts.</p>
 <p>Not part of <code>cargo test --workspace</code>, because this component is deliberately
 outside the Rust workspace.</p>
 <h2 id="using-it-outside-a-container">Using it outside a container</h2>

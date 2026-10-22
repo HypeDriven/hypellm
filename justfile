@@ -37,6 +37,8 @@ secrets_dir   := justfile_directory() / "run" / "secrets"
 tailscale_dir := justfile_directory() / "run" / "tailscale"
 # Nightly backups (k8s/backup.yaml): `current` is the router's backup_dir, `archive` the dated copies.
 backups_dir   := justfile_directory() / "run" / "backups"
+# The router's output, kept across restarts by hypellm-init: router.log and router.log.1-9, 100 MiB at most.
+logs_dir      := justfile_directory() / "run" / "logs"
 
 # The identity verifier's two directories, created empty and used only by the
 # verifier `just oidc` starts (see spec/components/identity-verifier.html). `verify` is the socket
@@ -441,12 +443,14 @@ adopt reason:
 # `just logs | jq -c`. `just logs tailscale` follows the tailnet node instead,
 # which is where a login URL or a routing problem shows up; `just logs
 # verifier` follows the identity verifier.
-[doc("Follow a container's log: router (default), tailscale or verifier")]
+[doc("Follow a container's log: router (default), tailscale or verifier; `kept` for the router's on-disk log")]
 logs service="router":
     #!/usr/bin/env bash
     set -euo pipefail
     case "{{service}}" in
         verifier) exec {{kubectl}} logs -f deploy/verifier ;;
+        # The copy hypellm-init keeps in run/logs, which outlives the pod; older lines are in router.log.1-9.
+        kept)     exec tail -n 200 -F "{{logs_dir}}/router.log" ;;
         *)        exec {{kubectl}} logs -f deploy/hypellm -c "{{service}}" ;;
     esac
 
@@ -643,8 +647,8 @@ _ports:
 # hostPath volumes are declared `type: Directory`, so they have to exist, owned
 # by the invoking user, before the pod starts.
 _dirs:
-    @mkdir -p "{{state_dir}}" "{{secrets_dir}}" "{{tailscale_dir}}" "{{verify_dir}}" "{{verifier_dir}}" "{{backups_dir}}/current"
-    @chmod 0700 "{{secrets_dir}}" "{{tailscale_dir}}" "{{verifier_dir}}" "{{backups_dir}}" "{{backups_dir}}/current"
+    @mkdir -p "{{state_dir}}" "{{secrets_dir}}" "{{tailscale_dir}}" "{{verify_dir}}" "{{verifier_dir}}" "{{backups_dir}}/current" "{{logs_dir}}"
+    @chmod 0700 "{{secrets_dir}}" "{{tailscale_dir}}" "{{verifier_dir}}" "{{backups_dir}}" "{{backups_dir}}/current" "{{logs_dir}}"
 
 # Generate the secret bundle once. A missing key is a startup failure by
 # design (exit 5) and is never silently regenerated: a router that invents its

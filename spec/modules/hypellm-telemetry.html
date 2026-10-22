@@ -204,7 +204,8 @@ A scrubber would imply that arbitrary text may be passed in, which is exactly
 the property this design refuses.</li>
 <li><strong>Manage log destinations.</strong> <code>Sink</code> is a one-method trait; the crate ships
 <code>StderrSink</code> and <code>MemorySink</code> only. No file sink, no rotation, no retention, no
-syslog. Where output goes is a deployment concern (specification 20).</li>
+syslog. Where output goes is a deployment concern (specification 20); the shipped
+container keeps a size-capped copy on disk through <a href="../components/container-init.html#durable-log">the container init</a>.</li>
 </ul>
 <h3 id="fleet-labels">Fleet labels</h3>
 <p><code>host</code>, <code>deployment</code>, <code>accelerator</code>, <code>agent</code>, <code>capability</code>, <code>effort</code> and
