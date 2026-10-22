@@ -25,10 +25,12 @@
 
 use hypellm_adapters::{Adapter, CredentialHandle, ErrorClassification, RequestMeta};
 use hypellm_core::canonical::CanonicalRequest;
+use hypellm_core::decision::OutputTally;
 use hypellm_core::error::{ErrorCode, RouterError};
 use hypellm_core::event::{CanonicalEvent, CanonicalUsage, UpstreamErrorClass};
 use hypellm_core::target::{Provider, Target};
 use hypellm_core::time::{Clock, Deadline};
+use std::collections::VecDeque;
 use std::time::Duration;
 use hypellm_net::{UpstreamConnection, UpstreamError};
 use core::fmt;
@@ -233,6 +235,100 @@ pub struct AttemptSummary {
     pub native_model: Option<String>,
 }
 
+/// What an attempt observed, whatever its outcome.
+///
+/// A failed attempt returns no [`AttemptSummary`], and a stream that was cut
+/// off never reports usage, so without this a request that ran for twenty
+/// minutes and one refused at once leave the same record. Everything kept
+/// here is a status, a time or a size (specification 10); the one exception
+/// is the output tail, which never leaves this struct.
+#[derive(Default)]
+pub struct AttemptProgress {
+    /// The upstream's HTTP status, once a response head arrived.
+    pub upstream_status: Option<u16>,
+    /// Milliseconds until the response head.
+    pub first_byte_millis: Option<u64>,
+    /// Milliseconds for the whole attempt.
+    pub total_millis: u64,
+    /// Output produced, by kind.
+    pub output: OutputTally,
+    /// The last [`AttemptProgress::TAIL_BYTES`] of output, in order, across
+    /// every kind.
+    ///
+    /// Held only so a failed attempt can say whether it ended in a loop; read
+    /// once by [`AttemptProgress::finish`] and then dropped. Never logged,
+    /// never traced, never returned. It is a second copy of bytes the client
+    /// has already been sent, bounded well inside specification 3.2's
+    /// per-stream allowance.
+    tail: VecDeque<u8>,
+}
+
+impl fmt::Debug for AttemptProgress {
+    /// Without the tail: it is response content.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AttemptProgress")
+            .field("upstream_status", &self.upstream_status)
+            .field("first_byte_millis", &self.first_byte_millis)
+            .field("total_millis", &self.total_millis)
+            .field("output", &self.output)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AttemptProgress {
+    /// How much trailing output is kept to look for a loop in: four times
+    /// [`OutputTally::REPEAT_MAX_PERIOD`], so the longest unit looked for
+    /// can be seen repeating.
+    pub const TAIL_BYTES: usize = 2048;
+
+    /// Count one event on its way to the client.
+    fn observe(&mut self, event: &CanonicalEvent) {
+        let bytes = match event {
+            CanonicalEvent::TextDelta(text) => {
+                self.output.text_bytes = self.output.text_bytes.saturating_add(len64(text));
+                text.as_bytes()
+            }
+            CanonicalEvent::ReasoningDelta(text) => {
+                self.output.reasoning_bytes =
+                    self.output.reasoning_bytes.saturating_add(len64(text));
+                text.as_bytes()
+            }
+            CanonicalEvent::ToolCallDelta(delta) => {
+                if delta.name.as_deref().is_some_and(|name| !name.is_empty()) {
+                    self.output.tool_calls = self.output.tool_calls.saturating_add(1);
+                }
+                self.output.tool_argument_bytes = self
+                    .output
+                    .tool_argument_bytes
+                    .saturating_add(len64(&delta.arguments_delta));
+                delta.arguments_delta.as_bytes()
+            }
+            _ => return,
+        };
+        self.output.deltas = self.output.deltas.saturating_add(1);
+        // Only the end of a delta larger than the whole tail can matter.
+        let keep = bytes
+            .get(bytes.len().saturating_sub(Self::TAIL_BYTES)..)
+            .unwrap_or_default();
+        self.tail.extend(keep);
+        let excess = self.tail.len().saturating_sub(Self::TAIL_BYTES);
+        self.tail.drain(..excess);
+    }
+
+    /// Close the record: find any repetition a failed attempt ended in, and
+    /// drop the tail either way.
+    fn finish(&mut self, failed: bool) {
+        let mut tail = core::mem::take(&mut self.tail);
+        if failed {
+            self.output.record_repetition(tail.make_contiguous());
+        }
+    }
+}
+
+fn len64(text: &str) -> u64 {
+    u64::try_from(text.len()).unwrap_or(u64::MAX)
+}
+
 /// Run one attempt against one target.
 ///
 /// Every step has a deadline derived from the request's, and none of them can
@@ -246,6 +342,7 @@ pub fn attempt(
     adapter: &dyn Adapter,
     deadline: Deadline,
     sink: &mut dyn EventSink,
+    progress: &mut AttemptProgress,
 ) -> Result<AttemptSummary, AttemptFailure> {
     attempt_with(
         state,
@@ -256,6 +353,7 @@ pub fn attempt(
         deadline,
         sink,
         CredentialChoice::Current,
+        progress,
     )
 }
 
@@ -274,6 +372,32 @@ pub fn attempt_with(
     deadline: Deadline,
     sink: &mut dyn EventSink,
     credential: CredentialChoice,
+    progress: &mut AttemptProgress,
+) -> Result<AttemptSummary, AttemptFailure> {
+    let started = state.clock.now_millis();
+    let result = exchange(
+        state, request, target, provider, adapter, deadline, sink, credential, progress,
+    );
+    progress.total_millis = state.clock.now_millis().saturating_sub(started);
+    progress.finish(result.is_err());
+    result
+}
+
+/// The body of [`attempt_with`], which closes `progress` on every path out.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one upstream exchange, fully specified, plus the record it fills"
+)]
+fn exchange(
+    state: &RouterState,
+    request: &CanonicalRequest,
+    target: &Target,
+    provider: &Provider,
+    adapter: &dyn Adapter,
+    deadline: Deadline,
+    sink: &mut dyn EventSink,
+    credential: CredentialChoice,
+    progress: &mut AttemptProgress,
 ) -> Result<AttemptSummary, AttemptFailure> {
     let clock = state.clock.as_ref();
     let started = clock.now_millis();
@@ -452,6 +576,8 @@ pub fn attempt_with(
 
     let first_byte_millis = clock.now_millis().saturating_sub(started);
     let first_byte_micros = clock.now_micros().saturating_sub(started_micros);
+    progress.upstream_status = Some(head.status);
+    progress.first_byte_millis = Some(first_byte_millis);
     let mut decoder = BodyDecoder::new(head.body, HttpLimits::UPSTREAM);
 
     // -- Error responses ---------------------------------------------------
@@ -510,6 +636,7 @@ pub fn attempt_with(
             sink,
             &mut saw_output,
             &mut collected,
+            progress,
         )
     } else {
         let body = connection
@@ -530,6 +657,7 @@ pub fn attempt_with(
                     if event.is_semantic_output() {
                         saw_output = true;
                     }
+                    progress.observe(event);
                     sink.deliver(event).map_err(|_| cancelled(saw_output))?;
                 }
                 // The same filter the streaming path uses. A non-streaming body
@@ -742,6 +870,7 @@ fn stream_events(
     sink: &mut dyn EventSink,
     saw_output: &mut bool,
     collected: &mut Vec<CanonicalEvent>,
+    progress: &mut AttemptProgress,
 ) -> Result<(), AttemptFailure> {
     let clock = state.clock.as_ref();
     let mut parser = SseParser::with_default_limits();
@@ -853,6 +982,7 @@ fn stream_events(
                     if event.is_terminal() {
                         ended = true;
                     }
+                    progress.observe(&event);
                     // Delivery is where backpressure lives: a blocked write to
                     // a slow client stops this loop, which stops reading from
                     // the upstream (specification 14).

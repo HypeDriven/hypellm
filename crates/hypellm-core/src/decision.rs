@@ -619,6 +619,83 @@ pub struct Attempt {
     pub total_millis: u64,
     /// The outcome.
     pub outcome: AttemptOutcome,
+    /// The upstream's HTTP status, when a response head arrived.
+    ///
+    /// A 200 on a failed attempt says the failure was inside the body — an
+    /// error event, a cut stream, a deadline — rather than a refusal.
+    pub upstream_status: Option<u16>,
+    /// The provider's own error type token, sanitised by the adapter. Never
+    /// the provider's message, which can echo the prompt (specification 10).
+    pub provider_code: Option<String>,
+    /// How much output the attempt produced, by kind. Sizes only.
+    pub output: OutputTally,
+}
+
+/// How much output an attempt produced, counted as it streamed.
+///
+/// Specification 10 makes prompts, tool arguments and provider bodies
+/// sensitive by default, so this carries sizes and a shape, never bytes: enough
+/// to tell a generation that ran away inside one tool call's arguments from one
+/// that emitted a hundred calls or a page of prose, without anyone having to
+/// read what it said.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutputTally {
+    /// Output deltas received. One per decoded token from llama.cpp, so it is
+    /// the nearest thing to an output token count a stream that never finished
+    /// can have; a provider that batches tokens into larger deltas sends fewer.
+    pub deltas: u64,
+    /// Bytes of assistant text.
+    pub text_bytes: u64,
+    /// Bytes of separately reported reasoning.
+    pub reasoning_bytes: u64,
+    /// Bytes of tool-call arguments.
+    pub tool_argument_bytes: u64,
+    /// Tool calls started: deltas that named a call.
+    pub tool_calls: u32,
+    /// The period of the repetition the output ended in, in bytes, when its
+    /// last [`OutputTally::REPEAT_MIN_BYTES`] or more repeat one unit at least
+    /// three times. Computed only when an attempt fails.
+    pub repeat_period: Option<u16>,
+    /// How many trailing bytes that repetition spans.
+    pub repeat_bytes: Option<u16>,
+}
+
+impl OutputTally {
+    /// The shortest repeating tail worth reporting. Below this a run of
+    /// spaces or a closing `]}}` reads as a loop.
+    pub const REPEAT_MIN_BYTES: usize = 128;
+    /// The longest repeating unit looked for.
+    pub const REPEAT_MAX_PERIOD: usize = 512;
+
+    /// Find the repetition `tail` ends in, if any, and record it.
+    ///
+    /// The smallest period wins, so a unit that repeats as a pair is reported
+    /// as the unit. Bounded: at most `REPEAT_MAX_PERIOD × tail.len()` byte
+    /// comparisons, run once per failed attempt and never on the stream path.
+    pub fn record_repetition(&mut self, tail: &[u8]) {
+        self.repeat_period = None;
+        self.repeat_bytes = None;
+        for period in 1..=Self::REPEAT_MAX_PERIOD {
+            if period.saturating_mul(3) > tail.len() {
+                return;
+            }
+            // Count back from the end while each byte equals the one a
+            // period before it.
+            let matched = (period..tail.len())
+                .rev()
+                .take_while(|&i| {
+                    i.checked_sub(period)
+                        .is_some_and(|earlier| tail.get(i) == tail.get(earlier))
+                })
+                .count();
+            let span = matched.saturating_add(period);
+            if span >= Self::REPEAT_MIN_BYTES && span >= period.saturating_mul(3) {
+                self.repeat_period = u16::try_from(period).ok();
+                self.repeat_bytes = u16::try_from(span).ok();
+                return;
+            }
+        }
+    }
 }
 
 /// How an attempt ended.
@@ -752,6 +829,33 @@ mod tests {
         let before = codes.len();
         codes.dedup();
         assert_eq!(codes.len(), before);
+    }
+
+    #[test]
+    fn a_tail_stuck_in_a_loop_reports_its_unit_and_span() {
+        // Prose first, so the repetition is a suffix and not the whole buffer:
+        // the span must stop where the loop began.
+        let mut tail = b"{\"query\": \"select the dashboards\", \"ids\": [".to_vec();
+        for _ in 0..40 {
+            tail.extend_from_slice(b"\"a1b2\", ");
+        }
+        let mut tally = OutputTally::default();
+        tally.record_repetition(&tail);
+        assert_eq!(tally.repeat_period, Some(8), "the unit, not a multiple of it");
+        assert_eq!(tally.repeat_bytes, Some(320), "the 40 units and nothing before them");
+    }
+
+    #[test]
+    fn ordinary_output_reports_no_repetition() {
+        let tail: Vec<u8> = (0u32..2048)
+            .map(|i| u8::try_from(i.wrapping_mul(2_654_435_761) >> 24).unwrap_or(0))
+            .collect();
+        let mut tally = OutputTally::default();
+        tally.record_repetition(&tail);
+        assert_eq!(tally.repeat_period, None);
+        // Nor does a short run that merely repeats: closing brackets are not a loop.
+        tally.record_repetition(b"some text }}}}}}}}");
+        assert_eq!(tally.repeat_period, None);
     }
 
     #[test]

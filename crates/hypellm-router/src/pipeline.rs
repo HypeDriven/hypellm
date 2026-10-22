@@ -751,6 +751,9 @@ fn execute_once(
                 first_byte_millis: None,
                 total_millis: 0,
                 outcome: AttemptOutcome::DeadlineExceeded,
+                upstream_status: None,
+                provider_code: None,
+                output: hypellm_core::decision::OutputTally::default(),
             });
             return Outcome {
                 error: Some(RouterError::new(
@@ -1102,6 +1105,9 @@ fn execute_once(
         // An artifact job runs against a shim, and only against one: a job
         // routed to any other family, or a single exchange routed to a shim,
         // is refused before anything is sent.
+        // Filled by the exchange whatever its outcome, so a failed attempt
+        // leaves a record of how far it got.
+        let mut progress = dispatch::AttemptProgress::default();
         let mut result = match pass.artifact {
             Some(run) if provider.family == hypellm_core::target::ProviderFamily::Job => {
                 crate::job_exchange::run(state, request, target, provider, run, overall)
@@ -1116,7 +1122,16 @@ fn execute_once(
                 provider_code: None,
                 client_cancelled: false,
             }),
-            None => dispatch::attempt(state, request, target, provider, adapter, overall, sink),
+            None => dispatch::attempt(
+                state,
+                request,
+                target,
+                provider,
+                adapter,
+                overall,
+                sink,
+                &mut progress,
+            ),
         };
 
         // Specification 22.2 step 16's bounded overlap. A rotation performed
@@ -1141,6 +1156,7 @@ fn execute_once(
                 && provider.credential_ref.is_some()
                 && pass.artifact.is_none()
             {
+                let mut retried_progress = dispatch::AttemptProgress::default();
                 let retried = dispatch::attempt_with(
                     state,
                     request,
@@ -1150,6 +1166,7 @@ fn execute_once(
                     overall,
                     sink,
                     dispatch::CredentialChoice::Superseded,
+                    &mut retried_progress,
                 );
                 if retried.is_ok() {
                     state.telemetry.log(
@@ -1173,6 +1190,7 @@ fn execute_once(
                         ),
                     );
                     result = retried;
+                    progress = retried_progress;
                     served_by_superseded = true;
                 }
             }
@@ -1272,6 +1290,9 @@ fn execute_once(
                     first_byte_millis: summary.first_byte_millis,
                     total_millis: summary.total_millis,
                     outcome: AttemptOutcome::Success,
+                    upstream_status: progress.upstream_status,
+                    provider_code: None,
+                    output: progress.output,
                 });
                 trace.chosen = Some(target.id.clone());
                 return Outcome {
@@ -1318,7 +1339,14 @@ fn execute_once(
                 }
                 publish_breaker_state(state, &health, &target.id, clock.now_millis());
 
+                if failure.phase == dispatch::AttemptPhase::AfterOutput {
+                    saw_output = true;
+                }
+                // A client that left is recorded as that, not as the
+                // connection failure it is reported to the caller as: the
+                // trace is read by an operator asking whose fault it was.
                 let outcome = match failure.phase {
+                    _ if failure.client_cancelled => AttemptOutcome::Cancelled,
                     dispatch::AttemptPhase::BeforeAcceptance => {
                         AttemptOutcome::FailedBeforeAcceptance(failure.class)
                     }
@@ -1326,16 +1354,18 @@ fn execute_once(
                         AttemptOutcome::FailedAfterAcceptance(failure.class)
                     }
                     dispatch::AttemptPhase::AfterOutput => {
-                        saw_output = true;
                         AttemptOutcome::FailedAfterOutput(failure.class)
                     }
                 };
                 trace.attempts.push(Attempt {
                     target: target.id.clone(),
                     sequence: u16::try_from(sequence).unwrap_or(u16::MAX),
-                    first_byte_millis: None,
-                    total_millis: 0,
+                    first_byte_millis: progress.first_byte_millis,
+                    total_millis: progress.total_millis,
                     outcome,
+                    upstream_status: progress.upstream_status,
+                    provider_code: failure.provider_code.clone(),
+                    output: progress.output,
                 });
 
                 state.telemetry.count(
@@ -1659,9 +1689,16 @@ pub fn record_completion(
         hypellm_telemetry::Field::Alias,
         request.requested_model.as_str(),
     )
+    // On a failure nothing was chosen, and the target that failed is the
+    // first thing an operator asks about.
     .opt_str_field(
         hypellm_telemetry::Field::Target,
-        outcome.trace.chosen.as_ref().map(TargetId::as_str),
+        outcome
+            .trace
+            .chosen
+            .as_ref()
+            .or_else(|| outcome.trace.attempts.last().map(|a| &a.target))
+            .map(TargetId::as_str),
     )
     .str_field(
         hypellm_telemetry::Field::Operation,
@@ -1703,8 +1740,54 @@ pub fn record_completion(
             ),
         None => event,
     };
+    let event = match outcome.trace.attempts.last() {
+        Some(attempt) if !outcome.is_success() => with_failed_attempt(event, attempt),
+        _ => event,
+    };
 
     state.telemetry.log(&event);
+}
+
+/// The last attempt of a failed request, on its `request.completed` line.
+///
+/// A failure has no usage to report, and without this a stream cut off after
+/// twenty minutes of tool-call arguments and a refusal in the first second
+/// left the same line. Statuses, codes and sizes only (specification 10): the
+/// provider's message and the output itself stay out of the log.
+fn with_failed_attempt(
+    event: hypellm_telemetry::Event,
+    attempt: &Attempt,
+) -> hypellm_telemetry::Event {
+    use hypellm_telemetry::Field;
+    let output = &attempt.output;
+    let mut event = event
+        .str_field(Field::AttemptOutcome, attempt.outcome.code())
+        .opt_str_field(
+            Field::ErrorClass,
+            attempt.outcome.error_class().map(|c| c.as_str()),
+        )
+        .opt_str_field(Field::ProviderCode, attempt.provider_code.as_deref())
+        .int_field(Field::DurationMs, attempt.total_millis);
+    if let Some(status) = attempt.upstream_status {
+        event = event.int_field(Field::UpstreamStatus, u64::from(status));
+    }
+    if let Some(first_byte) = attempt.first_byte_millis {
+        event = event.int_field(Field::FirstByteMs, first_byte);
+    }
+    if output.deltas > 0 {
+        event = event
+            .int_field(Field::OutputDeltas, output.deltas)
+            .int_field(Field::TextBytes, output.text_bytes)
+            .int_field(Field::ReasoningBytes, output.reasoning_bytes)
+            .int_field(Field::ToolArgumentBytes, output.tool_argument_bytes)
+            .int_field(Field::ToolCalls, u64::from(output.tool_calls));
+    }
+    if let (Some(period), Some(span)) = (output.repeat_period, output.repeat_bytes) {
+        event = event
+            .int_field(Field::RepeatPeriod, u64::from(period))
+            .int_field(Field::RepeatBytes, u64::from(span));
+    }
+    event
 }
 
 /// Fold a completed request into the rolling rate and latency window.

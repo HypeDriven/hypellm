@@ -3188,6 +3188,34 @@ impl AdminApi {
                             attempt.first_byte_millis.map(Value::from),
                         );
                         object.push("total_millis", Value::from(attempt.total_millis));
+                        object.push_opt(
+                            "upstream_status",
+                            attempt.upstream_status.map(|s| Value::from(u64::from(s))),
+                        );
+                        object.push_opt(
+                            "provider_code",
+                            attempt.provider_code.as_deref().map(Value::from),
+                        );
+                        // Sizes and a shape, never the output (specification 10).
+                        let tally = &attempt.output;
+                        let mut output = Object::new();
+                        output.push("deltas", Value::from(tally.deltas));
+                        output.push("text_bytes", Value::from(tally.text_bytes));
+                        output.push("reasoning_bytes", Value::from(tally.reasoning_bytes));
+                        output.push(
+                            "tool_argument_bytes",
+                            Value::from(tally.tool_argument_bytes),
+                        );
+                        output.push("tool_calls", Value::from(u64::from(tally.tool_calls)));
+                        output.push_opt(
+                            "repeat_period",
+                            tally.repeat_period.map(|p| Value::from(u64::from(p))),
+                        );
+                        output.push_opt(
+                            "repeat_bytes",
+                            tally.repeat_bytes.map(|b| Value::from(u64::from(b))),
+                        );
+                        object.push("output", Value::Object(output));
                         Value::Object(object)
                     })
                     .collect(),

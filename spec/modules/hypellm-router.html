@@ -465,6 +465,12 @@ management listeners differ, so both are given.</p>
 <td><code>wire_http1::Limits::UPSTREAM</code> in <code>dispatch::attempt</code> (cumulative across chunks)</td>
 </tr>
 <tr>
+<td>Output tail kept per attempt, for loop detection</td>
+<td>2 KiB</td>
+<td>—</td>
+<td><code>dispatch::AttemptProgress::TAIL_BYTES</code>; read once when an attempt fails, to find the repetition its output ended in, then dropped. Never logged or traced</td>
+</tr>
+<tr>
 <td>Upstream SSE line buffer / event</td>
 <td>256 KiB / 1 MiB</td>
 <td>—</td>

@@ -99,8 +99,8 @@ pub use canonical::{
     Role, RoutingHints, Sampling, StreamOptions, TokenEstimate, ToolCall, ToolChoice, ToolDef,
 };
 pub use decision::{
-    Attempt, AttemptOutcome, Candidate, DecisionTrace, Exclusion, ExclusionReason, ResidencyClass,
-    ScoreTerms,
+    Attempt, AttemptOutcome, Candidate, DecisionTrace, Exclusion, ExclusionReason, OutputTally,
+    ResidencyClass, ScoreTerms,
 };
 pub use error::{ErrorCode, RouterError};
 pub use fleet_access::{FleetAccessDefault, FleetGrant, FleetModelSelector, HostSelector};

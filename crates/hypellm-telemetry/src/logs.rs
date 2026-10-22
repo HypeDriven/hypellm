@@ -78,7 +78,7 @@ pub enum Field {
     KeyId,
     /// The client-visible alias.
     Alias,
-    /// The chosen target.
+    /// The chosen target; on a failed request, the one last attempted.
     Target,
     /// The provider family.
     Family,
@@ -128,6 +128,30 @@ pub enum Field {
     Capability,
     /// A duration in milliseconds, for fleet work.
     DurationMs,
+    /// How the last attempt ended, from the decision trace's closed set.
+    AttemptOutcome,
+    /// The upstream error class of the last attempt.
+    ErrorClass,
+    /// The provider's own error type token, sanitised by the adapter.
+    ProviderCode,
+    /// The upstream's HTTP status — distinct from [`Field::Status`], which is
+    /// the client's.
+    UpstreamStatus,
+    /// Output deltas an attempt received: about one per token from llama.cpp.
+    OutputDeltas,
+    /// Bytes of assistant text an attempt produced.
+    TextBytes,
+    /// Bytes of reasoning an attempt produced.
+    ReasoningBytes,
+    /// Bytes of tool-call arguments an attempt produced. A size, never the
+    /// arguments.
+    ToolArgumentBytes,
+    /// Tool calls an attempt started.
+    ToolCalls,
+    /// The period, in bytes, of the repetition an attempt's output ended in.
+    RepeatPeriod,
+    /// How many trailing bytes that repetition spans.
+    RepeatBytes,
 }
 
 impl Field {
@@ -165,6 +189,17 @@ impl Field {
             Self::Deployment => "deployment",
             Self::Capability => "capability",
             Self::DurationMs => "duration_ms",
+            Self::AttemptOutcome => "attempt_outcome",
+            Self::ErrorClass => "error_class",
+            Self::ProviderCode => "provider_code",
+            Self::UpstreamStatus => "upstream_status",
+            Self::OutputDeltas => "output_deltas",
+            Self::TextBytes => "text_bytes",
+            Self::ReasoningBytes => "reasoning_bytes",
+            Self::ToolArgumentBytes => "tool_argument_bytes",
+            Self::ToolCalls => "tool_calls",
+            Self::RepeatPeriod => "repeat_period",
+            Self::RepeatBytes => "repeat_bytes",
         }
     }
 
@@ -198,6 +233,21 @@ impl Field {
             Self::Bytes,
             Self::AuditHead,
             Self::Component,
+            Self::Host,
+            Self::Deployment,
+            Self::Capability,
+            Self::DurationMs,
+            Self::AttemptOutcome,
+            Self::ErrorClass,
+            Self::ProviderCode,
+            Self::UpstreamStatus,
+            Self::OutputDeltas,
+            Self::TextBytes,
+            Self::ReasoningBytes,
+            Self::ToolArgumentBytes,
+            Self::ToolCalls,
+            Self::RepeatPeriod,
+            Self::RepeatBytes,
         ]
     }
 }

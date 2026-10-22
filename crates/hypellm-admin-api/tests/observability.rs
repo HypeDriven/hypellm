@@ -164,6 +164,16 @@ fn detailed_trace(admin: &Harness, id: u128) -> DecisionTrace {
                 first_byte_millis: None,
                 total_millis: 120,
                 outcome: AttemptOutcome::FailedBeforeAcceptance(UpstreamErrorClass::Connection),
+                upstream_status: Some(503),
+                provider_code: Some("overloaded_error".to_owned()),
+                output: hypellm_core::decision::OutputTally {
+                    deltas: 7,
+                    tool_argument_bytes: 900,
+                    tool_calls: 1,
+                    repeat_period: Some(12),
+                    repeat_bytes: Some(600),
+                    ..Default::default()
+                },
             },
             Attempt {
                 target: local,
@@ -171,6 +181,9 @@ fn detailed_trace(admin: &Harness, id: u128) -> DecisionTrace {
                 first_byte_millis: Some(40),
                 total_millis: 900,
                 outcome: AttemptOutcome::Success,
+                upstream_status: Some(200),
+                provider_code: None,
+                output: Default::default(),
             },
         ],
         routing_micros: 137,
@@ -1155,6 +1168,14 @@ fn a_decision_trace_reports_every_candidate_exclusion_and_attempt_the_router_rec
         "the class, never the provider's error text"
     );
     assert!(attempts[0].opt_field_i64("first_byte_millis").unwrap().is_none());
+    assert_eq!(attempts[0].field_i64("upstream_status").unwrap(), 503);
+    assert_eq!(attempts[0].field_str("provider_code").unwrap(), "overloaded_error");
+    let output = attempts[0].get("output").expect("an output tally");
+    assert_eq!(output.field_i64("deltas").unwrap(), 7);
+    assert_eq!(output.field_i64("tool_argument_bytes").unwrap(), 900);
+    assert_eq!(output.field_i64("tool_calls").unwrap(), 1);
+    assert_eq!(output.field_i64("repeat_period").unwrap(), 12);
+    assert_eq!(output.field_i64("repeat_bytes").unwrap(), 600);
     assert_eq!(attempts[1].field_str("outcome").unwrap(), "success");
     assert_eq!(attempts[1].field_i64("first_byte_millis").unwrap(), 40);
     assert_eq!(attempts[1].field_i64("sequence").unwrap(), 1);

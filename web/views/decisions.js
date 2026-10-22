@@ -353,6 +353,11 @@ function attemptsPanel(trace) {
               : mono(row.outcome),
         },
         { label: 'Error class', cell: (row) => mono(row.error_class) },
+        // The upstream's own status: a 200 beside a failure means it failed
+        // inside the body, not that the provider refused.
+        { label: 'Upstream', numeric: true, cell: (row) => integer(row.upstream_status) },
+        { label: 'Provider code', cell: (row) => mono(row.provider_code) },
+        { label: 'Output', cell: (row) => outputSummary(row.output) },
         {
           label: 'First byte',
           numeric: true,
@@ -368,6 +373,28 @@ function attemptsPanel(trace) {
         : 'No attempt was made: no target was selected, so nothing was sent upstream.',
     }),
   });
+}
+
+/**
+ * What an attempt produced, as sizes. The trace carries no output, by design.
+ *
+ * @param {object | undefined} output
+ * @returns {Node}
+ */
+function outputSummary(output) {
+  if (!output || typeof output !== 'object' || !(output.deltas > 0)) {
+    return text('—');
+  }
+  const parts = [`${integer(output.deltas)} deltas`];
+  if (output.text_bytes > 0) parts.push(`text ${integer(output.text_bytes)} B`);
+  if (output.reasoning_bytes > 0) parts.push(`reasoning ${integer(output.reasoning_bytes)} B`);
+  if (output.tool_argument_bytes > 0 || output.tool_calls > 0) {
+    parts.push(`${integer(output.tool_calls)} tool calls, ${integer(output.tool_argument_bytes)} B arguments`);
+  }
+  if (typeof output.repeat_period === 'number') {
+    parts.push(`ended repeating a ${integer(output.repeat_period)} B unit over ${integer(output.repeat_bytes)} B`);
+  }
+  return text(parts.join('; '));
 }
 
 /**

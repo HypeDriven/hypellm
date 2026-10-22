@@ -793,6 +793,7 @@ fn probe_credential(
         adapter,
         deadline,
         &mut sink,
+        &mut crate::dispatch::AttemptProgress::default(),
     );
     let millis = clock.now_millis().saturating_sub(started);
 

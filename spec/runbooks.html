@@ -225,6 +225,33 @@ construction can hold no prompt, credential, or upstream URL. A trace belonging
 to another tenant is reported as <strong>not found</strong>, not as forbidden.</p>
 <p>Traces are an in-memory ring of 4 096 entries and are lost on restart
 (<code>crates/hypellm-admin-api/src/decisions.rs</code>).</p>
+<p><strong>What a failed attempt records.</strong> Each attempt in the trace carries
+<code>upstream_status</code>, the adapter's sanitised <code>provider_code</code>, its real
+<code>first_byte_millis</code> and <code>total_millis</code>, and an <code>output</code> tally: deltas
+received (about one per token from llama.cpp), bytes of text, reasoning and
+tool-call arguments, tool calls started, and — when the output ended in a loop —
+<code>repeat_period</code> (the repeating unit, in bytes) and <code>repeat_bytes</code> (how far
+back the repetition reaches). The failed request's <code>request.completed</code> line
+carries the same facts for its last attempt: <code>target</code>, <code>attempt_outcome</code>,
+<code>error_class</code>, <code>provider_code</code>, <code>upstream_status</code>, <code>duration_ms</code>,
+<code>output_deltas</code>, <code>text_bytes</code>, <code>reasoning_bytes</code>,
+<code>tool_argument_bytes</code>, <code>tool_calls</code>, <code>repeat_period</code>,
+<code>repeat_bytes</code>. All of them are sizes, codes and statuses. The output and the
+provider's error message are never recorded, because specification 10 makes
+both sensitive and provider messages routinely echo the prompt.</p>
+<p>Three readings that come up:</p>
+<ul>
+<li><code>code=invalid_request</code> with <code>attempt_outcome=cancelled</code>: the client
+closed the connection, or stopped reading until the slow-client timeout fired. The
+caller is told <code>invalid_request</code> because nobody is left to receive it; it
+is not evidence against the target, and the breaker does not count it.</li>
+<li><code>upstream_status=200</code> beside a failure: the provider accepted and the
+failure was inside the body, from an error event, a stream that ended without
+finishing, or the deadline.</li>
+<li>A large <code>tool_argument_bytes</code> with a <code>repeat_period</code>: the model was looping
+inside a tool call's arguments when it was stopped. Cap the output with the
+request's <code>max_tokens</code>, or fix whatever sampler setting made it loop.</li>
+</ul>
 <h3 id="2-automatic-breaking-is-already-running">2. Automatic breaking is already running</h3>
 <p>Before you intervene, know what the router does on its own
 (<code>crates/hypellm-core/src/health.rs</code>): a breaker opens on the configured failure
