@@ -1029,8 +1029,14 @@ impl PolicySnapshot {
         } else {
             0
         };
+        let conversation_bonus = if req.hints.conversation_preferred_target.as_ref() == Some(&target.id) {
+            ScoreTerms::CONVERSATION_SLICE
+        } else {
+            0
+        };
         let affinity = live
             .affinity_bonus(&target.id)
+            .max(conversation_bonus)
             .clamp(0, ScoreTerms::CONVERSATION_SLICE)
             .saturating_add(warmth)
             .saturating_add(hint_bonus);
