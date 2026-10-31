@@ -77,6 +77,7 @@ pub const OVERLAP_HINT_MILLIS: u64 = 5 * 60 * 1000;
 pub mod admission;
 pub mod budget;
 pub mod canonical;
+pub mod conversation_affinity;
 pub mod decision;
 pub mod error;
 pub mod event;
@@ -98,6 +99,7 @@ pub use canonical::{
     Modality, Operation, QualityClass, ReasoningEffort, RequestLimits, Residency, ResponseFormat,
     Role, RoutingHints, Sampling, StreamOptions, TokenEstimate, ToolCall, ToolChoice, ToolDef,
 };
+pub use conversation_affinity::{ConversationAffinity, ConversationKey};
 pub use decision::{
     Attempt, AttemptOutcome, Candidate, DecisionTrace, Exclusion, ExclusionReason, OutputTally,
     ResidencyClass, ScoreTerms,
