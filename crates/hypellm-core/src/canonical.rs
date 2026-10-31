@@ -985,6 +985,10 @@ pub struct StreamOptions {
 pub struct RoutingHints {
     /// Prefer this target if it is already eligible.
     pub prefer_target: Option<TargetId>,
+    /// Opaque conversation identifier used for soft prefix-cache affinity.
+    pub conversation_id: Option<String>,
+    /// Internal router-observed target; never accepted from client JSON.
+    pub conversation_preferred_target: Option<TargetId>,
     /// Require local inference.
     pub require_local: bool,
     /// An idempotency key supplied by the client.
@@ -995,7 +999,7 @@ impl RoutingHints {
     /// True when the client supplied any hint at all.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.prefer_target.is_none() && !self.require_local && self.idempotency_key.is_none()
+        self.prefer_target.is_none() && self.conversation_id.is_none() && self.conversation_preferred_target.is_none() && !self.require_local && self.idempotency_key.is_none()
     }
 }
 
