@@ -446,6 +446,8 @@ impl hypellm_admin_api::CredentialSink for CredentialStore {
 /// truth or an operator's change would apply to only one of them.
 #[derive(Debug)]
 pub struct RouterState {
+    /// Lazily initialized bounded per-conversation cache affinity observations.
+    pub conversation_affinity: std::sync::OnceLock<std::sync::Mutex<hypellm_core::ConversationAffinity>>,
     /// The active configuration. Swapped atomically on reload.
     pub config: Arc<Activatable<ValidatedConfig>>,
     /// API keys.
