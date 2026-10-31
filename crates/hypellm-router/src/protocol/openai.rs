@@ -1180,8 +1180,19 @@ pub(crate) fn parse_hints(
         })
         .transpose()?;
 
+    let conversation_id = raw
+        .opt_field_str("conversation_id")
+        .map_err(type_error)?
+        .map(str::to_owned);
+    if let Some(id) = &conversation_id {
+        if id.is_empty() || id.len() > 128 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_: .".contains(&b)) || id.contains(' ') {
+            return Err(RouterError::invalid_request("invalid conversation_id").with_param("hypellm_routing.conversation_id"));
+        }
+    }
     Ok(RoutingHints {
         prefer_target,
+        conversation_id,
+        conversation_preferred_target: None,
         require_local: raw
             .opt_field_bool("require_local")
             .map_err(type_error)?
