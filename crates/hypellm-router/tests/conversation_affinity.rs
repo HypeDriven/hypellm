@@ -9,13 +9,15 @@
 //! - affinity is a score, not a pin — a target whose breaker is open is not
 //!   chosen, and the conversation follows the target that served it instead;
 //! - an observation from before the target was started again is discarded;
-//! - zero in the settings switches it off and records nothing.
+//! - zero in the settings switches it off and records nothing;
+//! - a harness that sends no identifier gets the same affinity from its
+//!   conversation's opening messages, which it resends on every turn.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::BTreeSet;
 
-use hypellm_core::canonical::{CanonicalRequest, Operation};
+use hypellm_core::canonical::{CanonicalRequest, Message, Operation, Role};
 use hypellm_core::event::CanonicalEvent;
 use hypellm_core::ids::{AliasId, RequestId, TargetId};
 use hypellm_core::rbac::PermissionSet;
@@ -72,18 +74,47 @@ binding id=default scope=tenant:acme model=* prefer=*
     }
 }
 
+/// A request naming `conversation`; with `None`, a one-off whose opening is
+/// unique, so nothing — not even its fingerprint — ties it to another.
 fn request(rid: u128, conversation: Option<&str>) -> CanonicalRequest {
     let mut request = hypellm_adapters::testing::request_fixture();
     request.requested_model = AliasId::new("test-alias").unwrap();
     request.request_id = RequestId::from_u128(rid);
     request.hints.conversation_id = conversation.map(str::to_owned);
+    if conversation.is_none() {
+        request.messages = vec![Message::text(Role::User, format!("one-off {rid}"))];
+    }
+    request
+}
+
+/// Turn `turn` of a harness conversation that opens with `opening`: the same
+/// system prompt and first message every time, then the turns since. No
+/// conversation identifier, as a harness sends none.
+fn harness_turn(rid: u128, opening: &str, turn: usize) -> CanonicalRequest {
+    let mut request = request(rid, None);
+    request.messages = vec![
+        Message::text(Role::System, "You are a coding agent."),
+        Message::text(Role::User, opening),
+    ];
+    for n in 0..turn {
+        request
+            .messages
+            .push(Message::text(Role::Assistant, format!("step {n}")));
+        request
+            .messages
+            .push(Message::text(Role::User, format!("continue {n}")));
+    }
     request
 }
 
 fn serve(router: &TestRouter, rid: u128, conversation: Option<&str>) -> TargetId {
+    serve_request(router, &request(rid, conversation))
+}
+
+fn serve_request(router: &TestRouter, request: &CanonicalRequest) -> TargetId {
     let outcome = pipeline::execute(
         &router.state,
-        &request(rid, conversation),
+        request,
         &[],
         PermissionSet::empty(),
         &mut Sink,
@@ -213,4 +244,28 @@ fn zero_in_the_settings_switches_affinity_off_and_records_nothing() {
             "{settings}"
         );
     }
+}
+
+#[test]
+fn a_harness_that_sends_no_identifier_gets_affinity_from_its_opening() {
+    let f = fixture("");
+    let first = serve_request(&f.router, &harness_turn(1, "Fix the parser.", 0));
+    // Adversarial: as one-offs, these identifiers would land elsewhere.
+    let elsewhere = ids_landing_on(&f.router, &other(&first), 100..100 + TURNS * 4);
+    assert!(
+        elsewhere.len() >= 4,
+        "the fixture must spread without affinity"
+    );
+    for (turn, rid) in elsewhere.into_iter().enumerate() {
+        assert_eq!(
+            serve_request(&f.router, &harness_turn(rid, "Fix the parser.", turn + 1)),
+            first,
+            "turn {turn}"
+        );
+    }
+    // Conversations that open differently are not pulled along with it.
+    let spread: BTreeSet<TargetId> = (500..500 + TURNS)
+        .map(|rid| serve_request(&f.router, &harness_turn(rid, &format!("task {rid}"), 3)))
+        .collect();
+    assert_eq!(spread.len(), 2, "distinct openings still spread");
 }

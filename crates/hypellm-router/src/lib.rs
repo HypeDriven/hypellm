@@ -49,6 +49,7 @@
 )]
 
 pub mod admin;
+pub mod conversation;
 pub mod dispatch;
 pub mod fleet;
 pub mod job_exchange;

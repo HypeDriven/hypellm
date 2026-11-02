@@ -1162,10 +1162,21 @@ pub(crate) fn parse_hints(
     // hints" is decided before anything about the payload can change the
     // outcome. Ordering it second made the gate unreachable for any body that
     // omitted the key, which is every body a test wrote under the wrong one.
+    //
+    // `conversation_id` is the one exception, and it is read for every
+    // principal: it names no target, only a key under which the router looks
+    // up the target it already observed serving this tenant, principal and
+    // alias — so it cannot steer a caller anywhere it was not routed before.
+    // Since it is honoured for everyone it is validated for everyone.
+    let raw = value.get_present(HINTS_KEY);
+    let conversation_id = raw.map(parse_conversation_id).transpose()?.flatten();
     if !context.hints_permitted {
-        return Ok(RoutingHints::default());
+        return Ok(RoutingHints {
+            conversation_id,
+            ..RoutingHints::default()
+        });
     }
-    let Some(raw) = value.get_present(HINTS_KEY) else {
+    let Some(raw) = raw else {
         return Ok(RoutingHints::default());
     };
 
@@ -1180,19 +1191,6 @@ pub(crate) fn parse_hints(
         })
         .transpose()?;
 
-    let conversation_id = raw
-        .opt_field_str("conversation_id")
-        .map_err(type_error)?
-        .map(str::to_owned);
-    if conversation_id
-        .as_deref()
-        .is_some_and(|id| !hypellm_core::valid_conversation_id(id))
-    {
-        return Err(RouterError::invalid_request(
-            "conversation_id must be 1 to 128 ASCII letters, digits or -_:.",
-        )
-        .with_param("hypellm_routing.conversation_id"));
-    }
     Ok(RoutingHints {
         prefer_target,
         conversation_id,
@@ -1205,6 +1203,20 @@ pub(crate) fn parse_hints(
             .map_err(type_error)?
             .map(str::to_owned),
     })
+}
+
+/// `hypellm_routing.conversation_id`, refused unless it is a valid identifier.
+fn parse_conversation_id(raw: &Value) -> Result<Option<String>, RouterError> {
+    let Some(id) = raw.opt_field_str("conversation_id").map_err(type_error)? else {
+        return Ok(None);
+    };
+    if !hypellm_core::valid_conversation_id(id) {
+        return Err(RouterError::invalid_request(
+            "conversation_id must be 1 to 128 ASCII letters, digits or -_:.",
+        )
+        .with_param("hypellm_routing.conversation_id"));
+    }
+    Ok(Some(id.to_owned()))
 }
 
 // -- Rendering --------------------------------------------------------------
@@ -2637,27 +2649,35 @@ mod tests {
     }
 
     #[test]
-    fn a_conversation_id_is_gated_like_every_hint_and_bounded_when_permitted() {
+    fn a_conversation_id_is_honoured_for_every_principal_and_nothing_else_comes_with_it() {
         let body = |id: &str| {
-            format!(r#"{{"model":"m","messages":[{{"role":"user","content":"x"}}],"hypellm_routing":{{"conversation_id":"{id}"}}}}"#)
+            format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":"x"}}],"hypellm_routing":{{"conversation_id":"{id}","prefer_target":"local:qwen","require_local":true}}}}"#
+            )
         };
-        // Unpermitted: dropped, even when malformed, as the other hints are.
-        assert!(parse_chat(&body("bad id")).unwrap().hints.conversation_id.is_none());
-
         let mut permitted = context();
         permitted.hints_permitted = true;
-        let parse = |id: &str| parse_chat_request(body(id).as_bytes(), &permitted, &Limits::DEFAULT);
-        assert_eq!(
-            parse("conv-1:a.b_c").unwrap().hints.conversation_id.as_deref(),
-            Some("conv-1:a.b_c")
-        );
-        for bad in ["", "has space", "slash/", &"x".repeat(129)] {
-            let error = parse(bad).expect_err(bad);
+        for context in [context(), permitted] {
+            let parse =
+                |id: &str| parse_chat_request(body(id).as_bytes(), &context, &Limits::DEFAULT);
+            let request = parse("conv-1:a.b_c").unwrap();
+            assert_eq!(request.hints.conversation_id.as_deref(), Some("conv-1:a.b_c"));
+            // The exemption is the identifier alone: the hints that do name
+            // a target still need the permission.
             assert_eq!(
-                error.param.as_ref().map(|p| p.as_str()),
-                Some("hypellm_routing.conversation_id"),
-                "{bad:?}"
+                request.hints.prefer_target.is_some(),
+                context.hints_permitted,
+                "prefer_target must follow the permission"
             );
+            assert_eq!(request.hints.require_local, context.hints_permitted);
+            for bad in ["", "has space", "slash/", &"x".repeat(129)] {
+                let error = parse(bad).expect_err(bad);
+                assert_eq!(
+                    error.param.as_ref().map(|p| p.as_str()),
+                    Some("hypellm_routing.conversation_id"),
+                    "{bad:?}"
+                );
+            }
         }
     }
 

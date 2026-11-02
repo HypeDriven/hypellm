@@ -662,7 +662,8 @@ impose a floor; the higher of the two applies, so this can narrow the candidate
 set and never widens it.</p>
 <h3 id="routing-hints">Routing hints</h3>
 <p>An optional <code>hypellm_routing</code> object, honoured only if the key is permitted to
-send hints — otherwise silently ignored, by design.</p>
+send hints — otherwise silently ignored, by design. <code>conversation_id</code> is the
+exception, honoured for every key, because it names no target.</p>
 <pre><code class="language-json">{
   &quot;model&quot;: &quot;chat-standard&quot;,
   &quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;ping&quot;}],
@@ -686,7 +687,12 @@ smallest slice of the score — a tie-break between equally suitable targets tha
 cannot create eligibility, beat a warmer target or outrank a binding. The
 router remembers only the target, never the prompt, keyed by tenant, principal
 and alias, so one caller cannot steer another's conversation. Send a stable
-identifier per conversation; a new one per turn does nothing.</li>
+identifier per conversation; a new one per turn does nothing.
+<p>Coding harnesses need not send it. Without one, the router recognises a
+conversation by its opening — the system messages and first user message,
+which a harness resends unchanged on every turn — as a keyed hash
+(<code>prefix:</code> plus 32 hex digits) that holds no prompt text. An explicit
+<code>conversation_id</code> takes precedence.</p></li>
 <li><code>require_local</code> excludes targets not marked local — inference that would
 leave the deployment.</li>
 <li><code>idempotency_key</code> marks the request safe to fail over after a provider has

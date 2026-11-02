@@ -951,6 +951,9 @@ impl Router {
 
         let state = Arc::new(RouterState {
             conversation_affinity: std::sync::Mutex::new(hypellm_core::ConversationAffinity::new()),
+            conversation_fingerprint_key: hypellm_crypto::secret::Secret::new(
+                crate::conversation::fingerprint_key(&secrets.pseudonym),
+            ),
             jobs,
             anonymous_access,
             config: Arc::new(Activatable::new(config)),

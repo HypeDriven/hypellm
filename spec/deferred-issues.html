@@ -176,7 +176,7 @@
 </tr>
 <tr>
 <td>Conversation affinity</td>
-<td><code>conversation_id</code> is a hint, so only a principal with <code>OperateTargets</code> can send it; the table is in memory, per router, and cannot see a cache eviction or a restart it did not observe.</td>
+<td>Harnesses get it without sending anything, from their conversation's opening; the table is in memory, per router, and cannot see a cache eviction or a restart it did not observe.</td>
 <td>Treat it as a best-effort cache-hit improvement, never as a guarantee of where a turn runs.</td>
 </tr>
 <tr>
@@ -321,9 +321,9 @@
 <p>This bound is the reason the hint is admissible at all. A hint that could beat policy would be a client-controlled destination by a longer route, which Appendix B forbids.</p>
 <h2 id="conversation-affinity-is-per-router-and-best-effort">Conversation affinity is per router, and best-effort</h2>
 <p><strong>Specification:</strong> §6.3 (the affinity term). <strong>Implementation:</strong> <code>hypellm_core::conversation_affinity</code>, <code>crates/hypellm-router/src/pipeline.rs</code>.</p>
-<p><code>hypellm_routing.conversation_id</code> sends a turn back to the target that last served the conversation, as the 4,000-point conversation slice of the affinity term. What it does not do:</p>
+<p>A turn goes back to the target that last served its conversation, as the 4,000-point conversation slice of the affinity term. The conversation is <code>hypellm_routing.conversation_id</code> when a caller sends one — honoured for every principal, unlike the other hints, because it names no target — and otherwise a keyed hash of the system messages and first user message (<code>crates/hypellm-router/src/conversation.rs</code>). What it does not do:</p>
 <ul>
-<li><strong>It needs hint permission.</strong> It travels in <code>hypellm_routing</code>, which is dropped unless the principal holds <code>OperateTargets</code> (§5.1). A plain inference key's <code>conversation_id</code> is ignored.</li>
+<li><strong>The derived identifier is only as stable as the opening.</strong> A harness that rewrites its first messages mid-session — compaction, an edited system prompt — starts a new conversation as far as the router can tell. Two conversations that open identically are one conversation; that costs nothing, since their prefixes are shared too. Only the first 16 KiB of each opening message's text is hashed, with its full length, and image, document, audio and tool-result parts contribute their kind, not their bytes.</li>
 <li><strong>It is not a cache oracle.</strong> The router remembers which target answered, not what is in its KV cache. A cache evicted under memory pressure, or a server restarted faster than two probe rounds, still attracts the conversation until its observation expires or another target serves it. Restarts it does see — a probe outage, or a fleet activation — drop the observations.</li>
 <li><strong>It is per router and in memory.</strong> Independent nodes do not share it, and a restart loses it; the next turn of each conversation routes as if it were the first.</li>
 <li><strong>Callers sharing a principal share the namespace.</strong> Two callers authenticated as one principal — every anonymous caller, for example — who choose the same identifier share an entry. It can move their turns only between targets both were eligible for.</li>

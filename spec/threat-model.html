@@ -669,7 +669,11 @@ target at all: the router maps it to the target it last observed serving that
 tenant, principal and alias, so a caller can only be steered back to a target it
 was already routed to, and the table holding those observations is bounded by
 <code>settings conversation_affinity_max_entries</code>
-(<code>crates/hypellm-core/src/conversation_affinity.rs</code>).</p>
+(<code>crates/hypellm-core/src/conversation_affinity.rs</code>). That is also why it alone
+is read without <code>OperateTargets</code>. When a request names none, the identifier is an
+HMAC of its opening messages under a key derived from <code>pseudonym.key</code>
+(<code>crates/hypellm-router/src/conversation.rs</code>): the table holds no prompt text,
+and its contents cannot be confirmed against a guessed prompt without the key.</p>
 <p>Residual risk: a principal holding <code>OperateTargets</code> <em>and</em> accepting prompts from
 untrusted sources could be steered between configured targets. That is a
 narrower blast radius than an arbitrary destination, but it is real, and

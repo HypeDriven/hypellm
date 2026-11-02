@@ -450,6 +450,9 @@ pub struct RouterState {
     /// affinity. Bounded by `settings conversation_affinity_max_entries`,
     /// read at each observation so a reload applies without a restart.
     pub conversation_affinity: std::sync::Mutex<hypellm_core::ConversationAffinity>,
+    /// The key a conversation's opening messages are fingerprinted under when
+    /// the request names no `conversation_id` (`crate::conversation`).
+    pub conversation_fingerprint_key: hypellm_crypto::secret::Secret<32>,
     /// The active configuration. Swapped atomically on reload.
     pub config: Arc<Activatable<ValidatedConfig>>,
     /// API keys.

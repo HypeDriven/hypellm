@@ -347,7 +347,10 @@ hints are dropped silently unless the principal holds
 <code>TargetId</code> and resolved against configured targets by the router core, never
 used as an address. <code>conversation_id</code> is validated by
 <code>hypellm_core::valid_conversation_id</code> and only ever looked up: the target it maps
-to is one <code>pipeline</code> recorded after serving the same tenant, principal and alias. Prompts, tool schemas, and image URLs are carried as inert
+to is one <code>pipeline</code> recorded after serving the same tenant, principal and alias.
+It is the one hint read without <code>OperateTargets</code>. Absent one, <code>conversation</code>
+derives an identifier as an HMAC of the opening messages (at most 16 messages, 16 KiB of
+text each) under a key derived from <code>pseudonym.key</code>, so no prompt text is held. Prompts, tool schemas, and image URLs are carried as inert
 data. Nothing in <code>protocol/</code> interprets a field as configuration, destination,
 or credential.</li>
 <li><strong>The control socket is unauthenticated.</strong> <code>main.rs</code> binds a Unix socket and

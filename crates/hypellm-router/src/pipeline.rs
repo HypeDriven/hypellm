@@ -661,19 +661,35 @@ fn affinity_limits(config: &hypellm_config::ValidatedConfig) -> hypellm_core::Af
     }
 }
 
-/// The request's conversation, when it names one and affinity is on.
+/// The request's conversation, when affinity is on.
+///
+/// An explicit `hypellm_routing.conversation_id` wins; otherwise the
+/// conversation is recognised by its opening messages, which is how a harness
+/// that sends no identifier still gets affinity (`crate::conversation`).
 fn conversation_key(
+    state: &RouterState,
     config: &hypellm_config::ValidatedConfig,
     request: &CanonicalRequest,
 ) -> Option<hypellm_core::ConversationKey> {
     if affinity_limits(config).disabled() {
         return None;
     }
+    let derived;
+    let id = match request.hints.conversation_id.as_deref() {
+        Some(id) => id,
+        None => {
+            derived = crate::conversation::prefix_fingerprint(
+                state.conversation_fingerprint_key.expose(),
+                request,
+            )?;
+            derived.as_str()
+        }
+    };
     hypellm_core::ConversationKey::new(
         request.tenant.clone(),
         request.principal.clone(),
         request.requested_model.clone(),
-        request.hints.conversation_id.as_deref()?,
+        id,
     )
 }
 
@@ -764,7 +780,7 @@ fn execute_once(
     let fleet_view = state.fleet_view(request, groups, permissions);
     // Conversation affinity is a soft score, never a pin or an eligibility
     // override: the live state reports it as part of the affinity term.
-    let conversation = conversation_key(config, request);
+    let conversation = conversation_key(state, config, request);
     let conversation_target = conversation
         .as_ref()
         .and_then(|key| conversation_target(state, &fleet_view, key, context.now_millis));
