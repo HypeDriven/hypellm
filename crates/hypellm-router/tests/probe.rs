@@ -396,3 +396,43 @@ fn the_loop_stops_within_one_probe_timeout_of_shutdown() {
         "shutdown waited {took:?}, more than one probe timeout"
     );
 }
+
+#[test]
+fn a_target_the_probe_finds_down_loses_its_conversations() {
+    // A server that went away came back with an empty KV cache, so steering a
+    // conversation back to it would buy nothing; the observation must go with
+    // the outage rather than outlive it until its TTL.
+    let down = Slave::start();
+    let up = Slave::start();
+    let unused = FakeUpstream::start(CannedResponse::json(200, OK_BODY));
+    let router = router_with_config(&unused, &config(down.port(), up.port(), ""));
+    let state = &router.state;
+
+    let mut conversation = request();
+    conversation.hints.conversation_id = Some("conv-1".to_owned());
+    let served = pipeline::execute(state, &conversation, &[], PermissionSet::empty(), &mut Collect::default());
+    assert_eq!(served.trace.chosen, Some(tid("down:model")));
+    let key = hypellm_core::ConversationKey::new(
+        conversation.tenant.clone(),
+        conversation.principal.clone(),
+        conversation.requested_model.clone(),
+        "conv-1",
+    )
+    .unwrap();
+    let held = |state: &hypellm_router::state::RouterState| {
+        let now = state.clock.now_millis();
+        state.conversation_affinity.lock().unwrap().preferred(&key, now).is_some()
+    };
+    assert!(held(state), "a served turn is remembered");
+
+    down.set(LOADING);
+    probe::run_round(state, TIMEOUT, &never);
+    assert!(held(state), "one miss is not an outage");
+    probe::run_round(state, TIMEOUT, &never);
+    assert!(!held(state), "an outage forgets the target's conversations");
+
+    down.set(HEALTHY);
+    probe::run_round(state, TIMEOUT, &never);
+    probe::run_round(state, TIMEOUT, &never);
+    assert!(!held(state), "recovery does not bring a stale observation back");
+}

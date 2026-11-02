@@ -233,10 +233,14 @@ fn a_cold_deployment_is_started_and_becomes_ready() {
     };
     assert!(!plan.evicts(), "an empty host needs no eviction");
 
+    assert_eq!(h.runtime.activation_epoch(&music.target), 0);
     assert_eq!(
         h.runtime.ensure_ready(&music.target, &plan, "abc", 900_000),
         ActivationResult::Ready
     );
+    // A freshly started model has an empty KV cache: the epoch moving is what
+    // retires every conversation observed on it before.
+    assert_eq!(h.runtime.activation_epoch(&music.target), 1);
 
     let verbs = h.agent.verbs();
     assert!(
@@ -290,6 +294,11 @@ fn readiness_is_confirmed_by_observation_and_not_by_the_verb_returning() {
             code: "fleet_activation_failed"
         },
         "an activation the inventory does not confirm is not a ready deployment"
+    );
+    assert_eq!(
+        h.runtime.activation_epoch(&music.target),
+        0,
+        "only a start that succeeded empties the cache conversations rely on"
     );
     let (acquired, released) = h.runtime.ledger().accounting();
     assert_eq!((acquired, released), (1, 1), "the lease is still released once");

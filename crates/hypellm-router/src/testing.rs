@@ -587,7 +587,7 @@ pub fn router_with_config(_upstream: &FakeUpstream, config_text: &str) -> TestRo
     let telemetry = Arc::new(telemetry);
     let enrollment_telemetry = Arc::clone(&telemetry);
     let state = RouterState {
-            conversation_affinity: std::sync::OnceLock::new(),
+        conversation_affinity: std::sync::Mutex::new(hypellm_core::ConversationAffinity::new()),
         // The harness enables jobs unconditionally, so a test that exercises
         // `/v1/jobs` does not have to remember to turn it on in its fixture.
         // The workers are started by `serve`; a test driving the store

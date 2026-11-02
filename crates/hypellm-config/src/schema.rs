@@ -92,6 +92,8 @@ pub const SCHEMAS: &[Schema] = &[
             "max_queued_batch_jobs",
             "max_job_result_bytes",
             "job_retention_ms",
+            "conversation_affinity_ttl_ms",
+            "conversation_affinity_max_entries",
             "job_poll_ms",
             "max_job_part_bytes",
             "max_job_spool_bytes",

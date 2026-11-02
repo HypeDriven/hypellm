@@ -343,6 +343,10 @@ an invariant to preserve: no request-derived string may ever be fed to <code>par
 or <code>target_probe_timeout_ms</code> of 0, above <code>MAX_TARGET_PROBE_TIMEOUT_MS</code> (10,000), or not
 below the interval (<code>invalid_probe_settings</code>). Refused, not clamped, so the document
 says what the router does.</p>
+<p><code>check_conversation_affinity_settings</code> refuses <code>conversation_affinity_max_entries</code>
+above <code>MAX_CONVERSATION_AFFINITY_ENTRIES</code> (1,000,000) and
+<code>conversation_affinity_ttl_ms</code> above <code>MAX_CONVERSATION_AFFINITY_TTL_MS</code> (one day)
+(<code>invalid_conversation_affinity</code>), since the table is router memory requests fill.</p>
 <h2 id="fuzz-targets">Fuzz targets</h2>
 <p><code>tests/fuzz.rs</code> — eight targets, run by <code>cargo test -p hypellm-config</code>. The
 engine is <code>hypellm-test-corpus::fuzz</code>; there is no <code>fuzz/</code> directory and no

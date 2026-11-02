@@ -668,6 +668,7 @@ send hints — otherwise silently ignored, by design.</p>
   &quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;ping&quot;}],
   &quot;hypellm_routing&quot;: {
     &quot;prefer_target&quot;: &quot;spark:qwen38-q5&quot;,
+    &quot;conversation_id&quot;: &quot;session-42&quot;,
     &quot;require_local&quot;: true,
     &quot;idempotency_key&quot;: &quot;...&quot;
   }
@@ -678,6 +679,14 @@ send hints — otherwise silently ignored, by design.</p>
 score. It cannot make an ineligible target eligible, beat a warmer one, or
 outrank a policy binding. Express hard preference through aliases and
 bindings instead.</li>
+<li><code>conversation_id</code> (1–128 ASCII letters, digits or <code>-_:.</code>; anything else is a
+<code>400</code>) sends a turn back to the target that last served the same conversation,
+so its prompt prefix is likely still in that server's KV cache. It is the
+smallest slice of the score — a tie-break between equally suitable targets that
+cannot create eligibility, beat a warmer target or outrank a binding. The
+router remembers only the target, never the prompt, keyed by tenant, principal
+and alias, so one caller cannot steer another's conversation. Send a stable
+identifier per conversation; a new one per turn does nothing.</li>
 <li><code>require_local</code> excludes targets not marked local — inference that would
 leave the deployment.</li>
 <li><code>idempotency_key</code> marks the request safe to fail over after a provider has

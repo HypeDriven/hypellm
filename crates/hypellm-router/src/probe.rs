@@ -151,6 +151,13 @@ pub fn run_round(state: &RouterState, timeout: Duration, stop: &dyn Fn() -> bool
             let changed = state.health.record_probe(target, ok);
             publish(state, target, ok);
             if let Some(now) = changed {
+                if now == ProbeState::Unreachable {
+                    // A server that went away has lost its KV cache, so no
+                    // conversation should be steered back to it on recovery.
+                    if let Ok(mut table) = state.conversation_affinity.lock() {
+                        table.invalidate_target(target);
+                    }
+                }
                 log_transition(state, target, now);
             }
         }

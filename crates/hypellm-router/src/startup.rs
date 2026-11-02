@@ -950,7 +950,7 @@ impl Router {
         });
 
         let state = Arc::new(RouterState {
-            conversation_affinity: std::sync::OnceLock::new(),
+            conversation_affinity: std::sync::Mutex::new(hypellm_core::ConversationAffinity::new()),
             jobs,
             anonymous_access,
             config: Arc::new(Activatable::new(config)),

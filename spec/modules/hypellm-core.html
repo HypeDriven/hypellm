@@ -373,6 +373,16 @@ gate.</p>
 <td><code>ids::MAX_ID_LEN</code>, checked in <code>ids::validate</code></td>
 </tr>
 <tr>
+<td>Conversation identifier</td>
+<td>1–128 bytes of <code>[A-Za-z0-9._:-]</code></td>
+<td><code>conversation_affinity::valid_conversation_id</code>, shared with the protocol parser</td>
+</tr>
+<tr>
+<td>Conversation affinity table</td>
+<td>Caller-supplied <code>AffinityLimits</code>: entries never exceed <code>max_entries</code> (soonest-expiring evicted first); every observation expires after <code>ttl_ms</code>; <code>O(log n)</code> per lookup and observation, <code>O(n)</code> only for <code>invalidate_target</code></td>
+<td><code>ConversationAffinity::observe</code></td>
+</tr>
+<tr>
 <td>Identifier alphabet</td>
 <td><code>[A-Za-z0-9._:-]</code>, non-empty</td>
 <td><code>ids::validate</code></td>
@@ -772,6 +782,13 @@ layer covers the ones nobody did.</p>
 <ul>
 <li><a href="../../crates/hypellm-core/src/policy.rs"><code>LiveState</code></a> is the seam. Implement it to inject health; <code>IdealLiveState</code>
 reports everything healthy and is what policy simulation uses.</li>
+<li><code>LiveState::affinity_bonus</code> is the conversation-affinity slice of the affinity
+term, clamped to <code>ScoreTerms::CONVERSATION_SLICE</code> (4,000) and read only after every
+filter. <code>conversation_affinity::ConversationAffinity</code> is the table behind it: keyed by
+<code>ConversationKey</code> (tenant, principal, alias, identifier), holding a target and its
+activation epoch and nothing from the request. It holds no clock and no
+configuration — time and <code>AffinityLimits</code> are passed in, so a reload applies on the
+next observation.</li>
 <li><code>LiveState::probe_unreachable</code> (default <code>false</code>) is the liveness probe's
 eligibility filter, reported as <code>ExclusionReason::ProbeUnreachable</code>. In
 <code>HealthRegistry</code> it is backed by <code>record_probe</code>, <code>probe_status</code> and

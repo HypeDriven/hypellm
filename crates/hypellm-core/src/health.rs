@@ -1116,8 +1116,8 @@ impl LiveState for HealthRegistry {
     }
 
     fn affinity_bonus(&self, _target: &TargetId) -> i64 {
-        // Conversation and cache affinity are tracked by the streaming layer,
-        // which supplies its own LiveState wrapper when it has a hint. The
+        // Conversation affinity is supplied by the router's fleet-aware
+        // wrapper for a request that carries a conversation identifier. The
         // registry itself has no affinity information.
         0
     }

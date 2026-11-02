@@ -652,6 +652,80 @@ fn finish_budget(
     }
 }
 
+/// The affinity table's limits from the configuration in force.
+fn affinity_limits(config: &hypellm_config::ValidatedConfig) -> hypellm_core::AffinityLimits {
+    hypellm_core::AffinityLimits {
+        ttl_ms: config.settings.conversation_affinity_ttl_ms,
+        max_entries: usize::try_from(config.settings.conversation_affinity_max_entries)
+            .unwrap_or(usize::MAX),
+    }
+}
+
+/// The request's conversation, when it names one and affinity is on.
+fn conversation_key(
+    config: &hypellm_config::ValidatedConfig,
+    request: &CanonicalRequest,
+) -> Option<hypellm_core::ConversationKey> {
+    if affinity_limits(config).disabled() {
+        return None;
+    }
+    hypellm_core::ConversationKey::new(
+        request.tenant.clone(),
+        request.principal.clone(),
+        request.requested_model.clone(),
+        request.hints.conversation_id.as_deref()?,
+    )
+}
+
+/// The current activation epoch of `target`; zero without a fleet.
+fn activation_epoch(state: &RouterState, target: &TargetId) -> u64 {
+    state
+        .fleet
+        .get()
+        .map_or(0, |fleet| fleet.activation_epoch(target))
+}
+
+/// The target that last served this conversation, if its cache can still hold
+/// the prefix.
+///
+/// A target the fleet has started again since, or that is no longer running,
+/// has an empty cache, so the observation is dropped rather than steering the
+/// conversation to a cold prefix.
+fn conversation_target(
+    state: &RouterState,
+    view: &crate::fleet::FleetView,
+    key: &hypellm_core::ConversationKey,
+    now_ms: u64,
+) -> Option<TargetId> {
+    let mut table = state.conversation_affinity.lock().ok()?;
+    let observation = table.preferred(key, now_ms)?;
+    let target = observation.target.clone();
+    let running = matches!(
+        view.class(&target),
+        hypellm_core::decision::ResidencyClass::Unmanaged | hypellm_core::decision::ResidencyClass::Resident | hypellm_core::decision::ResidencyClass::ResidentBusy
+    );
+    if running && observation.epoch == activation_epoch(state, &target) {
+        Some(target)
+    } else {
+        table.forget(key);
+        None
+    }
+}
+
+/// Remember that `target` served this conversation successfully.
+fn observe_conversation(
+    state: &RouterState,
+    config: &hypellm_config::ValidatedConfig,
+    key: hypellm_core::ConversationKey,
+    target: &TargetId,
+) {
+    let epoch = activation_epoch(state, target);
+    let now = state.clock.now_millis();
+    if let Ok(mut table) = state.conversation_affinity.lock() {
+        table.observe(key, target.clone(), epoch, now, affinity_limits(config));
+    }
+}
+
 /// One pass through routing and the attempt loop.
 #[allow(clippy::too_many_arguments)]
 fn execute_once(
@@ -688,23 +762,15 @@ fn execute_once(
     // second sample could classify a target one way for the filter and another
     // for the score.
     let fleet_view = state.fleet_view(request, groups, permissions);
-    let live = crate::fleet::FleetAwareLiveState::new(state.health.as_ref(), &fleet_view);
-    // Affinity is a soft score, never a hard pin or an eligibility override.
-    let mut affinity_request = request.clone();
-    if let Some(id) = request.hints.conversation_id.as_deref() {
-        if let Some(key) = hypellm_core::ConversationKey::new(
-            request.tenant.clone(), request.principal.clone(),
-            request.requested_model.clone(), id,
-        ) {
-            if let Some(store) = state.conversation_affinity.get() {
-                if let Ok(guard) = store.lock() {
-                    affinity_request.hints.conversation_preferred_target =
-                        guard.preferred(&key, context.now_millis).cloned();
-                }
-            }
-        }
-    }
-    let route = snapshot.route(&context, &affinity_request, &live);
+    // Conversation affinity is a soft score, never a pin or an eligibility
+    // override: the live state reports it as part of the affinity term.
+    let conversation = conversation_key(config, request);
+    let conversation_target = conversation
+        .as_ref()
+        .and_then(|key| conversation_target(state, &fleet_view, key, context.now_millis));
+    let live = crate::fleet::FleetAwareLiveState::new(state.health.as_ref(), &fleet_view)
+        .with_conversation_target(conversation_target.as_ref());
+    let route = snapshot.route(&context, request, &live);
 
     let mut trace = DecisionTrace {
         request_id: request.request_id,
@@ -1310,20 +1376,8 @@ fn execute_once(
                     output: progress.output,
                 });
                 trace.chosen = Some(target.id.clone());
-                if let Some(id) = request.hints.conversation_id.as_deref() {
-                    if let Some(key) = hypellm_core::ConversationKey::new(
-                        request.tenant.clone(), request.principal.clone(),
-                        request.requested_model.clone(), id,
-                    ) {
-                        let store = state.conversation_affinity.get_or_init(|| {
-                            std::sync::Mutex::new(hypellm_core::ConversationAffinity::new(
-                                10 * 60 * 1000, 10_000,
-                            ))
-                        });
-                        if let Ok(mut guard) = store.lock() {
-                            guard.observe(key, target.id.clone(), clock.now_millis());
-                        }
-                    }
+                if let Some(key) = conversation {
+                    observe_conversation(state, config, key, &target.id);
                 }
                 return Outcome {
                     trace,

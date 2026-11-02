@@ -1184,15 +1184,18 @@ pub(crate) fn parse_hints(
         .opt_field_str("conversation_id")
         .map_err(type_error)?
         .map(str::to_owned);
-    if let Some(id) = &conversation_id {
-        if id.is_empty() || id.len() > 128 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_: .".contains(&b)) || id.contains(' ') {
-            return Err(RouterError::invalid_request("invalid conversation_id").with_param("hypellm_routing.conversation_id"));
-        }
+    if conversation_id
+        .as_deref()
+        .is_some_and(|id| !hypellm_core::valid_conversation_id(id))
+    {
+        return Err(RouterError::invalid_request(
+            "conversation_id must be 1 to 128 ASCII letters, digits or -_:.",
+        )
+        .with_param("hypellm_routing.conversation_id"));
     }
     Ok(RoutingHints {
         prefer_target,
         conversation_id,
-        conversation_preferred_target: None,
         require_local: raw
             .opt_field_bool("require_local")
             .map_err(type_error)?
@@ -2631,6 +2634,31 @@ mod tests {
             request.hints.prefer_target.as_ref().map(|t| t.as_str()),
             Some("local:qwen")
         );
+    }
+
+    #[test]
+    fn a_conversation_id_is_gated_like_every_hint_and_bounded_when_permitted() {
+        let body = |id: &str| {
+            format!(r#"{{"model":"m","messages":[{{"role":"user","content":"x"}}],"hypellm_routing":{{"conversation_id":"{id}"}}}}"#)
+        };
+        // Unpermitted: dropped, even when malformed, as the other hints are.
+        assert!(parse_chat(&body("bad id")).unwrap().hints.conversation_id.is_none());
+
+        let mut permitted = context();
+        permitted.hints_permitted = true;
+        let parse = |id: &str| parse_chat_request(body(id).as_bytes(), &permitted, &Limits::DEFAULT);
+        assert_eq!(
+            parse("conv-1:a.b_c").unwrap().hints.conversation_id.as_deref(),
+            Some("conv-1:a.b_c")
+        );
+        for bad in ["", "has space", "slash/", &"x".repeat(129)] {
+            let error = parse(bad).expect_err(bad);
+            assert_eq!(
+                error.param.as_ref().map(|p| p.as_str()),
+                Some("hypellm_routing.conversation_id"),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

@@ -345,7 +345,9 @@ caller's key being wrong (specification 8.2).</li>
 hints are dropped silently unless the principal holds
 <code>rbac::Permission::OperateTargets</code>; <code>prefer_target</code> is validated into a
 <code>TargetId</code> and resolved against configured targets by the router core, never
-used as an address. Prompts, tool schemas, and image URLs are carried as inert
+used as an address. <code>conversation_id</code> is validated by
+<code>hypellm_core::valid_conversation_id</code> and only ever looked up: the target it maps
+to is one <code>pipeline</code> recorded after serving the same tenant, principal and alias. Prompts, tool schemas, and image URLs are carried as inert
 data. Nothing in <code>protocol/</code> interprets a field as configuration, destination,
 or credential.</li>
 <li><strong>The control socket is unauthenticated.</strong> <code>main.rs</code> binds a Unix socket and
@@ -523,6 +525,12 @@ management listeners differ, so both are given.</p>
 <td>One endpoint at a time, each within <code>settings target_probe_timeout_ms</code> (1–10,000 ms, below the interval); rounds every <code>target_probe_interval_ms</code> (0 off, else at least 1,000 ms); the response head only is read, and the socket is never pooled</td>
 <td>10,000 ms interval, 2,000 ms timeout</td>
 <td><code>probe::probe_loop</code>, <code>Egress::dial_probe</code>; shutdown is checked between probes, so a drain waits for at most one</td>
+</tr>
+<tr>
+<td>Conversation affinity</td>
+<td><code>settings conversation_affinity_max_entries</code> (default 10,000; at most 1,000,000) conversations, each for <code>conversation_affinity_ttl_ms</code> (default 600,000; at most one day); one mutex, held for one <code>O(log n)</code> lookup before routing and one observation after a success</td>
+<td>—</td>
+<td><code>RouterState::conversation_affinity</code>; dropped for a target on a probe outage (<code>probe::run_round</code>), and for a conversation when its target is no longer running or the fleet has started it since (<code>FleetRuntime::activation_epoch</code>)</td>
 </tr>
 <tr>
 <td>Live jobs per tenant</td>

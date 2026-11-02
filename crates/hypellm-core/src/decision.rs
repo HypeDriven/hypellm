@@ -462,7 +462,8 @@ impl ScoreTerms {
     pub const WARMTH_SLICE: i64 = 40_000;
     /// The slice a permitted client hint may occupy.
     pub const HINT_SLICE: i64 = 6_000;
-    /// The slice reserved for conversation affinity. Not implemented.
+    /// The slice conversation affinity may occupy, through
+    /// [`crate::policy::LiveState::affinity_bonus`].
     pub const CONVERSATION_SLICE: i64 = 4_000;
 
     /// The gap between adjacent rungs of the warmth ladder.

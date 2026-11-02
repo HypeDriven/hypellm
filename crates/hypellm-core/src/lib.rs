@@ -99,7 +99,9 @@ pub use canonical::{
     Modality, Operation, QualityClass, ReasoningEffort, RequestLimits, Residency, ResponseFormat,
     Role, RoutingHints, Sampling, StreamOptions, TokenEstimate, ToolCall, ToolChoice, ToolDef,
 };
-pub use conversation_affinity::{ConversationAffinity, ConversationKey};
+pub use conversation_affinity::{
+    AffinityLimits, ConversationAffinity, ConversationKey, valid_conversation_id,
+};
 pub use decision::{
     Attempt, AttemptOutcome, Candidate, DecisionTrace, Exclusion, ExclusionReason, OutputTally,
     ResidencyClass, ScoreTerms,

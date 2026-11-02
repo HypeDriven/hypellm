@@ -318,6 +318,12 @@ pub struct Settings {
     pub max_job_result_bytes: u64,
     /// How long a finished job stays readable, in milliseconds.
     pub job_retention_ms: u64,
+    /// How long a conversation's last serving target stays preferred, in
+    /// milliseconds. Zero turns conversation affinity off.
+    pub conversation_affinity_ttl_ms: u64,
+    /// The most conversations whose serving target is remembered at once.
+    /// Zero turns conversation affinity off.
+    pub conversation_affinity_max_entries: u32,
     /// How often an artifact job's shim is polled, in milliseconds; never
     /// more often than every 250 (orchestration §11.5).
     pub job_poll_ms: u64,
@@ -411,6 +417,8 @@ impl Default for Settings {
             max_queued_batch_jobs: None,
             max_job_result_bytes: 8 * 1024 * 1024,
             job_retention_ms: 900_000,
+            conversation_affinity_ttl_ms: 600_000,
+            conversation_affinity_max_entries: 10_000,
             job_poll_ms: 2_000,
             max_job_part_bytes: 1024 * 1024 * 1024,
             max_job_spool_bytes: 4 * 1024 * 1024 * 1024,
@@ -963,6 +971,7 @@ pub fn build(document: &Document, version: u64) -> Result<ValidatedConfig, Vec<C
 
     check_document_limits(&settings, &mut errors);
     check_probe_settings(&settings, &mut errors);
+    check_conversation_affinity_settings(&settings, &mut errors);
 
     let tenants = collect(document, "tenant", &mut errors, build_tenant);
     let mut tenant_map: BTreeMap<TenantId, TenantConfig> = BTreeMap::new();
@@ -1893,6 +1902,12 @@ fn build_settings(document: &Document) -> Result<Settings, ConfigError> {
         },
         max_job_result_bytes: f.u64_field("max_job_result_bytes", d.max_job_result_bytes)?,
         job_retention_ms: f.u64_field("job_retention_ms", d.job_retention_ms)?,
+        conversation_affinity_ttl_ms: f
+            .u64_field("conversation_affinity_ttl_ms", d.conversation_affinity_ttl_ms)?,
+        conversation_affinity_max_entries: f.u32_field(
+            "conversation_affinity_max_entries",
+            d.conversation_affinity_max_entries,
+        )?,
         job_poll_ms: f.u64_field("job_poll_ms", d.job_poll_ms)?.max(250),
         max_job_part_bytes: f.u64_field("max_job_part_bytes", d.max_job_part_bytes)?,
         max_job_spool_bytes: f.u64_field("max_job_spool_bytes", d.max_job_spool_bytes)?,
@@ -1929,6 +1944,39 @@ pub const MAX_TARGET_PROBE_TIMEOUT_MS: u64 = 10_000;
 /// one at or above the interval would let one hung endpoint stretch every round
 /// past its schedule. Both are refused rather than clamped, so the document
 /// says what the router does.
+/// The most conversations `conversation_affinity_max_entries` may name.
+pub const MAX_CONVERSATION_AFFINITY_ENTRIES: u32 = 1_000_000;
+/// The longest `conversation_affinity_ttl_ms`: a day. A KV cache does not
+/// outlive that, so a longer preference only points at a cold prefix.
+pub const MAX_CONVERSATION_AFFINITY_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Keep the affinity table's memory and lifetime bounded (specification 3.2).
+fn check_conversation_affinity_settings(settings: &Settings, errors: &mut Vec<ConfigError>) {
+    let position = Position { line: 1, column: 1 };
+    let entries = settings.conversation_affinity_max_entries;
+    if entries > MAX_CONVERSATION_AFFINITY_ENTRIES {
+        errors.push(ConfigError::new(
+            "invalid_conversation_affinity",
+            format!(
+                "conversation_affinity_max_entries must be at most \
+                 {MAX_CONVERSATION_AFFINITY_ENTRIES}, not {entries}"
+            ),
+            position,
+        ));
+    }
+    let ttl = settings.conversation_affinity_ttl_ms;
+    if ttl > MAX_CONVERSATION_AFFINITY_TTL_MS {
+        errors.push(ConfigError::new(
+            "invalid_conversation_affinity",
+            format!(
+                "conversation_affinity_ttl_ms must be at most \
+                 {MAX_CONVERSATION_AFFINITY_TTL_MS}, not {ttl}"
+            ),
+            position,
+        ));
+    }
+}
+
 fn check_probe_settings(settings: &Settings, errors: &mut Vec<ConfigError>) {
     let position = Position { line: 1, column: 1 };
     let interval = settings.target_probe_interval_ms;

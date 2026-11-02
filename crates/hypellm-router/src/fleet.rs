@@ -198,6 +198,11 @@ pub struct FleetRuntime {
     unmanaged: RwLock<BTreeSet<DeploymentId>>,
     /// Monotonic counter behind lease identifiers.
     lease_counter: AtomicU64,
+    /// Successful activations per target. A target started since a
+    /// conversation was last served there has an empty KV cache, so the
+    /// conversation's affinity no longer means anything. Bounded by the
+    /// configured targets.
+    activation_epochs: RwLock<BTreeMap<TargetId, u64>>,
     /// Whether every configured agent answered its last handshake.
     agents_reachable: AtomicBool,
     /// Whether every configured agent agrees about the fleet digest.
@@ -435,6 +440,7 @@ impl FleetRuntime {
             timings: RwLock::new(BTreeMap::new()),
             unmanaged: RwLock::new(BTreeSet::new()),
             lease_counter: AtomicU64::new(0),
+            activation_epochs: RwLock::new(BTreeMap::new()),
             agents_reachable: AtomicBool::new(false),
             digest_agreed: AtomicBool::new(true),
             activations_total: AtomicU64::new(0),
@@ -1185,7 +1191,10 @@ impl FleetRuntime {
         let outcome = self.run_plan(target, plan, &lease_id, deadline_ms, &policy);
 
         let (activation_outcome, result) = match outcome {
-            Ok(()) => (ActivationOutcome::Succeeded, ActivationResult::Ready),
+            Ok(()) => {
+                self.bump_activation_epoch(target);
+                (ActivationOutcome::Succeeded, ActivationResult::Ready)
+            }
             Err(code) => {
                 // A failure after eviction leaves the fleet worse than it was:
                 // something stopped, nothing started. The rollback is bounded
@@ -1453,6 +1462,25 @@ impl FleetRuntime {
             },
         );
         Some(all_back)
+    }
+
+    /// How many times this router has started `target`.
+    ///
+    /// Zero for a target it never started, including every unmanaged one.
+    #[must_use]
+    pub fn activation_epoch(&self, target: &TargetId) -> u64 {
+        self.activation_epochs
+            .read()
+            .ok()
+            .and_then(|epochs| epochs.get(target).copied())
+            .unwrap_or(0)
+    }
+
+    fn bump_activation_epoch(&self, target: &TargetId) {
+        if let Ok(mut epochs) = self.activation_epochs.write() {
+            let epoch = epochs.entry(target.clone()).or_insert(0);
+            *epoch = epoch.wrapping_add(1);
+        }
     }
 
     /// Release the lease exactly once and record the outcome durably.
@@ -2899,6 +2927,8 @@ pub fn exclusion_for(class: ResidencyClass) -> Option<ExclusionReason> {
 pub struct FleetAwareLiveState<'a> {
     health: &'a hypellm_core::health::HealthRegistry,
     view: &'a FleetView,
+    /// The target that last served this request's conversation, if any.
+    conversation: Option<&'a TargetId>,
 }
 
 impl<'a> FleetAwareLiveState<'a> {
@@ -2908,7 +2938,26 @@ impl<'a> FleetAwareLiveState<'a> {
         health: &'a hypellm_core::health::HealthRegistry,
         view: &'a FleetView,
     ) -> Self {
-        Self { health, view }
+        Self {
+            health,
+            view,
+            conversation: None,
+        }
+    }
+
+    /// Prefer the target that last served this request's conversation.
+    ///
+    /// Scored as [`ScoreTerms::CONVERSATION_SLICE`] of the affinity term,
+    /// which policy reads only after every eligibility filter and which the
+    /// warmth ladder's step exceeds — so it breaks a tie between equally
+    /// suitable targets and can neither create eligibility nor promote a
+    /// colder target.
+    ///
+    /// [`ScoreTerms::CONVERSATION_SLICE`]: hypellm_core::decision::ScoreTerms::CONVERSATION_SLICE
+    #[must_use]
+    pub const fn with_conversation_target(mut self, target: Option<&'a TargetId>) -> Self {
+        self.conversation = target;
+        self
     }
 }
 
@@ -2929,7 +2978,12 @@ impl hypellm_core::policy::LiveState for FleetAwareLiveState<'_> {
         self.health.queue_penalty(target)
     }
     fn affinity_bonus(&self, target: &TargetId) -> i64 {
-        self.health.affinity_bonus(target)
+        let conversation = if self.conversation == Some(target) {
+            hypellm_core::decision::ScoreTerms::CONVERSATION_SLICE
+        } else {
+            0
+        };
+        self.health.affinity_bonus(target).max(conversation)
     }
     fn has_capacity(&self, target: &TargetId) -> bool {
         self.health.has_capacity(target)

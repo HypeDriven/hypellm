@@ -175,6 +175,11 @@
 <td>Express hard preference through aliases and priority bindings; use the hint only to break ties between comparable targets.</td>
 </tr>
 <tr>
+<td>Conversation affinity</td>
+<td><code>conversation_id</code> is a hint, so only a principal with <code>OperateTargets</code> can send it; the table is in memory, per router, and cannot see a cache eviction or a restart it did not observe.</td>
+<td>Treat it as a best-effort cache-hit improvement, never as a guarantee of where a turn runs.</td>
+</tr>
+<tr>
 <td>Long-running generative work</td>
 <td><code>/v1/jobs</code> exists and is <strong>off by default</strong>. Jobs live in the router's memory, so a restart loses them and their results.</td>
 <td>Enable it with <code>settings job_workers=N</code>. Treat a job identifier as valid only for this router's lifetime; a client that must survive a restart should resubmit rather than poll.</td>
@@ -314,6 +319,15 @@
 <p><code>hypellm_routing.prefer_target</code> is honoured, within deliberately narrow limits. It is parsed from the request body, validated as a target identifier, dropped unless the principal is permitted to supply hints, and then added as <code>ScoreTerms::HINT_SLICE</code> to the affinity term of the named target — read only after every eligibility filter has already passed.</p>
 <p>What that means for a caller: the hint can break a tie between two comparable targets, and can do nothing else. It cannot make an ineligible target eligible, cannot outrank a warmer target — the warmth ladder's step exceeds the whole hint slice — and cannot outrank a priority binding, whose rank term is two orders of magnitude larger. An unknown or ineligible <code>prefer_target</code> is ignored rather than refused, so a harness that always sends one keeps working.</p>
 <p>This bound is the reason the hint is admissible at all. A hint that could beat policy would be a client-controlled destination by a longer route, which Appendix B forbids.</p>
+<h2 id="conversation-affinity-is-per-router-and-best-effort">Conversation affinity is per router, and best-effort</h2>
+<p><strong>Specification:</strong> §6.3 (the affinity term). <strong>Implementation:</strong> <code>hypellm_core::conversation_affinity</code>, <code>crates/hypellm-router/src/pipeline.rs</code>.</p>
+<p><code>hypellm_routing.conversation_id</code> sends a turn back to the target that last served the conversation, as the 4,000-point conversation slice of the affinity term. What it does not do:</p>
+<ul>
+<li><strong>It needs hint permission.</strong> It travels in <code>hypellm_routing</code>, which is dropped unless the principal holds <code>OperateTargets</code> (§5.1). A plain inference key's <code>conversation_id</code> is ignored.</li>
+<li><strong>It is not a cache oracle.</strong> The router remembers which target answered, not what is in its KV cache. A cache evicted under memory pressure, or a server restarted faster than two probe rounds, still attracts the conversation until its observation expires or another target serves it. Restarts it does see — a probe outage, or a fleet activation — drop the observations.</li>
+<li><strong>It is per router and in memory.</strong> Independent nodes do not share it, and a restart loses it; the next turn of each conversation routes as if it were the first.</li>
+<li><strong>Callers sharing a principal share the namespace.</strong> Two callers authenticated as one principal — every anonymous caller, for example — who choose the same identifier share an entry. It can move their turns only between targets both were eligible for.</li>
+</ul>
 <h2 id="machine-memory-counts-only-routed-work">Machine memory counts only routed work</h2>
 <p><strong>Specification:</strong> <a href="router-specification.html#124-machine-memory">§12.4</a>. <strong>Implementation:</strong> <code>crates/hypellm-core/src/machine.rs</code>.</p>
 <p>A machine's memory is a declared figure, and what holds it is what the router admitted. Nothing measures the machine: a client that calls a service's own port directly, a service that keeps its models loaded between jobs, or a resident model that grows past what its machine record leaves out are all invisible, and the router can admit work the machine cannot hold. The figures are conservative estimates an operator keeps true, the way a fleet <code>deployment memory_bytes</code> is. A restart forgets every claim; waiting jobs make new ones on their next pass, in whatever order they come back.</p>
