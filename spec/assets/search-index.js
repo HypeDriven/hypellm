@@ -2427,7 +2427,7 @@ window.HYPELLM_WIKI_INDEX = [
     "group": "Start here",
     "heading": "Build and verify",
     "url": "overview.html#build-and-verify",
-    "text": "Requirements: Rust 1.85 or newer on Linux. All commands run offline. cargo build --workspace --offline cargo test --workspace --offline cargo clippy --workspace --all-targets --offline cargo run -q -p hypellm-devtools --bin depscan --offline -- --root . depscan enforces the repository's supply-chain policy: no registry dependencies, build scripts, procedural macros, dynamic loading, unsafe Rust, remote web assets or vendored browser code."
+    "text": "Requirements: Rust 1.95 or newer on Linux. All commands run offline. cargo build --workspace --offline cargo test --workspace --offline cargo clippy --workspace --all-targets --offline cargo run -q -p hypellm-devtools --bin depscan --offline -- --root . depscan enforces the repository's supply-chain policy: no registry dependencies, build scripts, procedural macros, dynamic loading, unsafe Rust, remote web assets or vendored browser code."
   },
   {
     "page": "Project overview",

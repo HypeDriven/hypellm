@@ -366,7 +366,7 @@ fn await_recovery(
     let limit = config.settings.max_recovery_waiters;
     let admitted = state
         .recovery_waiters
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < limit).then(|| n + 1))
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < limit).then(|| n + 1))
         .is_ok();
     if !admitted {
         record_recovery(state, request, "refused");
@@ -471,7 +471,7 @@ fn await_activation(
     let limit = config.settings.max_parked_requests;
     let admitted = state
         .parked_requests
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < limit).then(|| n + 1))
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < limit).then(|| n + 1))
         .is_ok();
     if !admitted {
         record_parking(state, request, "refused");

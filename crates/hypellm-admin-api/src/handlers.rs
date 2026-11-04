@@ -842,7 +842,7 @@ impl AnonymousAuditBudget {
             // number and report a handful of suppressed attempts.
             let _ = self
                 .suppressed
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                     Some(n.saturating_add(1))
                 });
             (false, rolled)
@@ -920,7 +920,7 @@ impl Drop for KdfSlot<'_> {
         // exceeded on the next attempt.
         let _ = self
             .0
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 Some(n.saturating_sub(1))
             });
     }
@@ -983,7 +983,7 @@ impl PasswordThrottle {
     /// bound.
     fn enter(&self) -> Option<KdfSlot<'_>> {
         self.in_flight
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 (n < MAX_CONCURRENT_PASSWORD_CHECKS).then(|| n.saturating_add(1))
             })
             .ok()

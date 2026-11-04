@@ -832,7 +832,7 @@ impl Scope {
         let _ = self.spend_in_period(now_ms);
         let _ = self
             .spent
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 Some(current.saturating_add(minor_units))
             });
     }

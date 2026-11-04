@@ -22,7 +22,7 @@
 # ---------------------------------------------------------------------------
 # The tag is pinned rather than floating: `rust:1` would silently move the
 # compiler under a security artifact between two builds of the same commit.
-FROM rust:1.95-trixie AS build
+FROM rust:1.99.1-trixie AS build
 
 WORKDIR /src
 

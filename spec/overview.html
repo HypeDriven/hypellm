@@ -113,7 +113,7 @@ Operators ─────────HTTPS edge────────▶ manag
 </code></pre>
 <p>Inference and management use separate listeners, handlers, authentication methods and resource limits. Starting and stopping containers happens in a separate agent process, because the router must not execute a subprocess: the socket between them carries opaque identifiers and bounded integers, and the agent resolves each against its own allowlist. The router speaks HTTP/1.1 internally. Production deployments place a platform TLS edge in front of inbound listeners and use local platform helpers for outbound TLS and OIDC token verification; the router does not implement TLS or asymmetric signature verification itself. A reference identity verifier ships in <code>verifier/</code>, out of the workspace like the agent, and performs no cryptography of its own.</p>
 <h2 id="build-and-verify">Build and verify</h2>
-<p>Requirements: Rust 1.85 or newer on Linux. All commands run offline.</p>
+<p>Requirements: Rust 1.95 or newer on Linux. All commands run offline.</p>
 <pre><code class="language-bash">cargo build --workspace --offline
 cargo test --workspace --offline
 cargo clippy --workspace --all-targets --offline
