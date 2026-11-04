@@ -251,11 +251,16 @@ fn the_pkce_verifier_reaches_the_token_exchange() {
     let (handle, state, nonce, code_verifier) = begin(&admin);
     verifier.echo_nonce(&nonce);
 
-    admin
+    let response = admin
         .request(Method::Get, "/admin/v1/auth/google/callback")
         .query(&format!("code=auth-code-xyz&state={state}"))
         .cookie(&format!("__Host-hypellm_oidc={handle}"))
         .send();
+    assert!(
+        response.status == 200 || response.status == 204 || response.status == 302,
+        "the callback did not complete: {}",
+        response.status
+    );
 
     let exchanges = verifier.exchanges();
     assert_eq!(exchanges.len(), 1, "the code was not exchanged exactly once");

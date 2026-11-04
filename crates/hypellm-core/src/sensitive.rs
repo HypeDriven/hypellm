@@ -164,6 +164,9 @@ mod tests {
     fn redaction_survives_being_nested_in_a_struct() {
         // The property that matters: a developer deriving Debug on a struct
         // containing a secret gets redacted output for free.
+        // Read only through the derived `Debug`, which is the property under
+        // test; the dead-code lint does not count that as a read.
+        #[allow(dead_code)]
         #[derive(Debug)]
         struct Credential {
             id: &'static str,

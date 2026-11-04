@@ -3722,7 +3722,7 @@ mod tests {
     fn no_output_follows_the_finish_reason() {
         let request = parse_responses(RESPONSES_MINIMAL).unwrap();
         let mut state = ResponsesStreamState::new();
-        render_responses_chunk(
+        let primed = render_responses_chunk(
             &mut state,
             &request,
             &CanonicalEvent::Finish {
@@ -3730,6 +3730,7 @@ mod tests {
             },
             0,
         );
+        assert!(!primed.is_empty(), "the priming event must itself produce frames");
         let after = render_responses_chunk(
             &mut state,
             &request,
@@ -3780,12 +3781,13 @@ mod tests {
         // every open item closed and a terminal frame emitted.
         let request = parse_responses(RESPONSES_MINIMAL).unwrap();
         let mut state = ResponsesStreamState::new();
-        render_responses_chunk(
+        let primed = render_responses_chunk(
             &mut state,
             &request,
             &CanonicalEvent::TextDelta("partial".to_owned()),
             0,
         );
+        assert!(!primed.is_empty(), "the priming event must itself produce frames");
         let closing = state.finish(&request, FinishReason::Cancelled, 0);
         assert_eq!(
             frame_names(&closing),
@@ -3814,12 +3816,13 @@ mod tests {
     fn an_error_ends_the_stream_with_an_error_event() {
         let request = parse_responses(RESPONSES_MINIMAL).unwrap();
         let mut state = ResponsesStreamState::new();
-        render_responses_chunk(
+        let primed = render_responses_chunk(
             &mut state,
             &request,
             &CanonicalEvent::TextDelta("x".to_owned()),
             0,
         );
+        assert!(!primed.is_empty(), "the priming event must itself produce frames");
         let frames = state.error(&RouterError::new(ErrorCode::RateLimited, "quota exceeded"));
         assert_eq!(frame_names(&frames), vec!["error"]);
         let value = parse_str(&frames[0].data, &Limits::SMALL).unwrap();
