@@ -119,7 +119,7 @@ fn target(id: &str) -> Target {
         cost_class: CostClass::CHEAPEST,
         quality_class: QualityClass::LOWEST,
         document_token_estimate: None,
-            bytes_per_token: None,
+            bytes_per_token_hundredths: None,
         residency: None,
         is_local: true,
         admin_state: AdminState::Enabled,
@@ -305,7 +305,10 @@ fn a_document_url_is_never_dereferenced_and_never_influences_routing() {
 
 #[test]
 fn a_declared_bytes_per_token_changes_what_is_reserved() {
-    use hypellm_core::canonical::{DEFAULT_BYTES_PER_TOKEN, MAX_BYTES_PER_TOKEN, TokenEstimate};
+    use hypellm_core::canonical::{
+        DEFAULT_BYTES_PER_TOKEN_HUNDREDTHS, MAX_BYTES_PER_TOKEN_HUNDREDTHS,
+        MIN_BYTES_PER_TOKEN_HUNDREDTHS, TokenEstimate,
+    };
 
     // The point of the field: an operator who has measured their target's
     // tokenizer reserves closer to what the request will actually use. A test
@@ -314,11 +317,11 @@ fn a_declared_bytes_per_token_changes_what_is_reserved() {
     let req = request(vec![ContentPart::Text("x".repeat(4_000))]);
 
     let base = TokenEstimate {
-        bytes_per_token: DEFAULT_BYTES_PER_TOKEN,
+        bytes_per_token_hundredths: DEFAULT_BYTES_PER_TOKEN_HUNDREDTHS,
         ..TokenEstimate::default()
     };
     let calibrated = TokenEstimate {
-        bytes_per_token: 4,
+        bytes_per_token_hundredths: 400,
         ..TokenEstimate::default()
     };
 
@@ -330,31 +333,47 @@ fn a_declared_bytes_per_token_changes_what_is_reserved() {
          {reserved_calibrated} vs {reserved_by_default}"
     );
 
+    // A fractional ratio is honoured exactly, not truncated to a whole number:
+    // 4,000 bytes at 2.5 bytes per token is 1,600 tokens (plus the framing
+    // every estimate carries), between what 2 and 3 would reserve. A rounding
+    // implementation would land on one of those instead.
+    let framing = req.estimated_input_tokens_for(&base) - 2_000;
+    let at = |h: u32| {
+        req.estimated_input_tokens_for(&TokenEstimate {
+            bytes_per_token_hundredths: h,
+            ..TokenEstimate::default()
+        })
+    };
+    assert_eq!(at(250), 1_600 + framing);
+    assert_eq!(at(300), 1_334 + framing, "ceil(4000 / 3) rounds up, never down");
+    // Rounding is always up, so a fraction never under-counts.
+    assert_eq!(at(333), 1_202 + framing, "ceil(400000 / 333) is 1202");
+
     // And it is bounded on both ends, because this is the one knob that makes
     // the input half of a quota smaller. Zero must not divide by zero, and a
     // number past the ceiling must not shrink the estimate further than the
     // ceiling allows — the configuration refuses both, and a `TokenEstimate`
     // built any other way must still be safe.
     let zero = TokenEstimate {
-        bytes_per_token: 0,
+        bytes_per_token_hundredths: 0,
         ..TokenEstimate::default()
     };
     assert_eq!(
         req.estimated_input_tokens_for(&zero),
         req.estimated_input_tokens_for(&TokenEstimate {
-            bytes_per_token: 1,
+            bytes_per_token_hundredths: MIN_BYTES_PER_TOKEN_HUNDREDTHS,
             ..TokenEstimate::default()
         }),
         "zero must clamp to the most conservative setting, not divide by zero"
     );
     let absurd = TokenEstimate {
-        bytes_per_token: u32::MAX,
+        bytes_per_token_hundredths: u32::MAX,
         ..TokenEstimate::default()
     };
     assert_eq!(
         req.estimated_input_tokens_for(&absurd),
         req.estimated_input_tokens_for(&TokenEstimate {
-            bytes_per_token: MAX_BYTES_PER_TOKEN,
+            bytes_per_token_hundredths: MAX_BYTES_PER_TOKEN_HUNDREDTHS,
             ..TokenEstimate::default()
         }),
         "a value past the ceiling must clamp to it rather than erase the estimate"

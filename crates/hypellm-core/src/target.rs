@@ -596,14 +596,15 @@ pub struct Target {
     /// same document costs a page-image model and a text-extracting model
     /// quite different amounts.
     pub document_token_estimate: Option<u32>,
-    /// Input bytes assumed to make one token when reserving for this target.
+    /// Input bytes assumed to make one token when reserving for this target,
+    /// in hundredths of a byte (`bytes_per_token=2.6` is 260).
     ///
-    /// `None` uses [`crate::canonical::DEFAULT_BYTES_PER_TOKEN`], which is
+    /// `None` uses [`crate::canonical::DEFAULT_BYTES_PER_TOKEN_HUNDREDTHS`], which is
     /// deliberately pessimistic. Declared per target because the number an
     /// operator can justify is a property of *that model's tokenizer on that
     /// deployment's traffic*, measured from `hypellm_token_estimate_error`, and
     /// a router-wide figure would be either useless or wrong somewhere.
-    pub bytes_per_token: Option<u32>,
+    pub bytes_per_token_hundredths: Option<u32>,
     /// Data region this target's inference happens in.
     pub residency: Option<Residency>,
     /// Whether inference is local to this deployment.
@@ -659,9 +660,9 @@ impl Target {
         TokenEstimate {
             document_token_estimate: self.document_token_estimate.unwrap_or(default_document),
             output_multiplier: self.capabilities.effort_multipliers.for_effort(effort),
-            bytes_per_token: self
-                .bytes_per_token
-                .unwrap_or(crate::canonical::DEFAULT_BYTES_PER_TOKEN),
+            bytes_per_token_hundredths: self
+                .bytes_per_token_hundredths
+                .unwrap_or(crate::canonical::DEFAULT_BYTES_PER_TOKEN_HUNDREDTHS),
         }
     }
 
@@ -756,7 +757,7 @@ mod tests {
             cost_class: CostClass::CHEAPEST,
             quality_class: Default::default(),
             document_token_estimate: None,
-            bytes_per_token: None,
+            bytes_per_token_hundredths: None,
             residency: Some(Residency::new("eu")),
             is_local: true,
             admin_state: AdminState::Enabled,

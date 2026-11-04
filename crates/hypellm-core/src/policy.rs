@@ -1281,7 +1281,7 @@ mod tests {
             cost_class: CostClass::new(cost),
             quality_class: Default::default(),
             document_token_estimate: None,
-            bytes_per_token: None,
+            bytes_per_token_hundredths: None,
             residency: Some(Residency::new("eu")),
             is_local: local,
             admin_state: AdminState::Enabled,

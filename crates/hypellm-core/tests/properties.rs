@@ -184,7 +184,7 @@ fn snapshot(rng: &mut Rng) -> PolicySnapshot {
                 cost_class: CostClass(u8::try_from(rng.below(10)).unwrap_or(0)),
                 quality_class: Default::default(),
                 document_token_estimate: None,
-            bytes_per_token: None,
+            bytes_per_token_hundredths: None,
                 residency: None,
                 // A local target earns a large locality bonus, which is what
                 // makes pin ordering and deny handling non-trivial.

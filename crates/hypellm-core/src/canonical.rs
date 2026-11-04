@@ -1216,8 +1216,10 @@ impl CanonicalRequest {
         // would make the input half of the estimate vanish; the configuration
         // refuses both, and clamping here means a `TokenEstimate` built any
         // other way cannot produce an unbounded admission.
-        let per_token =
-            u64::from(estimate.bytes_per_token.clamp(1, MAX_BYTES_PER_TOKEN));
+        let per_token_hundredths = u64::from(estimate.bytes_per_token_hundredths.clamp(
+            MIN_BYTES_PER_TOKEN_HUNDREDTHS,
+            MAX_BYTES_PER_TOKEN_HUNDREDTHS,
+        ));
         // Per-message framing overhead that every provider adds.
         let framing = u64::try_from(self.messages.len())
             .unwrap_or(u64::MAX)
@@ -1225,8 +1227,12 @@ impl CanonicalRequest {
         let documents = u64::try_from(self.document_parts())
             .unwrap_or(u64::MAX)
             .saturating_mul(u64::from(estimate.document_token_estimate));
+        // Fixed-point in hundredths, so a measured 2.6 is expressible without
+        // floating point: ceil(bytes / (h / 100)) = ceil(bytes * 100 / h).
+        // Saturating, so an enormous input saturates high, never wraps low.
         bytes
-            .div_ceil(per_token)
+            .saturating_mul(100)
+            .div_ceil(per_token_hundredths)
             .saturating_add(framing)
             .saturating_add(documents)
     }
@@ -1273,7 +1279,8 @@ impl CanonicalRequest {
 /// lower it per target, or router-wide through `default_document_token_estimate`.
 pub const DEFAULT_DOCUMENT_TOKEN_ESTIMATE: u32 = 4_096;
 
-/// Input bytes assumed to make one token when no target declares otherwise.
+/// Input bytes assumed to make one token when no target declares otherwise,
+/// in hundredths of a byte (200 is 2.00 bytes per token).
 ///
 /// Two, which is deliberately pessimistic: real text tokenizes at roughly three
 /// to four bytes per token for English and more for code, so this reserves
@@ -1285,17 +1292,27 @@ pub const DEFAULT_DOCUMENT_TOKEN_ESTIMATE: u32 = 4_096;
 /// quota that should have held it — so the default errs the other way and stays
 /// there. An operator who has *measured* their target, using the per-target
 /// `hypellm_token_estimate_error` histogram, declares what they measured with
-/// `target … bytes_per_token=N`. The router never adjusts this on its own: a
-/// gateway that quietly loosened its own quota enforcement in response to
-/// traffic would be enforcing whatever the traffic taught it.
-pub const DEFAULT_BYTES_PER_TOKEN: u32 = 2;
+/// `target … bytes_per_token=N` (a decimal with up to two fractional digits,
+/// such as `2.6`). Fixed-point rather than floating point so the estimate is
+/// exact integer arithmetic and identical on every host. The router never
+/// adjusts this on its own: a gateway that quietly loosened its own quota
+/// enforcement in response to traffic would be enforcing whatever the traffic
+/// taught it.
+pub const DEFAULT_BYTES_PER_TOKEN_HUNDREDTHS: u32 = 200;
 
-/// The largest `bytes_per_token` a target may declare.
+/// The smallest `bytes_per_token` a target may declare, in hundredths (1.00).
+///
+/// Below one byte per token the estimate exceeds the input's byte length,
+/// which no tokenizer produces; it is also the clamp that keeps a
+/// `TokenEstimate` built outside the configuration from dividing by zero.
+pub const MIN_BYTES_PER_TOKEN_HUNDREDTHS: u32 = 100;
+
+/// The largest `bytes_per_token` a target may declare, in hundredths (8.00).
 ///
 /// Eight bytes per token is already beyond any real tokenizer on any real
 /// input; past this the field stops being a calibration and becomes a way to
 /// disable the input half of quota accounting by editing one number.
-pub const MAX_BYTES_PER_TOKEN: u32 = 8;
+pub const MAX_BYTES_PER_TOKEN_HUNDREDTHS: u32 = 800;
 
 /// The two target-declared inputs to a token estimate.
 ///
@@ -1308,14 +1325,15 @@ pub struct TokenEstimate {
     pub document_token_estimate: u32,
     /// Multiplier applied to the requested output length.
     pub output_multiplier: u32,
-    /// Input bytes assumed to make one token, for this target.
+    /// Input bytes assumed to make one token, for this target, in hundredths
+    /// of a byte (260 is 2.6 bytes per token).
     ///
-    /// [`DEFAULT_BYTES_PER_TOKEN`] unless the target declares otherwise. A
+    /// [`DEFAULT_BYTES_PER_TOKEN_HUNDREDTHS`] unless the target declares otherwise. A
     /// *smaller* number reserves more, so this is the knob that trades quota
     /// accuracy against the risk of admitting a request that should have been
     /// held — which is why it is administrator-declared per target and never
     /// inferred by the router from what it observed.
-    pub bytes_per_token: u32,
+    pub bytes_per_token_hundredths: u32,
 }
 
 impl TokenEstimate {
@@ -1325,7 +1343,7 @@ impl TokenEstimate {
         Self {
             document_token_estimate: DEFAULT_DOCUMENT_TOKEN_ESTIMATE,
             output_multiplier: effort.default_output_multiplier(),
-            bytes_per_token: DEFAULT_BYTES_PER_TOKEN,
+            bytes_per_token_hundredths: DEFAULT_BYTES_PER_TOKEN_HUNDREDTHS,
         }
     }
 }

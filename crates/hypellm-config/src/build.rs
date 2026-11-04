@@ -2471,26 +2471,27 @@ fn build_target(f: &Fields<'_>) -> Result<(Target, Position), ConfigError> {
         }
     };
 
-    let bytes_per_token = match f.opt_str("bytes_per_token") {
+    let bytes_per_token_hundredths = match f.hundredths_field("bytes_per_token")? {
         None => None,
-        Some(_) => {
-            let raw = f.u32_field("bytes_per_token", 0)?;
-            // Both ends matter, and for opposite reasons. Zero would divide by
-            // zero; anything above the ceiling makes the input half of the
-            // estimate small enough that the field stops being a calibration
-            // and becomes a way to disable quota accounting by editing one
-            // number. Refused rather than clamped: an operator who wrote 64
-            // meant something, and silently running at 8 would tell them their
-            // quota was doing something it is not.
-            if raw == 0 || raw > hypellm_core::canonical::MAX_BYTES_PER_TOKEN {
+        Some(raw) => {
+            use hypellm_core::canonical::{
+                MAX_BYTES_PER_TOKEN_HUNDREDTHS, MIN_BYTES_PER_TOKEN_HUNDREDTHS,
+            };
+            // Both ends matter, and for opposite reasons. Below one byte per
+            // token the estimate exceeds the input's own length (and zero would
+            // divide by zero); anything above the ceiling makes the input half
+            // of the estimate small enough that the field stops being a
+            // calibration and becomes a way to disable quota accounting by
+            // editing one number. Refused rather than clamped: an operator who
+            // wrote 64 meant something, and silently running at 8 would tell
+            // them their quota was doing something it is not.
+            if !(MIN_BYTES_PER_TOKEN_HUNDREDTHS..=MAX_BYTES_PER_TOKEN_HUNDREDTHS).contains(&raw) {
                 return Err(f.error(
                     "invalid_bytes_per_token",
-                    format!(
-                        "bytes_per_token must be between 1 and {}; it is a measured \
-                         property of the target's tokenizer, and a larger value \
-                         under-reserves input tokens rather than calibrating them",
-                        hypellm_core::canonical::MAX_BYTES_PER_TOKEN
-                    ),
+                    "bytes_per_token must be between 1.00 and 8.00; it is a \
+                     measured property of the target's tokenizer, and a larger \
+                     value under-reserves input tokens rather than calibrating them"
+                        .to_owned(),
                 ));
             }
             Some(raw)
@@ -2507,7 +2508,7 @@ fn build_target(f: &Fields<'_>) -> Result<(Target, Position), ConfigError> {
             cost_class: CostClass::new(cost),
             quality_class: QualityClass::new(quality),
             document_token_estimate,
-            bytes_per_token,
+            bytes_per_token_hundredths,
             residency: f.opt_str("residency").map(Residency::new),
             is_local: f.bool_field("local", false)?,
             admin_state,

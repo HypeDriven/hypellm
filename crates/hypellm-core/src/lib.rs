@@ -186,7 +186,7 @@ mod invariant_tests {
                 cost_class: CostClass::CHEAPEST,
                 quality_class: Default::default(),
                 document_token_estimate: None,
-            bytes_per_token: None,
+            bytes_per_token_hundredths: None,
                 residency: None,
                 is_local: true,
                 admin_state: AdminState::Enabled,

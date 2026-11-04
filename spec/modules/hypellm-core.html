@@ -335,8 +335,10 @@ is no configuration that reaches the metadata service. Two honest caveats:
 not a security boundary (it accepts <code>_</code> in labels), and this module cannot
 defend against rebinding at all, because it never resolves anything.</p>
 <p><strong>Token estimation must never under-count.</strong> <code>estimated_input_tokens</code> is
-<code>ceil(bytes / 2)</code> plus 8 per message, computed with saturating arithmetic, which
-is pessimistic against a real tokenizer's 3–4 bytes per token. Under-counting
+<code>ceil(bytes × 100 / h)</code> plus 8 per message, where <code>h</code> is the target's
+<code>bytes_per_token</code> in fixed-point hundredths (default 200, clamped to 100–800),
+computed with saturating integer arithmetic. The default is pessimistic against a
+real tokenizer's 3–4 bytes per token. Under-counting
 would admit a request past a quota that should have held it, so the bias is
 deliberate. This crate implements no tokenizer; specification 12's &quot;selected
 target tokenizer when available&quot; is the caller's substitution.</p>

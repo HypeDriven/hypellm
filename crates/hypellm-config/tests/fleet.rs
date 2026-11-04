@@ -472,3 +472,44 @@ fn an_agent_key_must_be_one_ed25519_key_and_its_comment_is_dropped() {
         );
     }
 }
+
+#[test]
+fn bytes_per_token_accepts_a_measured_fraction_exactly() {
+    // The calibration the field exists for is rarely a whole number: a
+    // tokenizer measured at 2.6 bytes per token had to be declared as 2 (a
+    // third over-reserved) or 3 (under-counting real traffic). Stored in
+    // hundredths, so the value is exact rather than a float that rounds.
+    for (written, hundredths) in [("2", 200), ("2.6", 260), ("2.65", 265), ("1.00", 100), ("8", 800)] {
+        let text = format!(
+            "target id=spark:x provider=spark model=m bytes_per_token={written}\n\
+             alias id=x targets=spark:x"
+        );
+        let config = load(&text).unwrap_or_else(|e| panic!("{written} refused: {e:?}"));
+        let target = &config.snapshot.targets[&hypellm_core::ids::TargetId::new("spark:x").unwrap()];
+        assert_eq!(target.bytes_per_token_hundredths, Some(hundredths), "{written}");
+    }
+}
+
+#[test]
+fn bytes_per_token_refuses_what_it_would_otherwise_round_or_misread() {
+    // Each of these would have to be rounded, guessed at, or read as a float
+    // that the integer quota arithmetic cannot use. Refused, not coerced.
+    for bad in ["2.655", "2.", ".5", "-2", "+2", "2e0", "NaN", "inf", "2,5", "0x2", "2.6.1"] {
+        let text = format!("target id=spark:x provider=spark model=m bytes_per_token={bad}");
+        assert!(
+            codes(&text).contains(&"invalid_decimal".to_owned()),
+            "{bad} must be invalid_decimal, got {:?}",
+            codes(&text)
+        );
+    }
+    // Well-formed but outside 1.00–8.00: the range check, not the syntax one.
+    for out_of_range in ["0", "0.99", "8.01", "64"] {
+        let text =
+            format!("target id=spark:x provider=spark model=m bytes_per_token={out_of_range}");
+        assert!(
+            codes(&text).contains(&"invalid_bytes_per_token".to_owned()),
+            "{out_of_range}: {:?}",
+            codes(&text)
+        );
+    }
+}

@@ -535,6 +535,59 @@ impl<'a> Fields<'a> {
         })
     }
 
+    /// An optional non-negative decimal with at most two fractional digits,
+    /// returned in hundredths: `2` is 200, `2.6` is 260, `2.65` is 265.
+    ///
+    /// Fixed-point, not floating point: the value feeds integer quota
+    /// arithmetic, and parsing it as `f64` would admit `NaN`, `inf`, `1e3` and
+    /// values that round differently from what the operator wrote. Only
+    /// `digits` or `digits.digits` is accepted; a sign, an exponent, a bare
+    /// `.5` or `2.`, and a third fractional digit are errors rather than
+    /// silently rounded.
+    pub fn hundredths_field(&self, key: &str) -> Result<Option<u32>, ConfigError> {
+        let Some(v) = self.opt_str(key) else {
+            return Ok(None);
+        };
+        let invalid = || {
+            self.err(
+                "invalid_decimal",
+                format!(
+                    "field '{key}' must be a non-negative decimal with at most two \
+                     fractional digits, found '{v}'"
+                ),
+            )
+        };
+        let (whole, frac) = match v.split_once('.') {
+            Some((w, f)) => (w, f),
+            None => (v, ""),
+        };
+        let all_digits = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+        if whole.is_empty()
+            || !all_digits(whole)
+            || !all_digits(frac)
+            || frac.len() > 2
+            || (v.contains('.') && frac.is_empty())
+        {
+            return Err(invalid());
+        }
+        let whole: u32 = whole.parse().map_err(|_| invalid())?;
+        let frac: u32 = match frac.len() {
+            0 => 0,
+            1 => frac.parse::<u32>().map_err(|_| invalid())?.saturating_mul(10),
+            _ => frac.parse().map_err(|_| invalid())?,
+        };
+        whole
+            .checked_mul(100)
+            .and_then(|w| w.checked_add(frac))
+            .map(Some)
+            .ok_or_else(|| {
+                self.err(
+                    "integer_out_of_range",
+                    format!("field '{key}' exceeds the 32-bit range"),
+                )
+            })
+    }
+
     /// A signed 64-bit field, defaulting when absent.
     pub fn i64_field(&self, key: &str, default: i64) -> Result<i64, ConfigError> {
         match self.record.get(key) {
