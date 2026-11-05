@@ -284,7 +284,7 @@ _session reason:
     trap 'rm -f "$headers"' EXIT
     # printf is a shell builtin, so the payload never becomes another process's
     # argv on its way to curl's stdin.
-    payload=$(jq -nc --arg t "$token" --arg r "{{reason}}" '{token:$t, reason:$r}')
+    payload=$(jq -nc --arg t "$token" --arg r {{quote(reason)}} '{token:$t, reason:$r}')
     body=$(printf '%s' "$payload" | curl -sS -D "$headers" -X POST \
         -H 'Content-Type: application/json' --data-binary @- \
         "http://127.0.0.1:{{admin_port}}/admin/v1/auth/break-glass") \
@@ -424,10 +424,12 @@ restart: down up
 adopt reason:
     #!/usr/bin/env bash
     set -euo pipefail
-    [ -n "{{reason}}" ] || { echo "a reason is required; it is recorded" >&2; exit 1; }
+    # The router refuses a shorter reason at startup, and by then the old pod is gone.
+    reason={{quote(reason)}}
+    [ "${#reason}" -ge 8 ] || { echo "a reason of at least 8 characters is required; it is recorded" >&2; exit 1; }
     kstack apply {{ns}} >/dev/null
     index=$({{kubectl}} get deploy/hypellm -o json | jq '[.spec.template.spec.containers[].name] | index("router")')
-    jq -nc --arg reason "{{reason}}" --argjson i "$index" \
+    jq -nc --arg reason "$reason" --argjson i "$index" \
         '[{op:"add", path:"/spec/template/spec/containers/\($i)/args/-", value:"--adopt-config"},
           {op:"add", path:"/spec/template/spec/containers/\($i)/args/-", value:$reason}]' \
         | {{kubectl}} patch deploy/hypellm --type=json --patch-file=/dev/stdin >/dev/null
