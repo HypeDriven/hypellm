@@ -158,3 +158,77 @@ fn a_machine_that_stays_down_fails_within_its_wait_and_the_deadline() {
     assert!(elapsed < 4_500, "it must not wait past the request deadline ({elapsed} ms)");
     assert_eq!(upstream.served(), 0);
 }
+
+#[derive(Debug)]
+struct RebootClock {
+    inner: hypellm_core::time::TestClock,
+    health: std::sync::Mutex<Option<std::sync::Weak<hypellm_core::health::HealthRegistry>>>,
+}
+
+impl hypellm_core::time::Clock for RebootClock {
+    fn now_millis(&self) -> u64 {
+        self.inner.now_millis()
+    }
+    fn now_micros(&self) -> u64 {
+        self.inner.now_micros()
+    }
+    fn wall_millis(&self) -> u64 {
+        self.inner.wall_millis()
+    }
+    fn sleep(&self, duration: std::time::Duration) {
+        self.inner.sleep(duration);
+        if self.now_millis() >= 900_000
+            && let Some(health) = self
+                .health
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+        {
+            let target = hypellm_core::ids::TargetId::new("local:model").unwrap();
+            health.record_probe(&target, true);
+            health.record_probe(&target, true);
+        }
+    }
+}
+
+#[test]
+fn a_synchronous_request_survives_a_full_fifteen_minute_machine_reboot() {
+    use hypellm_core::health::{BreakerConfig, HealthRegistry};
+    use hypellm_core::time::{Clock, Deadline, TestClock};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let upstream = FakeUpstream::start(CannedResponse::json(200, OK_BODY));
+    let mut router = router_with_config(&upstream, &config(upstream.address.port(), 900_000));
+    let clock = Arc::new(RebootClock {
+        inner: TestClock::new(),
+        health: std::sync::Mutex::new(None),
+    });
+    let health = Arc::new(HealthRegistry::new(clock.clone(), BreakerConfig::DEFAULT));
+    *clock.health.lock().unwrap() = Some(Arc::downgrade(&health));
+    let target = hypellm_core::ids::TargetId::new("local:model").unwrap();
+    health.record_probe(&target, false);
+    health.record_probe(&target, false);
+    let state = Arc::get_mut(&mut router.state).unwrap();
+    state.clock = clock.clone();
+    state.health = health;
+    let mut request = request();
+    request.limits.deadline = Deadline::after(clock.as_ref(), Duration::from_millis(1_020_000));
+    let outcome = pipeline::execute(
+        state,
+        &request,
+        &[],
+        PermissionSet::empty(),
+        &mut Collect::default(),
+    );
+    assert!(outcome.is_success(), "{:?}", outcome.error);
+    assert_eq!(clock.now_millis(), 900_000);
+    assert_eq!(upstream.served(), 1);
+    assert_eq!(
+        state
+            .recovery_waiters
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}

@@ -1129,11 +1129,13 @@ immediately. Other scopes without <code>queued=</code> refuse immediately.</li>
 <p>Queue depth and wait are published as <code>hypellm_queue_depth</code> and
 <code>hypellm_queue_wait_milliseconds</code>.</p>
 <h3 id="waiting-out-an-outage">Waiting out an outage</h3>
-<p>By default a request fails as soon as every target for its alias is
-unreachable. A provider can instead ask for requests to wait for it to come
-back — a machine rebooting, or llama.cpp answering <code>503</code> while it loads:</p>
+<p>Providers attached to a <code>machine</code>, or serving an active fleet deployment,
+default to a 15-minute recovery window. Requests keep waiting through a reboot,
+connection failures, or llama.cpp answering <code>503</code> while it loads. Other
+providers default to failing immediately. An explicit setting, including zero,
+overrides the default:</p>
 <pre><code class="language-text">provider id=spark family=llamacpp scheme=http host=spark.lan port=8000 \
-    egress=private_network recovery_wait_ms=90000
+    egress=private_network recovery_wait_ms=900000
 </code></pre>
 <ul>
 <li><strong>When it applies:</strong> nothing has reached the client, at least one target was
@@ -1141,12 +1143,18 @@ unreachable (connection refused or timed out, a <code>5xx</code> before acceptan
 open breaker, stale fleet state), and nothing failed for a reason time does
 not cure. A caller over quota, an unknown alias or a <code>4xx</code> fails at once.</li>
 <li><strong>How long:</strong> the longest <code>recovery_wait_ms</code> among the alias's providers, at
-most 600000, and never past the request deadline (<code>default_deadline_ms</code>, or
-the caller's own). Retries back off from 250 ms to 2 s. A streamed request
+most 900000. HTTP admission adds this allowance to the normal request deadline
+(for jobs, the larger of <code>job_retention_ms</code> and <code>default_deadline_ms</code>),
+so recovery leaves time for execution. An artifact job's caller-specified patience
+still caps its deadline. Pipeline callers' explicit deadlines are unchanged.
+Retries back off from 250 ms to 2 s. A streamed request
 gets an SSE keepalive each round, and a client that leaves ends the wait.</li>
 <li><strong>How many:</strong> at most <code>settings max_recovery_waiters</code> (default 256) wait at
 once. Past that, a request fails at once, because each waiter holds a
-connection worker.</li>
+connection worker. Jobs stay in their bounded queue with <code>waiting_for=recovery</code>,
+retry every two seconds, and hold no worker between attempts. Outage retries
+do not consume the fleet governance attempt limit, and the recovery window is
+not renewed on each retry.</li>
 <li>It is set per provider (one machine's endpoint) and editable from the
 dashboard's Machines panel.</li>
 </ul>

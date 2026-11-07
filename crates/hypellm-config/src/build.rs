@@ -1537,6 +1537,25 @@ pub fn build(document: &Document, version: u64) -> Result<ValidatedConfig, Vec<C
         return Err(errors);
     }
 
+    // Fleet machines may reboot without withdrawing their models from the
+    // queue. An explicit provider setting, including zero, remains authoritative.
+    if fleet.is_active() {
+        let explicit: BTreeSet<&str> = document
+            .of_kind("provider")
+            .filter(|r| r.has("recovery_wait_ms"))
+            .filter_map(|r| r.get("id"))
+            .collect();
+        for deployment in fleet.deployments.values() {
+            if let Some(provider) = targets
+                .get(&deployment.target)
+                .and_then(|t| providers.get_mut(&t.provider_id))
+                .filter(|p| !explicit.contains(p.id.as_str()))
+            {
+                provider.recovery_wait_ms = 900_000;
+            }
+        }
+    }
+
     // Which slave each fleet-managed target runs on. Declared placement, not
     // observed: a deployment says where a target runs whether or not
     // orchestration is currently switched on, and access to that machine is
@@ -2197,9 +2216,14 @@ fn build_provider(
             recovery_wait_ms: {
                 // Bounded, because a wait is a held connection: an hour-long
                 // recovery window would let a dead fleet pin every thread the
-                // listener has. Ten minutes covers a machine rebooting.
-                const MAX_RECOVERY_WAIT_MS: u64 = 600_000;
-                let wait = f.u64_field("recovery_wait_ms", 0)?;
+                // listener has. Fifteen minutes covers a machine rebooting.
+                const MAX_RECOVERY_WAIT_MS: u64 = 900_000;
+                let default = if f.opt_str("machine").is_some() {
+                    900_000
+                } else {
+                    0
+                };
+                let wait = f.u64_field("recovery_wait_ms", default)?;
                 if wait > MAX_RECOVERY_WAIT_MS {
                     return Err(f.error(
                         "invalid_recovery_wait",

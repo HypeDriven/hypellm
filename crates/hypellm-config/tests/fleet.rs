@@ -69,6 +69,77 @@ fn a_complete_fleet_declaration_builds() {
         140_384_485_376 - 17_179_869_184
     );
     assert!(!config.fleet.digest().is_empty());
+    assert_eq!(
+        config
+            .snapshot
+            .providers
+            .values()
+            .next()
+            .unwrap()
+            .recovery_wait_ms,
+        900_000
+    );
+}
+
+#[test]
+fn recovery_defaults_cover_always_on_machines_and_preserve_explicit_settings() {
+    for (machine, explicit, expected) in [
+        (false, "", 0),
+        (true, "", 900_000),
+        (true, "recovery_wait_ms=0", 0),
+        (true, "recovery_wait_ms=1234", 1234),
+    ] {
+        let text = BASE.replace(
+            "egress=private_network",
+            &format!(
+                "egress=private_network {} {explicit}",
+                if machine { "machine=spark" } else { "" }
+            ),
+        );
+        let text = format!("{text}\nmachine id=spark memory_bytes=140384485376\n");
+        let config = hypellm_config::load(&text, 1).unwrap();
+        assert_eq!(
+            config
+                .snapshot
+                .providers
+                .values()
+                .next()
+                .unwrap()
+                .recovery_wait_ms,
+            expected
+        );
+    }
+    for explicit in ["recovery_wait_ms=0", "recovery_wait_ms=1234"] {
+        let text = format!(
+            "{}\n{SPARK}",
+            BASE.replace(
+                "egress=private_network",
+                &format!("egress=private_network {explicit}")
+            )
+        );
+        let config = hypellm_config::load(&text, 1).unwrap();
+        assert_ne!(
+            config
+                .snapshot
+                .providers
+                .values()
+                .next()
+                .unwrap()
+                .recovery_wait_ms,
+            900_000
+        );
+    }
+}
+
+#[test]
+fn recovery_accepts_fifteen_minutes_and_rejects_longer_windows() {
+    for (wait, valid) in [(900_000, true), (900_001, false), (u64::MAX, false)] {
+        let text = BASE.replace(
+            "egress=private_network",
+            &format!("egress=private_network recovery_wait_ms={wait}"),
+        );
+        assert_eq!(hypellm_config::load(&text, 1).is_ok(), valid);
+    }
 }
 
 #[test]

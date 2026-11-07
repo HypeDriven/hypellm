@@ -50,6 +50,15 @@ pub(crate) fn wall_seconds(clock: &dyn Clock) -> u64 {
     clock.wall_millis() / 1000
 }
 
+// Leave the normal execution allowance after a machine has recovered. Applied
+// once at HTTP admission; pipeline callers' explicit deadlines stay unchanged.
+fn allow_recovery(config: &hypellm_config::ValidatedConfig, request: &mut CanonicalRequest) {
+    let wait =
+        u64::try_from(pipeline::recovery_budget(config, request).as_millis()).unwrap_or(u64::MAX);
+    request.limits.deadline =
+        Deadline::at(request.limits.deadline.as_millis().saturating_add(wait));
+}
+
 /// The inference listener.
 #[derive(Debug)]
 pub struct InferenceHandler {
@@ -296,6 +305,7 @@ impl InferenceHandler {
         let request = match parsed {
             Ok(mut request) => {
                 request.operation = operation;
+                allow_recovery(&config, &mut request);
                 request
             }
             Err(error) => return respond_error(writer, &error, Some(request_id), protocol),
@@ -444,13 +454,25 @@ impl InferenceHandler {
                 }
             }
             let mut request = request;
+            allow_recovery(&config, &mut request);
             if let Some(asked) = asked {
                 // The caller may wait less than the configured ceiling, never
                 // more.
-                let patience = Duration::from_millis(asked).min(patience);
-                request.limits.deadline = Deadline::after(state.clock.as_ref(), patience);
+                request.limits.deadline = request.limits.deadline.min(Deadline::after(
+                    state.clock.as_ref(),
+                    Duration::from_millis(asked),
+                ));
             }
-            return self.accept_job(writer, principal, request_id, protocol, &config, jobs, request, Some(spec));
+            return self.accept_job(
+                writer,
+                principal,
+                request_id,
+                protocol,
+                &config,
+                jobs,
+                request,
+                Some(spec),
+            );
         }
 
         let mut request = match openai::parse_chat_request(body, &context, &limits) {
@@ -458,6 +480,7 @@ impl InferenceHandler {
             Err(error) => return respond_error(writer, &error, Some(request_id), protocol),
         };
         request.operation = Operation::Chat;
+        allow_recovery(&config, &mut request);
         // A job's result is collected whole from `/result`. Streaming it to a
         // connection that has already been released is not a thing that can
         // happen, so the flag is cleared rather than honoured — leaving it set
@@ -1615,6 +1638,26 @@ fn write_json_plain(writer: &mut ClientWriter, status: u16, payload: &str) -> io
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn machine_outages_leave_the_normal_execution_allowance_after_recovery() {
+        let text = crate::testing::default_config_text(8000)
+            .replace("egress=local", "egress=local machine=box");
+        let config = hypellm_config::load(
+            &format!("{text}\nmachine id=box memory_bytes=1000000000000\n"),
+            1,
+        )
+        .expect("valid machine configuration");
+        let mut request = hypellm_adapters::testing::request_fixture();
+        request.requested_model = hypellm_core::ids::AliasId::new("test-alias").expect("valid alias");
+        request.limits.deadline = Deadline::at(120_000);
+        allow_recovery(&config, &mut request);
+        assert_eq!(request.limits.deadline.as_millis(), 1_020_000);
+
+        // A caller's shorter artifact-job patience still caps the allowance.
+        let caller = Deadline::at(60_000);
+        assert_eq!(request.limits.deadline.min(caller).as_millis(), 60_000);
+    }
 
     /// A configuration with two groups in one tenant and a third in another,
     /// so that both the membership filter and the tenant filter are exercised.

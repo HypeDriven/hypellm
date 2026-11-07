@@ -148,9 +148,8 @@ pub fn execute_for_key(
 ///
 /// `parked` is whether the job queue already counts this job as parked demand
 /// for its capability (specification 26.10): it re-asks the batching queue
-/// without being counted again, as a parked request does. A wait for a target
-/// to recover from an outage is unchanged — that is not capacity, and the job
-/// queue has nothing better to do with it.
+/// without being counted again, as a parked request does. An outage also
+/// returns immediately so the job queue can retry without holding a worker.
 #[allow(
     clippy::too_many_arguments,
     reason = "a pass of one job, fully specified; a struct here would only move the arguments"
@@ -173,12 +172,16 @@ pub fn execute_job_pass(
         queue_wait: false,
         artifact,
     };
-    let first = execute_once(state, &config, request, groups, &permissions, key, sink, pass);
-    let budget = recovery_budget(&config, request);
-    if budget.is_zero() || !awaits_recovery(&first) {
-        return first;
-    }
-    await_recovery(state, &config, request, groups, &permissions, key, sink, first, budget, pass)
+    execute_once(
+        state,
+        &config,
+        request,
+        groups,
+        &permissions,
+        key,
+        sink,
+        pass,
+    )
 }
 
 /// The queue class a request from this caller belongs to.
@@ -276,7 +279,10 @@ fn alias_sampling(
 /// deserves a minute to come back, a hosted API none. The alias's candidates
 /// are known before routing, so the wait does not depend on which of them the
 /// router last tried.
-fn recovery_budget(config: &hypellm_config::ValidatedConfig, request: &CanonicalRequest) -> Duration {
+pub(crate) fn recovery_budget(
+    config: &hypellm_config::ValidatedConfig,
+    request: &CanonicalRequest,
+) -> Duration {
     let snapshot = &config.snapshot;
     let Some(alias) = snapshot.aliases.get(&request.requested_model) else {
         return Duration::ZERO;
@@ -298,9 +304,22 @@ fn recovery_budget(config: &hypellm_config::ValidatedConfig, request: &Canonical
 /// one target was unreachable, and nothing failed for a reason time does not
 /// cure. A caller over quota, an unknown alias, or a provider rejecting the
 /// request must hear so at once — waiting would only make the answer slower.
-fn awaits_recovery(outcome: &Outcome) -> bool {
+pub(crate) fn awaits_recovery(outcome: &Outcome) -> bool {
     use hypellm_core::event::UpstreamErrorClass;
-    if outcome.is_success() || outcome.saw_output {
+    if outcome.is_success()
+        || outcome.saw_output
+        || outcome.error.as_ref().is_some_and(|e| {
+            matches!(
+                e.code,
+                ErrorCode::TokenBudgetExhausted
+                    | ErrorCode::InternalFault
+                    | ErrorCode::Forbidden
+                    | ErrorCode::RateLimited
+                    | ErrorCode::InvalidRequest
+                    | ErrorCode::Unauthenticated
+            )
+        })
+    {
         return false;
     }
     let unreachable = |reason: ExclusionReason| {
@@ -390,6 +409,20 @@ fn await_recovery(
             break "client_gone";
         }
         outcome = execute_once(state, config, request, groups, permissions, key, sink, pass);
+        // The machine may be back before its model has started. Keep the
+        // ordinary cold-model queueing behavior during that transition too.
+        if pass.queue_wait && awaits_activation(&outcome) {
+            outcome = await_activation(
+                state,
+                config,
+                request,
+                groups,
+                permissions,
+                key,
+                sink,
+                outcome,
+            );
+        }
         if !awaits_recovery(&outcome) {
             break if outcome.is_success() { "recovered" } else { "failed" };
         }

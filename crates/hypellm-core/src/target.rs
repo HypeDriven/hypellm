@@ -359,6 +359,7 @@ pub struct Provider {
     pub egress_profile: String,
     /// How long a request may wait for this provider to come back when every
     /// candidate is unreachable, in milliseconds. Zero fails at once.
+    /// Defaults to fifteen minutes for machines and active fleet providers.
     pub recovery_wait_ms: u64,
 }
 

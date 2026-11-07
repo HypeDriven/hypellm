@@ -32,12 +32,12 @@ import { buttonRow, card } from '../components/table.js';
 const GIB = 1024 * 1024 * 1024;
 
 /** The router's ceiling on `recovery_wait_ms`. */
-const MAX_RECOVERY_WAIT_MS = 600_000;
+const MAX_RECOVERY_WAIT_MS = 900_000;
 
 const RECOVERY_HINT =
   'How long a request waits and retries when every machine for its alias is unreachable, ' +
   'using the longest wait among those providers; 0 fails at once, and the request deadline ' +
-  'still wins.';
+  'still wins. Fleet machines default to 900 seconds (15 minutes).';
 
 /**
  * Field specifications, per record kind. `gib` fields are entered in GiB and
@@ -113,14 +113,15 @@ function fromMillis(raw) {
  * @param {object} provider The provider's fields.
  * @param {string} prefix Unique id prefix.
  * @param {(edits: object[]) => Promise<unknown>} submit
+ * @param {number} defaultWait Effective default when the provider has no override.
  * @returns {HTMLElement}
  */
-function recoveryEditor(provider, prefix, submit) {
+function recoveryEditor(provider, prefix, submit, defaultWait = 0) {
   const made = textField({
     id: `${prefix}-recovery-${provider.id}`,
     label: `${provider.id} (${provider.scheme || 'http'}://${provider.host}${provider.port ? `:${provider.port}` : ''}) — recovery wait (seconds)`,
     type: 'number',
-    value: fromMillis(provider.recovery_wait_ms) || '0',
+    value: fromMillis(provider.recovery_wait_ms) || String(defaultWait / 1000),
   });
   made.input.setAttribute('min', '0');
   made.input.setAttribute('max', String(MAX_RECOVERY_WAIT_MS / 1000));
@@ -421,14 +422,16 @@ export function machinesPanel(ctx, fleet) {
       actionButton('Fleet policy', () => editPolicy(records, 'fleet', fleetPolicy), { tone: 'quiet' }),
     ]);
 
-    const cards = hosts.map((host) => hostCard(host, records));
+    const cards = hosts.map((host) => hostCard(host, records, enabled));
     // Every provider, including ones no fleet host serves — a LAN llama.cpp
     // reached by hostname still benefits from waiting out a restart.
     const providers = recordsOf(records, 'provider');
+    const managedProviders = new Set(providersFor(recordsOf(records, 'deployment'), records).map((p) => p.id));
     const providerCard = card('Providers', [
       el('p', { class: 'panel__note', text: RECOVERY_HINT }),
       ...(providers.length
-        ? providers.map((provider) => recoveryEditor(provider, 'all', submit))
+        ? providers.map((provider) => recoveryEditor(provider, 'all', submit,
+          provider.machine || (enabled && managedProviders.has(provider.id)) ? MAX_RECOVERY_WAIT_MS : 0))
         : [emptyState('No providers are declared.')]),
     ]);
     body.replaceChildren(
@@ -439,7 +442,7 @@ export function machinesPanel(ctx, fleet) {
     );
   }
 
-  function hostCard(host, records) {
+  function hostCard(host, records, enabled) {
     const accelerators = recordsOf(records, 'accelerator').filter((a) => a.host === host.id);
     const ids = new Set(accelerators.map((a) => a.id));
     const deployments = recordsOf(records, 'deployment').filter((d) => ids.has(d.accelerator));
@@ -473,7 +476,8 @@ export function machinesPanel(ctx, fleet) {
       ...(servingProviders.length
         ? [
             el('p', { class: 'panel__note', text: RECOVERY_HINT }),
-            ...servingProviders.map((provider) => recoveryEditor(provider, `host-${host.id}`, submit)),
+            ...servingProviders.map((provider) => recoveryEditor(provider, `host-${host.id}`, submit,
+              provider.machine || enabled ? MAX_RECOVERY_WAIT_MS : 0)),
           ]
         : []),
       buttonRow([

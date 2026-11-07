@@ -41,6 +41,10 @@
 //! Holding no worker while it waits, a job for a busy slave no longer keeps a
 //! job for an idle one waiting behind it.
 //!
+//! An unreachable machine also leaves its jobs queued without a worker, tried
+//! every two seconds within its provider recovery window and the job deadline.
+//! These retries do not consume the fleet governance attempt limit.
+//!
 //! A pass refused by the fleet's own governance — the activation budget, a host
 //! without room — still backs off (specification 26.10): at most
 //! [`MAX_JOB_ATTEMPTS`] passes, doubling from a second to a minute. Trying those
@@ -200,7 +204,8 @@ pub struct JobView {
     pub class: PriorityClass,
     /// While queued, why: `turn` before its first pass, `slot` when every
     /// slot it could use was taken, `activation` when its model has still to
-    /// be started, `backoff` after a refusal by fleet governance. `None` once
+    /// be started, `recovery` during a machine outage, `backoff` after a
+    /// refusal by fleet governance. `None` once
     /// it is running or finished.
     ///
     /// It names no other principal and counts nobody, so it says why a caller
@@ -298,6 +303,8 @@ struct Entry {
     attempts: u32,
     /// Not to be tried before this, on the router's monotonic clock.
     not_before_ms: u64,
+    /// One recovery window per consecutive outage, never renewed by a retry.
+    recovery_until_ms: Option<u64>,
     /// A worker is trying it now. It keeps its place until the pass ends.
     trying: bool,
     /// The pass holds its reservations: it is running, not waiting, and no
@@ -420,6 +427,9 @@ enum Wait {
     /// Its model has still to be started. Kept in place, no attempt, and
     /// counted as parked demand.
     Activation,
+    /// A machine is temporarily unreachable. No governance attempt or worker
+    /// is held while it recovers.
+    Recovery,
     /// Refused by fleet governance. An attempt, and a backoff.
     Backoff,
 }
@@ -429,6 +439,7 @@ impl Wait {
         match self {
             Self::Slot => "slot",
             Self::Activation => "activation",
+            Self::Recovery => "recovery",
             Self::Backoff => "backoff",
         }
     }
@@ -650,6 +661,7 @@ impl JobStore {
                 }),
                 attempts: 0,
                 not_before_ms: 0,
+                recovery_until_ms: None,
                 trying: false,
                 started: false,
                 blocked_in: None,
@@ -957,8 +969,15 @@ impl JobStore {
         }
         entry.trying = false;
         entry.started = false;
+        if wait != Wait::Recovery {
+            entry.recovery_until_ms = None;
+        }
         match wait {
             Wait::Slot | Wait::Activation => entry.blocked_in = Some(generation),
+            Wait::Recovery => {
+                entry.blocked_in = None;
+                entry.not_before_ms = now_ms.saturating_add(backoff_ms);
+            }
             Wait::Backoff => {
                 entry.attempts = entry.attempts.saturating_add(1);
                 entry.blocked_in = None;
@@ -972,7 +991,11 @@ impl JobStore {
             if job.view.state.is_terminal() {
                 return Ok(());
             }
-            let eta = if wait == Wait::Backoff { backoff_ms } else { 0 };
+            let eta = if matches!(wait, Wait::Backoff | Wait::Recovery) {
+                backoff_ms
+            } else {
+                0
+            };
             let changed = job.view.state != JobState::Queued
                 || job.view.waiting_for != Some(wait.as_str())
                 || job.view.eta_ms != eta;
@@ -993,6 +1016,19 @@ impl JobStore {
             .iter()
             .find(|e| e.work.id == *id)
             .map_or(0, |e| e.attempts)
+    }
+
+    /// Start an outage window once, returning how much remains. Retrying a
+    /// queued job must never turn a finite recovery budget into an endless one.
+    fn recovery_remaining(&self, id: &JobId, budget_ms: u64, now_ms: u64) -> u64 {
+        let mut queue = self.lock_queue();
+        let Some(entry) = queue.iter_mut().find(|e| e.work.id == *id) else {
+            return 0;
+        };
+        let until = entry
+            .recovery_until_ms
+            .get_or_insert(now_ms.saturating_add(budget_ms));
+        until.saturating_sub(now_ms)
     }
 
     /// Remove a job from the queue for good, returning the parked demand it
@@ -1380,7 +1416,10 @@ fn run_pass(state: &RouterState, jobs: &JobStore, work: &Arc<Work>, generation: 
 
     // A shim that ran out of memory, has not loaded its model, or a spool with
     // no room: the job waits and tries again, as for a governance refusal.
-    let raw_wait = if run_output.as_ref().is_some_and(|o| o.waits_for_capacity) && !outcome.is_success() {
+    let recovery_budget = pipeline::recovery_budget(&state.config(), &work.request);
+    let raw_wait = if !recovery_budget.is_zero() && pipeline::awaits_recovery(&outcome) {
+        Some(Wait::Recovery)
+    } else if run_output.as_ref().is_some_and(|o| o.waits_for_capacity) && !outcome.is_success() {
         Some(Wait::Backoff)
     } else {
         wait_of(&outcome)
@@ -1390,11 +1429,20 @@ fn run_pass(state: &RouterState, jobs: &JobStore, work: &Arc<Work>, generation: 
     // that reason, whatever the last pass happened to be refused for.
     let expired_waiting =
         raw_wait.is_some() && !cancelled && work.request.limits.deadline.is_expired(clock);
-    let wait = raw_wait.filter(|_| !cancelled && !expired_waiting);
+    let recovery_remaining = if raw_wait == Some(Wait::Recovery) {
+        jobs.recovery_remaining(
+            &work.id,
+            u64::try_from(recovery_budget.as_millis()).unwrap_or(u64::MAX),
+            now,
+        )
+    } else {
+        u64::MAX
+    };
+    let wait = raw_wait.filter(|_| !cancelled && !expired_waiting && recovery_remaining > 0);
     if let Some(wait) = wait {
         let attempts = match wait {
             Wait::Backoff => jobs.attempts(&work.id).saturating_add(1),
-            Wait::Slot | Wait::Activation => 0,
+            Wait::Slot | Wait::Activation | Wait::Recovery => 0,
         };
         if attempts < MAX_JOB_ATTEMPTS {
             let newly_parked = if wait == Wait::Activation && !parked {
@@ -1402,7 +1450,12 @@ fn run_pass(state: &RouterState, jobs: &JobStore, work: &Arc<Work>, generation: 
             } else {
                 None
             };
-            let backoff = requeue_backoff_ms(attempts).min(
+            let backoff = if wait == Wait::Recovery {
+                2_000.min(recovery_remaining)
+            } else {
+                requeue_backoff_ms(attempts)
+            }
+            .min(
                 u64::try_from(work.request.limits.deadline.remaining(clock).as_millis())
                     .unwrap_or(u64::MAX),
             );
@@ -1719,4 +1772,163 @@ pub fn job_body(view: &JobView) -> Value {
         root.push("error", Value::Object(error));
     }
     Value::Object(root)
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod recovery_tests {
+    use super::*;
+    use crate::testing::{
+        CannedResponse, FakeUpstream, TestRouter, default_config_text, router_with_config,
+    };
+    use hypellm_core::health::{BreakerConfig, HealthRegistry};
+    use hypellm_core::ids::TargetId;
+    use hypellm_core::time::{Deadline, TestClock};
+
+    const OK: &str = r#"{"id":"ok","model":"test-model","choices":[{"message":{"content":"fine"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+
+    fn setup(wait_ms: u64) -> (TestRouter, FakeUpstream, Arc<TestClock>) {
+        let upstream = FakeUpstream::start(CannedResponse::json(200, OK));
+        let text = default_config_text(upstream.address.port())
+            .replace(
+                "egress=local",
+                &format!("egress=local recovery_wait_ms={wait_ms}"),
+            )
+            .replace("prefer=local:model", "prefer=*");
+        let text = format!("{text}\n\
+provider id=healthy family=openai scheme=http host=127.0.0.1 port={} base_path=/v1 egress=local
+\
+target id=healthy:model provider=healthy model=test-model local=true operations=chat context=100000 max_output=8192
+\
+alias id=healthy targets=healthy:model\n", upstream.address.port());
+        let mut router = router_with_config(&upstream, &text);
+        let clock = Arc::new(TestClock::new());
+        let state = Arc::get_mut(&mut router.state).unwrap();
+        state.clock = clock.clone();
+        state.health = Arc::new(HealthRegistry::new(clock.clone(), BreakerConfig::DEFAULT));
+        for _ in 0..2 {
+            state
+                .health
+                .record_probe(&TargetId::new("local:model").unwrap(), false);
+        }
+        (router, upstream, clock)
+    }
+
+    fn submit(router: &TestRouter, alias: &str) -> JobId {
+        let mut request = hypellm_adapters::testing::request_fixture();
+        request.requested_model = AliasId::new(alias).unwrap();
+        request.limits.deadline = Deadline::after(
+            router.state.clock.as_ref(),
+            Duration::from_millis(1_020_000),
+        );
+        router
+            .state
+            .jobs()
+            .unwrap()
+            .submit(
+                request,
+                vec![],
+                PermissionSet::empty(),
+                None,
+                SubmitTerms::default(),
+                router.state.clock.wall_millis(),
+                router.state.clock.now_millis(),
+            )
+            .unwrap()
+            .id
+    }
+
+    fn pass(router: &TestRouter) -> JobId {
+        let jobs = router.state.jobs().unwrap();
+        match jobs.take(router.state.clock.as_ref(), None).unwrap() {
+            Taken::Try {
+                work,
+                generation,
+                parked,
+            } => {
+                run_pass(&router.state, jobs, &work, generation, parked);
+                work.id.clone()
+            }
+            _ => panic!("expected a runnable job"),
+        }
+    }
+
+    fn view(router: &TestRouter, id: &JobId) -> JobView {
+        router
+            .state
+            .jobs()
+            .unwrap()
+            .get(
+                id,
+                &TenantId::new("acme").unwrap(),
+                router.state.clock.now_millis(),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn fifteen_minute_outage_keeps_jobs_queued_and_the_worker_free_for_healthy_nodes() {
+        let (router, upstream, clock) = setup(900_000);
+        let down = submit(&router, "test-alias");
+        let healthy = submit(&router, "healthy");
+        assert_eq!(pass(&router), down);
+        assert_eq!(view(&router, &down).state, JobState::Queued);
+        assert_eq!(view(&router, &down).waiting_for, Some("recovery"));
+        assert_eq!(router.state.recovery_waiters.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            pass(&router),
+            healthy,
+            "the same worker can serve a healthy node immediately"
+        );
+        assert_eq!(view(&router, &healthy).state, JobState::Succeeded);
+        for _ in 0..449 {
+            clock.advance(2_000);
+            assert_eq!(pass(&router), down);
+            assert_eq!(view(&router, &down).state, JobState::Queued);
+        }
+        assert_eq!(
+            router.state.jobs().unwrap().attempts(&down),
+            0,
+            "outages never exhaust governance attempts"
+        );
+        clock.advance(2_000);
+        for _ in 0..2 {
+            router
+                .state
+                .health
+                .record_probe(&TargetId::new("local:model").unwrap(), true);
+        }
+        assert_eq!(pass(&router), down);
+        assert_eq!(view(&router, &down).state, JobState::Succeeded);
+        assert_eq!(upstream.served(), 2);
+        assert!(router.state.jobs().unwrap().lock_queue().is_empty());
+    }
+
+    #[test]
+    fn recovery_window_expires_instead_of_restarting_on_each_job_pass() {
+        let (router, upstream, clock) = setup(4_000);
+        let id = submit(&router, "test-alias");
+        pass(&router);
+        clock.advance(2_000);
+        pass(&router);
+        assert_eq!(view(&router, &id).state, JobState::Queued);
+        clock.advance(2_000);
+        pass(&router);
+        assert_eq!(view(&router, &id).state, JobState::Failed);
+        assert_eq!(upstream.served(), 0);
+        assert!(router.state.jobs().unwrap().lock_queue().is_empty());
+    }
+
+    #[test]
+    fn explicit_zero_recovery_wait_still_fails_jobs_immediately() {
+        let (router, _, _) = setup(0);
+        let id = submit(&router, "test-alias");
+        pass(&router);
+        assert_eq!(view(&router, &id).state, JobState::Failed);
+    }
 }

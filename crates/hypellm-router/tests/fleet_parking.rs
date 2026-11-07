@@ -54,7 +54,7 @@ fn config(port: u16, socket: &str, settings: &str, policy: &str, warm: bool) -> 
 settings state_dir=/tmp/hypellm-test default_deadline_ms=20000 retry_budget_ms=20000 \\
          max_attempts=3 fleet_enabled=true {settings}
 tenant id=acme
-provider id=cold family=openai scheme=http host=127.0.0.1 port={port} base_path=/v1 egress=local
+provider id=cold family=openai scheme=http host=127.0.0.1 port={port} base_path=/v1 egress=local recovery_wait_ms=0
 target id=cold:m provider=cold model=model-cold local=true cost=1 \\
        operations=chat capabilities=chat context=100000 max_output=8192 concurrency=8
 {warm_records}alias id=coder capability=chat targets={targets}
