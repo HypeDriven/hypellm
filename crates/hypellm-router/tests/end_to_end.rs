@@ -3028,3 +3028,137 @@ fn a_stream_with_bytes_after_its_sentinel_is_not_pooled() {
         "a connection that sent junk after its sentinel was reused"
     );
 }
+
+/// A llama.cpp `prompt_progress` chunk, as `return_progress` sends it while the
+/// prompt is read.
+const LLAMACPP_PROGRESS: &str = r#"{"choices":[],"created":1762500000,"id":"chatcmpl-p","model":"qwen","object":"chat.completion.chunk","prompt_progress":{"total":40000,"cache":0,"processed":8000,"time_ms":2900}}"#;
+
+fn llamacpp_config(port: u16, extra_settings: &str) -> String {
+    default_config_text(port)
+        .replace("family=openai", "family=llamacpp")
+        .replace("max_attempts=3", &format!("max_attempts=3 {extra_settings}"))
+}
+
+#[test]
+fn a_non_streaming_llamacpp_call_is_streamed_upstream_and_answered_whole() {
+    // A plain llama.cpp response sends nothing until the generation is done.
+    // A connection that stays quiet that long gets dropped by an idle-flow
+    // timeout on the path, with no RST or FIN, and the router then waits out
+    // its deadline for a reply that was already sent into nothing. The router
+    // streams instead, so the upstream sends a progress chunk every few
+    // seconds, and assembles the stream into the response the client asked
+    // for.
+    let upstream = FakeUpstream::start(
+        CannedResponse::event_stream(&[
+            LLAMACPP_PROGRESS,
+            LLAMACPP_PROGRESS,
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":null}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":"Back"}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":"pressure."}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":40000,"completion_tokens":3,"total_tokens":40003}}"#,
+        ])
+        .paced(Duration::from_millis(5)),
+    );
+    let config = llamacpp_config(upstream.address.port(), "");
+    let harness = Harness::start(upstream, router_with_config_text(&config));
+
+    let response = harness.request("POST", "/v1/chat/completions", CHAT_BODY, true);
+    assert_eq!(response.status, 200, "{}", response.body);
+
+    // What the upstream was asked for: a stream, with progress, with usage.
+    let sent = parse_str(&harness.upstream.last_body().expect("a body"), &Limits::DEFAULT)
+        .expect("JSON");
+    assert_eq!(sent.opt_field_bool("stream").unwrap(), Some(true));
+    assert_eq!(sent.opt_field_bool("return_progress").unwrap(), Some(true));
+    let options = sent.get("stream_options").expect("stream_options");
+    assert_eq!(options.opt_field_bool("include_usage").unwrap(), Some(true));
+
+    // What the client got: one whole chat completion, not a stream, with the
+    // provider's own usage rather than the router's estimate. A key budget
+    // settles only on reported usage.
+    assert!(
+        response.header("content-type").is_some_and(|v| v.starts_with("application/json")),
+        "{}",
+        response.head
+    );
+    let body = response.json();
+    let content = body
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|c| c.first())
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str());
+    assert_eq!(content, Some("Backpressure."), "{}", response.body);
+    let prompt_tokens = body
+        .get("usage")
+        .and_then(|u| u.get("prompt_tokens"))
+        .and_then(|t| t.as_u64());
+    assert_eq!(prompt_tokens, Some(40000), "{}", response.body);
+    assert!(!response.body.contains("prompt_progress"), "{}", response.body);
+}
+
+#[test]
+fn progress_chunks_do_not_hold_off_keepalives_to_a_streaming_client() {
+    // llama.cpp progress keeps the upstream connection busy, and none of it
+    // reaches the client. Keepalives used to fire only when an upstream read
+    // timed out, so an upstream sending progress every few seconds kept the
+    // client silent through the whole prefill. What counts is how long the
+    // *client* has heard nothing.
+    let mut frames = vec![LLAMACPP_PROGRESS; 12];
+    frames.push(r#"{"choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":"stop"}]}"#);
+    let upstream =
+        FakeUpstream::start(CannedResponse::event_stream(&frames).paced(Duration::from_millis(50)));
+    let config = llamacpp_config(upstream.address.port(), "keepalive_interval_ms=150");
+    let harness = Harness::start(upstream, router_with_config_text(&config));
+
+    let response = harness.request(
+        "POST",
+        "/v1/chat/completions",
+        r#"{"model":"test-alias","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+        true,
+    );
+    assert_eq!(response.status, 200, "{}", response.body);
+    let comments = response.body.lines().filter(|l| l.starts_with(':')).count();
+    assert!(
+        comments >= 2,
+        "~600 ms of progress at a 150 ms cadence produced {comments} keepalive(s):\n{}",
+        response.body
+    );
+    assert!(response.body.contains("hello"), "{}", response.body);
+    assert!(!response.body.contains("prompt_progress"), "{}", response.body);
+}
+
+#[test]
+fn a_streaming_client_gets_keepalives_while_the_upstream_withholds_its_head() {
+    // The client's stream opens when the request is admitted. llama.cpp sends
+    // no head until it has a first result, so the router used to wait in the
+    // head read for the whole prefill and the client saw headers and then
+    // nothing: a harness with a 300 s idle timeout gave up on 362 s of it.
+    let upstream = FakeUpstream::start(
+        CannedResponse::event_stream(&[
+            r#"{"choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":"stop"}]}"#,
+        ])
+        .after(Duration::from_millis(600)),
+    );
+    let config = default_config_text(upstream.address.port())
+        .replace("max_attempts=3", "max_attempts=3 keepalive_interval_ms=100");
+    let harness = Harness::start(upstream, router_with_config_text(&config));
+
+    let response = harness.request(
+        "POST",
+        "/v1/chat/completions",
+        r#"{"model":"test-alias","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+        true,
+    );
+    assert_eq!(response.status, 200, "{}", response.body);
+    let comments = response.body.lines().filter(|l| l.starts_with(':')).count();
+    assert!(
+        comments >= 2,
+        "a 600 ms wait for the head at a 100 ms cadence produced {comments} keepalive(s):\n{}",
+        response.body
+    );
+    assert!(response.body.contains("hello"), "{}", response.body);
+    assert!(response.body.contains("[DONE]"), "{}", response.body);
+}

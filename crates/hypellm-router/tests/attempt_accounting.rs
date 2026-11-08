@@ -175,6 +175,7 @@ fn a_stream_cut_off_mid_generation_is_reported_as_a_failure() {
         streaming: true,
         body_delay: std::time::Duration::ZERO,
         delay: std::time::Duration::ZERO,
+        pace: std::time::Duration::ZERO,
     });
     let router = router_with_config(&upstream, &default_config_text(upstream.address.port()));
     let mut request = request();
@@ -241,4 +242,35 @@ quota scope=tenant:acme tpm=60 token_burst={estimate}
     let outcome = run(&router, &request, &mut Collect::default());
     assert_eq!(upstream.served(), 2, "the failover never reached the second target");
     assert!(outcome.is_success(), "{:?} {:?}", outcome.error, outcome.trace.exclusions);
+}
+
+#[test]
+fn a_streams_first_byte_is_its_first_answer_not_its_head() {
+    // First-byte time feeds the target's latency score. llama.cpp with
+    // `return_progress` sends its head and a stream of progress chunks moments
+    // after the request, long before the answer starts. Timed at the head, a
+    // target spending most of a minute reading a prompt would look like the
+    // fastest one in the fleet.
+    let progress = r#"{"choices":[],"object":"chat.completion.chunk","prompt_progress":{"total":4000,"cache":0,"processed":1000,"time_ms":50}}"#;
+    let mut frames = vec![progress; 8];
+    frames.push(r#"{"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}"#);
+    let upstream = FakeUpstream::start(
+        CannedResponse::event_stream(&frames).paced(std::time::Duration::from_millis(40)),
+    );
+    let config = default_config_text(upstream.address.port()).replace("family=openai", "family=llamacpp");
+    let router = router_with_config(&upstream, &config);
+    let outcome = run(&router, &request(), &mut Collect::default());
+    assert!(outcome.is_success(), "{:?}", outcome.error);
+
+    // The answer is the ninth frame, 40 ms apart: at least 320 ms in.
+    let first_byte = outcome.summary.as_ref().and_then(|s| s.first_byte_millis).unwrap();
+    assert!(first_byte >= 300, "first byte timed at {first_byte} ms, which is the head");
+    let ewma = router
+        .state
+        .health
+        .entry(&target(), Operation::Chat)
+        .first_byte_ewma
+        .value()
+        .unwrap();
+    assert!(ewma >= 300, "the latency score saw {ewma} ms");
 }

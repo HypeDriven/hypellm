@@ -315,7 +315,9 @@ pub struct RequestMeta<'a> {
     pub endpoint: &'a Endpoint,
     /// The router's request identifier, for provider-side correlation.
     pub request_id: String,
-    /// Whether the client asked for a stream.
+    /// Whether the exchange with the upstream is a stream: what
+    /// [`Adapter::streams_upstream`] decided, which is not always what the
+    /// client asked for.
     pub streaming: bool,
     /// An idempotency key, when the client supplied one.
     pub idempotency_key: Option<String>,
@@ -362,6 +364,19 @@ pub trait Adapter: Send + Sync + fmt::Debug {
     /// Check the request against the target's declared capabilities.
     fn validate(&self, request: &CanonicalRequest, capabilities: &Capabilities)
     -> ValidationResult;
+
+    /// Whether the exchange with the upstream is a stream.
+    ///
+    /// Usually exactly what the client asked for. An adapter may stream a
+    /// request the client asked to receive whole, when the provider's stream
+    /// carries something its plain response cannot: llama.cpp reports prompt
+    /// progress on a stream and is silent for the whole of a plain response,
+    /// and a connection silent for minutes is one an intermediary can drop.
+    /// The router assembles such a stream into the client's single response;
+    /// the client cannot tell the difference.
+    fn streams_upstream(&self, request: &CanonicalRequest, _target: &Target) -> bool {
+        request.stream.enabled
+    }
 
     /// Build the request headers, including authentication.
     fn encode_headers(

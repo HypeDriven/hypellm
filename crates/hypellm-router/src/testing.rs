@@ -38,6 +38,13 @@ pub struct CannedResponse {
     /// The only way to have two requests in flight at once in a test, which is
     /// what admission queueing and concurrency limits are about.
     pub delay: std::time::Duration,
+    /// When non-zero, send the head and then each event-stream frame this far
+    /// apart.
+    ///
+    /// The shape of llama.cpp with `return_progress`: a connection that is
+    /// never quiet while the client hears nothing, because the frames are
+    /// prompt progress the router does not forward.
+    pub pace: std::time::Duration,
 }
 
 impl CannedResponse {
@@ -51,17 +58,16 @@ impl CannedResponse {
             streaming: false,
             delay: std::time::Duration::ZERO,
             body_delay: std::time::Duration::ZERO,
+            pace: std::time::Duration::ZERO,
         }
     }
 
     /// Send the head immediately, then go quiet for `delay` before the body.
     ///
-    /// Distinct from `after`, which delays the whole exchange. This is the
-    /// shape a real provider has — 200 and headers at once, then thinking —
-    /// and it is the silence specification 14's keepalives exist for. A fake
-    /// that delays the head instead exercises the *head* read, where a
-    /// keepalive would be impossible anyway because nothing has been sent to
-    /// the client yet.
+    /// Distinct from `after`, which delays the whole exchange, head included:
+    /// what llama.cpp does, sending no head until it has a first result. A
+    /// streaming client has its own head by then, so both silences are ones
+    /// specification 14's keepalives exist for.
     #[must_use]
     pub fn silent_before_body(mut self, delay: std::time::Duration) -> Self {
         self.body_delay = delay;
@@ -72,6 +78,13 @@ impl CannedResponse {
     #[must_use]
     pub fn after(mut self, delay: std::time::Duration) -> Self {
         self.delay = delay;
+        self
+    }
+
+    /// The same event stream, its frames sent `pace` apart after the head.
+    #[must_use]
+    pub fn paced(mut self, pace: std::time::Duration) -> Self {
+        self.pace = pace;
         self
     }
 
@@ -93,6 +106,7 @@ impl CannedResponse {
             streaming: true,
             delay: std::time::Duration::ZERO,
             body_delay: std::time::Duration::ZERO,
+            pace: std::time::Duration::ZERO,
         }
     }
 
@@ -129,6 +143,7 @@ impl CannedResponse {
             streaming: true,
             delay: std::time::Duration::ZERO,
             body_delay: std::time::Duration::ZERO,
+            pace: std::time::Duration::ZERO,
         }
     }
 
@@ -156,6 +171,7 @@ impl CannedResponse {
             streaming: true,
             delay: std::time::Duration::ZERO,
             body_delay: std::time::Duration::ZERO,
+            pace: std::time::Duration::ZERO,
         }
     }
 
@@ -292,6 +308,17 @@ impl FakeUpstream {
                         let _ = socket.flush();
                         std::thread::sleep(Duration::from_millis(20));
                         let _ = socket.write_all(terminator);
+                    } else if !response.pace.is_zero() {
+                        let _ = socket.write_all(&response.head_wire());
+                        let _ = socket.flush();
+                        let body = String::from_utf8_lossy(&response.body).into_owned();
+                        for frame in body.split_inclusive("\n\n") {
+                            std::thread::sleep(response.pace);
+                            if socket.write_all(frame.as_bytes()).is_err() {
+                                break;
+                            }
+                            let _ = socket.flush();
+                        }
                     } else if response.body_delay.is_zero() {
                         let _ = socket.write_all(&response.to_wire());
                     } else {

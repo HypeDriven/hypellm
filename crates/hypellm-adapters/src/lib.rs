@@ -117,7 +117,9 @@ mod tests {
     fn the_openai_compatible_families_share_an_encoding() {
         // Specification 23: capabilities are declared per target, not inferred
         // from the family. The families differ in what they declare, not in
-        // how a request is encoded.
+        // how a request is encoded. The one exception is llama.cpp chat, which
+        // is always streamed with progress (see `streams_upstream`), and it
+        // may differ by exactly those fields and no others.
         let request = request_fixture();
         let target = target_fixture();
         let endpoint = endpoint_fixture("api.example");
@@ -126,7 +128,6 @@ mod tests {
         let mut bodies = Vec::new();
         for family in [
             ProviderFamily::OpenAi,
-            ProviderFamily::LlamaCpp,
             ProviderFamily::DeepSeek,
             ProviderFamily::Moonshot,
             ProviderFamily::GenericOpenAi,
@@ -141,6 +142,27 @@ mod tests {
             bodies.windows(2).all(|w| w[0] == w[1]),
             "the OpenAI-compatible families must encode identically"
         );
+
+        let parse = |bytes: &[u8]| {
+            wire_json::parse(bytes, &wire_json::Limits::DEFAULT)
+                .expect("JSON")
+                .as_object()
+                .expect("an object")
+                .clone()
+        };
+        let shared = parse(&bodies[0]);
+        let llamacpp = parse(
+            &adapter_for(ProviderFamily::LlamaCpp)
+                .encode_request(&request, &meta)
+                .expect("encodes"),
+        );
+        let liveness = ["stream", "stream_options", "return_progress"];
+        for key in liveness {
+            assert!(llamacpp.contains_key(key), "llama.cpp chat must send {key}");
+        }
+        let rest: Vec<_> = llamacpp.iter().filter(|(k, _)| !liveness.contains(k)).collect();
+        let others: Vec<_> = shared.iter().collect();
+        assert_eq!(rest, others, "llama.cpp differs by more than its stream fields");
     }
 
     #[test]

@@ -495,6 +495,12 @@ be requiring the field not to work. What is required of it is the narrowing.</p>
 There is no registration function, no lookup table an operator can extend, and no
 path by which a request selects an adapter; adding a family is a compile error
 until <code>adapter_for</code> is updated.</p>
+<p><code>Adapter::streams_upstream</code> decides whether the exchange is a stream, which is
+usually what the client asked for. The llama.cpp family overrides it to stream every chat request,
+with <code>return_progress</code> and, for a client that wants a whole response, <code>include_usage</code>.
+A plain llama.cpp response is silent until the generation ends, and a connection that silent can be dropped by an
+idle-flow timeout on the path. The router assembles the stream into the response the client asked for.
+This choice is about the wire format and changes nothing about where a request is sent.</p>
 <p><code>job</code> is the shim protocol of orchestration §11.3, and the one family that is
 not a single exchange: <code>JobAdapter</code> builds the health, submit, status, part and
 cancel requests and parses their replies, pure like the rest, and

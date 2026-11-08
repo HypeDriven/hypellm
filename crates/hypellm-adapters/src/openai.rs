@@ -59,7 +59,7 @@ use hypellm_core::event::{
     CanonicalEvent, CanonicalUsage, FinishReason, ToolCallDelta, UpstreamErrorClass,
 };
 use hypellm_core::sensitive::Capped;
-use hypellm_core::target::{Capabilities, ProviderFamily};
+use hypellm_core::target::{Capabilities, ProviderFamily, Target};
 use wire_json::{Limits, Object, Value, parse, parse_str, to_vec};
 
 /// The OpenAI-compatible adapter.
@@ -84,6 +84,27 @@ impl OpenAiAdapter {
 impl Adapter for OpenAiAdapter {
     fn family(&self) -> ProviderFamily {
         self.family
+    }
+
+    /// llama.cpp chat is always streamed, with `return_progress`.
+    ///
+    /// A plain llama.cpp response sends nothing until the whole generation is
+    /// done, and a long prompt keeps the connection silent for minutes: long
+    /// enough for an idle-flow timeout on the path to drop it with no RST or
+    /// FIN, after which the router waits out the request deadline for a reply
+    /// that was already sent into nothing. The stream sends a `prompt_progress`
+    /// chunk every few seconds while the prompt is read and a token at a time
+    /// after it, so the connection is never idle. Keepalive on the socket would
+    /// do the same, but std has no stable setter and specification 18.2 forbids
+    /// the `unsafe` call.
+    ///
+    /// Only when the target declares streaming: one that does not would be sent
+    /// a request [`Adapter::validate`] refuses for any client that asks.
+    fn streams_upstream(&self, request: &CanonicalRequest, target: &Target) -> bool {
+        request.stream.enabled
+            || (self.family == ProviderFamily::LlamaCpp
+                && request.operation == Operation::Chat
+                && target.capabilities.streaming)
     }
 
     fn path_for(&self, request: &CanonicalRequest) -> Result<&'static str, ValidationFailure> {
@@ -253,12 +274,21 @@ impl Adapter for OpenAiAdapter {
             }
             _ => {
                 body.push("messages", encode_messages(request)?);
-                if request.stream.enabled {
+                if self.streams_upstream(request, meta.target) {
                     body.push("stream", Value::from(true));
-                    if request.stream.include_usage {
+                    // A client that asked for a whole response still gets the
+                    // provider's usage in it, and a key budget settles only on
+                    // reported usage (specification 12.1). A streaming client
+                    // gets the usage chunk only if it asked for one.
+                    if request.stream.include_usage || !request.stream.enabled {
                         let mut options = Object::new();
                         options.push("include_usage", Value::from(true));
                         body.push("stream_options", Value::Object(options));
+                    }
+                    // See `streams_upstream`. Progress chunks decode to no
+                    // canonical event, so no client ever sees one.
+                    if self.family == ProviderFamily::LlamaCpp {
+                        body.push("return_progress", Value::from(true));
                     }
                 }
                 if !request.tools.is_empty() {
@@ -1588,6 +1618,76 @@ mod tests {
 
         request.sampling.enable_thinking = None;
         assert!(encode(ProviderFamily::LlamaCpp, &request).get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn llamacpp_chat_is_streamed_with_progress_whatever_the_client_asked() {
+        // A plain llama.cpp response is silent until the generation ends, and
+        // a silent connection is one an idle-flow timeout drops. Only chat,
+        // only llama.cpp, and only to a target that declares streaming.
+        let target = target_fixture();
+        assert!(target.capabilities.streaming, "the fixture must declare streaming");
+        let endpoint = target_fixture_endpoint();
+        let encode = |family, request: &CanonicalRequest, target: &hypellm_core::target::Target| {
+            let adapter = OpenAiAdapter::new(family);
+            let meta = meta_fixture(target, &endpoint, adapter.streams_upstream(request, target));
+            let bytes = adapter.encode_request(request, &meta).expect("encodes");
+            parse(&bytes, &Limits::DEFAULT).expect("valid JSON")
+        };
+        let include_usage = |body: &Value| {
+            body.get("stream_options").and_then(|o| o.opt_field_bool("include_usage").ok().flatten())
+        };
+
+        // A client that wants the whole answer: streamed, with progress, and
+        // with usage, since a key budget settles only on reported usage.
+        let whole = request_fixture();
+        assert!(!whole.stream.enabled);
+        let body = encode(ProviderFamily::LlamaCpp, &whole, &target);
+        assert_eq!(body.opt_field_bool("stream").unwrap(), Some(true));
+        assert_eq!(body.opt_field_bool("return_progress").unwrap(), Some(true));
+        assert_eq!(include_usage(&body), Some(true));
+
+        // Another family is sent what the client asked for, and no llama.cpp
+        // field it would reject.
+        let body = encode(ProviderFamily::OpenAi, &whole, &target);
+        assert!(body.get("stream").is_none());
+        assert!(body.get("return_progress").is_none());
+
+        // A streaming client gets progress too, but a usage chunk only if it
+        // asked for one.
+        let mut streaming = request_fixture();
+        streaming.stream.enabled = true;
+        streaming.stream.include_usage = false;
+        let body = encode(ProviderFamily::LlamaCpp, &streaming, &target);
+        assert_eq!(body.opt_field_bool("return_progress").unwrap(), Some(true));
+        assert_eq!(include_usage(&body), None);
+
+        // A target that does not declare streaming is not sent a stream.
+        let mut plain = target_fixture();
+        plain.capabilities.streaming = false;
+        let body = encode(ProviderFamily::LlamaCpp, &whole, &plain);
+        assert!(body.get("stream").is_none());
+        assert!(body.get("return_progress").is_none());
+
+        // Embeddings do not stream.
+        let mut embeddings = request_fixture();
+        embeddings.operation = Operation::Embeddings;
+        embeddings.inputs = vec!["text".to_owned()];
+        let adapter = OpenAiAdapter::new(ProviderFamily::LlamaCpp);
+        assert!(!adapter.streams_upstream(&embeddings, &target));
+    }
+
+    #[test]
+    fn a_progress_chunk_decodes_to_nothing() {
+        // It must not reach a client as content, and it must not end the stream.
+        let adapter = OpenAiAdapter::new(ProviderFamily::LlamaCpp);
+        let events = adapter
+            .decode_stream_event(
+                None,
+                r#"{"choices":[],"object":"chat.completion.chunk","prompt_progress":{"total":4000,"cache":0,"processed":1000,"time_ms":900}}"#,
+            )
+            .expect("decodes");
+        assert!(events.is_empty(), "{events:?}");
     }
 
     #[test]

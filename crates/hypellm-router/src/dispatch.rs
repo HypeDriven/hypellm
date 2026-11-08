@@ -220,7 +220,14 @@ impl EventSink for AccumulatingSink {
 pub struct AttemptSummary {
     /// Usage, with its provenance.
     pub usage: CanonicalUsage,
-    /// Milliseconds until the first response byte.
+    /// Milliseconds until the first response byte: the response head, or for
+    /// a stream its first event that decoded to anything.
+    ///
+    /// Not the head of a stream, because a stream's head can come long before
+    /// its answer begins. llama.cpp's head comes with its first prompt-progress
+    /// chunk, which is moments after the request. This feeds the target's
+    /// latency score, so measuring at the head would make a slow target look
+    /// fast.
     pub first_byte_millis: Option<u64>,
     /// Milliseconds for the whole attempt.
     pub total_millis: u64,
@@ -418,7 +425,7 @@ fn exchange(
         target,
         endpoint,
         request_id: request.request_id.to_string(),
-        streaming: request.stream.enabled,
+        streaming: adapter.streams_upstream(request, target),
         idempotency_key: request.hints.idempotency_key.clone(),
     };
 
@@ -509,6 +516,7 @@ fn exchange(
     // the *same* target — it is not a failover, and no client-visible semantic
     // byte can have been emitted.
     let mut retried = false;
+    let keepalive = state.config().settings.keepalive_interval_ms;
     let (mut connection, head) = loop {
         let mut candidate = if retried {
             state.egress.dial_fresh(endpoint, profile, &credential_class)
@@ -526,9 +534,17 @@ fn exchange(
             Err(e) => Err((AttemptPhase::BeforeAcceptance, e)),
             // A failure reading the head means the upstream accepted the
             // request but produced nothing usable.
-            Ok(()) => candidate
-                .read_head(&Method::Post, &HttpLimits::UPSTREAM, clock, deadline)
-                .map_err(|e| (AttemptPhase::AfterAcceptance, e)),
+            Ok(()) => match read_head_keeping_alive(&mut candidate, clock, deadline, keepalive, sink) {
+                Ok(head) => Ok(head),
+                Err(HeadWait::Upstream(e)) => Err((AttemptPhase::AfterAcceptance, e)),
+                // Nothing to replay and no one to answer. The exchange may be
+                // half done, so the connection is not pooled.
+                Err(HeadWait::ClientGone) => {
+                    candidate.poison();
+                    state.egress.release(candidate);
+                    return Err(cancelled(false));
+                }
+            },
         };
 
         match outcome {
@@ -574,8 +590,8 @@ fn exchange(
         }
     };
 
-    let first_byte_millis = clock.now_millis().saturating_sub(started);
-    let first_byte_micros = clock.now_micros().saturating_sub(started_micros);
+    let mut first_byte_millis = clock.now_millis().saturating_sub(started);
+    let mut first_byte_micros = clock.now_micros().saturating_sub(started_micros);
     progress.upstream_status = Some(head.status);
     progress.first_byte_millis = Some(first_byte_millis);
     let mut decoder = BodyDecoder::new(head.body, HttpLimits::UPSTREAM);
@@ -627,7 +643,8 @@ fn exchange(
     let mut collected: Vec<CanonicalEvent> = Vec::new();
 
     let result = if head.is_event_stream() {
-        stream_events(
+        let mut first_event = None;
+        let streamed = stream_events(
             state,
             adapter,
             &mut connection,
@@ -637,7 +654,13 @@ fn exchange(
             &mut saw_output,
             &mut collected,
             progress,
-        )
+            &mut first_event,
+        );
+        if let Some((millis, micros)) = first_event {
+            first_byte_millis = millis.saturating_sub(started);
+            first_byte_micros = micros.saturating_sub(started_micros);
+        }
+        streamed
     } else {
         let body = connection
             .read_body_to_end(&mut decoder, clock, deadline)
@@ -777,6 +800,50 @@ fn cancelled(saw_output: bool) -> AttemptFailure {
     }
 }
 
+/// Why waiting for a response head ended without one.
+enum HeadWait {
+    /// The upstream failed, or the request deadline passed.
+    Upstream(UpstreamError),
+    /// A keepalive could not be written: the client is gone.
+    ClientGone,
+}
+
+/// Read the response head, writing a keepalive to the client each time
+/// `keepalive_ms` passes without one.
+///
+/// A streaming client has its response head as soon as the request is
+/// admitted, and an upstream can then be silent for minutes before its own:
+/// llama.cpp sends no head until it has a first result. Without this the
+/// client sees nothing at all for that time, and a client or intermediary
+/// with an idle timeout gives up on an answer that is still coming.
+///
+/// Polling is safe for the same reason as in [`stream_events`]: a read that
+/// times out leaves the connection's buffer as it was, so a partial head is
+/// resumed, not lost. A sink with no stream has a no-op keepalive, and for it
+/// this only wakes up every interval to wait again.
+fn read_head_keeping_alive(
+    connection: &mut UpstreamConnection,
+    clock: &dyn Clock,
+    deadline: Deadline,
+    keepalive_ms: u64,
+    sink: &mut dyn EventSink,
+) -> Result<wire_http1::ResponseHead, HeadWait> {
+    loop {
+        let poll = if keepalive_ms > 0 {
+            deadline.min(Deadline::after(clock, Duration::from_millis(keepalive_ms)))
+        } else {
+            deadline
+        };
+        match connection.read_head(&Method::Post, &HttpLimits::UPSTREAM, clock, poll) {
+            Ok(head) => return Ok(head),
+            Err(UpstreamError::Timeout) if keepalive_ms > 0 && !deadline.is_expired(clock) => {
+                sink.keepalive().map_err(|_| HeadWait::ClientGone)?;
+            }
+            Err(e) => return Err(HeadWait::Upstream(e)),
+        }
+    }
+}
+
 /// Build request headers, borrowing the credential for exactly as long as it
 /// takes.
 fn build_headers(
@@ -871,6 +938,7 @@ fn stream_events(
     saw_output: &mut bool,
     collected: &mut Vec<CanonicalEvent>,
     progress: &mut AttemptProgress,
+    first_event: &mut Option<(u64, u64)>,
 ) -> Result<(), AttemptFailure> {
     let clock = state.clock.as_ref();
     let mut parser = SseParser::with_default_limits();
@@ -884,6 +952,11 @@ fn stream_events(
     // as a finished one does, and treating it as success would deliver a
     // truncated answer as though it were whole.
     let mut ended = false;
+    // When the client was last written to. Keepalives follow the client's
+    // silence, not the upstream's: an upstream sending llama.cpp progress
+    // chunks every few seconds is never silent, while the client, which
+    // receives nothing from those chunks, can wait out a whole prefill.
+    let mut quiet_since = clock.now_millis();
 
     loop {
         if decoder.is_complete() {
@@ -896,7 +969,7 @@ fn stream_events(
         // decoder untouched (`fill` truncates back on error), which is what
         // makes polling safe here rather than a way to lose a partial frame.
         let poll = if keepalive > 0 {
-            deadline.min(Deadline::after(clock, Duration::from_millis(keepalive)))
+            deadline.min(Deadline::at(quiet_since.saturating_add(keepalive)))
         } else {
             deadline
         };
@@ -906,6 +979,7 @@ fn stream_events(
             // request still has time. Say so on the wire and wait again.
             Err(hypellm_net::UpstreamError::Timeout) if !deadline.is_expired(clock) => {
                 sink.keepalive().map_err(|_| cancelled(*saw_output))?;
+                quiet_since = clock.now_millis();
                 continue;
             }
             Err(e) => {
@@ -975,6 +1049,12 @@ fn stream_events(
                         )
                     })?;
 
+                if first_event.is_none() && !decoded.is_empty() {
+                    *first_event = Some((clock.now_millis(), clock.now_micros()));
+                }
+                if !decoded.is_empty() {
+                    quiet_since = clock.now_millis();
+                }
                 for event in decoded {
                     if event.is_semantic_output() {
                         *saw_output = true;
@@ -1007,6 +1087,11 @@ fn stream_events(
 
         if produced == 0 && decoder.is_complete() {
             return stream_end(ended, *saw_output);
+        }
+        // The upstream is talking and the client is hearing none of it.
+        if keepalive > 0 && clock.now_millis().saturating_sub(quiet_since) >= keepalive {
+            sink.keepalive().map_err(|_| cancelled(*saw_output))?;
+            quiet_since = clock.now_millis();
         }
     }
 }
