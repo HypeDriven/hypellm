@@ -51,7 +51,7 @@ verifier_dir  := justfile_directory() / "run" / "verifier"
 # run as the invoking user so the bind-mounted files stay readable from the
 # host without sudo. The pod runs as uid/gid 1000 for the same reason.
 # The LAN publisher in k8s/publish.yaml binds this address; keep the two in step.
-lan_addr := "192.168.8.121"
+lan_addr := "192.168.8.170"
 lan_net  := "192.168.8.0/24"
 
 uid := `id -u`

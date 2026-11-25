@@ -35,7 +35,7 @@ spec:
       terminationGracePeriodSeconds: 45
       containers:
         - name: tailscale
-          image: tailscale/tailscale:stable
+          image: tailscale/tailscale:v1.104.7   # pinned; was :stable (1.104.2 until 2026-11-23)
           env:
             - {name: TS_HOSTNAME, value: hypellm-router}
             - {name: TS_USERSPACE, value: "false"}

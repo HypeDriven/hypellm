@@ -33,7 +33,7 @@ spec:
         # port in the Hyper-V firewall, which blocks inbound by default.
         - name: inference-lan
           image: alpine/socat:1.8.0.3
-          args: ["TCP-LISTEN:18000,bind=192.168.8.121,fork,reuseaddr,range=192.168.8.0/24", "TCP:hypellm:18000"]
+          args: ["TCP-LISTEN:18000,bind=192.168.8.170,fork,reuseaddr,range=192.168.8.0/24", "TCP:hypellm:18000"]
         - name: management
           image: alpine/socat:1.8.0.3
           args: ["TCP-LISTEN:18001,bind=127.0.0.1,fork,reuseaddr", "TCP:hypellm:18001"]
