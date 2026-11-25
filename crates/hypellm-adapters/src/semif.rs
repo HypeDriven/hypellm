@@ -371,11 +371,17 @@ fn native_model(value: &Value) -> Option<String> {
     // `source` repository is what it was quantised from. Preferring the file
     // means two instances serving different quantisations of one model are
     // distinguishable in a decision trace, which is the question anyone asks
-    // when two scorers disagree.
+    // when two scorers disagree. A backend that loads no GGUF (squidDGX)
+    // reports `weights_id`, which changes exactly when its weights do, and
+    // `native_model`, the plain name. Callers key calibrated per-model
+    // thresholds on this value, so the weights-specific id wins: keyed on the
+    // plain name, new weights would silently inherit an old calibration.
     model
         .get("gguf")
         .and_then(|gguf| gguf.get("file"))
         .and_then(Value::as_str)
+        .or_else(|| model.get("weights_id").and_then(Value::as_str))
+        .or_else(|| model.get("native_model").and_then(Value::as_str))
         .or_else(|| model.get("source").and_then(Value::as_str))
         .map(str::to_owned)
 }
@@ -627,6 +633,38 @@ mod tests {
                 || name.eq_ignore_ascii_case("x-api-key")),
             "the scorer takes no credential, so none is sent"
         );
+    }
+
+    fn reported_model(body: &str) -> Option<String> {
+        let events = SemIfAdapter
+            .decode_response(200, body.as_bytes())
+            .expect("a well-formed score");
+        events.into_iter().find_map(|event| match event {
+            CanonicalEvent::Start { native_model, .. } => Some(native_model),
+            _ => None,
+        })?
+    }
+
+    #[test]
+    fn a_scorer_without_a_gguf_still_reports_the_model_it_names() {
+        // The squidDGX bridge's reply shape (inkling-2-mini, 2026-11-25).
+        let body = r#"{"id":"r","option_ids":["0","1"],"probabilities":[0.9,0.1],"input_tokens":115,
+            "model":{"native_model":"Inkling-2-Mini","backend":"squidDGX","max_prompt_tokens":16384}}"#;
+        assert_eq!(reported_model(body).as_deref(), Some("Inkling-2-Mini"));
+    }
+
+    #[test]
+    fn a_weights_id_outranks_the_plain_model_name() {
+        let body = r#"{"id":"r","option_ids":["0","1"],"probabilities":[0.9,0.1],
+            "model":{"native_model":"Inkling-2-Mini","weights_id":"Inkling-2-Mini.sha256x64m-5282d58af008ac3f.nvfp4.abl-sha256x64m-0123456789abcdef","backend":"squidDGX"}}"#;
+        assert_eq!(reported_model(body).as_deref(), Some("Inkling-2-Mini.sha256x64m-5282d58af008ac3f.nvfp4.abl-sha256x64m-0123456789abcdef"));
+    }
+
+    #[test]
+    fn the_gguf_file_outranks_every_other_model_name() {
+        let body = r#"{"id":"r","option_ids":["0","1"],"probabilities":[0.9,0.1],
+            "model":{"gguf":{"file":"q.gguf"},"weights_id":"W","native_model":"Q","source":"org/q"}}"#;
+        assert_eq!(reported_model(body).as_deref(), Some("q.gguf"));
     }
 
     #[test]
