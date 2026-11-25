@@ -203,7 +203,7 @@ class FluxCase(Case):
 
 
 # --------------------------------------------------------------------------
-# TRELLIS
+# TRELLIS.2
 # --------------------------------------------------------------------------
 
 
@@ -220,15 +220,17 @@ class TrellisCase(Case):
 
     def test_a_mesh_is_always_made_and_each_file_is_fetched_from_outputs(self) -> None:
         service = self.trellis()
-        job = self.job(options={"formats": ["gaussian_ply"], "texture_size": 2048}, params={"steps": 20},
-                       inputs={"image": ("png", PNG)})
+        job = self.job(options={"formats": ["mesh_ply"], "texture_size": 4096, "resolution": 1536},
+                       params={"steps": 20}, inputs={"image": ("png", PNG)})
         self.assertEqual(job.run("trellis.py", service.url), 0)
         (_, _, body), = service.sent("POST", "/generate")
         sent = json.loads(body)
-        self.assertEqual(sent["formats"], ["glb", "gaussian_ply"])
+        self.assertEqual(sent["formats"], ["glb", "mesh_ply"])
         self.assertEqual(sent["image"], base64.b64encode(PNG).decode())
-        self.assertEqual((sent["ss_sampling_steps"], sent["slat_sampling_steps"], sent["texture_size"]), (20, 20, 2048))
-        self.assertEqual(sorted(job.outputs()), ["gaussians.ply", "mesh.glb"])
+        self.assertEqual((sent["ss_sampling_steps"], sent["shape_sampling_steps"], sent["tex_sampling_steps"]),
+                         (20, 20, 20))
+        self.assertEqual((sent["texture_size"], sent["resolution"]), (4096, "1536"))
+        self.assertEqual(sorted(job.outputs()), ["geometry.ply", "mesh.glb"])
 
     def test_a_reply_naming_a_file_outside_outputs_is_not_followed(self) -> None:
         for url in ("/etc/passwd", "http://169.254.169.254/latest", "/outputs/../secret.glb", "/outputs/a/b.glb"):
@@ -241,7 +243,11 @@ class TrellisCase(Case):
         service = self.trellis()
         self.assertEqual(self.job(prompt="a chair", inputs={"image": ("png", PNG)}).run("trellis.py", service.url), 65)
         self.assertEqual(self.job().run("trellis.py", service.url), 65)
-        self.assertEqual(self.job(options={"formats": ["obj"]}, inputs={"image": ("png", PNG)})
+        for options in ({"formats": ["obj"]}, {"formats": ["gaussian_ply"]}, {"resolution": 2048},
+                        {"decimation_target": 5000.5}, {"remove_background": True}):
+            self.assertEqual(self.job(options=options, inputs={"image": ("png", PNG)})
+                             .run("trellis.py", service.url), 65, options)
+        self.assertEqual(self.job(params={"steps": 51}, inputs={"image": ("png", PNG)})
                          .run("trellis.py", service.url), 65)
         self.assertEqual(service.sent(), [])
 
