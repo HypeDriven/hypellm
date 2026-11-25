@@ -2214,10 +2214,10 @@ fn build_provider(
             enabled: f.bool_field("enabled", true)?,
             egress_profile: profile_name.to_owned(),
             recovery_wait_ms: {
-                // Bounded, because a wait is a held connection: an hour-long
-                // recovery window would let a dead fleet pin every thread the
-                // listener has. Fifteen minutes covers a machine rebooting.
-                const MAX_RECOVERY_WAIT_MS: u64 = 900_000;
+                // Bounded, because a wait is a held connection. One hour
+                // covers a new GPU node and a cold model start; the default
+                // remains fifteen minutes for an ordinary machine reboot.
+                const MAX_RECOVERY_WAIT_MS: u64 = 3_600_000;
                 let default = if f.opt_str("machine").is_some() {
                     900_000
                 } else {

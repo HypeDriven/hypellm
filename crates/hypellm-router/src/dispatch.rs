@@ -195,6 +195,11 @@ pub trait EventSink {
     /// longer be refused for want of budget sends it now. Specification 12.1:
     /// "Streaming MUST reserve before HTTP headers are sent."
     fn admitted(&mut self) {}
+
+    /// The request is starting a configured wait for target recovery.
+    ///
+    /// A streaming sink uses this to mark its response head before opening it.
+    fn recovery_wait(&mut self) {}
 }
 
 /// The sink refused further events: the client is gone or too slow.

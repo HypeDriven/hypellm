@@ -302,10 +302,16 @@ impl InferenceHandler {
             _ => openai::parse_chat_request(body, &context, &limits),
         };
 
+        let recovery_wait = head
+            .headers
+            .get("x-hypellm-recovery-wait")
+            .is_none_or(|value| value.trim() != "0");
         let request = match parsed {
             Ok(mut request) => {
                 request.operation = operation;
-                allow_recovery(&config, &mut request);
+                if recovery_wait {
+                    allow_recovery(&config, &mut request);
+                }
                 request
             }
             Err(error) => return respond_error(writer, &error, Some(request_id), protocol),
@@ -321,7 +327,7 @@ impl InferenceHandler {
         }
 
         if request.stream.enabled {
-            self.stream(&request, principal, writer, started)
+            self.stream(&request, principal, writer, started, recovery_wait)
         } else {
             // Read from the body rather than carried on the canonical request:
             // neither `top_n` nor `return_documents` is a routing input, and a
@@ -332,7 +338,7 @@ impl InferenceHandler {
             } else {
                 rerank::RenderOptions::default()
             };
-            self.buffered(&request, principal, writer, started, render)
+            self.buffered(&request, principal, writer, started, recovery_wait, render)
         }
     }
 
@@ -800,31 +806,33 @@ impl InferenceHandler {
         principal: &Principal,
         writer: &mut ClientWriter,
         started: u64,
+        recovery_wait: bool,
         render: rerank::RenderOptions,
     ) -> io::Result<Disposition> {
         let state = &self.state;
         let mut sink = AccumulatingSink::default();
-        let outcome = pipeline::execute_for_key(
+        let outcome = pipeline::execute_for_key_with_recovery(
             state,
             request,
             &principal.groups,
             principal.permissions(),
             principal.key_id.as_ref(),
             &mut sink,
+            recovery_wait,
         );
         let total = state.clock.now_millis().saturating_sub(started);
         // The key, not just the principal: specification 22.3 step 20 searches
         // usage by *key*, and one principal can hold several.
-        pipeline::record_completion(
-            state,
-            request,
-            &outcome,
-            total,
-            principal.key_id.as_ref(),
-        );
+        pipeline::record_completion(state, request, &outcome, total, principal.key_id.as_ref());
 
         if let Some(error) = &outcome.error {
-            return respond_error(writer, error, Some(request.request_id), request.protocol);
+            return respond_error_with_recovery(
+                writer,
+                error,
+                Some(request.request_id),
+                request.protocol,
+                outcome.recovery_waited,
+            );
         }
 
         let payload = match request.protocol {
@@ -835,11 +843,12 @@ impl InferenceHandler {
                     // upstream reply is still a clean error rather than a 200
                     // carrying a substituted body.
                     Err(error) => {
-                        return respond_error(
+                        return respond_error_with_recovery(
                             writer,
                             &error,
                             Some(request.request_id),
                             request.protocol,
+                            outcome.recovery_waited,
                         );
                     }
                 }
@@ -866,7 +875,13 @@ impl InferenceHandler {
         };
 
         let bytes_before = writer.bytes_written();
-        write_json(writer, 200, &payload, request.request_id)?;
+        write_json_with_recovery(
+            writer,
+            200,
+            &payload,
+            request.request_id,
+            outcome.recovery_waited,
+        )?;
         state.admission.record_output_bytes(
             writer.bytes_written().saturating_sub(bytes_before),
             state.clock.now_millis(),
@@ -880,39 +895,27 @@ impl InferenceHandler {
         principal: &Principal,
         writer: &mut ClientWriter,
         started: u64,
+        recovery_wait: bool,
     ) -> io::Result<Disposition> {
         let state = &self.state;
 
-        // The head goes out before the first upstream byte, so a client that
-        // is waiting on headers sees the stream open promptly.
-        //
-        // With one exception. Specification 12.1: "Streaming MUST reserve
-        // before HTTP headers are sent", because "an already-started response
-        // cannot change its HTTP status to 402". A key with a finite budget
-        // therefore has its head withheld until the pipeline reports the
-        // request admitted — a few lines later for a request that fits, and
-        // never for one that does not, which is then answered with a real 402.
-        // A key with no limit cannot be refused that way, so nothing about its
-        // stream changes.
+        // Normally the head opens before the first upstream byte. A finite key
+        // budget withholds it until admission (specification 12.1). Recovery
+        // also withholds it: otherwise an outage could not be answered with a
+        // real 503, and a recovered stream could not carry the held marker.
         let bytes_before = writer.bytes_written();
-        let head = ResponseBuilder::new(200)
-            .header("Content-Type", "text/event-stream")
-            .and_then(|b| b.header("Cache-Control", "no-store"))
-            .and_then(|b| b.header("X-Accel-Buffering", "no"))
-            .and_then(|b| b.header("X-Request-Id", &request.request_id.to_string()))
-            .and_then(ResponseBuilder::finish_streaming)
-            .map_err(|_| io::Error::other("response head"))?;
         let budgeted = principal
             .key_id
             .as_ref()
             .is_some_and(|key| state.budgets.view(key).limit.is_some());
-        let pending_head = if budgeted {
-            Some(head)
-        } else {
+        let defer_for_recovery =
+            !recovery_wait || !pipeline::recovery_budget(&state.config(), request).is_zero();
+        let pending_head = budgeted || defer_for_recovery;
+        if !pending_head {
+            let head = stream_response_head(request.request_id, false)?;
             writer.write(&head)?;
             writer.flush()?;
-            None
-        };
+        }
 
         let mut sink = StreamSink::new(
             request.clone(),
@@ -920,31 +923,26 @@ impl InferenceHandler {
             wall_seconds(state.clock.as_ref()),
             state.clock.as_ref(),
             pending_head,
+            defer_for_recovery,
         );
-        let outcome = pipeline::execute_for_key(
+        let outcome = pipeline::execute_for_key_with_recovery(
             state,
             request,
             &principal.groups,
             principal.permissions(),
             principal.key_id.as_ref(),
             &mut sink,
+            recovery_wait,
         );
         let total = state.clock.now_millis().saturating_sub(started);
         // The key, not just the principal: specification 22.3 step 20 searches
         // usage by *key*, and one principal can hold several.
-        pipeline::record_completion(
-            state,
-            request,
-            &outcome,
-            total,
-            principal.key_id.as_ref(),
-        );
+        pipeline::record_completion(state, request, &outcome, total, principal.key_id.as_ref());
 
         if let Some(error) = &outcome.error {
-            if error.code == ErrorCode::TokenBudgetExhausted && sink.pending_head.is_some() {
-                // Nothing has been written, so this is still an ordinary
-                // response: HTTP 402 and the JSON envelope, as for a request
-                // that did not ask to stream.
+            if sink.pending_head {
+                // Nothing has been written, so this is still an ordinary HTTP
+                // error rather than a 200 carrying an error event.
                 return respond_error(
                     sink.writer,
                     error,
@@ -1012,11 +1010,12 @@ struct StreamSink<'a> {
     responses: openai::ResponsesStreamState,
     saw_output: bool,
     closed: bool,
-    /// The response head, when it has not been written yet.
-    ///
-    /// Written by whichever comes first: the pipeline reporting the request
-    /// admitted, or the first frame.
-    pending_head: Option<Vec<u8>>,
+    /// Whether the response head has not been written yet.
+    pending_head: bool,
+    /// Keep the head and keepalives back until output or a recovery hold.
+    defer_for_recovery: bool,
+    /// Whether the head must carry the recovery-held marker.
+    recovery_held: bool,
 }
 
 impl<'a> StreamSink<'a> {
@@ -1025,7 +1024,8 @@ impl<'a> StreamSink<'a> {
         writer: &'a mut ClientWriter,
         created: u64,
         clock: &'a dyn Clock,
-        pending_head: Option<Vec<u8>>,
+        pending_head: bool,
+        defer_for_recovery: bool,
     ) -> Self {
         Self {
             request,
@@ -1039,18 +1039,30 @@ impl<'a> StreamSink<'a> {
             saw_output: false,
             closed: false,
             pending_head,
+            defer_for_recovery,
+            recovery_held: false,
         }
     }
 
     /// Write the withheld head, if there is one.
     fn open(&mut self) -> Result<(), SinkClosed> {
-        let Some(head) = self.pending_head.take() else {
+        if !self.pending_head {
             return Ok(());
+        }
+        let Ok(head) = stream_response_head(self.request.request_id, self.recovery_held) else {
+            self.closed = true;
+            return Err(SinkClosed);
         };
-        if self.writer.write(&head).and_then(|()| self.writer.flush()).is_err() {
+        if self
+            .writer
+            .write(&head)
+            .and_then(|()| self.writer.flush())
+            .is_err()
+        {
             self.closed = true;
             return Err(SinkClosed);
         }
+        self.pending_head = false;
         Ok(())
     }
 
@@ -1079,7 +1091,10 @@ impl<'a> StreamSink<'a> {
         // upstream. That is the pause specification 14's high watermark would
         // trigger, arrived at structurally instead of by configuration.
         let before = self.clock.now_millis();
-        let result = self.writer.write(bytes.as_bytes()).and_then(|()| self.writer.flush());
+        let result = self
+            .writer
+            .write(bytes.as_bytes())
+            .and_then(|()| self.writer.flush());
         self.blocked_millis = self
             .blocked_millis
             .saturating_add(self.clock.now_millis().saturating_sub(before));
@@ -1163,6 +1178,9 @@ impl EventSink for StreamSink<'_> {
         if self.closed {
             return Err(SinkClosed);
         }
+        if self.defer_for_recovery && !self.recovery_held {
+            return Ok(());
+        }
         let mut comment = String::new();
         wire_sse::encode_keepalive(&mut comment);
         self.push(&comment)
@@ -1170,10 +1188,19 @@ impl EventSink for StreamSink<'_> {
 
     fn admitted(&mut self) {
         // A failed write marks the sink closed; the next delivery reports it.
+        if !self.defer_for_recovery {
+            let _ = self.open();
+        }
+    }
+
+    fn recovery_wait(&mut self) {
+        self.recovery_held = true;
+        self.defer_for_recovery = false;
         let _ = self.open();
     }
 
     fn deliver(&mut self, event: &CanonicalEvent) -> Result<(), SinkClosed> {
+        self.defer_for_recovery = false;
         if event.is_semantic_output() {
             self.saw_output = true;
         }
@@ -1194,9 +1221,7 @@ impl EventSink for StreamSink<'_> {
             for frame in frames {
                 wire_sse::encode_event(&mut self.buffer, &frame.event, &frame.data);
             }
-        } else if let Some(chunk) =
-            openai::render_chat_chunk(&self.request, event, self.created)
-        {
+        } else if let Some(chunk) = openai::render_chat_chunk(&self.request, event, self.created) {
             wire_sse::encode_data(&mut self.buffer, &chunk);
         }
 
@@ -1512,6 +1537,16 @@ fn respond_error(
     request_id: Option<RequestId>,
     protocol: ClientProtocol,
 ) -> io::Result<Disposition> {
+    respond_error_with_recovery(writer, error, request_id, protocol, false)
+}
+
+fn respond_error_with_recovery(
+    writer: &mut ClientWriter,
+    error: &RouterError,
+    request_id: Option<RequestId>,
+    protocol: ClientProtocol,
+    recovery_held: bool,
+) -> io::Result<Disposition> {
     let payload = match protocol {
         ClientProtocol::AnthropicMessages => anthropic::render_error(error, request_id),
         _ => openai::render_error(error, request_id),
@@ -1520,6 +1555,11 @@ fn respond_error(
     let mut builder = ResponseBuilder::new(error.status())
         .header("Content-Type", "application/json")
         .map_err(|_| io::Error::other("response head"))?;
+    if recovery_held {
+        builder = builder
+            .header("X-HypeLLM-Recovery", "held")
+            .map_err(|_| io::Error::other("response head"))?;
+    }
     if let Some(secs) = error.retry_after_secs {
         builder = builder
             .header("Retry-After", &secs.to_string())
@@ -1555,16 +1595,50 @@ fn respond_error(
     Ok(Disposition::KeepAlive)
 }
 
+fn stream_response_head(request_id: RequestId, recovery_held: bool) -> io::Result<Vec<u8>> {
+    let mut builder = ResponseBuilder::new(200)
+        .header("Content-Type", "text/event-stream")
+        .and_then(|b| b.header("Cache-Control", "no-store"))
+        .and_then(|b| b.header("X-Accel-Buffering", "no"))
+        .and_then(|b| b.header("X-Request-Id", &request_id.to_string()))
+        .map_err(|_| io::Error::other("response head"))?;
+    if recovery_held {
+        builder = builder
+            .header("X-HypeLLM-Recovery", "held")
+            .map_err(|_| io::Error::other("response head"))?;
+    }
+    builder
+        .finish_streaming()
+        .map_err(|_| io::Error::other("response head"))
+}
+
 fn write_json(
     writer: &mut ClientWriter,
     status: u16,
     payload: &str,
     request_id: RequestId,
 ) -> io::Result<()> {
-    let head = ResponseBuilder::new(status)
+    write_json_with_recovery(writer, status, payload, request_id, false)
+}
+
+fn write_json_with_recovery(
+    writer: &mut ClientWriter,
+    status: u16,
+    payload: &str,
+    request_id: RequestId,
+    recovery_held: bool,
+) -> io::Result<()> {
+    let mut builder = ResponseBuilder::new(status)
         .header("Content-Type", "application/json")
         .and_then(|b| b.header("X-Request-Id", &request_id.to_string()))
-        .and_then(|b| b.finish_with_length(payload.len()))
+        .map_err(|_| io::Error::other("response head"))?;
+    if recovery_held {
+        builder = builder
+            .header("X-HypeLLM-Recovery", "held")
+            .map_err(|_| io::Error::other("response head"))?;
+    }
+    let head = builder
+        .finish_with_length(payload.len())
         .map_err(|_| io::Error::other("response head"))?;
     writer.write(&head)?;
     writer.write(payload.as_bytes())?;

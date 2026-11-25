@@ -851,7 +851,7 @@ pub mod names {
     pub const MODEL_OUTPUT_TOKENS: &str = "hypellm_model_output_tokens_total";
     /// Generation speed of one completed request, in output tokens per second.
     pub const OUTPUT_TOKENS_PER_SECOND: &str = "hypellm_output_tokens_per_second";
-    /// Requests waiting for a model right now, by alias and what they wait for.
+    /// Requests waiting for a model, by target, alias, and what they wait for.
     pub const PENDING_REQUESTS: &str = "hypellm_pending_requests";
     /// Requests that waited for a target to recover, by alias and outcome.
     pub const RECOVERY_WAITS: &str = "hypellm_recovery_waits_total";

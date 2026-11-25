@@ -70,9 +70,11 @@ fn a_machine_that_is_still_loading_is_waited_for_rather_than_failed() {
 
     // While it waited it was counted as pending; now it is not.
     let metrics = &router.state.telemetry.metrics;
+    assert!(outcome.recovery_waited, "the client response must be able to report the hold");
     let pending = Labels::new()
         .with(LabelName::Reason, "recovery")
-        .with(LabelName::Alias, "test-alias");
+        .with(LabelName::Alias, "test-alias")
+        .with(LabelName::Target, "local:model");
     assert_eq!(metrics.gauge_value(names::PENDING_REQUESTS, &pending), Some(0));
 
     // The completion is attributed to the model that served it.
@@ -177,7 +179,7 @@ impl hypellm_core::time::Clock for RebootClock {
     }
     fn sleep(&self, duration: std::time::Duration) {
         self.inner.sleep(duration);
-        if self.now_millis() >= 900_000
+        if self.now_millis() >= 2_400_000
             && let Some(health) = self
                 .health
                 .lock()
@@ -193,14 +195,14 @@ impl hypellm_core::time::Clock for RebootClock {
 }
 
 #[test]
-fn a_synchronous_request_survives_a_full_fifteen_minute_machine_reboot() {
+fn a_synchronous_request_survives_a_forty_minute_gpu_node_cold_start() {
     use hypellm_core::health::{BreakerConfig, HealthRegistry};
     use hypellm_core::time::{Clock, Deadline, TestClock};
     use std::sync::Arc;
     use std::time::Duration;
 
     let upstream = FakeUpstream::start(CannedResponse::json(200, OK_BODY));
-    let mut router = router_with_config(&upstream, &config(upstream.address.port(), 900_000));
+    let mut router = router_with_config(&upstream, &config(upstream.address.port(), 2_400_000));
     let clock = Arc::new(RebootClock {
         inner: TestClock::new(),
         health: std::sync::Mutex::new(None),
@@ -214,7 +216,7 @@ fn a_synchronous_request_survives_a_full_fifteen_minute_machine_reboot() {
     state.clock = clock.clone();
     state.health = health;
     let mut request = request();
-    request.limits.deadline = Deadline::after(clock.as_ref(), Duration::from_millis(1_020_000));
+    request.limits.deadline = Deadline::after(clock.as_ref(), Duration::from_millis(2_520_000));
     let outcome = pipeline::execute(
         state,
         &request,
@@ -223,7 +225,7 @@ fn a_synchronous_request_survives_a_full_fifteen_minute_machine_reboot() {
         &mut Collect::default(),
     );
     assert!(outcome.is_success(), "{:?}", outcome.error);
-    assert_eq!(clock.now_millis(), 900_000);
+    assert_eq!(clock.now_millis(), 2_400_000);
     assert_eq!(upstream.served(), 1);
     assert_eq!(
         state

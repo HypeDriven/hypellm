@@ -31,13 +31,14 @@ import { buttonRow, card } from '../components/table.js';
 
 const GIB = 1024 * 1024 * 1024;
 
-/** The router's ceiling on `recovery_wait_ms`. */
-const MAX_RECOVERY_WAIT_MS = 900_000;
+/** The router's ceiling and fleet default for `recovery_wait_ms`. */
+const MAX_RECOVERY_WAIT_MS = 3_600_000;
+const DEFAULT_RECOVERY_WAIT_MS = 900_000;
 
 const RECOVERY_HINT =
   'How long a request waits and retries when every machine for its alias is unreachable, ' +
   'using the longest wait among those providers; 0 fails at once, and the request deadline ' +
-  'still wins. Fleet machines default to 900 seconds (15 minutes).';
+  'still wins. Fleet machines default to 900 seconds (15 minutes); up to 3600 seconds (1 hour) is allowed.';
 
 /**
  * Field specifications, per record kind. `gib` fields are entered in GiB and
@@ -431,7 +432,7 @@ export function machinesPanel(ctx, fleet) {
       el('p', { class: 'panel__note', text: RECOVERY_HINT }),
       ...(providers.length
         ? providers.map((provider) => recoveryEditor(provider, 'all', submit,
-          provider.machine || (enabled && managedProviders.has(provider.id)) ? MAX_RECOVERY_WAIT_MS : 0))
+          provider.machine || (enabled && managedProviders.has(provider.id)) ? DEFAULT_RECOVERY_WAIT_MS : 0))
         : [emptyState('No providers are declared.')]),
     ]);
     body.replaceChildren(
@@ -477,7 +478,7 @@ export function machinesPanel(ctx, fleet) {
         ? [
             el('p', { class: 'panel__note', text: RECOVERY_HINT }),
             ...servingProviders.map((provider) => recoveryEditor(provider, `host-${host.id}`, submit,
-              provider.machine || enabled ? MAX_RECOVERY_WAIT_MS : 0)),
+              provider.machine || enabled ? DEFAULT_RECOVERY_WAIT_MS : 0)),
           ]
         : []),
       buttonRow([

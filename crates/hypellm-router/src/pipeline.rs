@@ -57,6 +57,8 @@ pub struct Outcome {
     /// Once true, the caller must not send an error body: the response has
     /// already begun (specification 6.5).
     pub saw_output: bool,
+    /// Whether this request waited for an unreachable target to recover.
+    pub recovery_waited: bool,
 }
 
 impl Outcome {
@@ -100,6 +102,23 @@ pub fn execute_for_key(
     key: Option<&KeyId>,
     sink: &mut dyn EventSink,
 ) -> Outcome {
+    execute_for_key_with_recovery(state, request, groups, permissions, key, sink, true)
+}
+
+/// [`execute_for_key`], with a per-request choice about waiting out an outage.
+///
+/// When `recovery_wait` is false, an otherwise recoverable outage returns
+/// immediately as a 503 with a retry hint. Other failures are unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_for_key_with_recovery(
+    state: &RouterState,
+    request: &CanonicalRequest,
+    groups: &[GroupId],
+    permissions: hypellm_core::rbac::PermissionSet,
+    key: Option<&KeyId>,
+    sink: &mut dyn EventSink,
+    recovery_wait: bool,
+) -> Outcome {
     // One snapshot for every round, recovery rounds included: a reload that
     // lands while a request waits for a machine to come back does not change
     // the policy that request is decided under.
@@ -126,15 +145,58 @@ pub fn execute_for_key(
             request
         });
     let request = with_usage.as_ref().unwrap_or(request);
-    let mut first = execute_once(state, &config, request, groups, &permissions, key, sink, Pass::INTERACTIVE);
+    let mut first = execute_once(
+        state,
+        &config,
+        request,
+        groups,
+        &permissions,
+        key,
+        sink,
+        Pass::INTERACTIVE,
+    );
     if awaits_activation(&first) {
-        first = await_activation(state, &config, request, groups, &permissions, key, sink, first);
+        first = await_activation(
+            state,
+            &config,
+            request,
+            groups,
+            &permissions,
+            key,
+            sink,
+            first,
+        );
     }
-    let budget = recovery_budget(&config, request);
-    if budget.is_zero() || !awaits_recovery(&first) {
+    if !awaits_recovery(&first) {
         return first;
     }
-    await_recovery(state, &config, request, groups, &permissions, key, sink, first, budget, Pass::INTERACTIVE)
+    if !recovery_wait {
+        let mut outcome = first;
+        outcome.error = Some(
+            RouterError::new(
+                ErrorCode::NoEligibleTarget,
+                "the target is unreachable and recovery waiting is disabled",
+            )
+            .with_retry_after(1),
+        );
+        return outcome;
+    }
+    let budget = recovery_budget(&config, request);
+    if budget.is_zero() {
+        return first;
+    }
+    await_recovery(
+        state,
+        &config,
+        request,
+        groups,
+        &permissions,
+        key,
+        sink,
+        first,
+        budget,
+        Pass::INTERACTIVE,
+    )
 }
 
 /// One pass of a queued job (orchestration §11.9).
@@ -385,7 +447,9 @@ fn await_recovery(
     let limit = config.settings.max_recovery_waiters;
     let admitted = state
         .recovery_waiters
-        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < limit).then(|| n + 1))
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            (n < limit).then(|| n + 1)
+        })
         .is_ok();
     if !admitted {
         record_recovery(state, request, "refused");
@@ -394,7 +458,9 @@ fn await_recovery(
 
     let clock = state.clock.as_ref();
     let until = Deadline::after(clock, budget).min(request.limits.deadline);
-    let pending = PendingGauge::enter(state, request, "recovery");
+    let target = pending_target(&first).cloned();
+    let pending = PendingGauge::enter(state, request, target.as_ref(), "recovery");
+    sink.recovery_wait();
     let mut outcome = first;
     let mut delay = FIRST_DELAY;
     let result = loop {
@@ -424,13 +490,18 @@ fn await_recovery(
             );
         }
         if !awaits_recovery(&outcome) {
-            break if outcome.is_success() { "recovered" } else { "failed" };
+            break if outcome.is_success() {
+                "recovered"
+            } else {
+                "failed"
+            };
         }
         delay = delay.saturating_mul(2).min(MAX_DELAY);
     };
     pending.leave();
     state.recovery_waiters.fetch_sub(1, Ordering::SeqCst);
     record_recovery(state, request, result);
+    outcome.recovery_waited = true;
     outcome
 }
 
@@ -504,7 +575,9 @@ fn await_activation(
     let limit = config.settings.max_parked_requests;
     let admitted = state
         .parked_requests
-        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < limit).then(|| n + 1))
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            (n < limit).then(|| n + 1)
+        })
         .is_ok();
     if !admitted {
         record_parking(state, request, "refused");
@@ -520,7 +593,8 @@ fn await_activation(
 
     let clock = state.clock.as_ref();
     let until = request.limits.deadline;
-    let pending = PendingGauge::enter(state, request, "parked");
+    let target = pending_target(&first).cloned();
+    let pending = PendingGauge::enter(state, request, target.as_ref(), "parked");
     let mut outcome = first;
     let mut seen = fleet.wake_signal().generation();
     let result = loop {
@@ -538,9 +612,22 @@ fn await_activation(
         // Read before the round, so a change made while it runs wakes the
         // next wait at once rather than being slept through.
         seen = fleet.wake_signal().generation();
-        outcome = execute_once(state, config, request, groups, permissions, key, sink, Pass::PARKED);
+        outcome = execute_once(
+            state,
+            config,
+            request,
+            groups,
+            permissions,
+            key,
+            sink,
+            Pass::PARKED,
+        );
         if !awaits_activation(&outcome) {
-            break if outcome.is_success() { "served" } else { "failed" };
+            break if outcome.is_success() {
+                "served"
+            } else {
+                "failed"
+            };
         }
     };
     pending.leave();
@@ -575,6 +662,33 @@ fn record_recovery(state: &RouterState, request: &CanonicalRequest, result: &str
     );
 }
 
+/// The configured target whose attempt or relevant exclusion caused a wait.
+fn pending_target(outcome: &Outcome) -> Option<&TargetId> {
+    outcome
+        .trace
+        .attempts
+        .last()
+        .map(|attempt| &attempt.target)
+        .or_else(|| {
+            outcome
+                .trace
+                .exclusions
+                .iter()
+                .find(|exclusion| {
+                    matches!(
+                        exclusion.reason,
+                        ExclusionReason::ActivationQueued
+                            | ExclusionReason::CircuitOpen
+                            | ExclusionReason::ProbeUnreachable
+                            | ExclusionReason::Unhealthy
+                            | ExclusionReason::FleetStateStale
+                            | ExclusionReason::FleetAgentUnavailable
+                    )
+                })
+                .map(|exclusion| &exclusion.target)
+        })
+}
+
 /// One request counted in `hypellm_pending_requests` while it waits.
 ///
 /// Left explicitly with [`PendingGauge::leave`]; `Drop` covers only an unwind,
@@ -585,14 +699,23 @@ struct PendingGauge<'a> {
 }
 
 impl<'a> PendingGauge<'a> {
-    fn enter(state: &'a RouterState, request: &CanonicalRequest, reason: &str) -> Self {
-        let mut labels = hypellm_telemetry::Labels::one(hypellm_telemetry::LabelName::Reason, reason);
+    fn enter(
+        state: &'a RouterState,
+        request: &CanonicalRequest,
+        target: Option<&TargetId>,
+        reason: &str,
+    ) -> Self {
+        let mut labels =
+            hypellm_telemetry::Labels::one(hypellm_telemetry::LabelName::Reason, reason);
         if let Some(alias) = alias_label(state, request) {
             labels = labels.with(hypellm_telemetry::LabelName::Alias, alias);
         }
+        if let Some(target) = target {
+            labels = labels.with(hypellm_telemetry::LabelName::Target, target.as_str());
+        }
         state.telemetry.metrics.gauge_add(
             hypellm_telemetry::names::PENDING_REQUESTS,
-            "Requests waiting for a model, by alias and what they wait for.",
+            "Requests waiting for a model, by target, alias, and what they wait for.",
             &labels,
             1,
         );
@@ -610,7 +733,7 @@ impl<'a> PendingGauge<'a> {
         if let Some(labels) = self.labels.take() {
             self.state.telemetry.metrics.gauge_add(
                 hypellm_telemetry::names::PENDING_REQUESTS,
-                "Requests waiting for a model, by alias and what they wait for.",
+                "Requests waiting for a model, by target, alias, and what they wait for.",
                 &labels,
                 -1,
             );
@@ -838,6 +961,7 @@ fn execute_once(
             trace,
             summary: None,
             saw_output: false,
+            recovery_waited: false,
         };
     }
 
@@ -893,6 +1017,7 @@ fn execute_once(
                 trace,
                 summary: None,
                 saw_output,
+                recovery_waited: false,
             };
         }
 
@@ -970,7 +1095,7 @@ fn execute_once(
         // "Alias/model" layer limits what the caller asked for, which is the
         // thing they control. A limit attached only to targets would be spread
         // across however many the alias resolves to.
-        let waiting = PendingGauge::enter(state, request, "capacity");
+        let waiting = PendingGauge::enter(state, request, Some(&target.id), "capacity");
         // The request id is stable across a job's passes, so it is the job's
         // place in line for its target's machine memory (`hypellm_core::machine`).
         // Only a job leaves a claim behind: a request that may wait waits on the
@@ -1103,6 +1228,7 @@ fn execute_once(
                             summary: None,
                             error: Some(error),
                             saw_output,
+                            recovery_waited: false,
                         };
                     }
                 }
@@ -1126,7 +1252,7 @@ fn execute_once(
             // loading. This is what turns a burst of ten requests into one
             // activation *and* ten served requests, rather than one activation
             // and nine failovers.
-            let waiting = PendingGauge::enter(state, request, "activation");
+            let waiting = PendingGauge::enter(state, request, Some(&target.id), "activation");
             let waited = wait_for(state, request, candidate, overall);
             waiting.leave();
             if let Err(reason) = waited {
@@ -1143,7 +1269,7 @@ fn execute_once(
                 continue;
             }
         } else if candidate.residency.requires_activation() {
-            let waiting = PendingGauge::enter(state, request, "activation");
+            let waiting = PendingGauge::enter(state, request, Some(&target.id), "activation");
             let activated =
                 activate_for(
                     state,
@@ -1433,6 +1559,7 @@ fn execute_once(
                     summary: Some(summary),
                     error: None,
                     saw_output,
+                    recovery_waited: false,
                 };
             }
             Err(failure) => {
@@ -1518,6 +1645,7 @@ fn execute_once(
                         summary: None,
                         error: Some(error),
                         saw_output,
+                        recovery_waited: false,
                     };
                 }
                 state.telemetry.count(
@@ -1547,6 +1675,7 @@ fn execute_once(
         summary: None,
         error: Some(error),
         saw_output,
+        recovery_waited: false,
     }
 }
 

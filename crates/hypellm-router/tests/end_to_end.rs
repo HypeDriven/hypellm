@@ -2275,6 +2275,136 @@ fn a_genuinely_unreachable_upstream_is_still_reported_as_a_failure() {
     assert_eq!(harness.upstream.served(), 0);
 }
 
+// -- Recovery visibility ------------------------------------------------------
+
+fn recovery_test_config(port: u16, wait_ms: u64) -> String {
+    default_config_text(port).replace(
+        "egress=local\n",
+        &format!("egress=local recovery_wait_ms={wait_ms}\n"),
+    )
+}
+
+fn chat_with_recovery_opt_out(harness: &Harness, body: &str) -> Response {
+    let raw = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: router.test\r\n\
+         Content-Type: application/json\r\nConnection: close\r\n\
+         Authorization: Bearer {}\r\nX-HypeLLM-Recovery-Wait: 0\r\n\
+         Content-Length: {}\r\n\r\n{body}",
+        harness.router.api_key,
+        body.len()
+    );
+    harness.raw(&raw)
+}
+
+#[test]
+fn a_response_after_recovery_is_marked_and_an_immediate_one_is_not() {
+    let upstream = FakeUpstream::start_sequence(vec![
+        CannedResponse::json(503, r#"{"error":{"type":"api_error"}}"#),
+        chat_completion_response(),
+        chat_completion_response(),
+    ]);
+    let config = recovery_test_config(upstream.address.port(), 4_000);
+    let harness = Harness::start(upstream, router_with_config_text(&config));
+
+    let held = harness.request("POST", "/v1/chat/completions", CHAT_BODY, true);
+    assert_eq!(held.status, 200, "{}", held.body);
+    assert_eq!(held.header("x-hypellm-recovery"), Some("held"));
+
+    let immediate = harness.request("POST", "/v1/chat/completions", CHAT_BODY, true);
+    assert_eq!(immediate.status, 200, "{}", immediate.body);
+    assert_eq!(immediate.header("x-hypellm-recovery"), None);
+    assert_eq!(harness.upstream.served(), 3);
+}
+
+#[test]
+fn a_failure_after_a_recovery_wait_also_carries_the_held_marker() {
+    let upstream = FakeUpstream::start(CannedResponse::json(
+        503,
+        r#"{"error":{"type":"api_error"}}"#,
+    ));
+    let config = recovery_test_config(upstream.address.port(), 300);
+    let harness = Harness::start(upstream, router_with_config_text(&config));
+
+    let response = harness.request("POST", "/v1/chat/completions", CHAT_BODY, true);
+    assert_eq!(response.status, 502, "{}", response.body);
+    assert_eq!(response.header("x-hypellm-recovery"), Some("held"));
+    assert!(harness.upstream.served() > 1, "the outage was retried");
+}
+
+#[test]
+fn recovery_opt_out_fails_fast_with_a_retry_hint() {
+    let upstream = FakeUpstream::start_sequence(vec![
+        CannedResponse::json(503, r#"{"error":{"type":"api_error"}}"#),
+        chat_completion_response(),
+    ]);
+    let config = recovery_test_config(upstream.address.port(), 60_000);
+    let harness = Harness::start(upstream, router_with_config_text(&config));
+
+    let started = std::time::Instant::now();
+    let response = chat_with_recovery_opt_out(&harness, CHAT_BODY);
+    assert_eq!(response.status, 503, "{}", response.body);
+    assert_eq!(response.header("retry-after"), Some("1"));
+    assert_eq!(
+        response
+            .json()
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(|c| c.as_str()),
+        Some("no_eligible_target")
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the request was held"
+    );
+    assert_eq!(
+        harness.upstream.served(),
+        1,
+        "no recovery retry may be attempted"
+    );
+}
+
+#[test]
+fn a_recovered_stream_carries_the_same_held_marker() {
+    let upstream = FakeUpstream::start_sequence(vec![
+        CannedResponse::json(503, r#"{"error":{"type":"api_error"}}"#),
+        CannedResponse::event_stream(&[
+            r#"{"id":"1","choices":[{"delta":{"content":"recovered"},"finish_reason":"stop"}]}"#,
+        ]),
+    ]);
+    let config = recovery_test_config(upstream.address.port(), 4_000);
+    let harness = Harness::start(upstream, router_with_config_text(&config));
+    let body = r#"{"model":"test-alias","stream":true,"messages":[{"role":"user","content":"x"}]}"#;
+
+    let response = harness.request("POST", "/v1/chat/completions", body, true);
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert_eq!(response.header("x-hypellm-recovery"), Some("held"));
+    assert!(response.body.contains("recovered"), "{}", response.body);
+}
+
+#[test]
+fn a_stream_that_opts_out_gets_a_real_503_instead_of_an_error_event() {
+    let upstream = FakeUpstream::start_sequence(vec![
+        CannedResponse::json(503, r#"{"error":{"type":"api_error"}}"#),
+        CannedResponse::event_stream(&[
+            r#"{"id":"1","choices":[{"delta":{"content":"too late"},"finish_reason":"stop"}]}"#,
+        ]),
+    ]);
+    let config = recovery_test_config(upstream.address.port(), 60_000);
+    let harness = Harness::start(upstream, router_with_config_text(&config));
+    let body = r#"{"model":"test-alias","stream":true,"messages":[{"role":"user","content":"x"}]}"#;
+
+    let response = chat_with_recovery_opt_out(&harness, body);
+    assert_eq!(response.status, 503, "{}", response.body);
+    assert_eq!(response.header("retry-after"), Some("1"));
+    assert_eq!(response.header("content-type"), Some("application/json"));
+    assert!(
+        !response.body.contains("data:"),
+        "an SSE response was committed: {}",
+        response.body
+    );
+    assert_eq!(harness.upstream.served(), 1);
+}
+
 // -- Fleet orchestration, end to end -----------------------------------------
 //
 // The goal the whole feature exists for, asserted at the outermost boundary: a

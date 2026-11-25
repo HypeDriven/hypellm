@@ -132,8 +132,14 @@ fn recovery_defaults_cover_always_on_machines_and_preserve_explicit_settings() {
 }
 
 #[test]
-fn recovery_accepts_fifteen_minutes_and_rejects_longer_windows() {
-    for (wait, valid) in [(900_000, true), (900_001, false), (u64::MAX, false)] {
+fn recovery_accepts_forty_minute_cold_starts_and_rejects_windows_over_an_hour() {
+    for (wait, valid) in [
+        (900_000, true),
+        (2_400_000, true),
+        (3_600_000, true),
+        (3_600_001, false),
+        (u64::MAX, false),
+    ] {
         let text = BASE.replace(
             "egress=private_network",
             &format!("egress=private_network recovery_wait_ms={wait}"),

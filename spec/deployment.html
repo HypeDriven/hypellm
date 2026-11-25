@@ -1135,7 +1135,7 @@ connection failures, or llama.cpp answering <code>503</code> while it loads. Oth
 providers default to failing immediately. An explicit setting, including zero,
 overrides the default:</p>
 <pre><code class="language-text">provider id=spark family=llamacpp scheme=http host=spark.lan port=8000 \
-    egress=private_network recovery_wait_ms=900000
+    egress=private_network recovery_wait_ms=2400000  # 40 minutes: new node plus cold start
 </code></pre>
 <ul>
 <li><strong>When it applies:</strong> nothing has reached the client, at least one target was
@@ -1143,12 +1143,18 @@ unreachable (connection refused or timed out, a <code>5xx</code> before acceptan
 open breaker, stale fleet state), and nothing failed for a reason time does
 not cure. A caller over quota, an unknown alias or a <code>4xx</code> fails at once.</li>
 <li><strong>How long:</strong> the longest <code>recovery_wait_ms</code> among the alias's providers, at
-most 900000. HTTP admission adds this allowance to the normal request deadline
+most 3600000 (one hour). HTTP admission adds this allowance to the normal request deadline
 (for jobs, the larger of <code>job_retention_ms</code> and <code>default_deadline_ms</code>),
 so recovery leaves time for execution. An artifact job's caller-specified patience
 still caps its deadline. Pipeline callers' explicit deadlines are unchanged.
 Retries back off from 250 ms to 2 s. A streamed request
 gets an SSE keepalive each round, and a client that leaves ends the wait.</li>
+<li><strong>Client controls:</strong> <code>X-HypeLLM-Recovery-Wait: 0</code> opts a synchronous
+request out of the hold. An unreachable target then fails immediately with <code>503</code>
+and <code>Retry-After: 1</code>; other failures are unchanged. A response whose request
+actually waited carries <code>X-HypeLLM-Recovery: held</code>. An ordinary slow response
+has no such header. Streaming headers are withheld when recovery is possible so
+the same marker and fail-fast status apply before a <code>200</code> is committed.</li>
 <li><strong>How many:</strong> at most <code>settings max_recovery_waiters</code> (default 256) wait at
 once. Past that, a request fails at once, because each waiter holds a
 connection worker. Jobs stay in their bounded queue with <code>waiting_for=recovery</code>,
@@ -1204,9 +1210,9 @@ the management listener, or on its own address with <code>settings metrics_liste
 <td><code>histogram_quantile(0.5, sum by (le, target) (rate(hypellm_output_tokens_per_second_bucket[5m])))</code></td>
 </tr>
 <tr>
-<td><code>hypellm_pending_requests{alias,reason}</code></td>
+<td><code>hypellm_pending_requests{target,alias,reason}</code></td>
 <td>Requests waiting for a model right now: <code>capacity</code> (admission queue), <code>activation</code> (a cold model starting), <code>parked</code> (waiting for a cold model to be started), <code>recovery</code> (an outage wait)</td>
-<td><code>sum by (alias) (hypellm_pending_requests)</code></td>
+<td><code>sum by (target, alias) (hypellm_pending_requests)</code></td>
 </tr>
 <tr>
 <td><code>hypellm_recovery_waits_total{alias,outcome}</code></td>
@@ -1230,8 +1236,8 @@ the management listener, or on its own address with <code>settings metrics_liste
 </tr>
 </tbody>
 </table></div>
-<p>The <code>alias</code> label appears only for aliases declared in the configuration; a
-caller-supplied name never becomes a label value.</p>
+<p>The <code>alias</code> and <code>target</code> labels come only from configured records;
+a caller-supplied name never becomes a label value.</p>
 <p>Provider families: <code>llamacpp</code> (or <code>llama.cpp</code>), <code>openai</code>, <code>anthropic</code>,
 <code>deepseek</code>, <code>moonshot</code> (or <code>kimi</code>), and <code>generic_openai</code>. The last requires
 <code>settings allow_generic_adapter=true</code> — it is refused otherwise
