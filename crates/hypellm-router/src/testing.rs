@@ -624,8 +624,14 @@ pub fn router_with_config(_upstream: &FakeUpstream, config_text: &str) -> TestRo
         // directly needs none.
         jobs: Some(Arc::new(
             crate::jobs::JobStore::new(crate::jobs::JobLimits::DEFAULT).with_spool(
-                crate::spool::Spool::open(dir.path(), 64 * 1024 * 1024, 256 * 1024 * 1024)
-                    .expect("the test spool"),
+                // The configured limits, as startup uses them, so a fixture
+                // can test a part near `max_job_part_bytes`.
+                crate::spool::Spool::open(
+                    dir.path(),
+                    config.settings.max_job_part_bytes,
+                    config.settings.max_job_spool_bytes,
+                )
+                .expect("the test spool"),
                 250,
             ),
         )),

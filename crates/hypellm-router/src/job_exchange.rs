@@ -390,7 +390,11 @@ fn fetch_part(
     let state = shim.state;
     let clock = state.clock.as_ref();
     let path = JobAdapter::part_path(id, &part.name);
-    let (mut connection, head) = shim.open(Method::Get, &path, b"", deadline, true)?;
+    // The head is held to the part's declared length, not the 64 MiB cap on
+    // an ordinary upstream reply: a part is bounded by `max_job_part_bytes`,
+    // checked above, and a TRELLIS.2 mesh_ply is ~190 MB.
+    let (mut connection, head) =
+        shim.open(Method::Get, &path, b"", deadline, true, part.bytes)?;
     let content_length = match head.body {
         BodyFraming::Fixed(n) => Some(n),
         _ => None,
@@ -505,6 +509,8 @@ impl Shim<'_> {
 
     /// Send one request and read its head, retrying once on a fresh socket
     /// when a pooled one turns out dead before any byte came back.
+    /// `max_body_bytes` bounds the `Content-Length` the response head may
+    /// declare; the caller reads the body under the same or a tighter limit.
     fn open(
         &self,
         method: Method,
@@ -512,6 +518,7 @@ impl Shim<'_> {
         body: &[u8],
         deadline: Deadline,
         idempotent: bool,
+        max_body_bytes: u64,
     ) -> Result<(hypellm_net::UpstreamConnection, wire_http1::ResponseHead), AttemptFailure> {
         let state = self.state;
         let clock = state.clock.as_ref();
@@ -535,6 +542,10 @@ impl Shim<'_> {
             self.provider.credential_ref.as_ref(),
         );
         let profile = state.egress_profile(&self.provider.id);
+        let head_limits = HttpLimits {
+            max_body_bytes,
+            ..HttpLimits::UPSTREAM
+        };
         let mut retried = false;
         loop {
             let mut connection = if retried {
@@ -547,7 +558,7 @@ impl Shim<'_> {
             let outcome = match connection.send(&wire, b"", clock, deadline) {
                 Err(e) => Err((AttemptPhase::BeforeAcceptance, e)),
                 Ok(()) => connection
-                    .read_head(&method, &HttpLimits::UPSTREAM, clock, deadline)
+                    .read_head(&method, &head_limits, clock, deadline)
                     .map_err(|e| (AttemptPhase::AfterAcceptance, e)),
             };
             match outcome {
@@ -585,7 +596,8 @@ impl Shim<'_> {
     ) -> Result<(u16, Vec<u8>), AttemptFailure> {
         let state = self.state;
         let clock = state.clock.as_ref();
-        let (mut connection, head) = self.open(method, path, body, deadline, idempotent)?;
+        let (mut connection, head) =
+            self.open(method, path, body, deadline, idempotent, MAX_REPLY_BYTES)?;
         let limits = HttpLimits {
             max_body_bytes: MAX_REPLY_BYTES,
             ..HttpLimits::UPSTREAM

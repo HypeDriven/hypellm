@@ -32,7 +32,7 @@ fn config(shim: u16) -> String {
     format!(
         "\
 settings state_dir=/tmp/hypellm-test default_deadline_ms=60000 retry_budget_ms=60000 \\
-         max_attempts=1 job_retention_ms=60000
+         max_attempts=1 job_retention_ms=60000 max_job_part_bytes=134217728
 tenant id=acme
 credential id=cred_shim
 provider id=trellis family=job scheme=http host=127.0.0.1 port={shim} egress=local credential=cred_shim
@@ -224,6 +224,30 @@ fn an_artifact_job_reaches_its_shim_and_its_parts_are_served_as_attachments() {
     assert_eq!(submit.get("verb").and_then(Value::as_str), Some("image-to-3d"));
     let inputs = submit.get("inputs").and_then(Value::as_array).unwrap();
     assert_eq!(inputs[0].get("data").and_then(Value::as_str), Some(PNG));
+}
+
+#[test]
+fn a_part_larger_than_an_ordinary_upstream_body_is_fetched_whole() {
+    // A TRELLIS.2 mesh_ply is ~190 MB (2026-11-24). The part limit is
+    // `max_job_part_bytes` (1 GiB by default), not the 64 MiB cap on an
+    // ordinary upstream reply: a part one byte past that cap must be spooled
+    // and served intact, not refused at its response head.
+    let big = vec![0x5a_u8; 64 * 1024 * 1024 + 1];
+    let h = Harness::start(ShimScript::succeeding(vec![
+        ShimPart::honest("mesh", "model/gltf-binary", b"glb"),
+        ShimPart::honest("geometry", "application/octet-stream", &big),
+    ]));
+    let job = h.submit(&mesh_job());
+    let view = h.wait_terminal(&job);
+    assert_eq!(view.get("state").and_then(Value::as_str), Some("succeeded"), "{view:?}");
+    let parts = view.get("parts").and_then(Value::as_array).expect("parts listed");
+    assert_eq!(
+        parts[1].get("sha256").and_then(Value::as_str).map(str::to_owned),
+        Some(hypellm_crypto::hex::encode(&hypellm_crypto::sha256::sha256(&big)))
+    );
+    let served = h.call("GET", &format!("/v1/jobs/{job}/result/geometry"), "");
+    assert_eq!(served.status, 200);
+    assert!(served.body == big, "the served part differs from what the shim produced");
 }
 
 #[test]
