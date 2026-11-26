@@ -45,9 +45,10 @@ spec:
             - {name: TS_ACCEPT_DNS, value: "false"}
             - {name: TS_EXTRA_ARGS, value: --accept-routes}
             - {name: TS_SERVE_CONFIG, value: /etc/tailscale/serve.json}
-            # A remote peer's path drops large WireGuard packets (2026-11-25); 1200 keeps
-            # request bodies under it. Revert if remote retests show no change.
-            - {name: TS_DEBUG_MTU, value: "1200"}
+            # The pod's eth0 (flannel overlay) is MTU 1230; WireGuard's ~60 bytes of overhead
+            # caps inner packets near 1,170, and larger ones were silently dropped on the
+            # remote internet path (2026-11-25). 1150 stays under it; 1200 did not.
+            - {name: TS_DEBUG_MTU, value: "1150"}
             - name: TS_AUTHKEY
               valueFrom: {secretKeyRef: {name: tailscale-authkey, key: authkey, optional: true}}
           securityContext:
