@@ -410,8 +410,9 @@ oidc: _dirs _verifier_secret
 down:
     kstack down {{ns}}
 
-# Graceful stop and start, picking up an edited docker/hypellm.conf.
-restart: down up
+# Graceful stop and start, picking up an edited docker/hypellm.conf. The image
+# is built before `down`, so a failed build leaves the running router alone.
+restart: build down up
 
 # Once any policy has been published through the management API, the router
 # resumes the last published version on every start and ignores this file —
