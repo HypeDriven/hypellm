@@ -30,8 +30,9 @@ mod harness;
 use harness::{Harness, LOCAL_TARGET, TENANT_A, TENANT_B};
 use hypellm_admin_api::traffic::{self, TrafficSample};
 use hypellm_admin_api::UsageStatus;
-use hypellm_core::ids::{TargetId, TenantId};
-use hypellm_core::time::Clock;
+use hypellm_core::canonical::{CanonicalRequest, ClientProtocol, Operation, RequestLimits, StreamOptions};
+use hypellm_core::ids::{AliasId, KeyId, PrincipalId, RequestId, TargetId, TenantId};
+use hypellm_core::time::{Clock, Deadline};
 use wire_json::Value;
 
 /// A completed request that succeeded, with the given timings.
@@ -117,6 +118,101 @@ fn one_tenants_request_rate_is_invisible_to_another_tenant() {
 }
 
 // -- Rate --------------------------------------------------------------------
+
+#[test]
+fn live_rows_keep_concurrent_requests_distinct_and_respect_usage_scope() {
+    let admin = Harness::new();
+    let now = admin.clock.now_millis();
+    let config = admin.config();
+    let target = &config.snapshot.targets[&TargetId::new(LOCAL_TARGET).unwrap()];
+    let mut request = CanonicalRequest {
+        request_id: RequestId::from_u128(1),
+        tenant: tenant(TENANT_A),
+        principal: PrincipalId::new(format!("user:viewer-{TENANT_A}")).unwrap(),
+        protocol: ClientProtocol::OpenAiChat,
+        operation: Operation::Chat,
+        requested_model: AliasId::new("chat").unwrap(),
+        messages: Vec::new(),
+        inputs: Vec::new(),
+        tools: Vec::new(),
+        tool_choice: None,
+        response_format: None,
+        sampling: Default::default(),
+        reasoning_effort: Default::default(),
+        limits: RequestLimits {
+            max_output_tokens: None,
+            deadline: Deadline::at(now + 10_000),
+            max_cost_class: None,
+            min_quality_class: None,
+            residency: None,
+        },
+        stream: StreamOptions {
+            enabled: true,
+            include_usage: false,
+        },
+        hints: Default::default(),
+    };
+    let key = KeyId::new("request-key").unwrap();
+    let first = admin
+        .traffic
+        .in_flight
+        .start(&request, &key, target)
+        .unwrap();
+    first.observe_output(now, 100);
+    request.principal = PrincipalId::new("other-user").unwrap();
+    let second = admin
+        .traffic
+        .in_flight
+        .start(&request, &key, target)
+        .unwrap();
+    let path = "/admin/v1/traffic";
+    let body = admin.get(&admin.operator(), path).json();
+    let rows = body.field_array("in_flight_requests").unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0].field_str("request_id"),
+        rows[1].field_str("request_id")
+    );
+    assert_eq!(rows[0].field_str("model").unwrap(), target.native_model);
+    assert_eq!(rows[0].field_str("key_id").unwrap(), key.as_str());
+    assert!(
+        rows[0]
+            .get("estimated_output_tokens_per_second")
+            .unwrap()
+            .as_f64()
+            .unwrap()
+            > 0.0
+    );
+    assert!(rows[1].get("estimated_output_tokens_per_second").is_none());
+
+    let body = admin.get(&admin.viewer(), path).json();
+    let own = body.field_array("in_flight_requests").unwrap();
+    assert_eq!(own.len(), 1);
+    assert!(own[0].get("key_id").is_none());
+    let other_tenant = admin.get(&admin.operator_in(TENANT_B), path).json();
+    assert!(
+        other_tenant
+            .field_array("in_flight_requests")
+            .unwrap()
+            .is_empty()
+    );
+
+    drop(second);
+    admin.advance(4_000);
+    let body = admin.get(&admin.operator(), path).json();
+    let rows = body.field_array("in_flight_requests").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]
+            .get("estimated_output_tokens_per_second")
+            .unwrap()
+            .as_f64(),
+        Some(0.0)
+    );
+    drop(first);
+    let body = admin.get(&admin.operator(), path).json();
+    assert!(body.field_array("in_flight_requests").unwrap().is_empty());
+}
 
 #[test]
 fn a_sample_that_has_aged_out_of_the_window_is_no_longer_counted_in_it() {

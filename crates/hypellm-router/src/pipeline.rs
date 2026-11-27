@@ -43,6 +43,37 @@ use std::time::Duration;
 use crate::dispatch::{self, AttemptFailure, AttemptSummary, EventSink};
 use crate::state::RouterState;
 
+struct MonitoredSink<'a> {
+    inner: &'a mut dyn EventSink,
+    activity: Option<hypellm_admin_api::in_flight::InFlightRequest<'a>>,
+    clock: &'a dyn hypellm_core::time::Clock,
+}
+
+impl EventSink for MonitoredSink<'_> {
+    fn deliver(&mut self, event: &CanonicalEvent) -> Result<(), dispatch::SinkClosed> {
+        self.inner.deliver(event)
+    }
+
+    fn observe_stream_output(&mut self, bytes: u64) {
+        if let Some(activity) = &self.activity {
+            activity.observe_output(self.clock.now_millis(), bytes);
+        }
+        self.inner.observe_stream_output(bytes);
+    }
+
+    fn keepalive(&mut self) -> Result<(), dispatch::SinkClosed> {
+        self.inner.keepalive()
+    }
+
+    fn admitted(&mut self) {
+        self.inner.admitted();
+    }
+
+    fn recovery_wait(&mut self) {
+        self.inner.recovery_wait();
+    }
+}
+
 /// What the pipeline produced.
 #[derive(Debug)]
 pub struct Outcome {
@@ -1364,6 +1395,11 @@ fn execute_once(
         // Filled by the exchange whatever its outcome, so a failed attempt
         // leaves a record of how far it got.
         let mut progress = dispatch::AttemptProgress::default();
+        let mut monitored = MonitoredSink {
+            inner: sink,
+            activity: key.and_then(|key| state.traffic.in_flight.start(request, key, target)),
+            clock,
+        };
         let mut result = match pass.artifact {
             Some(run) if provider.family == hypellm_core::target::ProviderFamily::Job => {
                 crate::job_exchange::run(state, request, target, provider, run, overall)
@@ -1385,7 +1421,7 @@ fn execute_once(
                 provider,
                 adapter,
                 overall,
-                sink,
+                &mut monitored,
                 &mut progress,
             ),
         };
@@ -1420,7 +1456,7 @@ fn execute_once(
                     provider,
                     adapter,
                     overall,
-                    sink,
+                    &mut monitored,
                     dispatch::CredentialChoice::Superseded,
                     &mut retried_progress,
                 );
@@ -1451,6 +1487,8 @@ fn execute_once(
                 }
             }
         }
+
+        drop(monitored);
 
         // A success with the *current* secret retires the superseded one at
         // once, so in a healthy rotation the window lasts one request and

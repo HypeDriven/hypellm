@@ -1,6 +1,7 @@
 #include "json.hpp"
 #include "model.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <string>
@@ -290,6 +291,30 @@ int main() {
 
     // Monitor rows: every visible model with its availability, users ranked by
     // throughput, honest empty and failure states.
+    {
+        MonitorInput input;
+        input.state = ConnectionState::Connected;
+        input.traffic = parseTraffic(*parseJson(R"({"capacity":{"available":false}, "in_flight_requests":[
+            {"request_id":"first", "key_id":"same-key", "model":"inkling-2-mini", "estimated_output_tokens_per_second":19.5},
+            {"request_id":"second", "key_id":"same-key", "model":"inkling-2-mini", "estimated_output_tokens_per_second":0},
+            {"request_id":"third", "model":"qwen3.8-27b", "target":"spark-b"}
+        ]})"));
+        const auto rows = buildMonitorRows(input, {});
+        check(rows.size() == 4 && rows[1].kind == RowKind::Request && rows[2].kind == RowKind::Request &&
+              rows[1].label == rows[2].label && rows[1].label.find("inkling-2-mini") != std::string::npos &&
+              rows[1].tooltip.find("first") != std::string::npos && rows[2].tooltip.find("second") != std::string::npos,
+              "concurrent requests for the same model and key have separate rows");
+        check(rows.size() == 4 && rows[1].caption == "~19.5 tok/s" && rows[2].caption == "~0.00 tok/s" &&
+              rows[3].label == "qwen3.8-27b" && rows[3].caption == "— tok/s",
+              "live, zero, and unavailable output rates display distinctly");
+        const auto geometry = stackRows(rows, 8);
+        check(geometry.heights.size() == 4 && geometry.heights[1] == kRowLabelHeight + 2,
+              "request rows leave no space for an occupancy bar");
+        input.state = ConnectionState::Unreachable;
+        const auto stale = buildMonitorRows(input, {});
+        check(std::none_of(stale.begin(), stale.end(), [](const auto& row) { return row.kind == RowKind::Request; }),
+              "failed refresh does not display stale requests as in flight");
+    }
     {
         RateBook rates(60000);
         const auto first = parseUsage(*parseJson(usageJson(1000, 500, 200, 500)));

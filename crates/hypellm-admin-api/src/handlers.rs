@@ -2973,6 +2973,33 @@ impl AdminApi {
         );
 
         root.push("capacity", self.capacity_value(session, now));
+        let tenant_wide = self.require(session, Permission::ReadTenantUsage).is_ok();
+        if tenant_wide || self.require(session, Permission::ReadOwnUsage).is_ok() {
+            let principal = (!tenant_wide).then_some(&session.principal);
+            let requests = self
+                .state
+                .traffic
+                .in_flight
+                .snapshot(&session.tenant, principal, now);
+            let rows = requests
+                .into_iter()
+                .map(|request| {
+                    let mut row = Object::new();
+                    row.push("request_id", Value::from(request.id.to_hex()));
+                    row.push("model", Value::from(request.model));
+                    row.push("target", Value::from(request.target.as_str()));
+                    if tenant_wide {
+                        row.push("key_id", Value::from(request.key.as_str()));
+                    }
+                    row.push_opt(
+                        "estimated_output_tokens_per_second",
+                        request.output_tokens_per_second.map(Value::from),
+                    );
+                    Value::Object(row)
+                })
+                .collect();
+            root.push("in_flight_requests", Value::Array(rows));
+        }
         Ok(ApiResponse::ok(&Value::Object(root)))
     }
 

@@ -43,6 +43,7 @@ pub mod enroll;
 pub mod fleet;
 pub mod fleet_access;
 pub mod handlers;
+pub mod in_flight;
 pub mod jobs;
 pub mod response;
 pub mod traffic;

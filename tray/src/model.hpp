@@ -41,12 +41,21 @@ struct TargetActivity {
     [[nodiscard]] std::optional<double> utilisation() const;
 };
 
+struct RequestActivity {
+    std::string requestId;
+    std::string keyId;
+    std::string model;
+    std::string target;
+    std::optional<double> outputTokensPerSecond;
+};
+
 struct TrafficSnapshot {
     bool capacityAvailable{false};
     std::optional<std::uint64_t> globalInFlight;
     std::optional<std::uint64_t> globalMaxConcurrency;
     std::uint64_t activeStreams{};
     std::vector<TargetActivity> targets;
+    std::vector<RequestActivity> requests;
     // False when the router dropped this tenant's samples; the minute figures
     // are then absent rather than a confident zero.
     bool attributed{true};
@@ -190,7 +199,7 @@ struct RateBook {
     void clear();
 };
 
-enum class RowKind { Status, Heading, Model, Principal, Key };
+enum class RowKind { Status, Heading, Request, Model, Principal, Key };
 
 struct MonitorRow {
     RowKind kind{RowKind::Status};

@@ -585,6 +585,8 @@ private:
     std::vector<int> rowHeights_;
     int logicalWidth_{kMonitorDefaultWidth};
     int logicalHeight_{48};
+    int contentHeight_{48};
+    int scrollOffset_{0};
     HBITMAP monitorBitmap_{};
     void* monitorBits_{};
     int monitorBmpW_{0};
@@ -834,7 +836,8 @@ App::ResizeEdge App::resizeEdgeAt(POINT client) const {
 }
 
 const MonitorHit* App::hitAt(POINT client) const {
-    const POINT logical = toLogical(client);
+    POINT logical = toLogical(client);
+    logical.y += scrollOffset_;
     for (const auto& hit : hits_) {
         if (PtInRect(&hit.rect, logical)) return &hit;
     }
@@ -912,7 +915,7 @@ void App::layoutMonitor() {
     }
     rowTops_ = std::move(stack.tops);
     rowHeights_ = std::move(stack.heights);
-    logicalHeight_ = std::max(40, stack.bottom + 4);
+    contentHeight_ = std::max(40, stack.bottom + 4);
 }
 
 void App::syncFloatingWindowSize() {
@@ -924,10 +927,24 @@ void App::syncFloatingWindowSize() {
     int width = client.right - client.left;
     if (width <= 0) width = window.right - window.left;
     width = std::max(width, kMonitorMinWindowWidth);
+    int top = window.top;
+    logicalHeight_ = contentHeight_;
+    MONITORINFO monitor{sizeof(monitor)};
+    if (GetMonitorInfoW(MonitorFromWindow(floatingWindow_, MONITOR_DEFAULTTONEAREST), &monitor)) {
+        const int workHeight = monitor.rcWork.bottom - monitor.rcWork.top;
+        const int maxLogicalHeight = std::max(1, static_cast<int>(
+            static_cast<double>(workHeight) * logicalWidth_ / width));
+        logicalHeight_ = std::min(contentHeight_, maxLogicalHeight);
+    }
+    scrollOffset_ = std::clamp(scrollOffset_, 0, contentHeight_ - logicalHeight_);
     const int height = std::max(1, static_cast<int>(std::lround(
         static_cast<double>(logicalHeight_) * static_cast<double>(width) / static_cast<double>(logicalWidth_))));
-    if (window.right - window.left != width || window.bottom - window.top != height) {
-        SetWindowPos(floatingWindow_, nullptr, 0, 0, width, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    if (height > window.bottom - window.top && monitor.rcWork.bottom > monitor.rcWork.top) {
+        top = std::max(static_cast<int>(monitor.rcWork.top),
+            std::min(top, static_cast<int>(monitor.rcWork.bottom) - height));
+    }
+    if (window.right - window.left != width || window.bottom - window.top != height || top != window.top) {
+        SetWindowPos(floatingWindow_, nullptr, window.left, top, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
     }
     const int corner = std::max(4, static_cast<int>(std::lround(kMonitorCorner * monitorScale())));
     SetWindowRgn(floatingWindow_, CreateRoundRectRgn(0, 0, width, height, corner, corner), TRUE);
@@ -944,7 +961,6 @@ void App::destroyMonitorBitmap() {
 }
 
 void App::renderMonitorBitmap() {
-    layoutMonitor();
     destroyMonitorBitmap();
 
     RECT client{};
@@ -988,8 +1004,10 @@ void App::renderMonitorBitmap() {
     // because an index past either is a read off the end of a vector.
     const std::size_t drawable = std::min({rows_.size(), rowTops_.size(), rowHeights_.size()});
     for (std::size_t index = 0; index < drawable; ++index) {
+        const int y = rowTops_[index] - scrollOffset_;
+        if (y >= logicalHeight_) break;
+        if (y + rowHeights_[index] <= 0) continue;
         const auto& row = rows_[index];
-        const int y = rowTops_[index];
         const std::wstring label = wide(row.label);
         const std::wstring caption = wide(row.caption);
         switch (row.kind) {
@@ -1047,6 +1065,7 @@ void App::renderMonitorBitmap() {
             // the half that says which target this is.
             RECT labelRect = scaled({kSidePad, y, logicalWidth_ - kSidePad - captionWidth, y + kLabelHeight});
             DrawTextW(mem, label.c_str(), -1, &labelRect, DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+            if (row.kind == RowKind::Request) break;
             RECT bar = scaled({kSidePad + 2, y + kLabelHeight + 1, logicalWidth_ - kSidePad - 2, y + kLabelHeight + 1 + kBarHeight});
             fill(bar, row.active ? kTrackActive : kTrackIdle);
             if (row.fraction) {
@@ -1060,6 +1079,12 @@ void App::renderMonitorBitmap() {
             break;
         }
         }
+    }
+
+    if (contentHeight_ > logicalHeight_) {
+        const int thumbHeight = std::clamp(MulDiv(logicalHeight_, logicalHeight_, contentHeight_), 1, logicalHeight_);
+        const int top = MulDiv(scrollOffset_, logicalHeight_ - thumbHeight, contentHeight_ - logicalHeight_);
+        fill(scaled({logicalWidth_ - 4, top, logicalWidth_ - 2, top + thumbHeight}), kTextDim);
     }
 
     SelectObject(mem, oldFont);
@@ -1551,6 +1576,17 @@ LRESULT App::onFloating(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: paintFloating(); return 0;
     case WM_SIZE: InvalidateRect(hwnd, nullptr, FALSE); return 0;
+    case WM_MOUSEWHEEL: {
+        const int delta = MulDiv(GET_WHEEL_DELTA_WPARAM(wParam), 3 * kRowLabelHeight, WHEEL_DELTA);
+        const int offset = std::clamp(scrollOffset_ - delta, 0, contentHeight_ - logicalHeight_);
+        if (offset != scrollOffset_) {
+            scrollOffset_ = offset;
+            SendMessageW(tooltip_, TTM_TRACKACTIVATE, FALSE, 0);
+            destroyMonitorBitmap();
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+    }
     case WM_SETCURSOR:
         if (LOWORD(lParam) == HTCLIENT) {
             POINT cursor{};

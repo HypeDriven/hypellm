@@ -43,6 +43,17 @@ std::optional<TrafficSnapshot> parseTraffic(const JsonValue& root) {
     const auto* capacity = root.get("capacity");
     if (!capacity || capacity->kind != JsonValue::Kind::Object) return std::nullopt;
     TrafficSnapshot snapshot;
+    if (const auto* requests = root.list("in_flight_requests")) {
+        for (const auto& row : *requests) {
+            const auto id = row.str("request_id");
+            const auto model = row.str("model");
+            if (!id || id->empty() || !model || model->empty()) continue;
+            const auto rate = row.num("estimated_output_tokens_per_second");
+            snapshot.requests.push_back({std::string(*id), std::string(row.str("key_id").value_or("")),
+                std::string(*model), std::string(row.str("target").value_or("")),
+                rate && std::isfinite(*rate) && *rate >= 0.0 ? rate : std::nullopt});
+        }
+    }
     snapshot.attributed = root.flag("attributed", true);
     if (const auto* windows = root.list("windows"); windows && snapshot.attributed) {
         for (const auto& window : *windows) {
@@ -470,6 +481,31 @@ std::vector<MonitorRow> buildMonitorRows(const MonitorInput& input, const Monito
     const Millis windowMillis = input.rates ? input.rates->principals.window() : 60000;
     bool anything = false;
 
+    if (input.state == ConnectionState::Connected && input.traffic && !input.traffic->requests.empty()) {
+        anything = true;
+        rows.push_back({RowKind::Heading, "In-flight requests", "", std::nullopt, false, Availability::Unknown, ""});
+        for (const auto& request : input.traffic->requests) {
+            MonitorRow row;
+            row.kind = RowKind::Request;
+            row.label = request.model;
+            row.active = true;
+            row.tooltip = request.model + "\r\nRequest " + request.requestId;
+            if (!request.target.empty()) row.tooltip += "\r\nTarget " + request.target;
+            if (options.showKeys && !request.keyId.empty()) {
+                row.label += " · " + shortId(request.keyId);
+                row.tooltip += "\r\nKey " + request.keyId;
+            }
+            if (request.outputTokensPerSecond) {
+                row.caption = "~" + formatRate(*request.outputTokensPerSecond) + " tok/s";
+                row.tooltip += "\r\nEstimated output tokens per second from recent streamed output.";
+            } else {
+                row.caption = "— tok/s";
+                row.tooltip += "\r\nA live token rate is available once streamed output arrives.";
+            }
+            rows.push_back(std::move(row));
+        }
+    }
+
     // The models section answers "which models can serve me, and what are
     // they doing", in that order. Gating the list on activity answered only
     // the second, and on a fleet that takes a request every few minutes it
@@ -735,6 +771,8 @@ RowStack stackRows(const std::vector<MonitorRow>& rows, int top, const std::vect
         int height = kRowLabelHeight + kRowBarHeight + kRowGap;
         if (rows[index].kind == RowKind::Heading) {
             height = kRowHeadingHeight;
+        } else if (rows[index].kind == RowKind::Request) {
+            height = kRowLabelHeight + 2;
         } else if (rows[index].kind == RowKind::Status) {
             const int wrapped = index < wrappedStatusHeights.size() ? wrappedStatusHeights[index] : 0;
             height = std::max(kRowLabelHeight, wrapped) + 6;

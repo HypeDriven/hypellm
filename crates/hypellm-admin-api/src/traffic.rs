@@ -167,6 +167,8 @@ impl TrafficSummary {
 /// The rolling window.
 #[derive(Debug)]
 pub struct TrafficWindow {
+    /// Upstream exchanges currently occupying a slot.
+    pub in_flight: crate::in_flight::InFlightRequests,
     /// Monotonic milliseconds at which observation began.
     started_millis: u64,
     /// One ring per tenant, created on that tenant's first completed request.
@@ -180,6 +182,7 @@ impl TrafficWindow {
     #[must_use]
     pub fn new(started_millis: u64) -> Self {
         Self {
+            in_flight: crate::in_flight::InFlightRequests::default(),
             started_millis,
             rings: RwLock::new(BTreeMap::new()),
             unattributed: AtomicU64::new(0),
