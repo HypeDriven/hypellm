@@ -24,9 +24,10 @@ hypellm-fleet = { path = "../hypellm-fleet" }
 hypellm-auth = { path = "../hypellm-auth" }
 wire-http1 = { path = "../wire-http1" }
 wire-json = { path = "../wire-json" }
-wire-sse = { path = "../wire-sse" }
 
 [dev-dependencies]
+# Only the streaming client test parses SSE.
+wire-sse = { path = "../wire-sse" }
 # `TempDir` is behind `test-harness` (specification 18.2), and this crate's
 # helper-socket tests need one.
 hypellm-store = { path = "../hypellm-store", features = ["test-harness"] }
