@@ -3292,3 +3292,168 @@ fn a_streaming_client_gets_keepalives_while_the_upstream_withholds_its_head() {
     assert!(response.body.contains("hello"), "{}", response.body);
     assert!(response.body.contains("[DONE]"), "{}", response.body);
 }
+
+// -- Wait status on a stream (X-HypeLLM-Status) -------------------------------
+//
+// A client that asks is told, on the stream itself, why its answer has not
+// started: parked, activation, capacity or recovery — and when that ends.
+
+const STATUS_STREAM_BODY: &str = r#"{"model":"test-alias","stream":true,"messages":[{"role":"user","content":"x"}]}"#;
+
+fn stream_from(address: SocketAddr, key: &str, ask_for_status: bool) -> Response {
+    let status = if ask_for_status { "X-HypeLLM-Status: 1\r\n" } else { "" };
+    let raw = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: router.test\r\n\
+         Content-Type: application/json\r\nConnection: close\r\n\
+         Authorization: Bearer {key}\r\n{status}Content-Length: {}\r\n\r\n{STATUS_STREAM_BODY}",
+        STATUS_STREAM_BODY.len()
+    );
+    raw_to(address, &raw)
+}
+
+/// The `hypellm-status` comments in a body, in order, as their JSON text.
+fn statuses(body: &str) -> Vec<String> {
+    body.lines()
+        .filter_map(|line| line.strip_prefix(": hypellm-status "))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn slow_stream() -> CannedResponse {
+    CannedResponse::event_stream(&[
+        r#"{"id":"1","choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}"#,
+    ])
+    .after(Duration::from_millis(300))
+}
+
+fn one_slot_config(port: u16) -> String {
+    default_config_text(port).replace("concurrency=8", "concurrency=1")
+        + "quota scope=target:local:model concurrency=1 queued=4\n"
+}
+
+#[test]
+fn a_queued_stream_that_asked_is_told_its_place_and_then_that_the_wait_is_over() {
+    let upstream = FakeUpstream::start(slow_stream());
+    let config = one_slot_config(upstream.address.port());
+    let harness = Harness::start(upstream, router_with_config_text(&config));
+    let (address, key) = (harness.address, harness.router.api_key.clone());
+
+    let holder = {
+        let key = key.clone();
+        std::thread::spawn(move || stream_from(address, &key, false))
+    };
+    std::thread::sleep(Duration::from_millis(80));
+    let queued = stream_from(address, &key, true);
+    let holder = holder.join().expect("holder thread");
+
+    assert_eq!(queued.status, 200, "{}", queued.body);
+    assert_eq!(queued.header("x-hypellm-status"), Some("1"));
+    assert_eq!(
+        statuses(&queued.body),
+        vec![
+            r#"{"status":"waiting","reason":"capacity","position":1}"#.to_owned(),
+            r#"{"status":"ready"}"#.to_owned(),
+        ],
+        "{}",
+        queued.body
+    );
+    // Before the first token, so the client can clear its status in time.
+    let ready = queued.body.find(r#"{"status":"ready"}"#).expect("ready");
+    let token = queued.body.find("answer").expect("the answer");
+    assert!(ready < token, "{}", queued.body);
+    // Plain SSE readers see the stream unchanged.
+    assert!(queued.sse_payloads().iter().all(|p| !p.contains("hypellm-status")));
+
+    // The holder did not ask, and did not wait: it hears nothing either way.
+    assert!(statuses(&holder.body).is_empty(), "{}", holder.body);
+    assert_eq!(holder.header("x-hypellm-status"), None);
+}
+
+#[test]
+fn a_queued_stream_that_did_not_ask_hears_no_status() {
+    let upstream = FakeUpstream::start(slow_stream());
+    let config = one_slot_config(upstream.address.port());
+    let harness = Harness::start(upstream, router_with_config_text(&config));
+    let (address, key) = (harness.address, harness.router.api_key.clone());
+
+    let holder = {
+        let key = key.clone();
+        std::thread::spawn(move || stream_from(address, &key, false))
+    };
+    std::thread::sleep(Duration::from_millis(80));
+    let queued = stream_from(address, &key, false);
+    let _ = holder.join();
+
+    assert_eq!(queued.status, 200, "{}", queued.body);
+    assert!(!queued.body.contains("hypellm-status"), "{}", queued.body);
+    assert_eq!(queued.header("x-hypellm-status"), None);
+}
+
+#[test]
+fn a_stream_that_never_waited_is_told_nothing_even_when_it_asked() {
+    let upstream = FakeUpstream::start(CannedResponse::event_stream(&[
+        r#"{"id":"1","choices":[{"delta":{"content":"now"},"finish_reason":"stop"}]}"#,
+    ]));
+    let router = router_for(&upstream);
+    let harness = Harness::start(upstream, router);
+    let response = stream_from(harness.address, &harness.router.api_key, true);
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert!(statuses(&response.body).is_empty(), "{}", response.body);
+}
+
+#[test]
+fn a_stream_waiting_out_an_outage_is_told_so_and_then_that_it_recovered() {
+    let upstream = FakeUpstream::start_sequence(vec![
+        CannedResponse::json(503, r#"{"error":{"type":"api_error"}}"#),
+        CannedResponse::event_stream(&[
+            r#"{"id":"1","choices":[{"delta":{"content":"recovered"},"finish_reason":"stop"}]}"#,
+        ]),
+    ]);
+    let config = recovery_test_config(upstream.address.port(), 4_000);
+    let harness = Harness::start(upstream, router_with_config_text(&config));
+
+    let response = stream_from(harness.address, &harness.router.api_key, true);
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert_eq!(response.header("x-hypellm-recovery"), Some("held"));
+    assert_eq!(
+        statuses(&response.body),
+        vec![
+            r#"{"status":"waiting","reason":"recovery"}"#.to_owned(),
+            r#"{"status":"ready"}"#.to_owned(),
+        ],
+        "{}",
+        response.body
+    );
+}
+
+#[test]
+fn a_stream_for_a_cold_model_is_told_the_model_is_starting_and_roughly_how_long() {
+    let socket = fleet_socket("status");
+    let upstream = FakeUpstream::start(CannedResponse::event_stream(&[
+        r#"{"id":"1","choices":[{"delta":{"content":"warm now"},"finish_reason":"stop"}]}"#,
+    ]));
+    let router = router_with_config_text(&fleet_config_text(upstream.address.port(), &socket));
+    let digest = router.state.config().fleet.digest();
+    let mut agent = hypellm_net::fleet_sim::SimulatedAgent::start(
+        &socket,
+        hypellm_net::fleet_sim::AgentScript::empty(digest, FLEET_KEY)
+            .with_deployment("d-model", hypellm_net::fleet_sim::Behaviour::ReadyAfter(1))
+            .with_state("d-model", "stopped"),
+    );
+    hypellm_router::testing::attach_fleet(&router, FLEET_KEY);
+    let harness = Harness::start(upstream, router);
+
+    let response = stream_from(harness.address, &harness.router.api_key, true);
+    agent.stop();
+
+    assert_eq!(response.status, 200, "{}", response.body);
+    let seen = statuses(&response.body);
+    assert_eq!(
+        seen.first().map(String::as_str),
+        Some(r#"{"status":"waiting","reason":"activation","eta_ms":1500}"#),
+        "{}",
+        response.body
+    );
+    assert_eq!(seen.last().map(String::as_str), Some(r#"{"status":"ready"}"#));
+    assert!(response.body.contains("warm now"), "{}", response.body);
+}

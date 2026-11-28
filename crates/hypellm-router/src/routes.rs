@@ -31,7 +31,7 @@ use std::time::Duration;
 use wire_http1::{Method, RequestHead, ResponseBuilder};
 use wire_json::Limits as JsonLimits;
 
-use crate::dispatch::{AccumulatingSink, EventSink, SinkClosed};
+use crate::dispatch::{AccumulatingSink, EventSink, SinkClosed, WaitStatus};
 use crate::pipeline;
 use crate::protocol::{ParseContext, anthropic, openai, rerank};
 use crate::server::{ClientWriter, Disposition, Handler};
@@ -327,7 +327,13 @@ impl InferenceHandler {
         }
 
         if request.stream.enabled {
-            self.stream(&request, principal, writer, started, recovery_wait)
+            // Opt-in, because honouring it can change how a failure is
+            // delivered: see `StreamSink::wait_status`.
+            let report_status = head
+                .headers
+                .get("x-hypellm-status")
+                .is_some_and(|value| value.trim() == "1");
+            self.stream(&request, principal, writer, started, recovery_wait, report_status)
         } else {
             // Read from the body rather than carried on the canonical request:
             // neither `top_n` nor `return_documents` is a routing input, and a
@@ -896,6 +902,7 @@ impl InferenceHandler {
         writer: &mut ClientWriter,
         started: u64,
         recovery_wait: bool,
+        report_status: bool,
     ) -> io::Result<Disposition> {
         let state = &self.state;
 
@@ -912,7 +919,7 @@ impl InferenceHandler {
             !recovery_wait || !pipeline::recovery_budget(&state.config(), request).is_zero();
         let pending_head = budgeted || defer_for_recovery;
         if !pending_head {
-            let head = stream_response_head(request.request_id, false)?;
+            let head = stream_response_head(request.request_id, false, report_status)?;
             writer.write(&head)?;
             writer.flush()?;
         }
@@ -925,6 +932,8 @@ impl InferenceHandler {
             pending_head,
             defer_for_recovery,
         );
+        sink.report_status = report_status;
+        sink.awaiting_admission = budgeted;
         let outcome = pipeline::execute_for_key_with_recovery(
             state,
             request,
@@ -1016,6 +1025,14 @@ struct StreamSink<'a> {
     defer_for_recovery: bool,
     /// Whether the head must carry the recovery-held marker.
     recovery_held: bool,
+    /// Whether the client asked for wait-status comments (`X-HypeLLM-Status: 1`).
+    report_status: bool,
+    /// Whether the head must stay closed until admission: a finite key budget
+    /// reserves before headers are sent (specification 12.1), so no status
+    /// may open it before then.
+    awaiting_admission: bool,
+    /// The last status written, so an unchanged one is not repeated.
+    last_status: Option<WaitStatus>,
 }
 
 impl<'a> StreamSink<'a> {
@@ -1041,6 +1058,9 @@ impl<'a> StreamSink<'a> {
             pending_head,
             defer_for_recovery,
             recovery_held: false,
+            report_status: false,
+            awaiting_admission: false,
+            last_status: None,
         }
     }
 
@@ -1049,7 +1069,8 @@ impl<'a> StreamSink<'a> {
         if !self.pending_head {
             return Ok(());
         }
-        let Ok(head) = stream_response_head(self.request.request_id, self.recovery_held) else {
+        let Ok(head) = stream_response_head(self.request.request_id, self.recovery_held, self.report_status)
+        else {
             self.closed = true;
             return Err(SinkClosed);
         };
@@ -1187,6 +1208,7 @@ impl EventSink for StreamSink<'_> {
     }
 
     fn admitted(&mut self) {
+        self.awaiting_admission = false;
         // A failed write marks the sink closed; the next delivery reports it.
         if !self.defer_for_recovery {
             let _ = self.open();
@@ -1197,6 +1219,41 @@ impl EventSink for StreamSink<'_> {
         self.recovery_held = true;
         self.defer_for_recovery = false;
         let _ = self.open();
+    }
+
+    /// A `: hypellm-status {...}` comment, for a client that asked for one.
+    ///
+    /// A comment rather than an event, because every SSE client ignores
+    /// comments and not every one ignores an event name it does not know.
+    /// Written only on a change, and never after semantic output: once a
+    /// token has been sent the wait is over by definition.
+    ///
+    /// When the head is still withheld for recovery, a status opens it. That
+    /// is the cost of the opt-in: a failure after the wait then arrives as an
+    /// in-stream error rather than a 429 or 503, because a 200 has been sent.
+    /// A head withheld for a key budget stays withheld until admission.
+    fn wait_status(&mut self, status: WaitStatus) {
+        if !self.report_status || self.closed || self.saw_output {
+            return;
+        }
+        if self.last_status == Some(status) {
+            return;
+        }
+        // "Ready" only clears a wait the client was told about.
+        if status == WaitStatus::Ready && self.last_status.is_none_or(|s| s == WaitStatus::Ready) {
+            return;
+        }
+        if self.pending_head {
+            if self.awaiting_admission {
+                return;
+            }
+            self.defer_for_recovery = false;
+        }
+        let mut comment = String::new();
+        wire_sse::encode_comment(&mut comment, &format!(" hypellm-status {}", status.to_json()));
+        if self.push(&comment).is_ok() {
+            self.last_status = Some(status);
+        }
     }
 
     fn deliver(&mut self, event: &CanonicalEvent) -> Result<(), SinkClosed> {
@@ -1595,7 +1652,11 @@ fn respond_error_with_recovery(
     Ok(Disposition::KeepAlive)
 }
 
-fn stream_response_head(request_id: RequestId, recovery_held: bool) -> io::Result<Vec<u8>> {
+fn stream_response_head(
+    request_id: RequestId,
+    recovery_held: bool,
+    report_status: bool,
+) -> io::Result<Vec<u8>> {
     let mut builder = ResponseBuilder::new(200)
         .header("Content-Type", "text/event-stream")
         .and_then(|b| b.header("Cache-Control", "no-store"))
@@ -1605,6 +1666,11 @@ fn stream_response_head(request_id: RequestId, recovery_held: bool) -> io::Resul
     if recovery_held {
         builder = builder
             .header("X-HypeLLM-Recovery", "held")
+            .map_err(|_| io::Error::other("response head"))?;
+    }
+    if report_status {
+        builder = builder
+            .header("X-HypeLLM-Status", "1")
             .map_err(|_| io::Error::other("response head"))?;
     }
     builder

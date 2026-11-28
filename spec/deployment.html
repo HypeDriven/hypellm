@@ -1176,6 +1176,21 @@ dashboard's Machines panel.</li>
 fleet_policy scope=host:spark idle_stop_ms=0   # never stop an idle model on this machine
 </code></pre>
 <p>When requests for several models wait for one machine, the router loads the model with the most waiting work per second of load first, keeps a loaded model serving while it has requests in flight rather than swapping it out, and lets <code>/v1/jobs</code> workers take jobs for loaded models before cold ones (router specification §26.11). <code>fleet_policy … max_reorder_wait_ms</code> (default 120000, two minutes) is the longest any work is put behind other models' in its priority class; past it, work goes in arrival order. <code>0</code> turns reordering off. Priority classes come first in both decisions: a model an interactive job or request waits for is loaded before one only batch work waits for. The Fleet screen shows each machine's next model to load and why.</p>
+<h3 id="wait-status-on-a-stream">Wait status on a stream</h3>
+<p>A streaming client can ask why its answer has not started by sending <code>X-HypeLLM-Status: 1</code> on a streamed <code>/v1/chat/completions</code>, <code>/v1/messages</code> or <code>/v1/responses</code> request. The response head then carries <code>X-HypeLLM-Status: 1</code>, and each time the request begins or changes a wait, before the first token, the router sends one SSE comment, which clients that do not look for it ignore:</p>
+<pre><code class="language-text">: hypellm-status {"status":"waiting","reason":"parked"}
+: hypellm-status {"status":"waiting","reason":"activation","eta_ms":42000}
+: hypellm-status {"status":"waiting","reason":"capacity","position":2}
+: hypellm-status {"status":"waiting","reason":"recovery"}
+: hypellm-status {"status":"ready"}
+</code></pre>
+<ul>
+<li><strong>Reasons</strong> are those of <code>hypellm_pending_requests</code>: <code>parked</code> and <code>activation</code> are a model being started, <code>capacity</code> the admission queue (or machine memory), <code>recovery</code> an outage wait. Unknown fields and reasons may be added; a client should ignore them.</li>
+<li><code>position</code> is the place in the admission order for a concurrency slot, 1 being next, and is sent again when it changes. It can grow when a higher-priority request arrives. A wait for machine memory has none.</li>
+<li><code>eta_ms</code> is the fleet plan's estimate of time to ready when the wait began, refined from observed start times. It is an estimate, absent when there is none, and not sent for <code>parked</code>.</li>
+<li><code>ready</code> is sent when the wait is over and the request is about to go upstream, only after a <code>waiting</code>. A request that never waited gets no status at all.</li>
+<li><strong>Cost of opting in:</strong> when the router would have withheld the response head (an alias with <code>recovery_wait_ms</code>), a status opens it, so a request that then fails — a queue timeout, a park reaching its deadline — gets the error in the stream instead of a <code>429</code> or <code>503</code>. A queue already full on arrival is still a <code>429</code> with <code>Retry-After</code>. For a key with a finite token budget the head stays withheld until the budget is reserved (§12.1), so that key's first wait for capacity is not reported.</li>
+</ul>
 <h3 id="metrics-for-prometheus">Metrics for Prometheus</h3>
 <p><code>GET /metrics</code> serves the Prometheus text exposition. It is unauthenticated on
 the management listener, or on its own address with <code>settings metrics_listen=</code>

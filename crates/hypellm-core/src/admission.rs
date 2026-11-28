@@ -623,6 +623,20 @@ impl QueueState {
             .map(|w| w.seq)
     }
 
+    /// Where `ticket` stands in the admission order: 1 is next.
+    ///
+    /// `None` once the ticket has left the line.
+    fn position(&self, ticket: u64) -> Option<u32> {
+        let mine = self.waiting.iter().find(|w| w.seq == ticket)?;
+        let key = (mine.class, mine.round, mine.seq);
+        let ahead = self
+            .waiting
+            .iter()
+            .filter(|w| (w.class, w.round, w.seq) < key)
+            .count();
+        Some(u32::try_from(ahead).unwrap_or(u32::MAX).saturating_add(1))
+    }
+
     /// The round to stamp on a new waiter of this tenant and class.
     fn next_round(&self, class: PriorityClass, tenant: &TenantId) -> usize {
         self.waiting
@@ -1046,12 +1060,15 @@ impl Scope {
         self.slot_freed.notify_all();
     }
 
-    /// Block until this ticket is at the head with capacity, or `timeout`.
+    /// Block until this ticket is at the head with capacity, until its place
+    /// in line differs from `reported`, or until `timeout`.
     ///
-    /// Returns whether the wait ended because it was this ticket's turn. The
-    /// caller must still attempt the acquisition — being at the head means
-    /// permission to try, not a held slot.
-    fn wait_for_turn(&self, ticket: u64, timeout: std::time::Duration) -> bool {
+    /// Returns early on a move so the caller can report it *outside* this
+    /// scope's lock: a report is a write to a client, and a write made under
+    /// the lock would stall every other waiter on a slow client. The caller
+    /// must still attempt the acquisition on [`Turn::Ready`] — being at the
+    /// head means permission to try, not a held slot.
+    fn wait_for_turn(&self, ticket: u64, timeout: std::time::Duration, reported: Option<u32>) -> Turn {
         let mut state = match self.queue.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -1059,10 +1076,15 @@ impl Scope {
         let mut remaining = timeout;
         loop {
             if state.head() == Some(ticket) && self.has_capacity() {
-                return true;
+                return Turn::Ready;
+            }
+            if let Some(position) = reported.and(state.position(ticket))
+                && Some(position) != reported
+            {
+                return Turn::Moved(position);
             }
             if remaining.is_zero() {
-                return false;
+                return Turn::TimedOut;
             }
             let started = std::time::Instant::now();
             let (next, result) = match self.slot_freed.wait_timeout(state, remaining) {
@@ -1076,10 +1098,23 @@ impl Scope {
             if result.timed_out() {
                 // One last look: the slot may have freed between the timeout
                 // firing and the lock being reacquired.
-                return state.head() == Some(ticket) && self.has_capacity();
+                return if state.head() == Some(ticket) && self.has_capacity() {
+                    Turn::Ready
+                } else {
+                    Turn::TimedOut
+                };
             }
             remaining = remaining.saturating_sub(started.elapsed());
         }
+    }
+
+    /// This ticket's current place in line.
+    fn position_of(&self, ticket: u64) -> Option<u32> {
+        let state = match self.queue.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.position(ticket)
     }
 
 }
@@ -2032,6 +2067,40 @@ impl AdmissionController {
         budget: std::time::Duration,
         key: Option<&str>,
     ) -> Result<(Reservation, u64), (Rejection, String)> {
+        self.reserve_queued_observed(
+            tenant,
+            principal,
+            alias,
+            target,
+            estimated_tokens,
+            class,
+            budget,
+            key,
+            &mut |_| {},
+        )
+    }
+
+    /// [`Self::reserve_queued_as`], reporting the wait to `progress`.
+    ///
+    /// `progress` is called on the requesting thread, outside every admission
+    /// lock, when a wait begins and each time the request's place in line
+    /// changes. It is not called for a reservation granted at once.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "reserve_queued_as's arguments plus the observer"
+    )]
+    pub fn reserve_queued_observed(
+        &self,
+        tenant: &TenantId,
+        principal: &PrincipalId,
+        alias: Option<(&AliasId, Operation)>,
+        target: &TargetId,
+        estimated_tokens: u64,
+        class: PriorityClass,
+        budget: std::time::Duration,
+        key: Option<&str>,
+        progress: &mut dyn FnMut(QueueProgress),
+    ) -> Result<(Reservation, u64), (Rejection, String)> {
         let take = MemoryAsk::Take { class, key };
         let first = self.acquire_chain(tenant, principal, alias, target, estimated_tokens, None, take);
         match first {
@@ -2053,6 +2122,7 @@ impl AdmissionController {
                     own = format!("wait-{}", self.next_wait.fetch_add(1, Ordering::SeqCst));
                     own.as_str()
                 };
+                progress(QueueProgress::AwaitingMemory);
                 let started = std::time::Instant::now();
                 let clock = Arc::clone(&self.clock);
                 let hold = ledger
@@ -2091,10 +2161,20 @@ impl AdmissionController {
                 };
 
                 let started = std::time::Instant::now();
-                let mut remaining = budget;
+                let mut reported = ticket.scope.position_of(ticket.ticket);
+                if let Some(position) = reported {
+                    progress(QueueProgress::Queued { position });
+                }
                 loop {
-                    if !ticket.scope.wait_for_turn(ticket.ticket, remaining) {
-                        return Err((Rejection::QueueTimeout, name));
+                    let remaining = budget.saturating_sub(started.elapsed());
+                    match ticket.scope.wait_for_turn(ticket.ticket, remaining, reported) {
+                        Turn::Ready => {}
+                        Turn::Moved(position) => {
+                            reported = Some(position);
+                            progress(QueueProgress::Queued { position });
+                            continue;
+                        }
+                        Turn::TimedOut => return Err((Rejection::QueueTimeout, name)),
                     }
                     let waited = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                     match self.acquire_chain(
@@ -2111,8 +2191,7 @@ impl AdmissionController {
                             // Lost the slot between the wake and the acquire.
                             // Keep the place in line and wait out the rest of
                             // the budget rather than starting over at the back.
-                            remaining = budget.saturating_sub(started.elapsed());
-                            if remaining.is_zero() {
+                            if budget.saturating_sub(started.elapsed()).is_zero() {
                                 return Err((Rejection::QueueTimeout, name));
                             }
                         }
@@ -2178,6 +2257,33 @@ fn apply_layer<K: Ord + Clone>(
 }
 
 /// A held place in a scope's queue, given up on every exit path.
+/// How a wait for a turn in a scope's line ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Turn {
+    /// At the head, with capacity: try to acquire.
+    Ready,
+    /// Still waiting, at a different place in line.
+    Moved(u32),
+    /// Out of time.
+    TimedOut,
+}
+
+/// What a queued reservation reports while it waits.
+///
+/// Reported only when a wait actually begins or changes — never for a
+/// reservation granted at once — so a caller can surface it to a client
+/// without announcing a wait that did not happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueProgress {
+    /// Waiting in a scope's line for a concurrency slot; 1 is next.
+    Queued {
+        /// This request's place in the admission order.
+        position: u32,
+    },
+    /// Waiting for machine memory, which has no comparable line position.
+    AwaitingMemory,
+}
+
 struct QueuedTicket<'a> {
     scope: &'a Arc<Scope>,
     ticket: u64,
@@ -2847,6 +2953,105 @@ mod tests {
             Some(0),
             "the waiter must leave the line"
         );
+    }
+
+    #[test]
+    fn a_waiter_is_told_its_place_and_told_again_when_it_moves_up() {
+        // The client-facing status (`X-HypeLLM-Status`) reports a place in
+        // line. It must be the place in the admission order, and it must be
+        // reported again when someone ahead leaves — here by timing out, which
+        // frees no slot and so is noticed only through the line itself.
+        let clock = Arc::new(TestClock::new());
+        let admission = controller(Arc::clone(&clock), ScopeLimits::UNLIMITED);
+        admission.configure_target(
+            &target(),
+            ScopeLimits {
+                max_concurrency: 1,
+                max_queued: 4,
+                ..ScopeLimits::UNLIMITED
+            },
+        );
+        let held = admission
+            .reserve(&tenant(), &principal(), &target(), 0)
+            .expect("the one slot");
+        let shared = Arc::new(admission);
+        let queued = |n: u32| {
+            for _ in 0..400 {
+                if shared.target_scope(&target()).is_some_and(|s| s.queued() == n) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            panic!("the line never reached {n}");
+        };
+
+        let ahead = {
+            let admission = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                admission.reserve_queued(
+                    &tenant(),
+                    &principal(),
+                    &target(),
+                    0,
+                    PriorityClass::Standard,
+                    std::time::Duration::from_millis(400),
+                )
+            })
+        };
+        queued(1);
+        let behind = {
+            let admission = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                let mut seen = Vec::new();
+                let result = admission.reserve_queued_observed(
+                    &tenant(),
+                    &principal(),
+                    None,
+                    &target(),
+                    0,
+                    PriorityClass::Standard,
+                    std::time::Duration::from_secs(5),
+                    None,
+                    &mut |progress| seen.push(progress),
+                );
+                (result.map(|(r, _)| drop(r)), seen)
+            })
+        };
+        assert!(matches!(
+            ahead.join().expect("thread"),
+            Err((Rejection::QueueTimeout, _))
+        ));
+        queued(1);
+        drop(held);
+        let (result, seen) = behind.join().expect("thread");
+        assert!(result.is_ok(), "the second waiter was admitted");
+        assert_eq!(
+            seen,
+            vec![
+                QueueProgress::Queued { position: 2 },
+                QueueProgress::Queued { position: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_immediate_reservation_reports_no_wait() {
+        let clock = Arc::new(TestClock::new());
+        let admission = controller(Arc::clone(&clock), ScopeLimits::UNLIMITED);
+        let mut seen = Vec::new();
+        let granted = admission.reserve_queued_observed(
+            &tenant(),
+            &principal(),
+            None,
+            &target(),
+            0,
+            PriorityClass::Standard,
+            std::time::Duration::from_secs(5),
+            None,
+            &mut |progress| seen.push(progress),
+        );
+        assert!(granted.is_ok());
+        assert!(seen.is_empty(), "no wait happened, so none is reported: {seen:?}");
     }
 
     #[test]

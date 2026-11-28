@@ -250,6 +250,11 @@
 <td>Keep <code>max_recovery_waiters</code> plus <code>max_parked_requests</code> well below <code>max_connections</code>, and waits no longer than a machine really takes to come back. Prefer <code>/v1/jobs</code> for work that may wait minutes for a model.</td>
 </tr>
 <tr>
+<td>Wait status for budgeted keys</td>
+<td>A stream that asks for <code>X-HypeLLM-Status</code> is not told about its first wait for capacity when its key has a finite token budget: specification 12.1 reserves the budget before the response head, and the admission queue comes before that reservation. Model starts and later waits are reported. Status is sent on streamed requests only.</td>
+<td>Rely on the client's own timer for that case, or give interactive keys no token limit.</td>
+</tr>
+<tr>
 <td>Address allowlists</td>
 <td>API-key address restrictions and trusted peers take IP addresses and prefixes, not host names: an authorization decision that depended on DNS would be one an attacker controlling a resolver could change.</td>
 <td>Give those machines stable addresses (DHCP reservations) and list the addresses.</td>

@@ -40,7 +40,7 @@ use hypellm_core::time::Deadline;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crate::dispatch::{self, AttemptFailure, AttemptSummary, EventSink};
+use crate::dispatch::{self, AttemptFailure, AttemptSummary, EventSink, WaitStatus};
 use crate::state::RouterState;
 
 struct MonitoredSink<'a> {
@@ -71,6 +71,10 @@ impl EventSink for MonitoredSink<'_> {
 
     fn recovery_wait(&mut self) {
         self.inner.recovery_wait();
+    }
+
+    fn wait_status(&mut self, status: dispatch::WaitStatus) {
+        self.inner.wait_status(status);
     }
 }
 
@@ -492,6 +496,7 @@ fn await_recovery(
     let target = pending_target(&first).cloned();
     let pending = PendingGauge::enter(state, request, target.as_ref(), "recovery");
     sink.recovery_wait();
+    sink.wait_status(WaitStatus::Recovery);
     let mut outcome = first;
     let mut delay = FIRST_DELAY;
     let result = loop {
@@ -527,6 +532,8 @@ fn await_recovery(
                 "failed"
             };
         }
+        // A round may have reported a different wait; this is the one in force.
+        sink.wait_status(WaitStatus::Recovery);
         delay = delay.saturating_mul(2).min(MAX_DELAY);
     };
     pending.leave();
@@ -626,6 +633,7 @@ fn await_activation(
     let until = request.limits.deadline;
     let target = pending_target(&first).cloned();
     let pending = PendingGauge::enter(state, request, target.as_ref(), "parked");
+    sink.wait_status(WaitStatus::Parked);
     let mut outcome = first;
     let mut seen = fleet.wake_signal().generation();
     let result = loop {
@@ -660,6 +668,8 @@ fn await_activation(
                 "failed"
             };
         }
+        // A round may have reported a different wait; this is the one in force.
+        sink.wait_status(WaitStatus::Parked);
     };
     pending.leave();
     fleet.unpark_alias(&request.requested_model, class);
@@ -718,6 +728,14 @@ fn pending_target(outcome: &Outcome) -> Option<&TargetId> {
                 })
                 .map(|exclusion| &exclusion.target)
         })
+}
+
+/// What a client is told while a model starts: the plan's estimate, if any.
+fn activation_status(view: &crate::fleet::FleetView, target: &TargetId) -> WaitStatus {
+    let eta = view.eta_ms(target);
+    WaitStatus::Activation {
+        eta_ms: (eta > 0).then_some(eta),
+    }
 }
 
 /// One request counted in `hypellm_pending_requests` while it waits.
@@ -1132,7 +1150,7 @@ fn execute_once(
         // Only a job leaves a claim behind: a request that may wait waits on the
         // machine itself, and one that may not has no next pass to present it.
         let claim = (!pass.queue_wait).then(|| request.request_id.to_string());
-        let reserved = state.admission.reserve_queued_as(
+        let reserved = state.admission.reserve_queued_observed(
             &request.tenant,
             &request.principal,
             Some((&request.requested_model, request.operation)),
@@ -1141,6 +1159,13 @@ fn execute_once(
             class,
             queue_budget,
             claim.as_deref(),
+            &mut |progress| {
+                let position = match progress {
+                    hypellm_core::admission::QueueProgress::Queued { position } => Some(position),
+                    hypellm_core::admission::QueueProgress::AwaitingMemory => None,
+                };
+                sink.wait_status(WaitStatus::Capacity { position });
+            },
         );
         waiting.leave();
         let reservation = match reserved {
@@ -1284,6 +1309,7 @@ fn execute_once(
             // activation *and* ten served requests, rather than one activation
             // and nine failovers.
             let waiting = PendingGauge::enter(state, request, Some(&target.id), "activation");
+            sink.wait_status(activation_status(&fleet_view, &target.id));
             let waited = wait_for(state, request, candidate, overall);
             waiting.leave();
             if let Err(reason) = waited {
@@ -1301,6 +1327,7 @@ fn execute_once(
             }
         } else if candidate.residency.requires_activation() {
             let waiting = PendingGauge::enter(state, request, Some(&target.id), "activation");
+            sink.wait_status(activation_status(&fleet_view, &target.id));
             let activated =
                 activate_for(
                     state,
@@ -1367,6 +1394,9 @@ fn execute_once(
                 continue;
             }
         };
+
+        // Every wait is behind it: what follows is upstream I/O.
+        sink.wait_status(WaitStatus::Ready);
 
         // Recorded before dispatch: the request is bound to this family from
         // the moment an attempt is made against it, whether or not it succeeds.

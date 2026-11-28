@@ -204,6 +204,69 @@ pub trait EventSink {
     ///
     /// A streaming sink uses this to mark its response head before opening it.
     fn recovery_wait(&mut self) {}
+
+    /// The request has begun, changed, or finished waiting before dispatch.
+    ///
+    /// Called when a wait actually begins — never for a reservation granted at
+    /// once — and with [`WaitStatus::Ready`] just before upstream I/O. A sink
+    /// that surfaces it to the client decides for itself whether anything is
+    /// worth sending; the default sends nothing.
+    fn wait_status(&mut self, _status: WaitStatus) {}
+}
+
+/// Why a request has not reached its provider yet.
+///
+/// The reasons are `hypellm_pending_requests`'s: a client shown these and an
+/// operator reading the gauge see the same vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitStatus {
+    /// Parked for a cold model whose start has not been triggered yet
+    /// (specification 26.10).
+    Parked,
+    /// Waiting for a model to finish starting. `eta_ms` is the fleet plan's
+    /// estimated time to ready when the wait began, if it has one.
+    Activation {
+        /// The plan's estimate, in milliseconds.
+        eta_ms: Option<u64>,
+    },
+    /// Waiting for capacity in the admission queue. `position` is the place
+    /// in line, 1 being next, when the wait is for a concurrency slot.
+    Capacity {
+        /// The request's place in the admission order.
+        position: Option<u32>,
+    },
+    /// Waiting for an unreachable target to recover.
+    Recovery,
+    /// The wait is over; the request is about to be sent upstream.
+    Ready,
+}
+
+impl WaitStatus {
+    /// The status as one line of JSON, for a client-facing comment.
+    ///
+    /// Built from closed vocabulary and integers only: no target, host or
+    /// alias name reaches the client through it.
+    #[must_use]
+    pub fn to_json(self) -> String {
+        let (status, reason) = match self {
+            Self::Ready => ("ready", None),
+            Self::Parked => ("waiting", Some("parked")),
+            Self::Activation { .. } => ("waiting", Some("activation")),
+            Self::Capacity { .. } => ("waiting", Some("capacity")),
+            Self::Recovery => ("waiting", Some("recovery")),
+        };
+        let mut out = format!("{{\"status\":\"{status}\"");
+        if let Some(reason) = reason {
+            out.push_str(&format!(",\"reason\":\"{reason}\""));
+        }
+        match self {
+            Self::Activation { eta_ms: Some(eta) } => out.push_str(&format!(",\"eta_ms\":{eta}")),
+            Self::Capacity { position: Some(p) } => out.push_str(&format!(",\"position\":{p}")),
+            _ => {}
+        }
+        out.push('}');
+        out
+    }
 }
 
 /// The sink refused further events: the client is gone or too slow.
